@@ -45,6 +45,9 @@ extern int  tx_policy_init(void);
 extern int  tx_txid(u8 out[32], const u8* tx, unsigned long txlen, u8* buf, unsigned long buflen);
 extern long p2p_write(int fd, const char* cmd, unsigned cmdlen, const void* pl, unsigned plen);
 extern long txrelay_poll_leg(int fd, void* mp, int max_ms);
+extern int (*txrelay_in_ibd_hook)(void);
+extern long txrelay_ibd_dropped_count(void);
+static int g_test_ibd = 0; static int test_ibd_hook(void){ return g_test_ibd; }
 extern long txrelay_stats(long*, long*, long*, long*, long*, long*);
 extern long txrelay_notfound_count(void);
 extern void txrelay_test_set_req_ttl_ms(long long ms);
@@ -1026,6 +1029,29 @@ int main(void){
         txrelay_wake_fd = -1; close(sp[0]); close(sp[1]); close(wk[0]); close(wk[1]);
     }
 
+    printf("\n== IBD: a tx announcement is dropped whole while the daemon is in initial block download (Core takes none) ==\n");
+    {
+        int sq[2]; if (socketpair(AF_UNIX, SOCK_STREAM, 0, sq) != 0){ ck("socketpair", 0); }
+        else {
+            /* a build without the gate REQUESTS the tx here and then blocks for the reply this
+             * test never sends: the revert-check of this case is a hang under `timeout`, not a
+             * FAIL line (2026-09-29) */
+            u8 h[32]; for (int i = 0; i < 32; i++) h[i] = (u8)(0xA5 ^ (i * 29));   /* announced by nobody before */
+            long before = txrelay_ibd_dropped_count();
+            txrelay_in_ibd_hook = test_ibd_hook; g_test_ibd = 1;
+            send_inv1(sq[1], h);
+            (void)txrelay_poll_leg(sq[0], mp_area, 200);
+            ck("in IBD: no getdata for the announced tx", no_bytes_pending(sq[1]));
+            ck("...and the drop is counted", txrelay_ibd_dropped_count() == before + 1);
+            g_test_ibd = 0;
+            send_inv1(sq[1], h);
+            (void)txrelay_poll_leg(sq[0], mp_area, 200);
+            char cmd[13]; static u8 pl[4096]; int plen = read_msg_nb(sq[1], cmd, pl, sizeof pl);
+            ck("out of IBD the same announcement is requested (it was not noted while dropped)", plen == 37 && strcmp(cmd, "getdata") == 0 && memcmp(pl+5, h, 32) == 0);
+            txrelay_in_ibd_hook = 0;
+            close(sq[0]); close(sq[1]);
+        }
+    }
     printf("\n%s (%d checks, %d failures)\n", g_fails==0 ? "ALL PASS" : "SOME FAILED", g_checks, g_fails);
     return g_fails ? 1 : 0;
 }

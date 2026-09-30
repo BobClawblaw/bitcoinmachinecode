@@ -2289,6 +2289,103 @@ and mempool state that the serial model currently protects for free, and that
 is a design change with its own correctness argument to make — not audit
 cleanup. What was wrong was that the cost was undocumented.
 
+**2026-09-29: the cost is now MEASURED as well.** Four times in three days
+(09-27 03:20:52 and 15:40:39, 09-28 12:43:11, 09-29 22:54:21, each within two
+seconds of a new block) the whole surface -- JSON-RPC and the Esplora facade --
+answered nothing for more than 90 s, seen by BlockYard's poll tiers and the
+mempool.space backend at the same instants, and the log could not say which
+handler held the lock. `rpc_server.c` times every take and release of
+`g_exec_lock` and writes one `[rpc] exec lock:` line for a wait or a hold of
+`BMC_RPC_EXEC_LOG_MS` (default 2000 ms) or longer, naming the JSON-RPC method
+or the facade/REST route plus the method it dispatched, and, for a waiter, the
+last exclusive holder (OPERATIONS.md, "Logging"). `tests/test_rpc_responsive`
+holds the write side and checks both lines. The next stall names itself.
+
+**2026-09-30: the one wait with a 90 s signature no longer holds the lock.**
+Every handler that waits on the WORKER -- another process, through the
+submit channel (`sendrawtransaction`, `submitpackage`, `testmempoolaccept`,
+`importmempool`), the block channel (`submitblock`, a `getblocktemplate`
+proposal) and the control channel (`addnode`, `setban`, `disconnectnode`) --
+spun for the worker's ack with the execution lock held, and the worker picks
+those channels up only at the top of its serve loop, which at a new block is
+inside the block's passes (each leg allowed 60 s). A broadcast landing in
+that window parked the whole surface for up to `SRT_WAIT_MS` = 90 s -- the
+size and the timing of all four stalls. `rpc_node.c` now takes the channel
+mutex through `submit_lock()` / `submit_unlock()`, which release the
+execution lock around the wait and take it back in the class it held
+(`rpc_server.c` `rpc_exec_yield_begin` / `_end`); a second submitter waits on
+the channel mutex, not on the surface. What a handler reads after the wait
+is its own (the reply buffers went from static to local or thread-local; the
+two package handlers hold the mutex from their parse to their reply, since
+their staging arrays are static). `tests/test_rpc_responsive` scenario E:
+with a status block nobody answers and the wait cut to 2.5 s, every trivial
+method and an exclusive `getblockhash` answer within 100 ms while a
+`sendrawtransaction` waits, the submit then times out honestly (-4), and
+the yield counter moved; with the yield made a no-op, `getblockhash` waited
+2,473 ms -- the stall, reproduced. The submitter itself still waits up to
+90 s; the worker servicing the channel between legs (not only at the top of
+its rotation) is the next step, and the #348 line names the holder if the
+next stall is something else.
+
+**2026-09-30, later: the worker was not the holder at the 09-29 stall, and the
+pollers' block lookups left the lock.** Production's log across the 22:54:21
+stall shows the worker's rotation at its normal cadence throughout (the
+tx-accept summary every 30 s, relay and dial lines), so its loop top was
+reached and any submission would have been picked up: the 90 s holder was
+something else in the RPC process, which the #348 line will name. Whatever
+it is, the fix that limits its blast radius is the one Core has by design:
+the calls the pollers make every block must not need the exclusive lock.
+`getblockhash` and `getblockheader` now run in the fast lane beside
+`getblockcount` (`rpc_chain_method_lane`, `FAST_LANE`): they read a few
+index records and a header prefix through the lane's own store handle, the
+hash index under `g_idx_mu`, the chainwork cache under `g_cw_mu`, and stack
+buffers -- nothing the write-locked handlers share. `tests/test_rpc_responsive`
+probes both under the held write lock and under six queued waits (0.1 ms;
+with the lane entry removed they waited 550-650 ms). Still on the exclusive
+lock, each for a shared buffer it would need its own of: `getblock`
+(`g_blockbuf`, the undo arrays), `getrawtransaction` (the mempool copy, the
+block scan), `getblockstats`, `gettxout`; the facade's and REST's own
+dispatch takes the exclusive lock too (`esp_lock`). A block lane with a
+private buffer is the next step on this path.
+
+**2026-09-30 07:21Z: the first holders named.** With the log threshold at
+2 s and a 77,800-transaction mempool, production wrote its first lines:
+`getrawmempool (excl) held 3467 ms; 2 waiting behind it`,
+`getmempoolinfo (shared) waited 2569 ms` behind it, then
+`getmempoolinfo (shared) held 2885 ms` and `held 2083 ms` with a
+`getrawmempool (excl)` waiting 2053 ms behind those. Not the 90 s stall,
+but its shape in miniature: the mempool reads hold the surface for seconds
+at a 78k pool, a SHARED holder parks the next writer, and the
+writer-preferring lock parks every reader behind that writer. The mempool
+methods are the next lane candidates, and their cost at this pool size is
+a row for the module benchmark.
+
+**2026-09-30, later: the mempool readers are cached and in a lane of their
+own.** The cost had a cause: `getmempoolinfo` summed vsize by PARSING every
+transaction in the pool on every call, and `getrawmempool` rebuilt its
+weight/RBF table the same way -- 77,800 parses per call. Core keeps the
+totals incrementally; this node's pool is shared memory the worker owns,
+so the RPC side now keeps a per-slot cache of each entry's parsed weight
+and RBF flag, keyed by the slot's txid and length: a walk of an unchanged
+pool is a memcmp per slot, and only slots that changed are parsed
+(`rpc_node.c` `mpc_weight`; `rpc_node_mpc_stats` counts hits and parses).
+And the readers no longer take the execution lock at all: `getmempoolinfo`,
+`getrawmempool`, `getmempoolentry`, `getmempoolancestors`,
+`getmempooldescendants`, `gettxspendingprevout` and `getmempoolcluster` are
+the *mempool lane* (`rpc_node_method_lane` = 2, NOLOCK in the server),
+serialised by their own recursive mutex inside `rpc_node_dispatch`; they
+read the pool under its own lock and share only this file's per-call
+tables, the slot cache and one static block buffer, none of which a
+write-locked handler touches. A slow `getrawmempool` now waits only its
+own kind. `tests/test_rpc_node`: a second walk parses nothing and answers
+the same bytes; `tests/test_rpc_server`: the lock-class rows;
+`tests/test_rpc_responsive`: both answer in 0.1 ms under the held write lock
+(with the lane removed, 549 ms). They are NOLOCK, not FAST: served by the
+worker threads, so six queued waits on four threads still delay them, as
+any NOLOCK call. What remains on the exclusive lock from the pollers' set:
+`getblock`, `getrawtransaction`, `getblockstats`, `gettxout`, and the
+facade's and REST's own dispatch (`esp_lock`).
+
 ### The wallet has no reorg awareness (WAL-13)
 
 `wallet_scan.c`'s on-disk record is `u32 height | txid | vout | value`

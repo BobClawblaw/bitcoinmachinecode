@@ -10,6 +10,7 @@ latest ones (audit 2026-09-02, recommendation 8: publish the height).
 
 | Date (UTC) | Height | Coins | muhash (prefix) | Occasion |
 |---|---|---|---|---|
+| 2026-09-30 06:50 | 969,273 | (not recorded) | `25640fa6c830242c` | run 31's capstone: a fresh IBD on main `49e26354` on the Core-matched defaults (5 h 28 m 11 s to its real tip), the per-height row equal to Core's and the live answer agreeing |
 | 2026-09-28 11:48 | 968,987 | (not recorded) | `1b39ab301f79d471` | run 30's capstone: a fresh IBD on main `1370d041` (4 h 54 m 30 s on the repaired link), the per-height row equal to Core's and the live answer agreeing |
 | 2026-09-28 00:53 | 968,910 | 165,238,604 | `c120bbaf14e37bdb` | production after #329 (the safegcd MuHash inverse): indexed row, no-height answer and Core all equal, 20,090,116.75 BTC |
 | 2026-09-28 02:09 | 968,920 | (not recorded) | `20a98a1547ea0e51` | production after #331 (the AVX2 keystream under MuHash): indexed row equal to Core's |

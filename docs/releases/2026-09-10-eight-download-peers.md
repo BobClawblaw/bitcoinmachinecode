@@ -1,5 +1,7 @@
 # 2026-09-10 — Eight download peers, the number Core uses
 
+> **Corrected 2026-09-29.** Eight is Core's *full-relay* class. Core downloads from every outbound peer that can serve blocks — the 8 full-relay **and** the 2 block-relay-only (`fPreferredDownload`, `net_processing.cpp`) — so its number is 10, and it keeps 16 blocks in flight per peer inside a 1,024-block window. The default now follows the two classes: `docs/releases/2026-09-29-core-download-shape-matched.md`.
+
 `bmc.catchupworkers` defaults to 8, matching Core's `MAX_OUTBOUND_FULL_RELAY_CONNECTIONS`. It was 64.
 
 **64 was never measured.** It arrived in 43950d24, the commit that fixed `par` (Core's script-verification thread count had been wired to the download worker count). That commit argues Core's `par` arithmetic at length and says nothing about the new setting's default; 64 is `DLC_WORKERS_HARD_MAX`, the size of the worker arrays, adopted as a default. Before that fix the harness ran `par=8`, so the worker count *was* 8 — fixing the `par` bug is what moved us off Core's number, as a side effect nobody argued for.

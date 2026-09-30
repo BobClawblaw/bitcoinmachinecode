@@ -13,6 +13,7 @@ static volatile int g_rest_on = 0;
 #include "rpc_chain.h"      /* rpc_chain_method_lane: which chain methods need no execution lock */
 
 #include <stdio.h>
+#include "daemon/log_ts.h"   /* 2026-09-29: the exec-lock lines are TIMES; stderr here carried no timestamp before */
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
@@ -93,6 +94,7 @@ static int g_threads = 4, g_workqueue = 64, g_timeout_s = 30;   /* Core's DEFAUL
  * a real client sends that in one burst. */
 #define RPC_REQ_DEADLINE_DEFAULT 60
 static long g_req_deadline_s = RPC_REQ_DEADLINE_DEFAULT;
+#define RPC_EXEC_LOG_MS_DEFAULT 2000   /* BMC_RPC_EXEC_LOG_MS: log an execution-lock wait or hold this long (0 = off) */
 #define RPC_QUEUE_CAP 4096
 static int g_q[RPC_QUEUE_CAP]; static int g_q_head, g_q_tail, g_q_n;
 static pthread_mutex_t g_q_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -559,6 +561,8 @@ static void exec_lock(void);
 static void exec_rlock(void);
 static void exec_unlock(void);
 static int  rpc_method_class(const char* m);
+static __thread const char* g_exec_label;   /* defined with the lock below */
+static __thread char g_exec_ctx[160];
 static rj_val* exec_one(rj_val* req, int* status, int* is_notification) {
     *status = HTTP_OK;
     *is_notification = 0;
@@ -588,9 +592,11 @@ static rj_val* exec_one(rj_val* req, int* status, int* is_notification) {
             /* the lock this METHOD needs, held for its dispatch only -- a
              * batch takes it per entry (see rpc_method_class) */
             int cls = rpc_method_class(method);
+            g_exec_label = method; g_exec_ctx[0] = 0;   /* who to name if this hold or wait is slow */
             if (cls == RPC_CLASS_EXCL) exec_lock(); else if (cls == RPC_CLASS_SHARED) exec_rlock();
             int ok = rpc_dispatch(method, params, g_wallet, &result, &dec, &dem);
             if (cls == RPC_CLASS_EXCL || cls == RPC_CLASS_SHARED) exec_unlock();
+            g_exec_label = 0;
             /* A V2 NOTIFICATION (no id) gets no response whatever the
              * method did. This flag used to be set only on the success
              * path, so a notification whose method FAILED was answered
@@ -854,14 +860,15 @@ static void exec_lock_init(void){
  * A method goes on the FAST or NOLOCK list only when its handler has been
  * made independent of what the write lock protects (see "lanes" in
  * rpc_chain.c). Adding one without that is a data race, not a slow query. */
+extern int rpc_node_method_lane(const char*) __attribute__((weak));   /* rpc_node.c: the mempool lane (2026-09-30); absent in some unit tests */
 static int rpc_method_class(const char* m){
     int lane = rpc_chain_method_lane(m);
+    if (!lane && rpc_node_method_lane) lane = rpc_node_method_lane(m);
     if (lane == 1) return RPC_CLASS_FAST;
     if (lane == 2) return RPC_CLASS_NOLOCK;
     if (!strcmp(m, "getpeerinfo") || !strcmp(m, "getconnectioncount") || !strcmp(m, "getnetworkinfo"))
         return RPC_CLASS_FAST;
-    if (!strcmp(m, "getmempoolinfo")) return RPC_CLASS_SHARED;
-    return RPC_CLASS_EXCL;
+    return RPC_CLASS_EXCL;   /* getmempoolinfo took the read side until 2026-09-30; it is in the mempool lane now */
 }
 /* Can this whole request run on the intake thread? Only when EVERY entry is
  * FAST: a single object, or a non-empty batch of them. Anything else --
@@ -891,10 +898,146 @@ static int rpc_body_is_fast(const char* body, size_t blen){
  * stalled for tens of seconds under an 11,900-transaction mempool. The
  * refresher now defers while this is non-zero (rpc_exec_waiters). */
 static volatile int g_exec_waiters = 0;
-static void exec_lock(void){ __sync_fetch_and_add(&g_exec_waiters, 1); pthread_rwlock_wrlock(&g_exec_lock); __sync_fetch_and_sub(&g_exec_waiters, 1); }
-static void exec_rlock(void){ __sync_fetch_and_add(&g_exec_waiters, 1); pthread_rwlock_rdlock(&g_exec_lock); __sync_fetch_and_sub(&g_exec_waiters, 1); }
-static void exec_unlock(void){ pthread_rwlock_unlock(&g_exec_lock); }
+/* 2026-09-29: WHO held the execution lock, and for how long. Four times in
+ * three days the whole RPC surface -- JSON-RPC and the facade alike -- stopped
+ * answering for more than 90 s within two seconds of a new block (2026-09-27
+ * 03:20:52 block 968777 and 15:40:39 block 968855, 09-28 12:43:11 block 968997,
+ * 09-29 22:54:21 blocks 969216/7), seen by BlockYard's three poll tiers and by
+ * the mempool.space backend at the same instants. Nothing in the log could
+ * say which handler held g_exec_lock, because nothing timed it. Every take
+ * and every release is timed on the monotonic clock now, and a WAIT or a HOLD
+ * of BMC_RPC_EXEC_LOG_MS or longer (default 2000 ms; 0 switches it off) is
+ * one line each:
+ *   [rpc] exec lock: getmininginfo (excl) waited 90123 ms; the last exclusive holder was esplora GET /internal/block/<hash>/txs -> getrawtransaction (held 90101 ms); 3 still waiting
+ *   [rpc] exec lock: esplora GET /internal/block/<hash>/txs -> getrawtransaction (excl) held 90101 ms (waited 0 ms); 3 waiting behind it
+ * The label is the JSON-RPC method, or for the facade and REST the route plus
+ * the method it dispatched (rpc_exec_set_label / rpc_exec_set_context, both
+ * thread-local: a connection is one thread here). A waiter names the LAST
+ * EXCLUSIVE holder because that is what a writer-preferring rwlock made it
+ * wait for; when the wait was behind readers instead, that holder's own hold
+ * will be shorter than the wait, which is the tell. The line is written AFTER
+ * the release, never under the lock. */
+static long g_exec_log_ms = RPC_EXEC_LOG_MS_DEFAULT;
+/* g_exec_label / g_exec_ctx: declared above exec_one, which names its dispatch */
+static __thread struct timespec g_exec_took;      /* when this thread got the lock */
+static __thread long g_exec_waited_ms;
+static __thread int g_exec_cls;                   /* RPC_CLASS_EXCL / RPC_CLASS_SHARED while held */
+static __thread int g_exec_held;                  /* 1 between exec_take and exec_unlock on this thread */
+static __thread int g_exec_yield_cls;             /* the class to re-take after a yield (0 = not yielded) */
+static long g_exec_yields;                        /* how many waits ran with the lock released; test hook */
+static pthread_mutex_t g_exec_log_mu = PTHREAD_MUTEX_INITIALIZER;
+static char g_exec_last_holder[256];              /* the last EXCLUSIVE holder's label */
+static long g_exec_last_hold_ms;
+static long g_exec_slow_events;                   /* lines emitted; test hook */
+static char g_exec_slow_ring[4][512];             /* the last four lines; test hook */
+static int  g_exec_slow_ring_n;
+static long ms_between(const struct timespec* a, const struct timespec* b){
+    return (b->tv_sec - a->tv_sec) * 1000L + (b->tv_nsec - a->tv_nsec) / 1000000L;
+}
+static void exec_label_of(char* out, size_t cap){
+    snprintf(out, cap, "%s%s%s", g_exec_ctx[0] ? g_exec_ctx : "", g_exec_ctx[0] ? " -> " : "", g_exec_label ? g_exec_label : "?");
+}
+static void exec_log_line(const char* line){
+    fprintf(stderr, "%s\n", line);
+    pthread_mutex_lock(&g_exec_log_mu);
+    snprintf(g_exec_slow_ring[g_exec_slow_ring_n % 4], sizeof g_exec_slow_ring[0], "%s", line);
+    g_exec_slow_ring_n++;
+    g_exec_slow_events++;
+    pthread_mutex_unlock(&g_exec_log_mu);
+}
+static void exec_take(int cls){
+    struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+    __sync_fetch_and_add(&g_exec_waiters, 1);
+    if (cls == RPC_CLASS_EXCL) pthread_rwlock_wrlock(&g_exec_lock); else pthread_rwlock_rdlock(&g_exec_lock);
+    __sync_fetch_and_sub(&g_exec_waiters, 1);
+    clock_gettime(CLOCK_MONOTONIC, &g_exec_took);
+    g_exec_waited_ms = ms_between(&t0, &g_exec_took);
+    g_exec_cls = cls; g_exec_held = 1;
+    if (g_exec_log_ms > 0 && g_exec_waited_ms >= g_exec_log_ms){
+        char me[256]; exec_label_of(me, sizeof me);
+        char last[256]; long last_ms;
+        pthread_mutex_lock(&g_exec_log_mu);
+        snprintf(last, sizeof last, "%s", g_exec_last_holder[0] ? g_exec_last_holder : "(none yet)");
+        last_ms = g_exec_last_hold_ms;
+        pthread_mutex_unlock(&g_exec_log_mu);
+        char line[640];
+        snprintf(line, sizeof line, "[rpc] exec lock: %s (%s) waited %ld ms; the last exclusive holder was %s (held %ld ms); %d still waiting",
+                 me, cls == RPC_CLASS_EXCL ? "excl" : "shared", g_exec_waited_ms, last, last_ms, g_exec_waiters);
+        exec_log_line(line);
+    }
+}
+static void exec_lock(void){ exec_take(RPC_CLASS_EXCL); }
+static void exec_rlock(void){ exec_take(RPC_CLASS_SHARED); }
+static void exec_unlock(void){
+    struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
+    long held = ms_between(&g_exec_took, &t1);
+    int cls = g_exec_cls; long waited = g_exec_waited_ms;
+    char me[256]; exec_label_of(me, sizeof me);
+    if (cls == RPC_CLASS_EXCL){
+        pthread_mutex_lock(&g_exec_log_mu);
+        snprintf(g_exec_last_holder, sizeof g_exec_last_holder, "%s", me);
+        g_exec_last_hold_ms = held;
+        pthread_mutex_unlock(&g_exec_log_mu);
+    }
+    int waiting = g_exec_waiters;
+    g_exec_held = 0;
+    pthread_rwlock_unlock(&g_exec_lock);
+    if (g_exec_log_ms > 0 && held >= g_exec_log_ms){
+        char line[640];
+        snprintf(line, sizeof line, "[rpc] exec lock: %s (%s) held %ld ms (waited %ld ms); %d waiting behind it",
+                 me, cls == RPC_CLASS_EXCL ? "excl" : "shared", held, waited, waiting);
+        exec_log_line(line);
+    }
+}
 int rpc_exec_waiters(void){ return g_exec_waiters; }
+/* 2026-09-30: a handler that waits on the WORKER -- another process, reached
+ * through the submit, block and control channels -- must not hold the
+ * execution lock while it waits. sendrawtransaction spun up to 90 s for the
+ * worker's ack with the write side held, and the worker picks the channel up
+ * only at the top of its serve loop, so a broadcast that landed while the
+ * worker was inside a new block's passes parked the whole surface -- JSON-RPC,
+ * facade and REST -- behind it (four 90 s stalls in three days, each within
+ * two seconds of a block). The handler releases the lock around the wait and
+ * takes it back, in the class it held, before it touches anything the lock
+ * protects; the channel has its own mutex (rpc_node.c g_submit_lock), which
+ * is taken and released inside the yield so a second submitter waits on the
+ * mutex, not on the surface. No-ops when this thread holds nothing (the FAST
+ * and NOLOCK lanes, the unit tests that link rpc_node without the server). */
+void rpc_exec_yield_begin(void){
+    if (!g_exec_held || g_exec_yield_cls) return;
+    g_exec_yield_cls = g_exec_cls;
+    exec_unlock();
+    __sync_fetch_and_add(&g_exec_yields, 1);
+}
+void rpc_exec_yield_end(void){
+    if (!g_exec_yield_cls) return;
+    int cls = g_exec_yield_cls; g_exec_yield_cls = 0;
+    exec_take(cls);
+}
+long rpc_exec_yields(void){ return g_exec_yields; }
+/* The facade and REST name what they dispatch (rpc_esplora.c / rest.c call
+ * these through weak references, so their unit tests link without us). */
+void rpc_exec_set_label(const char* method){ g_exec_label = method; }
+void rpc_exec_set_context(const char* who, const char* verb, size_t vlen, const char* path, size_t plen){
+    if (!who){ g_exec_ctx[0] = 0; return; }
+    if (plen > 120) plen = 120;
+    snprintf(g_exec_ctx, sizeof g_exec_ctx, "%s %.*s %.*s", who, (int)vlen, verb, (int)plen, path);
+}
+/* Test hooks: the threshold, how many lines went out, and the last four. */
+void rpc_exec_set_log_ms(long ms){ g_exec_log_ms = ms < 0 ? 0 : ms; }
+long rpc_exec_log_ms(void){ return g_exec_log_ms; }
+long rpc_exec_slow_events(void){ pthread_mutex_lock(&g_exec_log_mu); long n = g_exec_slow_events; pthread_mutex_unlock(&g_exec_log_mu); return n; }
+void rpc_exec_slow_log(char* out, size_t cap){
+    pthread_mutex_lock(&g_exec_log_mu);
+    size_t p = 0; if (cap) out[0] = 0;
+    for (int i = 0; i < 4 && p < cap; i++){
+        int k = (g_exec_slow_ring_n + i) % 4;
+        if (!g_exec_slow_ring[k][0]) continue;
+        int n = snprintf(out + p, cap - p, "%s\n", g_exec_slow_ring[k]);
+        if (n > 0) p += (size_t)n;
+    }
+    pthread_mutex_unlock(&g_exec_log_mu);
+}
 #define LP_MAX_WAIT_S  60
 #define LP_POLL_MS     250
 
@@ -983,7 +1126,7 @@ int rpc_method_lock_class(const char* m){ return rpc_method_class(m); }
 /* test_rpc_responsive: hold / release the execution lock's WRITE side from
  * outside any handler -- the shape of a long write-locked handler. The same
  * thread must release what it took (a pthread rwlock rule). */
-void rpc_exec_hold_for_test(int take){ if (take) exec_lock(); else exec_unlock(); }
+void rpc_exec_hold_for_test(int take){ if (take){ g_exec_label = "test hold"; g_exec_ctx[0] = 0; exec_lock(); } else { exec_unlock(); g_exec_label = 0; } }
 int rpc_body_fast(const char* body, unsigned long blen){ return rpc_body_is_fast(body, (size_t)blen); }
 
 typedef struct { int cfd; char* buf; size_t body_off, blen; unsigned char prev[32]; int have_prev; } lp_req_t;
@@ -1140,7 +1283,9 @@ static void service_conn(int cfd) {
      * rpcallowip check already happened at accept. */
     if (g_rest_on && rest_is_path(path, plen)){
         char* rout = 0; size_t routlen = 0; int rstatus = 500; const char* rctype = "text/plain";
+        rpc_exec_set_context("rest", m, mlen, path, plen);          /* names the route in an exec-lock line */
         rest_handle(m, mlen, path, plen, body, blen, g_wallet, &rout, &routlen, &rstatus, &rctype);
+        rpc_exec_set_context(NULL, NULL, 0, NULL, 0);   /* the route is over; this thread reads JSON-RPC next */
         char rh[256]; int rl = snprintf(rh, sizeof rh, "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", rstatus, status_text(rstatus), rctype, routlen);
         (void)write_all(cfd, rh, (size_t)rl); if (rout && routlen) (void)write_all(cfd, rout, routlen);
         free(rout); free(buf); close(cfd); return;
@@ -1485,6 +1630,10 @@ int rpc_server_start(const rpc_server_cfg* cfg, int* actual_port,
           g_req_deadline_s = RPC_REQ_DEADLINE_DEFAULT;
           if (g_req_deadline_s < g_timeout_s) g_req_deadline_s = g_timeout_s;
       } }
+    /* BMC_RPC_EXEC_LOG_MS: the execution-lock wait/hold worth a log line
+     * (see exec_take). 0 switches the lines off; unset keeps the default. */
+    { const char* e = getenv("BMC_RPC_EXEC_LOG_MS");
+      if (e && *e){ long v = strtol(e, NULL, 10); g_exec_log_ms = v < 0 ? 0 : v; } }
     g_q_head = g_q_tail = g_q_n = 0;
     g_xq_head = g_xq_tail = g_xq_n = 0;
     g_run = 1;

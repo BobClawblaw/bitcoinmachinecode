@@ -1197,6 +1197,17 @@ void txrelay_stats3(long* retried_other, long* gaveup, long* active){
 }
 
 void (*txrelay_on_pong)(int fd, const unsigned char nonce[8]) = 0;   /* set by the daemon (2026-09-09) */
+/* 2026-09-29: Core records no transaction announcements while it is in initial
+ * block download (net_processing.cpp: AddTxAnnouncement only when
+ * !IsInitialBlockDownload()), so it never fetches a mempool it cannot
+ * validate. This node fetched every announced tx on its legs during a sync
+ * and rejected them all for missing inputs (run 30: "+0 accepted | rejected:
+ * N missing-inputs" every pass). The daemon sets the hook to its IBD flag
+ * (the tip older than maxtipage); with it set, a tx inv is dropped whole --
+ * not noted, not requested -- and the block entries are still scanned. */
+int (*txrelay_in_ibd_hook)(void) = 0;
+static long txr_ibd_dropped = 0;
+long txrelay_ibd_dropped_count(void){ return txr_ibd_dropped; }
 /* ---- 2026-09-10, CORE_DIVERGENCES row 2: the request queue drains --------
  * Core's TxRequestTracker keeps every announcement and requests as the
  * in-flight budget frees up. Ours requested at most TXR_MAX_REQ per pass and
@@ -1480,6 +1491,7 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
             unsigned cc;
             unsigned long n = txr_varint(pl, pl + plen, &cc);
             txr_block_inv_scan(fd, pl, plen);            /* 2026-09-10: a block inv is an announcement, blocksonly or not */
+            if (txrelay_in_ibd_hook && txrelay_in_ibd_hook()){ txr_ibd_dropped += (long)n; continue; }   /* 2026-09-29: Core's rule -- no tx announcements are taken in IBD */
             if (txr_blocksonly()){                       /* -blocksonly: a tx inv from a leg we told fRelay=0 is a violation */
                 for (unsigned long i = 0; i < n; i++){
                     const u8* e = pl + cc + i*36; if (cc + (i+1)*36 > plen) break;

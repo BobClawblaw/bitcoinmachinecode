@@ -5209,10 +5209,11 @@ static double dlc_effective_floor(double median_bps){
  * blocks against run 9's 86k). 4096 is the same slack Core gives itself;
  * the archive is still consolidated behind it (holes bounded, the connect
  * never more than the window behind the download). */
-/* 2026-09-10: the window is now dlc_window_blocks(nw, DLC_CHUNK_BLOCKS) --
- * six times what is in flight, never under 4,096 -- and anchored to the
- * CONNECTED tip (dlc_window_anchor), Core's shape. */
-static long g_dlc_window = DLC_WINDOW_MIN;
+/* 2026-09-10: the window is dlc_window_blocks(nw, DLC_CHUNK_BLOCKS), anchored
+ * to the CONNECTED tip (dlc_window_anchor), Core's shape; 2026-09-29: and
+ * Core's SIZE, 1,024 -- it had been six times the claimed chunks, never under
+ * 4,096, and run 30 sat at that edge for the whole sync. */
+static long g_dlc_window = DLC_BLOCK_DOWNLOAD_WINDOW;
 /* Core's BLOCK_STALLING_TIMEOUT_DEFAULT: when the window is full and one
  * peer blocks it, Core re-requests from another peer after 2 s. Same here:
  * a worker idle at a full window for 2 s fetches the blocking chunk itself
@@ -8336,7 +8337,7 @@ static int txsub_package(char* msg, unsigned long mcap){
 static long long txsub_now_ms(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec*1000LL + ts.tv_nsec/1000000; }
 #define DL_PARALLEL_GAP      2000L
 #define DL_PARALLEL_REARM_S  600L
-static int g_catchup_workers = 16;
+static int g_catchup_workers = 10;   /* replaced at boot by the config's (derived) value */
 /* The backlog the apply-first rule looks at is what the connect can ACTUALLY
  * apply: the contiguous prefix above the applied height, i.e. up to the
  * first hole. Until 2026-09-08 it was archive tip minus applied height, and
@@ -8474,6 +8475,12 @@ static void dl_after_gate_rewind(long back){
 static int dl_announce_allowed(unsigned long tip_time, long long now, long maxtipage){
     return now - (long long)tip_time <= maxtipage;      /* a tip in the future is fine: not IBD */
 }
+/* 2026-09-29: the IBD flag as a cached value for the tx relay (tx_relay.c's
+ * txrelay_in_ibd_hook): 1 at boot until the store has a tip, then whatever
+ * dl_new_block_choke last computed from the connected tip's time. Reading the
+ * tip block per inv would be an 8 MB read per message; this is a load. */
+static int g_dl_in_ibd = 1;
+static int dl_in_ibd_cached(void){ return g_dl_in_ibd; }
 /* the Core rule again, for the history repair: the tip is older than maxtipage */
 static int dl_tip_is_ibd(void){
     static unsigned char hb[8u<<20]; long tip = *(int*)(store_buf+24); if (tip < 0) return 1;
@@ -8494,6 +8501,7 @@ static void dl_new_block_choke(void){
         if(store_read_at(store_buf, (unsigned long)now_tip, thb, (long)sizeof thb) >= 80){
             unsigned long tip_time = (unsigned long)thb[68] | ((unsigned long)thb[69]<<8) | ((unsigned long)thb[70]<<16) | ((unsigned long)thb[71]<<24);
             in_ibd = !dl_announce_allowed(tip_time, (long long)time(NULL), g_cfg.maxtipage > 0 ? g_cfg.maxtipage : 86400);
+            g_dl_in_ibd = in_ibd;                                   /* 2026-09-29: the tx relay reads this */
             if(in_ibd){ if(!ibd_said){ ibd_said = 1; fprintf(stderr,"[dl] per-block lines and tip announcements are off while the tip is older than maxtipage (initial block download; Core relays no blocks in IBD) -- they resume at the tip\n"); } }
             else {
                 ibd_said = 0;
@@ -9838,6 +9846,27 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                   }
                   if(waited > 0)
                       fprintf(stderr,"[dl] waited for %d pass helper(s) before the parallel download; %d still running\n", waited, outstanding); }
+                /* 2026-09-29: Core's IBD shape -- the peers it downloads from
+                 * ARE its outbound set: the 8 full-relay + 2 block-relay-only
+                 * preferred-download peers and nothing beside them. Ours were
+                 * the idle legs PLUS the workers: run 30 held "connected 4/8"
+                 * legs and 8 workers, 12 outbound for a five-hour sync, and the
+                 * legs did nothing for it (announcements are off in IBD) while
+                 * sitting on strangers' inbound slots and taking their tx
+                 * relay. While the archive tip is older than maxtipage (Core's
+                 * IsInitialBlockDownload clause) every idle leg is closed here,
+                 * named, before the download; the top-up re-dials after it
+                 * returns. A hole re-fetch or a handoff on a fresh tip keeps
+                 * its legs: that is a few chunks, not a sync. */
+                if(!hole_blocks && dl_tip_is_ibd()){
+                    int closed = 0;
+                    for(int i=0;i<mux_n_out;i++){
+                        if(mux_out_fd[i] < 0 || leg_pass_busy(i)) continue;
+                        leg_close_ours(i, "ibd-download", "Core's IBD shape: the download peers are the outbound set");
+                        mux_out_nextretry[i] = 0; closed++;
+                    }
+                    if(closed) fprintf(stderr,"[dl] closed %d idle leg(s) for the parallel download (IBD: the tip is older than maxtipage); the top-up re-dials them after\n", closed);
+                }
                 long got = dl_catchup(dir, g_catchup_workers);
                 store_reload(store_buf);
                 if(got <= 0){
@@ -12136,7 +12165,10 @@ int main(int argc, char** argv){
     { long tr = archive_trim_derived_tails();
       if(tr < 0) fprintf(stderr,"[boot] WARNING: could not trim the derived files past the tip: %s\n", strerror(errno)); }
     { extern void par_set(int); par_set(g_cfg.par); }   /* -par: script-verification threads (Core semantics) */
+    { extern int par_script_threads(void);              /* 2026-09-29: said at boot, as Core says "Script verification uses N additional threads" */
+      fprintf(stderr,"[boot] script verification: %d thread(s) including the caller (par=%d; Core's cap is 15 workers + the caller)\n", par_script_threads(), g_cfg.par); }
     if(store_init(store_buf)!=1){ fprintf(stderr,"store_init failed\n"); return 1; }
+    { extern int (*txrelay_in_ibd_hook)(void); txrelay_in_ibd_hook = dl_in_ibd_cached; g_dl_in_ibd = dl_tip_is_ibd(); }   /* 2026-09-29: Core takes no tx announcements in IBD */
     /* Before ANY append can happen, in the parent -- so the serve loop's
      * tip appends and the boot catch-up are covered as well as the download.
      * Children inherit it across fork. */
@@ -12383,7 +12415,7 @@ int main(int argc, char** argv){
          * finds, so it is a ceiling, not a promise. */
         int catchup_workers;
         if(argc>=6) catchup_workers = atoi(argv[5]);
-        else        catchup_workers = g_cfg.catchup_workers;   /* bmc.catchupworkers, default 8 since 2026-09-10: Core's outbound full-relay count */
+        else        catchup_workers = g_cfg.catchup_workers;   /* bmc.catchupworkers, or (2026-09-29) max_outbound + max_block_relay_only: Core's preferred-download set */
         if(catchup_workers<1) catchup_workers=1;
         if(catchup_workers>64) catchup_workers=64;
         dial_gate_configure(g_cfg.dial_rate_limit); dl_gate_configure(g_cfg.download_rate_limit_kbps);

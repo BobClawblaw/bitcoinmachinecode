@@ -28,14 +28,23 @@
 # run 22's or with Core's. That is deliberate: run 22 already settled the
 # timing question, and correctness is now the open one.
 set -u
-DEST=${DEST:-/mnt/2tbssd/bmc-bench}
+DEST=${DEST:-/srv/nvme8tb/bench/bmc-bench}   # under /srv/nvme8tb, the path a mount on /mnt cannot shadow (2026-09-29)
 SRCREF=${SRCREF:-HEAD}
 P2P=${P2P:-8462}; RPC=${RPC:-8461}
-WORKERS=${WORKERS:-8}
-# NICE: the daemon's CPU niceness. 10 suits a correctness run sharing the box;
-# a TIMED run against Core must use 0, because the Core baseline runs at
-# Nice=0 under systemd and a niced node measures the scheduler, not the code.
-NICE=${NICE:-10}
+WORKERS=${WORKERS:-}   # empty = the daemon's derived default, Core's preferred-download set: bmc.maxoutbound + bmc.blockrelayonly = 10 (2026-09-29)
+# NICE: the daemon's CPU niceness. The default is 0 (2026-09-29): the Core
+# baseline runs at Nice=0 under systemd and a niced node measures the
+# scheduler, not the code. Pass NICE=10 for a correctness run sharing the box.
+NICE=${NICE:-0}
+# PARITY=1 (default, 2026-09-29): the conf carries the Core baseline's bench
+# protocol so a timed run is even by default -- the three indexes, the same
+# maxconnections, and the same four ZMQ topics Core's bench publishes to
+# nobody (bmc's ZMQ is Core's; a publisher with no subscriber costs the same
+# on both sides). The worker key stays unset (derived: Core's 10 download
+# peers), par stays unset (0 = every core, capped at Core's 16 on both sides),
+# dbcache=8192 on both. PARITY=0 leaves them out.
+PARITY=${PARITY:-1}
+ZMQPORT=${ZMQPORT:-28484}
 # EXTRA_CONF: newline-separated keys appended to the conf, so a benchmark can
 # match the Core baseline's protocol (txindex, blockfilterindex, maxconnections)
 # without editing this file.
@@ -49,7 +58,7 @@ ph(){ echo "$(ts) $*" | tee -a "$PH"; }
 mkdir -p "$DEST" && cd "$DEST" || exit 2
 : > "$PH"; : > "$PROG"; rm -f RESULT 2>/dev/null
 
-ph "START host=$(hostname) kernel=$(uname -r) workers=$WORKERS"
+ph "START host=$(hostname) kernel=$(uname -r) workers=${WORKERS:-derived(10)}"
 [ -d src ] || git clone -q /storage/bitcoinmachinecode src
 # Hard-reset to the REMOTE ref. `checkout <branch>` on an existing clone keeps
 # whatever that branch pointed at when it was cloned, which silently built the
@@ -81,13 +90,24 @@ port=$P2P
 rpcport=$RPC
 dbcache=8192
 bmc.bootcatchup=0
-bmc.catchupworkers=$WORKERS
+${WORKERS:+bmc.catchupworkers=$WORKERS}
 # THE POINT OF THIS RUN: a per-height muhash record, so a set that diverges
 # from Core names the block it diverged on instead of only the tip.
 coinstatsindex=1
 CONF
+if [ "$PARITY" = 1 ]; then cat >> data/bitcoin.conf <<CONF
+# Core baseline parity (PARITY=1): docs/devlog/BENCHMARKS.md, "The even comparison"
+txindex=1
+blockfilterindex=1
+maxconnections=48
+zmqpubhashblock=tcp://127.0.0.1:$ZMQPORT
+zmqpubrawblock=tcp://127.0.0.1:$ZMQPORT
+zmqpubhashtx=tcp://127.0.0.1:$ZMQPORT
+zmqpubrawtx=tcp://127.0.0.1:$ZMQPORT
+CONF
+fi
 [ -n "$EXTRA_CONF" ] && printf '%s\n' "$EXTRA_CONF" >> data/bitcoin.conf
-ph "CONF port=$P2P rpcport=$RPC dbcache=8192 workers=$WORKERS coinstatsindex=1 nice=$NICE extra=[$(printf '%s' "$EXTRA_CONF" | tr '\n' ' ')]"
+ph "CONF port=$P2P rpcport=$RPC dbcache=8192 workers=${WORKERS:-derived(10)} coinstatsindex=1 nice=$NICE parity=$PARITY extra=[$(printf '%s' "$EXTRA_CONF" | tr '\n' ' ')]"
 
 T0=$(date +%s); echo "$T0" > epoch.start
 setsid nohup nice -n "$NICE" src/asm/daemon/bmcbitcoind serve "$DEST/data" > console.log 2>&1 < /dev/null &

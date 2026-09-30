@@ -47,7 +47,7 @@ node_config_t g_cfg = {
     .utxo_bulk_blob_mb     = 1024,
     .utxo_bulk_gap_blocks  = 50000L,
     .utxo_compact_threshold= 12,
-    .dbcache_mb            = 1024,     /* Core v31 -dbcache default (MiB)    */
+    .dbcache_mb            = 450,      /* Core v31.1 -dbcache default: DEFAULT_KERNEL_CACHE 450 MiB (kernel/caches.h; the dev tree agrees). It was 1024 here, which no Core release defaults to (2026-09-29) */
     .connect_timeout_ms    = 5000,     /* Core v31 -timeout default          */
     .peer_timeout_s        = 60,
     .port                  = 8333,
@@ -62,7 +62,11 @@ node_config_t g_cfg = {
     .download_rate_limit_kbps = 0,   /* bmc.downloadratelimit: off unless set */
     .coinstatshist_repair = 1, .coinstatshist_workers = 0, .esplora_port = 0, .esplora_bind = "127.0.0.1",
     .upload_rate_limit_kbps = 0,     /* bmc.uploadratelimit: off unless set */
-    .catchup_workers       = 8,      /* bmc.catchupworkers: peers downloading at once. Core's MAX_OUTBOUND_FULL_RELAY_CONNECTIONS (2026-09-10) */
+    .catchup_workers       = 10,     /* bmc.catchupworkers: peers downloading at once. Core's preferred-download set:
+                                      * MAX_OUTBOUND_FULL_RELAY_CONNECTIONS 8 + MAX_BLOCK_RELAY_ONLY_CONNECTIONS 2
+                                      * (net_processing.cpp fPreferredDownload: every outbound peer that can serve
+                                      * blocks; 2026-09-29). Derived from the classes below when the key is absent. */
+    .catchup_workers_explicit = 0,
     .maxrecvbuffer_kb      = 5000,   /* Core -maxreceivebuffer default       */
     .maxmempool_mb         = 300,    /* Core -maxmempool default (MB)        */
     .mempoolexpiry_h       = 336,    /* Core -mempoolexpiry default (2 weeks)*/
@@ -370,7 +374,7 @@ static void set_defaults(void){
     g_cfg.utxo_compact_threshold= 12;
     g_cfg.assumevalid_mode      = 0;        /* the chain default (Core defaultAssumeValid) */
     memset(g_cfg.assumevalid, 0, 32);
-    g_cfg.dbcache_mb            = 1024;     /* Core v31 default (MiB) */
+    g_cfg.dbcache_mb            = 450;      /* Core v31.1 default (MiB), 2026-09-29 */
     g_cfg.connect_timeout_ms    = 5000;     /* Core's -timeout default */
     g_cfg.peer_timeout_s        = 60;       /* Core's -peertimeout default */
     g_cfg.port                  = 8333;
@@ -382,7 +386,8 @@ static void set_defaults(void){
     g_cfg.blocksonly            = 0;
     g_cfg.bind_addr[0]          = 0;
     g_cfg.par                   = 0;
-    g_cfg.catchup_workers       = 8;
+    g_cfg.catchup_workers       = 10;    /* derived from the outbound classes unless the key appears */
+    g_cfg.catchup_workers_explicit = 0;
     g_cfg.dial_rate_limit       = 0;
     g_cfg.download_rate_limit_kbps = 0;
     g_cfg.upload_rate_limit_kbps = 0;
@@ -790,11 +795,13 @@ long node_config_load(const char* path){
              * at once; every live peer does, up to it (2026-09-10, Core's
              * shape). Not -par: that is Core's script-verification thread
              * count and means exactly that here (2026-09-06). */
-            t=clamp_int(IV,1,64,key,&bad); if(t!=-1){ g_cfg.catchup_workers=t; applied++; } }
+            t=clamp_int(IV,1,64,key,&bad); if(t!=-1){ g_cfg.catchup_workers=t; g_cfg.catchup_workers_explicit=1; applied++; } }
         else if(!strcmp(key,"par")){
-            /* Core -par: worker threads. 0 = auto, and NEGATIVE means "leave
-             * that many cores free", which is why the lower bound is not 0.
-             * Drives the chunk-claiming catch-up worker count. */
+            /* Core -par: script-verification threads, the caller included.
+             * 0 = auto, and NEGATIVE means "leave that many cores free", which
+             * is why the lower bound is not 0. Capped at Core's 15 workers +
+             * the caller in tx_verify.c (par_script_threads); the download
+             * count is bmc.catchupworkers, not this. */
             t=clamp_int(IV,-64,64,key,&bad); if(t!=-1 || IV>=-64){ g_cfg.par=IV; applied++; } }
         else if(!strcmp(key,"maxreceivebuffer")){
             /* Core -maxreceivebuffer is in units of 1000 bytes. Bounds how
@@ -1305,6 +1312,16 @@ long node_config_load(const char* path){
         g_cfg.max_outbound=8;
         g_cfg.max_block_relay_only=2; g_cfg.max_feeler=1;
         bad++;
+    }
+    /* Core's download shape (2026-09-29): during IBD Core fetches blocks from
+     * every outbound peer that can serve them -- its full-relay AND its
+     * block-relay-only peers (fPreferredDownload) -- so the parallel download
+     * ceiling follows those two classes unless bmc.catchupworkers= names a
+     * number. 8 + 2 = 10 at the defaults; an operator who raises
+     * bmc.maxoutbound raises the download with it, as Core would. */
+    if(!g_cfg.catchup_workers_explicit){
+        int d = g_cfg.max_outbound + g_cfg.max_block_relay_only;
+        g_cfg.catchup_workers = d < 1 ? 1 : (d > 64 ? 64 : d);
     }
     fprintf(stderr,"[config] loaded %s: %ld setting(s) applied%s\n",
             path, applied, bad?" (some rejected -- see above)":"");

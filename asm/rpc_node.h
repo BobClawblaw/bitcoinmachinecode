@@ -510,6 +510,7 @@ typedef struct {
 void rpc_node_set_status(const node_status_t* st);
 void rpc_node_set_user_agent(const char* ua);   /* -uacomment: getnetworkinfo subversion */
 void rpc_node_set_status_rw(node_status_t* st);
+void rpc_node_set_submit_wait_ms_for_test(long ms);   /* the submit channel's ack wait; 0 restores the shipped 90 s (2026-09-30) */
 
 /* Hand the RPC layer the SHARED mempool (daemon/mempool_cfg.c's MAP_SHARED
  * pre-fork region) so getrawmempool/getmempoolinfo/getmempoolentry report the
@@ -620,6 +621,8 @@ const char* rpc_node_method_at(int i);
 
 /* Dispatch a live-node method. Returns 1 (result set), 0 (error: ec and em
  * set), or -1 (not ours -- caller keeps looking). */
+int  rpc_node_method_lane(const char* method);   /* 2 = the mempool lane: no execution lock, its own mutex (2026-09-30) */
+void rpc_node_mpc_stats(long* hits, long* parses); /* the per-slot parse cache's counters; test hook */
 int rpc_node_dispatch(const char* method, const rj_val* params,
                       rj_val** result, long* ec, const char** em);
 

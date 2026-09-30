@@ -49,12 +49,18 @@
 #include <stdint.h>
 #include "test_tmpdir.h"
 #include "../daemon/txosp_format.h"
+#include "../rpc_node.h"        /* E: a status block with no worker behind it (2026-09-30) */
 
 extern int  store_init(void* st);
 extern long store_append(void* st, const unsigned char* hash32, const void* blk, long len);
 extern void sha256d(unsigned char out[32], const void* data, unsigned long len);
 /* rpc_server.c test hook: hold / release the execution lock's write side */
 extern void rpc_exec_hold_for_test(int take);
+/* rpc_server.c: the exec-lock wait/hold log (2026-09-29) -- its threshold,
+ * how many lines went out, and the last four of them */
+extern void rpc_exec_set_log_ms(long ms);
+extern long rpc_exec_slow_events(void);
+extern void rpc_exec_slow_log(char* out, size_t cap);
 
 static int fails = 0;
 static void ck(const char* l, int c){ printf("%s %s\n", c ? "ok  :" : "FAIL:", l); if (!c) fails++; }
@@ -72,7 +78,7 @@ static int connect_port(void){
     return fd;
 }
 static int send_call(int fd, const char* method, const char* params){
-    char body[512], req[1024];
+    char body[2048], req[3072];      /* E sends a real 285-byte transaction as hex */
     int bl = snprintf(body, sizeof body, "{\"jsonrpc\":\"1.0\",\"id\":7,\"method\":\"%s\",\"params\":%s}", method, params);
     int rl = snprintf(req, sizeof req, "POST / HTTP/1.1\r\nHost: x\r\nAuthorization: Basic " AUTH "\r\n"
                       "Content-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", bl, body);
@@ -93,6 +99,32 @@ static double call_ms(const char* method, const char* params, char* out, size_t 
 static const char* TRIVIAL[] = { "uptime", "getblockcount", "getblockchaininfo", "getnetworkinfo", "getpeerinfo", "getindexinfo" };
 #define NTRIV (sizeof TRIVIAL / sizeof TRIVIAL[0])
 /* One method, three calls, each timed; the WORST must be under the bound. */
+static char g_hash1[80] = "";   /* getblockhash 1, for the getblockheader probe (2026-09-30) */
+static void probe_one_p(const char* scenario, const char* m, const char* params){
+    char out[65536]; double worst = 0; int ok200 = 1;
+    for (int k = 0; k < 3; k++){
+        double ms = call_ms(m, params, out, sizeof out);
+        if (ms > worst) worst = ms;
+        if (strncmp(out, "HTTP/1.1 200", 12) || !strstr(out, "\"result\"")) ok200 = 0;
+    }
+    char label[256];
+    snprintf(label, sizeof label, "%s: %s %s answers in %.1f ms (worst of 3; bound 100 ms)", scenario, m, params, worst);
+    ck(label, ok200 && worst < 100.0);
+}
+/* the pollers' block lookups, off the execution lock since 2026-09-30: probed beside the trivial six */
+static void probe_lookups(const char* scenario, int with_mempool){
+    char p[128]; snprintf(p, sizeof p, "[\"%s\"]", g_hash1);
+    probe_one_p(scenario, "getblockhash", "[1]");
+    probe_one_p(scenario, "getblockheader", p);
+    /* the mempool readers are NOLOCK, not FAST (2026-09-30): they never take
+     * the execution lock, so a held write lock does not park them (scenario
+     * B), but they are served by the worker threads, so with six waits on
+     * four threads they queue like any NOLOCK call (scenario A skips them) */
+    if (with_mempool){
+        probe_one_p(scenario, "getmempoolinfo", "[]");
+        probe_one_p(scenario, "getrawmempool", "[]");
+    }
+}
 static void probe_one(const char* scenario, const char* m){
     char out[65536]; double worst = 0; int ok200 = 1;
     for (int k = 0; k < 3; k++){
@@ -105,6 +137,15 @@ static void probe_one(const char* scenario, const char* m){
     ck(label, ok200 && worst < 100.0);
 }
 
+/* E: a sendrawtransaction that waits on a worker which never answers (2026-09-30) */
+static const char* E_TX_HEX = "01000000000101ad2bb91208eef398def3ed3e784d9ee9b7befeb56a3053c3561849b88bc4cedf0000000000ffffffff037a3e0100000000001600148d7a0a3461e3891723e5fdf8129caa0075060cff7a3e0100000000001600148d7a0a3461e3891723e5fdf8129caa0075060cff0000000000000000256a2342697462616e6b20496e632e204a6170616e20737570706f727473205365675769742102483045022100a6e33a7aff720ba9f33a0a8346a16fdd022196862796d511d31978c40c9ad48b02206fb8f67bd699a8c952b3386a81d122c366d2d36cd08e2de21207e6aa6f96ce9501210283409659355b6d1cc3c32decd5d561abaac86c37a353b52895a5e6c196d6f44800000000";
+typedef struct { double ms; char out[4096]; } submit_t;
+static void* submit_wait(void* a){
+    submit_t* s = a; char params[1024];
+    snprintf(params, sizeof params, "[\"%s\"]", E_TX_HEX);
+    s->ms = call_ms("sendrawtransaction", params, s->out, sizeof s->out);
+    return NULL;
+}
 /* waitfornewblock in flight: send the request and keep the socket open */
 #define WAIT_MS 800
 typedef struct { int fd; double ms; char out[4096]; } slow_t;
@@ -138,6 +179,7 @@ static void scenario_waits(const char* m, int check_waits){
     for (int i = 0; i < NS; i++) pthread_create(&th[i], NULL, slow_wait, &sl[i]);
     struct timespec settle = { 0, 150 * 1000000L }; nanosleep(&settle, NULL);
     probe_one("6 waitfornewblock in flight (4 RPC threads)", m);
+    if (check_waits) probe_lookups("6 waitfornewblock in flight (4 RPC threads)", 0);
     for (int i = 0; i < NS; i++) pthread_join(th[i], NULL);
     if (!check_waits) return;
     int answered = 0; double worst = 0;
@@ -152,6 +194,7 @@ static void scenario_lock(const char* m){
     pthread_t th; pthread_create(&th, NULL, hold_lock, (void*)700L);
     struct timespec settle = { 0, 150 * 1000000L }; nanosleep(&settle, NULL);
     probe_one("execution lock held", m);
+    if (!strcmp(m, "uptime")) probe_lookups("execution lock held", 1);   /* once per scenario, under the same hold */
     pthread_join(th, NULL);
 }
 
@@ -188,13 +231,49 @@ int main(void){
 
     { char out[4096]; call_ms("getblockcount", "[]", out, sizeof out);
       ck("baseline: getblockcount answers 300", strstr(out, "\"result\":300") != NULL); }
+    { char out[4096]; call_ms("getblockhash", "[1]", out, sizeof out);
+      char* r = strstr(out, "\"result\":\""); if (r){ r += 10; char* e = strchr(r, '"'); if (e && e - r == 64){ memcpy(g_hash1, r, 64); g_hash1[64] = 0; } }
+      ck("getblockhash 1 gives a 64-hex hash for the header probe", g_hash1[0] != 0); }
     for (unsigned i = 0; i < NTRIV; i++) probe_one("idle", TRIVIAL[i]);
+    probe_lookups("idle", 1);
 
     /* ---- A. six slow calls in flight, four RPC threads ---- */
     for (unsigned i = 0; i < NTRIV; i++) scenario_waits(TRIVIAL[i], i == 0);
 
     /* ---- B. the execution lock's write side held ---- */
     for (unsigned i = 0; i < NTRIV; i++) scenario_lock(TRIVIAL[i]);
+
+    /* ---- D. a slow holder is NAMED in the log (2026-09-29) ----
+     * Four stalls of the whole RPC surface in three days, each over 90 s and
+     * each right after a block, and not one line saying which handler held
+     * the lock. The write side is held 700 ms with the threshold at 200 ms
+     * and an exclusive method sent into the wait: the hold must be logged
+     * with the holder's name, the wait with the waiter's name AND the
+     * holder's, and at threshold 0 nothing is logged at all. The scenarios
+     * above hold the lock for the same 700 ms at the shipped 2000 ms
+     * threshold and must have written nothing. */
+    { ck("the 700 ms holds above the threshold wrote no line", rpc_exec_slow_events() == 0);
+      rpc_exec_set_log_ms(200);
+      long before = rpc_exec_slow_events();
+      pthread_t th; pthread_create(&th, NULL, hold_lock, (void*)700L);
+      struct timespec settle = { 0, 150 * 1000000L }; nanosleep(&settle, NULL);
+      char out[4096]; double ms = call_ms("getchaintips", "[]", out, sizeof out);   /* EXCL: queues behind the hold (getblockhash left the lock on 2026-09-30) */
+      pthread_join(th, NULL);
+      ck("the exclusive call waited for the hold", ms > 400 && strstr(out, "\"result\"") != NULL);
+      long n = rpc_exec_slow_events() - before;
+      char log[2048]; rpc_exec_slow_log(log, sizeof log);
+      printf("      %ld line(s):\n%s", n, log);
+      ck("two lines: the hold and the wait", n == 2);
+      ck("the hold names its holder and its length", strstr(log, "test hold (excl) held ") != NULL);
+      ck("the wait names the waiter, and who it waited for", strstr(log, "getchaintips (excl) waited ") != NULL && strstr(log, "the last exclusive holder was test hold (held ") != NULL);
+      rpc_exec_set_log_ms(0);
+      before = rpc_exec_slow_events();
+      pthread_create(&th, NULL, hold_lock, (void*)400L);
+      nanosleep(&settle, NULL);
+      call_ms("getchaintips", "[]", out, sizeof out);
+      pthread_join(th, NULL);
+      ck("threshold 0 switches the lines off", rpc_exec_slow_events() == before);
+      rpc_exec_set_log_ms(2000); }
 
     /* ---- C. getindexinfo against a 67 MB txospender tail that keeps growing ---- */
     { extern void rpc_chain_set_index_config(int, int, int, int, int);
@@ -242,6 +321,33 @@ int main(void){
       printf("      getindexinfo on a growing 67 MB tail: at most %.3f ms of CPU per call\n", worst_cpu_ms);
       ck("getindexinfo reports the tail's coverage (300, synced)", right);
       ck("getindexinfo's cost does not scale with the tail: < 0.5 ms CPU per call", worst_cpu_ms < 0.5); }
+
+    /* ---- E. a submit waiting on the worker does not hold the surface (2026-09-30) ----
+     * The four 90 s stalls of the whole surface, each within two seconds of
+     * a block, have the shape of sendrawtransaction spinning for the
+     * worker's ack with the execution lock held while the worker is inside a
+     * block's passes. Here the worker never answers: a status block with
+     * nobody behind it, and the wait cut from 90 s to 2.5 s. While the
+     * submit waits, every trivial method AND an exclusive one must answer
+     * within the 100 ms bound; the submit itself must then time out
+     * honestly (-4), and the lock must have been yielded for the wait. Last,
+     * because the status block changes what the chain methods report. */
+    { static node_status_t fake; memset(&fake, 0, sizeof fake);
+      rpc_node_set_status_rw(&fake);
+      rpc_node_set_submit_wait_ms_for_test(2500);
+      long y0 = rpc_exec_yields();
+      pthread_t th; static submit_t sb; memset(&sb, 0, sizeof sb);
+      pthread_create(&th, NULL, submit_wait, &sb);
+      struct timespec settle = { 0, 300 * 1000000L }; nanosleep(&settle, NULL);
+      for (unsigned i = 0; i < NTRIV; i++) probe_one("sendrawtransaction waiting on the worker", TRIVIAL[i]);
+      { char out[4096]; double ms = call_ms("getchaintips", "[]", out, sizeof out);
+        char label[200]; snprintf(label, sizeof label, "an EXCLUSIVE call answers while the submit waits: getchaintips in %.1f ms (bound 100 ms)", ms);
+        ck(label, ms < 100.0 && strstr(out, "\"result\"") != NULL); }
+      pthread_join(th, NULL);
+      printf("      the submit answered after %.0f ms: %.120s\n", sb.ms, strstr(sb.out, "{") ? strstr(sb.out, "{") : sb.out);
+      ck("the submit itself timed out honestly (-4) after its 2.5 s wait", sb.ms >= 2400 && strstr(sb.out, "\"code\":-4") != NULL);
+      ck("the execution lock was yielded for the wait", rpc_exec_yields() > y0);
+      rpc_node_set_submit_wait_ms_for_test(0); }
 
     rpc_server_stop();
     printf(fails ? "\nTESTS FAILED (%d failures)\n" : "\nALL TESTS PASSED (%d failures)\n", fails);

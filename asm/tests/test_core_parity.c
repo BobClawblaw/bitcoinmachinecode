@@ -166,7 +166,7 @@ int main(void){
     ck("coinstatsindex defaults OFF, as in Core",   g_cfg.coinstatsindex == 0);
     ck("limitancestorcount defaults to Core's 25",   g_cfg.limitancestorcount == 25);
     ck("limitdescendantcount defaults to Core's 25", g_cfg.limitdescendantcount == 25);
-    ck("dbcache defaults to Core's 1024 MiB",        g_cfg.dbcache_mb == 1024);
+    ck("dbcache defaults to Core's 450 MiB (DEFAULT_KERNEL_CACHE, v31.1; this line pinned 1024 until 2026-09-29, a value no Core release defaults to)", g_cfg.dbcache_mb == 450);
     ck("maxconnections defaults to Core's 200",      g_cfg.max_connections == 200);
     ck("par defaults to Core's 0 (auto)",            g_cfg.par == 0);
     ck("rpcthreads defaults to Core's 4 (DEFAULT_HTTP_THREADS)", g_cfg.rpcthreads == 4);
