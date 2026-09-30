@@ -2327,6 +2327,27 @@ the yield counter moved; with the yield made a no-op, `getblockhash` waited
 its rotation) is the next step, and the #348 line names the holder if the
 next stall is something else.
 
+**2026-09-30, later: the worker was not the holder at the 09-29 stall, and the
+pollers' block lookups left the lock.** Production's log across the 22:54:21
+stall shows the worker's rotation at its normal cadence throughout (the
+tx-accept summary every 30 s, relay and dial lines), so its loop top was
+reached and any submission would have been picked up: the 90 s holder was
+something else in the RPC process, which the #348 line will name. Whatever
+it is, the fix that limits its blast radius is the one Core has by design:
+the calls the pollers make every block must not need the exclusive lock.
+`getblockhash` and `getblockheader` now run in the fast lane beside
+`getblockcount` (`rpc_chain_method_lane`, `FAST_LANE`): they read a few
+index records and a header prefix through the lane's own store handle, the
+hash index under `g_idx_mu`, the chainwork cache under `g_cw_mu`, and stack
+buffers -- nothing the write-locked handlers share. `tests/test_rpc_responsive`
+probes both under the held write lock and under six queued waits (0.1 ms;
+with the lane entry removed they waited 550-650 ms). Still on the exclusive
+lock, each for a shared buffer it would need its own of: `getblock`
+(`g_blockbuf`, the undo arrays), `getrawtransaction` (the mempool copy, the
+block scan), `getblockstats`, `gettxout`; the facade's and REST's own
+dispatch takes the exclusive lock too (`esp_lock`). A block lane with a
+private buffer is the next step on this path.
+
 ### The wallet has no reorg awareness (WAL-13)
 
 `wallet_scan.c`'s on-disk record is `u32 height | txid | vout | value`

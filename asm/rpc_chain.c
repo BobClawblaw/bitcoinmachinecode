@@ -5721,7 +5721,8 @@ static int cmd_scantxoutset(const rj_val* params, rj_val** res, long* ec, const 
  * wait), 0 = the execution lock is required. */
 int rpc_chain_method_lane(const char* m){
     if (!strcmp(m, "uptime") || !strcmp(m, "getblockcount") || !strcmp(m, "getbestblockhash")
-     || !strcmp(m, "getblockchaininfo") || !strcmp(m, "getdifficulty") || !strcmp(m, "getindexinfo"))
+     || !strcmp(m, "getblockchaininfo") || !strcmp(m, "getdifficulty") || !strcmp(m, "getindexinfo")
+     || !strcmp(m, "getblockhash") || !strcmp(m, "getblockheader"))   /* 2026-09-30: the pollers' block lookups; a few preads on the lane handle, the hash index under g_idx_mu, stack buffers */
         return 1;
     if (!strcmp(m, "getchaintxstats") || !strcmp(m, "waitfornewblock")
      || !strcmp(m, "waitforblockheight") || !strcmp(m, "waitforblock"))
@@ -5748,8 +5749,8 @@ int rpc_chain_dispatch(const char* m, const rj_val* params, rj_val** res, long* 
     if (!strcmp(m, "getblockcount")) FAST_LANE(cmd_getblockcount(res));
     if (!strcmp(m, "getbestblockhash")) FAST_LANE(cmd_getbestblockhash(res, ec, em));
     if (!strcmp(m, "getchaintips")) return cmd_getchaintips(res, ec, em);
-    if (!strcmp(m, "getblockhash")) return cmd_getblockhash(params, res, ec, em);
-    if (!strcmp(m, "getblockheader")) return cmd_getblockheader(params, res, ec, em);
+    if (!strcmp(m, "getblockhash")) FAST_LANE(cmd_getblockhash(params, res, ec, em));       /* 2026-09-30: off the execution lock */
+    if (!strcmp(m, "getblockheader")) FAST_LANE(cmd_getblockheader(params, res, ec, em));
     if (!strcmp(m, "getblock")) return cmd_getblock(params, res, ec, em);
     if (!strcmp(m, "getblockstats")) return cmd_getblockstats(params, res, ec, em);
     if (!strcmp(m, "getnetworkhashps")) return cmd_getnetworkhashps(params, res, ec, em);

@@ -99,6 +99,24 @@ static double call_ms(const char* method, const char* params, char* out, size_t 
 static const char* TRIVIAL[] = { "uptime", "getblockcount", "getblockchaininfo", "getnetworkinfo", "getpeerinfo", "getindexinfo" };
 #define NTRIV (sizeof TRIVIAL / sizeof TRIVIAL[0])
 /* One method, three calls, each timed; the WORST must be under the bound. */
+static char g_hash1[80] = "";   /* getblockhash 1, for the getblockheader probe (2026-09-30) */
+static void probe_one_p(const char* scenario, const char* m, const char* params){
+    char out[65536]; double worst = 0; int ok200 = 1;
+    for (int k = 0; k < 3; k++){
+        double ms = call_ms(m, params, out, sizeof out);
+        if (ms > worst) worst = ms;
+        if (strncmp(out, "HTTP/1.1 200", 12) || !strstr(out, "\"result\"")) ok200 = 0;
+    }
+    char label[256];
+    snprintf(label, sizeof label, "%s: %s %s answers in %.1f ms (worst of 3; bound 100 ms)", scenario, m, params, worst);
+    ck(label, ok200 && worst < 100.0);
+}
+/* the pollers' block lookups, off the execution lock since 2026-09-30: probed beside the trivial six */
+static void probe_lookups(const char* scenario){
+    char p[128]; snprintf(p, sizeof p, "[\"%s\"]", g_hash1);
+    probe_one_p(scenario, "getblockhash", "[1]");
+    probe_one_p(scenario, "getblockheader", p);
+}
 static void probe_one(const char* scenario, const char* m){
     char out[65536]; double worst = 0; int ok200 = 1;
     for (int k = 0; k < 3; k++){
@@ -153,6 +171,7 @@ static void scenario_waits(const char* m, int check_waits){
     for (int i = 0; i < NS; i++) pthread_create(&th[i], NULL, slow_wait, &sl[i]);
     struct timespec settle = { 0, 150 * 1000000L }; nanosleep(&settle, NULL);
     probe_one("6 waitfornewblock in flight (4 RPC threads)", m);
+    if (check_waits) probe_lookups("6 waitfornewblock in flight (4 RPC threads)");
     for (int i = 0; i < NS; i++) pthread_join(th[i], NULL);
     if (!check_waits) return;
     int answered = 0; double worst = 0;
@@ -167,6 +186,7 @@ static void scenario_lock(const char* m){
     pthread_t th; pthread_create(&th, NULL, hold_lock, (void*)700L);
     struct timespec settle = { 0, 150 * 1000000L }; nanosleep(&settle, NULL);
     probe_one("execution lock held", m);
+    if (!strcmp(m, "uptime")) probe_lookups("execution lock held");   /* once per scenario, under the same hold */
     pthread_join(th, NULL);
 }
 
@@ -203,7 +223,11 @@ int main(void){
 
     { char out[4096]; call_ms("getblockcount", "[]", out, sizeof out);
       ck("baseline: getblockcount answers 300", strstr(out, "\"result\":300") != NULL); }
+    { char out[4096]; call_ms("getblockhash", "[1]", out, sizeof out);
+      char* r = strstr(out, "\"result\":\""); if (r){ r += 10; char* e = strchr(r, '"'); if (e && e - r == 64){ memcpy(g_hash1, r, 64); g_hash1[64] = 0; } }
+      ck("getblockhash 1 gives a 64-hex hash for the header probe", g_hash1[0] != 0); }
     for (unsigned i = 0; i < NTRIV; i++) probe_one("idle", TRIVIAL[i]);
+    probe_lookups("idle");
 
     /* ---- A. six slow calls in flight, four RPC threads ---- */
     for (unsigned i = 0; i < NTRIV; i++) scenario_waits(TRIVIAL[i], i == 0);
@@ -225,7 +249,7 @@ int main(void){
       long before = rpc_exec_slow_events();
       pthread_t th; pthread_create(&th, NULL, hold_lock, (void*)700L);
       struct timespec settle = { 0, 150 * 1000000L }; nanosleep(&settle, NULL);
-      char out[4096]; double ms = call_ms("getblockhash", "[1]", out, sizeof out);   /* EXCL: queues behind the hold */
+      char out[4096]; double ms = call_ms("getchaintips", "[]", out, sizeof out);   /* EXCL: queues behind the hold (getblockhash left the lock on 2026-09-30) */
       pthread_join(th, NULL);
       ck("the exclusive call waited for the hold", ms > 400 && strstr(out, "\"result\"") != NULL);
       long n = rpc_exec_slow_events() - before;
@@ -233,12 +257,12 @@ int main(void){
       printf("      %ld line(s):\n%s", n, log);
       ck("two lines: the hold and the wait", n == 2);
       ck("the hold names its holder and its length", strstr(log, "test hold (excl) held ") != NULL);
-      ck("the wait names the waiter, and who it waited for", strstr(log, "getblockhash (excl) waited ") != NULL && strstr(log, "the last exclusive holder was test hold (held ") != NULL);
+      ck("the wait names the waiter, and who it waited for", strstr(log, "getchaintips (excl) waited ") != NULL && strstr(log, "the last exclusive holder was test hold (held ") != NULL);
       rpc_exec_set_log_ms(0);
       before = rpc_exec_slow_events();
       pthread_create(&th, NULL, hold_lock, (void*)400L);
       nanosleep(&settle, NULL);
-      call_ms("getblockhash", "[1]", out, sizeof out);
+      call_ms("getchaintips", "[]", out, sizeof out);
       pthread_join(th, NULL);
       ck("threshold 0 switches the lines off", rpc_exec_slow_events() == before);
       rpc_exec_set_log_ms(2000); }
@@ -308,8 +332,8 @@ int main(void){
       pthread_create(&th, NULL, submit_wait, &sb);
       struct timespec settle = { 0, 300 * 1000000L }; nanosleep(&settle, NULL);
       for (unsigned i = 0; i < NTRIV; i++) probe_one("sendrawtransaction waiting on the worker", TRIVIAL[i]);
-      { char out[4096]; double ms = call_ms("getblockhash", "[1]", out, sizeof out);
-        char label[200]; snprintf(label, sizeof label, "an EXCLUSIVE call answers while the submit waits: getblockhash in %.1f ms (bound 100 ms)", ms);
+      { char out[4096]; double ms = call_ms("getchaintips", "[]", out, sizeof out);
+        char label[200]; snprintf(label, sizeof label, "an EXCLUSIVE call answers while the submit waits: getchaintips in %.1f ms (bound 100 ms)", ms);
         ck(label, ms < 100.0 && strstr(out, "\"result\"") != NULL); }
       pthread_join(th, NULL);
       printf("      the submit answered after %.0f ms: %.120s\n", sb.ms, strstr(sb.out, "{") ? strstr(sb.out, "{") : sb.out);
