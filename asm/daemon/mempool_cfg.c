@@ -26,9 +26,11 @@
 #include <sys/mman.h>
 #include <signal.h>
 #include <unistd.h>
+#include <stdint.h>
 #include "node_config.h"
 #include "mempool_journal.h"
 #include "mempool_seq.h"
+#include "mempool_lock.h"
 
 extern unsigned long mpool_struct_size(unsigned long slots);
 extern void mpool_init(void* mp, unsigned long slots, void* blob, unsigned long blob_cap);
@@ -91,7 +93,25 @@ extern int  node_config_accept_stale_fee(void) __attribute__((weak));   /* -acce
 __attribute__((weak)) void fest_on_forget(const unsigned char* txid){ (void)txid; }
 unsigned long mp_ext_polstate_n = 0;
 
-static pthread_mutex_t* g_mp_mutex = 0;   /* in its own shared page */
+/* The lock's shared page: the mutex (Linux: a robust process-shared
+ * pthread mutex; Darwin: the pid-word lock below, in the same bytes) and,
+ * since 2026-09-30, WHO holds it -- the holder's site and pid, and the last
+ * release's site, pid and hold -- so a waiter in one process can name the
+ * holder in another (mempool_lock.h). The holder fields are written only by
+ * the holder, under the lock; a taker reads last_* after its own take, so
+ * they are the release that let it in. */
+typedef struct {
+    union { pthread_mutex_t mu; unsigned char pad[128]; } lk;
+    volatile uint32_t waiting;       /* takers between their first try and the take */
+    uint32_t holder_pid;             /* 0 = free (informational; the mutex is the truth) */
+    uint64_t holder_since_ns;        /* CLOCK_MONOTONIC at the take */
+    char     holder_site[96];        /* "site" or "site/phase" */
+    uint32_t last_pid;
+    long     last_held_ms;
+    char     last_site[96];
+} mp_lockpage_t;
+static mp_lockpage_t*   g_mp_page  = 0;
+static pthread_mutex_t* g_mp_mutex = 0;   /* &g_mp_page->lk.mu */
 static int g_mp_robust = 0;               /* MEM-20: PTHREAD_MUTEX_ROBUST armed */
 
 /* ---------------------------------------------------------------- MEM-20
@@ -207,18 +227,106 @@ static volatile int g_mp_closed   = 0;      /* mp_quiesce ran: park, do not ente
 static unsigned long g_mp_owner_died = 0;   /* EOWNERDEAD recoveries seen by this process */
 static __thread sigset_t g_mp_saved_mask;
 static void mp_park(void){ for (;;) sleep(3600); }   /* until the process exits */
-void mp_lock(void){
+
+/* ---------------------------------------------------------------- 2026-09-30
+ * WHO holds this lock, and for how long -- mempool_lock.h says why. Per
+ * thread: when it took the lock, how long it waited, its site, and the steps
+ * it named (mp_lock_phase). Per process: the threshold, the count of lines
+ * written and the last four (the test hooks). The line is written after the
+ * release, never under the lock. */
+#define MP_LOCK_LOG_MS_DEFAULT 1000
+#define MP_LOCK_PHASES 16
+static long g_ml_log_ms = -1;                       /* -1: BMC_MEMPOOL_LOCK_LOG_MS not read yet */
+static __thread struct timespec g_ml_took;
+static __thread long g_ml_waited_ms;
+static __thread int  g_ml_held;                     /* 1 between the take and the release on this thread */
+static __thread const char* g_ml_site;
+static __thread struct { const char* name; struct timespec since; long ms; } g_ml_phase[MP_LOCK_PHASES];
+static __thread int g_ml_nphase;
+static pthread_mutex_t g_ml_log_mu = PTHREAD_MUTEX_INITIALIZER;
+static long g_ml_slow_events;
+static char g_ml_slow_ring[4][512];
+static int  g_ml_slow_ring_n;
+extern void rpc_exec_current_label(char* out, size_t cap) __attribute__((weak));   /* rpc_server.c: the method this thread dispatches */
+static long ml_ms_between(const struct timespec* a, const struct timespec* b){
+    return (b->tv_sec - a->tv_sec) * 1000L + (b->tv_nsec - a->tv_nsec) / 1000000L;
+}
+static long ml_log_ms(void){
+    if (g_ml_log_ms < 0){
+        long v = MP_LOCK_LOG_MS_DEFAULT;
+        const char* e = getenv("BMC_MEMPOOL_LOCK_LOG_MS");
+        if (e && *e){ v = strtol(e, NULL, 10); if (v < 0) v = 0; }
+        g_ml_log_ms = v;
+    }
+    return g_ml_log_ms;
+}
+static void ml_log_line(const char* line){
+    fprintf(stderr, "%s\n", line);
+    pthread_mutex_lock(&g_ml_log_mu);
+    snprintf(g_ml_slow_ring[g_ml_slow_ring_n % 4], sizeof g_ml_slow_ring[0], "%s", line);
+    g_ml_slow_ring_n++;
+    g_ml_slow_events++;
+    pthread_mutex_unlock(&g_ml_log_mu);
+}
+/* close the open step (if any) at t */
+static void ml_phase_close(const struct timespec* t){
+    if (g_ml_nphase > 0){
+        int k = g_ml_nphase - 1;
+        g_ml_phase[k].ms += ml_ms_between(&g_ml_phase[k].since, t);
+    }
+}
+static void ml_holder_site_set(const char* phase){
+    if (!g_mp_page) return;
+    if (phase) snprintf(g_mp_page->holder_site, sizeof g_mp_page->holder_site, "%s/%s", g_ml_site, phase);
+    else       snprintf(g_mp_page->holder_site, sizeof g_mp_page->holder_site, "%s", g_ml_site);
+}
+void mp_lock_phase(const char* phase){
+    if (!g_mp_mutex || !g_ml_held || !phase) return;
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    ml_phase_close(&t);
+    if (g_ml_nphase < MP_LOCK_PHASES){
+        g_ml_phase[g_ml_nphase].name = phase;
+        g_ml_phase[g_ml_nphase].since = t;
+        g_ml_phase[g_ml_nphase].ms = 0;
+        g_ml_nphase++;
+    } else {
+        g_ml_phase[MP_LOCK_PHASES-1].since = t;     /* folded into the last */
+    }
+    ml_holder_site_set(phase);
+}
+void mp_lock_at(const char* site){
     if (!g_mp_mutex) return;
     if (g_mp_closed) mp_park();
     __atomic_add_fetch(&g_mp_inflight, 1, __ATOMIC_SEQ_CST);
     if (g_mp_closed){ __atomic_sub_fetch(&g_mp_inflight, 1, __ATOMIC_SEQ_CST); mp_park(); }
     { sigset_t term; sigemptyset(&term); sigaddset(&term, SIGTERM); sigaddset(&term, SIGINT);
       pthread_sigmask(SIG_BLOCK, &term, &g_mp_saved_mask); }
+    /* the site: the caller's name, or for the RPC layer's hook (NULL) the
+     * method this thread is dispatching, copied out because the label is
+     * the RPC layer's and may change under us */
+    static __thread char sitebuf[128];
+    if (!site){
+        sitebuf[0] = 0;
+        if (rpc_exec_current_label) rpc_exec_current_label(sitebuf, sizeof sitebuf);
+        site = sitebuf[0] ? sitebuf : "(unnamed)";
+    }
+    struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+    __atomic_add_fetch(&g_mp_page->waiting, 1, __ATOMIC_SEQ_CST);
 #ifdef __APPLE__
     int r = mp_rlock_lock(MP_RL);
 #else
     int r = pthread_mutex_lock(g_mp_mutex);
 #endif
+    __atomic_sub_fetch(&g_mp_page->waiting, 1, __ATOMIC_SEQ_CST);
+    clock_gettime(CLOCK_MONOTONIC, &g_ml_took);
+    g_ml_waited_ms = ml_ms_between(&t0, &g_ml_took);
+    g_ml_site = site; g_ml_nphase = 0; g_ml_held = 1;
+    /* the release that let us in, read before we overwrite the holder fields */
+    uint32_t last_pid = g_mp_page->last_pid; long last_ms = g_mp_page->last_held_ms;
+    char last[96]; snprintf(last, sizeof last, "%s", g_mp_page->last_site[0] ? g_mp_page->last_site : "(none yet)");
+    g_mp_page->holder_pid = (uint32_t)getpid();
+    g_mp_page->holder_since_ns = (uint64_t)g_ml_took.tv_sec * 1000000000ull + (uint64_t)g_ml_took.tv_nsec;
+    ml_holder_site_set(NULL);
     if (r == EOWNERDEAD){
         /* the previous holder died inside the critical section */
 #ifndef __APPLE__
@@ -232,9 +340,29 @@ void mp_lock(void){
             "[mempool]          the chain on the next reorg reconcile; restart if you\n"
             "[mempool]          want it rebuilt now.\n");
     }
+    long thr = ml_log_ms();
+    if (thr > 0 && g_ml_waited_ms >= thr){
+        char line[640];
+        snprintf(line, sizeof line, "[mempool] pool lock: %s (pid %d) waited %ld ms; the holder was %s (pid %u, held %ld ms); %u still waiting",
+                 site, (int)getpid(), g_ml_waited_ms, last, (unsigned)last_pid, last_ms, (unsigned)g_mp_page->waiting);
+        ml_log_line(line);
+    }
 }
+void mp_lock(void){ mp_lock_at(NULL); }
 void mp_unlock(void){
     if (!g_mp_mutex) return;
+    struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
+    long held = ml_ms_between(&g_ml_took, &t1), waited = g_ml_waited_ms;
+    ml_phase_close(&t1);
+    const char* site = g_ml_site ? g_ml_site : "?";
+    int nphase = g_ml_nphase;
+    /* the last release, for the next taker's line; then free */
+    g_mp_page->last_pid = (uint32_t)getpid();
+    g_mp_page->last_held_ms = held;
+    memcpy(g_mp_page->last_site, g_mp_page->holder_site, sizeof g_mp_page->last_site);
+    g_mp_page->holder_pid = 0; g_mp_page->holder_site[0] = 0;
+    unsigned waiting = g_mp_page->waiting;
+    g_ml_held = 0;
 #ifdef __APPLE__
     mp_rlock_unlock(MP_RL);
 #else
@@ -243,6 +371,30 @@ void mp_unlock(void){
     sigset_t m = g_mp_saved_mask;                /* copy first: a pending SIGTERM may end us in the call */
     __atomic_sub_fetch(&g_mp_inflight, 1, __ATOMIC_SEQ_CST);
     pthread_sigmask(SIG_SETMASK, &m, NULL);
+    long thr = ml_log_ms();
+    if (thr > 0 && held >= thr){
+        char line[640]; size_t p = 0;
+        p += (size_t)snprintf(line + p, sizeof line - p, "[mempool] pool lock: %s (pid %d) held %ld ms (waited %ld ms)",
+                              site, (int)getpid(), held, waited);
+        for (int k = 0; k < nphase && p < sizeof line; k++)
+            p += (size_t)snprintf(line + p, sizeof line - p, "%s %s %ld ms", k ? "," : ":", g_ml_phase[k].name, g_ml_phase[k].ms);
+        if (p < sizeof line) snprintf(line + p, sizeof line - p, "; %u waiting behind it", waiting);
+        ml_log_line(line);
+    }
+}
+void mp_lock_set_log_ms(long ms){ g_ml_log_ms = ms < 0 ? 0 : ms; }
+long mp_lock_log_ms(void){ return ml_log_ms(); }
+long mp_lock_slow_events(void){ pthread_mutex_lock(&g_ml_log_mu); long n = g_ml_slow_events; pthread_mutex_unlock(&g_ml_log_mu); return n; }
+void mp_lock_slow_log(char* out, size_t cap){
+    pthread_mutex_lock(&g_ml_log_mu);
+    size_t p = 0; if (cap) out[0] = 0;
+    for (int i = 0; i < 4 && p < cap; i++){
+        int k = (g_ml_slow_ring_n + i) % 4;
+        if (!g_ml_slow_ring[k][0]) continue;
+        int n = snprintf(out + p, cap - p, "%s\n", g_ml_slow_ring[k]);
+        if (n > 0) p += (size_t)n;
+    }
+    pthread_mutex_unlock(&g_ml_log_mu);
 }
 /* Close this process's gate and wait (bounded) for its threads to leave the
  * critical section. Returns how many are still inside at the bound (0 = the
@@ -259,7 +411,7 @@ int mp_quiesce(long max_ms){
         usleep(1000);
     }
 }
-void mp_fork_child_reset(void){ g_mp_inflight = 0; g_mp_closed = 0; }
+void mp_fork_child_reset(void){ g_mp_inflight = 0; g_mp_closed = 0; g_ml_held = 0; g_ml_nphase = 0; }
 unsigned long mp_lock_owner_died_count(void){ return g_mp_owner_died; }
 
 /* for the test: 1 when the shared lock was created ROBUST */
@@ -351,7 +503,7 @@ int mempool_configure(void){
      * pool without a lock. */
 #ifdef __APPLE__
     /* Darwin: the pid-word lock above, zeroed (free) by the anonymous map */
-    { void* pg = mmap(0, sizeof(mp_rlock_t), PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
+    { void* pg = mmap(0, sizeof(mp_lockpage_t), PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
       if (pg == MAP_FAILED){
           munmap(area, struct_sz); munmap(blob, (size_t)blob_cap);
           mp_ext_area=0; mp_ext_blob=0; mp_ext_slots=0; mp_ext_blobcap=0;
@@ -360,9 +512,9 @@ int mempool_configure(void){
           return 0;
       }
       g_mp_robust = 1;
-      g_mp_mutex = (pthread_mutex_t*)pg; }
+      g_mp_page = (mp_lockpage_t*)pg; g_mp_mutex = &g_mp_page->lk.mu; }
 #else
-    { void* pg = mmap(0, sizeof(pthread_mutex_t), PROT_READ|PROT_WRITE,
+    { void* pg = mmap(0, sizeof(mp_lockpage_t), PROT_READ|PROT_WRITE,
                       MAP_SHARED|MAP_ANONYMOUS, -1, 0);
       pthread_mutexattr_t at;
       /* MEM-20: ROBUST is requested but NOT required -- see mp_lock above. */
@@ -378,14 +530,14 @@ int mempool_configure(void){
           pthread_mutexattr_setpshared(&at, PTHREAD_PROCESS_SHARED)!=0 ||
           (rb && pthread_mutexattr_setrobust(&at, PTHREAD_MUTEX_ROBUST)!=0) ||
           pthread_mutex_init((pthread_mutex_t*)pg, &at)!=0){
-          if (pg!=MAP_FAILED) munmap(pg, sizeof(pthread_mutex_t));
+          if (pg!=MAP_FAILED) munmap(pg, sizeof(mp_lockpage_t));
           munmap(area, struct_sz); munmap(blob, (size_t)blob_cap);
           mp_ext_area=0; mp_ext_blob=0; mp_ext_slots=0; mp_ext_blobcap=0;
           mp_ext_inited=0; g_mp_area=0;
           fprintf(stderr,"[mempool] process-shared lock unavailable -- falling back to the built-in 2MiB mempool\n");
           return 0;
       }
-      g_mp_mutex = (pthread_mutex_t*)pg; }
+      g_mp_page = (mp_lockpage_t*)pg; g_mp_mutex = &g_mp_page->lk.mu; }
 #endif
 
     /* Shared tx-accept policy state (fee/ancestor registry), init'd once
@@ -693,7 +845,7 @@ long mempool_expire_now(void){
     if(hours <= 0) return 0;
     long cutoff = (long)time(0) - hours*3600;
     long removed = 0;
-    mp_lock();
+    mp_lock_at(__func__);
     for(unsigned long i=0;i<=g_seen_mask;i++){
         mp_seen_t* e = &g_seen[i];
         if(__atomic_load_n(&e->used, __ATOMIC_ACQUIRE) != MPS_LIVE || e->t > cutoff) continue;
@@ -779,7 +931,7 @@ void mempool_seq_block_locked(const unsigned char hash[32], int label){
 }
 
 void mempool_seq_block(const unsigned char hash[32], int label){
-    mp_lock();
+    mp_lock_at(__func__);
     mempool_seq_block_locked(hash, label);
     mp_unlock();
 }

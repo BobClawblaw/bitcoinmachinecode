@@ -2266,10 +2266,26 @@ static int cmd_getrawtransaction(const rj_val* params, rj_val** res, long* ec, c
          *
          * rpc_node_mempool_rawtx copies the bytes out under the pool lock;
          * nothing here holds a live pointer into shared memory that an
-         * eviction could move. */
+         * eviction could move.
+         *
+         * 2026-09-30: the copy waits on the POOL lock, which the download
+         * worker holds for seconds at a new block (the lock's own log names
+         * the site), and this handler held the RPC execution lock while it
+         * waited -- the facade's most-dispatched call after getblock, so the
+         * whole surface waited with it (2,045 ms holds in production, of
+         * which the handler's own work was under 20). The execution lock is
+         * released around the consult and taken back before anything it
+         * protects is touched (the index, the block buffer, the tip), as
+         * #349 did for the worker waits; the copy lands in a per-thread
+         * buffer because another handler runs on another thread meanwhile.
+         * Weak: the unit tests link this file without the server. */
         {
-            static u8 mraw[RPC_TXSUBMIT_MAX];
+            static __thread u8 mraw[RPC_TXSUBMIT_MAX];
+            extern void rpc_exec_yield_begin(void) __attribute__((weak));
+            extern void rpc_exec_yield_end(void) __attribute__((weak));
+            if (rpc_exec_yield_begin) rpc_exec_yield_begin();
             long mlen = rpc_node_mempool_rawtx(want_wire, mraw, sizeof mraw);
+            if (rpc_exec_yield_end) rpc_exec_yield_end();
             if (mlen > 0){
                 if (verbosity <= 0){
                     char* hx = malloc((size_t)mlen*2 + 1);
@@ -2294,6 +2310,7 @@ static int cmd_getrawtransaction(const rj_val* params, rj_val** res, long* ec, c
                 *res = tx_to_json(mraw, &w, -1);
                 return 1;
             }
+            tip = refresh();     /* the tip may have moved during the yield: the block path's confirmations are counted from it */
         }
 
         long th; u32 toff, tlen;

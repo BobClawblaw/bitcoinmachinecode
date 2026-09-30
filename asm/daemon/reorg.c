@@ -131,8 +131,7 @@ extern int  utxo_live_rewind_to(long height);
 /* bitcoin_mempool.asm / bitcoin_mempool_policy.c */
 extern long mpool_del(void* mp, const unsigned char txid[32]);
 /* shared-mempool cross-process lock (daemon/mempool_cfg.c; no-op fallback) */
-extern void mp_lock(void);
-extern void mp_unlock(void);
+#include "mempool_lock.h"
 extern long mpool_count(void* mp);
 extern long mpool_policy_add(void* pol, void* st, void* mp,
                              const unsigned char* tx, unsigned long txlen,
@@ -1363,7 +1362,7 @@ long reorg_mempool_reconcile_ex(reorg_mempool_t* m,
      * child's policy-add or the RPC thread's iteration landing mid-rebuild
      * would see a half-emptied pool. mp_lock is a no-op for the per-process
      * static fallback. */
-    mp_lock();
+    mp_lock_at(__func__);
 
     /* ---- MEM-8 (audit 2026-09-03): size the snapshot from the POOL ----
      *
