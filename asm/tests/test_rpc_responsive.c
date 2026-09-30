@@ -112,10 +112,18 @@ static void probe_one_p(const char* scenario, const char* m, const char* params)
     ck(label, ok200 && worst < 100.0);
 }
 /* the pollers' block lookups, off the execution lock since 2026-09-30: probed beside the trivial six */
-static void probe_lookups(const char* scenario){
+static void probe_lookups(const char* scenario, int with_mempool){
     char p[128]; snprintf(p, sizeof p, "[\"%s\"]", g_hash1);
     probe_one_p(scenario, "getblockhash", "[1]");
     probe_one_p(scenario, "getblockheader", p);
+    /* the mempool readers are NOLOCK, not FAST (2026-09-30): they never take
+     * the execution lock, so a held write lock does not park them (scenario
+     * B), but they are served by the worker threads, so with six waits on
+     * four threads they queue like any NOLOCK call (scenario A skips them) */
+    if (with_mempool){
+        probe_one_p(scenario, "getmempoolinfo", "[]");
+        probe_one_p(scenario, "getrawmempool", "[]");
+    }
 }
 static void probe_one(const char* scenario, const char* m){
     char out[65536]; double worst = 0; int ok200 = 1;
@@ -171,7 +179,7 @@ static void scenario_waits(const char* m, int check_waits){
     for (int i = 0; i < NS; i++) pthread_create(&th[i], NULL, slow_wait, &sl[i]);
     struct timespec settle = { 0, 150 * 1000000L }; nanosleep(&settle, NULL);
     probe_one("6 waitfornewblock in flight (4 RPC threads)", m);
-    if (check_waits) probe_lookups("6 waitfornewblock in flight (4 RPC threads)");
+    if (check_waits) probe_lookups("6 waitfornewblock in flight (4 RPC threads)", 0);
     for (int i = 0; i < NS; i++) pthread_join(th[i], NULL);
     if (!check_waits) return;
     int answered = 0; double worst = 0;
@@ -186,7 +194,7 @@ static void scenario_lock(const char* m){
     pthread_t th; pthread_create(&th, NULL, hold_lock, (void*)700L);
     struct timespec settle = { 0, 150 * 1000000L }; nanosleep(&settle, NULL);
     probe_one("execution lock held", m);
-    if (!strcmp(m, "uptime")) probe_lookups("execution lock held");   /* once per scenario, under the same hold */
+    if (!strcmp(m, "uptime")) probe_lookups("execution lock held", 1);   /* once per scenario, under the same hold */
     pthread_join(th, NULL);
 }
 
@@ -227,7 +235,7 @@ int main(void){
       char* r = strstr(out, "\"result\":\""); if (r){ r += 10; char* e = strchr(r, '"'); if (e && e - r == 64){ memcpy(g_hash1, r, 64); g_hash1[64] = 0; } }
       ck("getblockhash 1 gives a 64-hex hash for the header probe", g_hash1[0] != 0); }
     for (unsigned i = 0; i < NTRIV; i++) probe_one("idle", TRIVIAL[i]);
-    probe_lookups("idle");
+    probe_lookups("idle", 1);
 
     /* ---- A. six slow calls in flight, four RPC threads ---- */
     for (unsigned i = 0; i < NTRIV; i++) scenario_waits(TRIVIAL[i], i == 0);

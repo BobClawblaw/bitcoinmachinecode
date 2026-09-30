@@ -1058,8 +1058,34 @@ static unsigned long mp_tx_weight(const unsigned char* tx, unsigned long len){
     unsigned long base = len - 2 - wit_bytes;      /* minus marker+flag+witness */
     return base*3 + len;
 }
-static unsigned long mp_tx_vsize(const unsigned char* tx, unsigned long len){
-    return (mp_tx_weight(tx,len) + 3) / 4;
+/* (mp_tx_vsize, (weight+3)/4, went with the cache below: every vsize now comes from a cached weight) */
+static int mp_tx_signals_rbf(const unsigned char* tx, unsigned long len);   /* below */
+/* ---- 2026-09-30: a per-slot cache of what a parse of an entry gives ---------
+ * getmempoolinfo summed vsize by PARSING every transaction in the pool on
+ * every call, and getrawmempool rebuilt its weight/RBF table the same way: at
+ * a 77,800-transaction pool that is 2-3.5 s per call with the execution lock
+ * held, and production's first exec-lock lines named exactly those two
+ * (getrawmempool held 3,467 ms; getmempoolinfo 2,885 ms). Core keeps the
+ * totals incrementally. This node's pool is shared memory the worker owns,
+ * so the RPC side keeps its own cache instead, indexed by SLOT: an entry is
+ * re-parsed only when its slot's txid or length changed since the last walk,
+ * and a walk of unchanged slots is a memcmp per slot. Keyed on txid AND
+ * length so a same-txid different-witness replacement is not served the old
+ * weight. Guarded by the mempool lane's mutex (rpc_node_dispatch). */
+typedef struct { unsigned char id[32]; unsigned long len, w; unsigned char rbf, used; } mpc_t;
+static mpc_t* g_mpc; static unsigned long g_mpc_n;
+static long g_mpc_hits, g_mpc_parses;                 /* test hooks */
+void rpc_node_mpc_stats(long* hits, long* parses){ if (hits) *hits = g_mpc_hits; if (parses) *parses = g_mpc_parses; }
+static unsigned long mpc_weight(unsigned long n, unsigned long i, const mp_ent* e, unsigned char* rbf){
+    if (g_mpc_n != n){ free(g_mpc); g_mpc = (mpc_t*)calloc(n ? n : 1, sizeof *g_mpc); g_mpc_n = g_mpc ? n : 0; }
+    mpc_t* c = (g_mpc && i < g_mpc_n) ? &g_mpc[i] : 0;
+    if (c && c->used && c->len == e->len && !memcmp(c->id, e->txid, 32)){ g_mpc_hits++; if (rbf) *rbf = c->rbf; return c->w; }
+    unsigned long w = mp_tx_weight(e->tx, e->len);
+    unsigned char r = (unsigned char)mp_tx_signals_rbf(e->tx, e->len);
+    g_mpc_parses++;
+    if (c){ memcpy(c->id, e->txid, 32); c->len = e->len; c->w = w; c->rbf = r; c->used = 1; }
+    if (rbf) *rbf = r;
+    return w;
 }
 
 /* -limitancestorcount / -limitancestorsize, injected by main.c from the
@@ -1093,7 +1119,7 @@ static int cmd_getmempoolinfo(rj_val** res){
         unsigned long n = mp_slot_count(g_mph.mp);
         for (unsigned long i=0;i<n;i++){ mp_ent e;
             if (mp_slot(g_mph.mp,i,&e) != 1) continue;
-            bytes += mp_tx_vsize(e.tx, e.len);
+            bytes += (mpc_weight(n, i, &e, 0) + 3) / 4;   /* 2026-09-30: a parse only for a slot that changed */
             blob_used += e.len;
             if (!have_totals){                       /* no policy module linked */
                 unsigned long long f,s;
@@ -1411,7 +1437,7 @@ extern int rpc_chain_txospender_lookup(const unsigned char txid_wire[32], unsign
                                        long* height_out, unsigned char blockhash_wire[32], unsigned char* txout, long txcap, long* txlen_out) __attribute__((weak));
 static int cmd_gettxspendingprevout(const rj_val* params, rj_val** res,
                                     long* ec, const char** em){
-    static char tbuf[256];
+    static __thread char tbuf[256];
     if (!params || params->typ != RJ_ARR || params->nitems < 1){
         *ec = -1; *em = "gettxspendingprevout requires outputs"; return 0; }
     /* Core type-checks EVERY argument before ANY value and reports EVERY
@@ -1499,7 +1525,7 @@ static int cmd_gettxspendingprevout(const rj_val* params, rj_val** res,
          * txospenderindex is unavailable." -- RPC_MISC_ERROR. The text
          * here was an older wording. */
         if (!index_ok || !rpc_chain_txospender_lookup){
-            static char nomsg[200];
+            static __thread char nomsg[200];
             const rj_val* e0 = list->items[pending[0]];
             char lx[65]; const char* tx0 = rj_obj_get((rj_val*)e0, "txid")->str;   /* validated: 64 hex digits */
             for (int b = 0; b < 64; b++) lx[b] = (char)((tx0[b] >= 'A' && tx0[b] <= 'F') ? tx0[b] - 'A' + 'a' : tx0[b]);
@@ -1740,10 +1766,11 @@ static int cmd_getrawmempool(const rj_val* params, rj_val** res, long* ec, const
                 for (unsigned long i=0;i<n;i++){ mp_ent e2;
                     if (mp_slot(g_mph.mp,i,&e2) != 1) continue;
                     memcpy(g_mpe_vs[g_mpe_vs_n].id, e2.txid, 32);
-                    g_mpe_vs[g_mpe_vs_n].w = mp_tx_weight(e2.tx, e2.len);
+                    { unsigned char rbf = 0;
+                      g_mpe_vs[g_mpe_vs_n].w = mpc_weight(n, i, &e2, &rbf);   /* 2026-09-30: the slot cache */
+                      g_mpe_vs[g_mpe_vs_n].rbf = rbf; }
                     g_mpe_vs[g_mpe_vs_n].vs = (g_mpe_vs[g_mpe_vs_n].w+3)/4;
                     g_mpe_vs[g_mpe_vs_n].inf = -1;
-                    g_mpe_vs[g_mpe_vs_n].rbf = (unsigned char)mp_tx_signals_rbf(e2.tx, e2.len);
                     g_mpe_vs_n++;
                 }
                 /* the whole graph in one pass; -1 means fall back per entry */
@@ -1818,7 +1845,7 @@ static rj_val* mpe_amount(unsigned long long sat){
     return rj_numf("%llu.%08llu", sat/100000000ULL, sat%100000000ULL);
 }
 static int cmd_getmempoolentry(const rj_val* params, rj_val** res, long* ec, const char** em){
-    static char embuf[256];
+    static __thread char embuf[256];
     if (!params || params->typ != RJ_ARR || params->nitems < 1){
         *ec = -1; *em = "getmempoolentry requires txid"; return 0; }
     if (params->items[0]->typ != RJ_STR)
@@ -2063,7 +2090,7 @@ static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx,
  * uses, filtered to members still in the structural pool. */
 static int cmd_mpe_relatives(const rj_val* params, rj_val** res, long* ec, const char** em,
                              int want_desc){
-    static char embuf[256];
+    static __thread char embuf[256];
     if (!params || params->typ != RJ_ARR || params->nitems < 1){
         *ec = -1; *em = want_desc ? "getmempooldescendants requires txid"
                                   : "getmempoolancestors requires txid"; return 0; }
@@ -3752,7 +3779,7 @@ static int mpc_lookup_here(void* ctx, const unsigned char txid[32], mpc_entry* o
  * nothing here can recover them: that case still refuses, and says why, rather
  * than inventing an ordering that would differ from Core's silently. */
 static int cmd_getmempoolcluster(const rj_val* params, rj_val** res, long* ec, const char** em){
-    static char embuf[512];
+    static __thread char embuf[512];
     /* This had the right CODE for a wrong type and the wrong one for a missing
      * argument, which it folded into the same branch: Core answers -1 there.
      * It also hardcoded the type as "null" whatever was passed. The three
@@ -3840,7 +3867,36 @@ static int cmd_getmempoolcluster(const rj_val* params, rj_val** res, long* ec, c
     return 1;
 }
 
+/* ---- 2026-09-30: the mempool lane ---------------------------------------------
+ * The mempool readers run without the RPC execution lock (rpc_server.c
+ * classes them NOLOCK through rpc_node_method_lane) and under this mutex
+ * instead: they read the pool under its own lock (mpl/mpu, shared with the
+ * worker) and share only what this file owns -- the per-call tables
+ * (g_mpe_vs, g_mpe_inf, g_mpe_chunk), the slot cache (g_mpc) and one
+ * handler's static block buffer -- none of which a write-locked handler
+ * touches. Recursive because the facade dispatches one of them from inside
+ * another's frame. A slow getrawmempool now waits only its own kind. */
+static pthread_mutex_t g_mpx_mu;
+static pthread_once_t g_mpx_once = PTHREAD_ONCE_INIT;
+static void mpx_init(void){ pthread_mutexattr_t a; pthread_mutexattr_init(&a); pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE); pthread_mutex_init(&g_mpx_mu, &a); pthread_mutexattr_destroy(&a); }
+int rpc_node_method_lane(const char* m){
+    if (!strcmp(m, "getmempoolinfo") || !strcmp(m, "getrawmempool") || !strcmp(m, "getmempoolentry")
+     || !strcmp(m, "getmempoolancestors") || !strcmp(m, "getmempooldescendants")
+     || !strcmp(m, "gettxspendingprevout") || !strcmp(m, "getmempoolcluster")) return 2;
+    return 0;
+}
+static int rpc_node_dispatch_unlocked(const char* m, const rj_val* params, rj_val** res, long* ec, const char** em);
 int rpc_node_dispatch(const char* m, const rj_val* params, rj_val** res, long* ec, const char** em){
+    if (rpc_node_method_lane(m)){
+        pthread_once(&g_mpx_once, mpx_init);
+        pthread_mutex_lock(&g_mpx_mu);
+        int r = rpc_node_dispatch_unlocked(m, params, res, ec, em);
+        pthread_mutex_unlock(&g_mpx_mu);
+        return r;
+    }
+    return rpc_node_dispatch_unlocked(m, params, res, ec, em);
+}
+static int rpc_node_dispatch_unlocked(const char* m, const rj_val* params, rj_val** res, long* ec, const char** em){
     (void)ec; (void)em;
     if (!strcmp(m, "getconnectioncount")) return cmd_getconnectioncount(res);
     if (!strcmp(m, "getnetworkinfo"))     return cmd_getnetworkinfo(res);

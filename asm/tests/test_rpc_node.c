@@ -683,6 +683,18 @@ int main(void){
       ck("shared pool: bytes = 85 + 113 = 198 (vsize sum)", r && S(r,"bytes") && !strcmp(S(r,"bytes"),"198"));
       ck("shared pool: maxmempool = injected 8388608", r && S(r,"maxmempool") && !strcmp(S(r,"maxmempool"),"8388608"));
       rj_free(r);
+      /* 2026-09-30: the per-slot parse cache -- a second walk of an unchanged
+       * pool parses nothing and answers the same; the lane classification of
+       * the mempool readers is 2 (no execution lock) */
+      { long h0, p0, h1, p1; rpc_node_mpc_stats(&h0, &p0);
+        r = NULL; rpc_node_dispatch("getmempoolinfo", NULL, &r, &ec, &em);
+        rpc_node_mpc_stats(&h1, &p1);
+        ck("slot cache: the second getmempoolinfo parsed no entry (2 hits, 0 parses)", h1 - h0 == 2 && p1 == p0);
+        ck("...and answers the same bytes (198)", r && S(r,"bytes") && !strcmp(S(r,"bytes"),"198"));
+        rj_free(r);
+        ck("getmempoolinfo / getrawmempool / getmempoolentry are in the mempool lane (2)",
+           rpc_node_method_lane("getmempoolinfo") == 2 && rpc_node_method_lane("getrawmempool") == 2 && rpc_node_method_lane("getmempoolentry") == 2);
+        ck("getpeerinfo is not", rpc_node_method_lane("getpeerinfo") == 0); }
 
       /* ---- getmempoolentry: drive a REAL parent->child chain through the
        * REAL policy accept path (mpool_policy_add), then assert the graph
