@@ -188,9 +188,9 @@ testnet4, signet (public or custom) and regtest.
   [`docs/MEMPOOL_SPACE.md`](docs/MEMPOOL_SPACE.md).
 - `getblocktemplate`/`submitblock`/`submitheader`,
   `prioritisetransaction`, `dumptxoutset` (assumeutxo snapshot export).
-- ZMQ publishers for `hashblock`, `hashtx`, `rawblock`, `rawtx` with per-topic
-  high-water marks; `blocknotify`, `alertnotify`, `startupnotify`,
-  `shutdownnotify` shell hooks.
+- ZMQ publishers for `hashblock`, `hashtx`, `rawblock`, `rawtx` and Core's
+  mempool `sequence` topic, with per-topic high-water marks; `blocknotify`,
+  `alertnotify`, `startupnotify`, `shutdownnotify` shell hooks.
 
 **Chains**
 
@@ -384,7 +384,7 @@ log echoes the resolved values.
 | `walletdir` | chain directory | directory holding the wallet files and the `wallets/<name>/` subdirectories of named wallets; absolute, or relative to the chain directory; created if absent |
 | `debuglogfile` | `debug.log` | the daemon's own leveled log, relative to the chain directory or absolute; `0` disables it |
 | `signer` | — | external signer command |
-| `zmqpubhashblock` / `zmqpubhashtx` / `zmqpubrawblock` / `zmqpubrawtx` (+`hwm`) | — | ZMQ endpoints; `tcp://*` is refused, name an interface |
+| `zmqpubhashblock` / `zmqpubhashtx` / `zmqpubrawblock` / `zmqpubrawtx` / `zmqpubsequence` (+`hwm`) | — | ZMQ endpoints; `tcp://*` is refused, name an interface |
 | `blocknotify` / `alertnotify` / `startupnotify` / `shutdownnotify` | — | shell hooks; `%s` is sanitised before substitution |
 | `whitelist` / `whitebind` / `asmap` / `bantime` / `maxuploadtarget` / `blocksonly` | — / — / — / `86400` / `0` / `0` | peer permissions, AS bucketing, bans, upload budget, no tx relay |
 | `bmc.dialratelimit` / `bmc.downloadratelimit` / `bmc.uploadratelimit` | `0` / `0` / `0` | node-wide ceilings, off by default: outbound connection attempts per second; KB/s the sync may pull; KB/s the node may send (Core has only `maxuploadtarget`, a MiB-per-day budget, which is implemented too) |
@@ -451,9 +451,12 @@ log echoes the resolved values.
   batch route cannot starve JSON-RPC callers. Address routes need the
   history index; `/scripthash` is refused (501) until it exists.
 - ZMQ: a native ZMTP 3.1 PUB implementation (no libzmq dependency) publishes
-  `hashblock`, `hashtx`, `rawblock` and `rawtx`; `getzmqnotifications` lists
-  the endpoints. Subscribers that observe a sequence gap resynchronise via
-  RPC, as with Core.
+  `hashblock`, `hashtx`, `rawblock`, `rawtx` and `sequence` (A/R with Core's
+  mempool sequence, C/D per block; `getrawmempool`'s `mempool_sequence`
+  answers from the same counter; where it is not Core's:
+  `docs/CORE_DIVERGENCES.md`); `getzmqnotifications` lists the endpoints.
+  Subscribers that observe a sequence gap resynchronise via RPC, as with
+  Core.
 - Wire identity: user agent `/BitcoinMachineCode:0.0.1/`, protocol version
   70016, defined once in `asm/version.inc`.
 
@@ -485,8 +488,6 @@ in [`docs/FEATURE_GAPS.md`](docs/FEATURE_GAPS.md):
 - **Download window.** 4,096 blocks above the first unfilled height against
   Core's 1,024: Core keeps ~128–160 blocks in flight, this node 640, and the
   window preserves Core's slack ratio rather than its constant.
-- **ZMQ `sequence` topic** is refused by configuration rather than
-  published; the other four topics are supported.
 - **Wallet.** The seed wallet always carries bech32 (wpkh); `createwalletdescriptor`
   adds legacy (pkh, 44'), p2sh-segwit (sh(wpkh), 49') and bech32m (tr, 86'),
   after which `getnewaddress`/`getrawchangeaddress` accept that address type,
