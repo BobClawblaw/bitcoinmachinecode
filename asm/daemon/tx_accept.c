@@ -740,8 +740,7 @@ static int   g_pol_ready = 0;
  * lock. Both are no-ops / null in the static per-process fallback. */
 extern void* mp_ext_polstate;
 extern unsigned long mp_ext_polstate_n;
-extern void mp_lock(void);
-extern void mp_unlock(void);
+#include "mempool_lock.h"       /* mp_lock_at / mp_unlock / mp_lock_phase (2026-09-30: every take is named) */
 
 /* tx_policy_init(void) -> 1 ok / 0 failed. Called once per connection
  * alongside tx_dispatch_init. */
@@ -749,7 +748,7 @@ extern void mp_unlock(void);
 static void txacc_note_sigops(void* mp_area, const u8 txid[32], const u8* tx, unsigned long txlen){
     long c = txacc_sigop_cost(mp_area, tx, txlen);
     if (c < 0) return;                 /* unresolvable: leave 0 (fallback) */
-    mp_lock();
+    mp_lock_at(__func__);
     mpool_policy_set_sigops(g_pol_state, txid, (unsigned int)c);
     mp_unlock();
 }
@@ -919,7 +918,7 @@ long tx_accept_validate(void* mp_area, const u8 txid[32], const u8* tx, unsigned
             return 0;
         }
     }
-    mp_lock();
+    mp_lock_at(__func__);
     long padd = mpool_policy_add(g_pol, g_pol_state, mp_area, tx, txlen, txid, placeholder_utxo);
     if (padd == 1) txacc_fee_note(txid);           /* fee estimation, under the same lock */
     mp_unlock();
@@ -1011,7 +1010,7 @@ long tx_accept_validate_p2p(void* mp_area, const u8 txid[32], const u8* tx,
             return -26;
         }
     }
-    mp_lock();
+    mp_lock_at(__func__);
     long padd = mpool_policy_add(g_pol, g_pol_state, mp_area, tx, txlen, txid, placeholder_utxo);
     if (padd == 1) txacc_fee_note(txid);           /* fee estimation, under the same lock */
     mp_unlock();
@@ -1068,7 +1067,7 @@ long tx_accept_validate_reason(void* mp_area, const u8 txid[32], const u8* tx,
             return -26;
         }
     }
-    mp_lock();
+    mp_lock_at(__func__);
     long padd = mpool_policy_add(g_pol, g_pol_state, mp_area, tx, txlen, txid, placeholder_utxo);
     if (padd == 1) txacc_fee_note(txid);           /* fee estimation, under the same lock */
     mp_unlock();
@@ -1125,7 +1124,7 @@ long tx_accept_test_reason(void* mp_area, const u8 txid[32], const u8* tx,
             return -26;
         }
     }
-    mp_lock();
+    mp_lock_at(__func__);
     long pt = mpool_policy_test(g_pol, g_pol_state, mp_area, tx, txlen, txid,
                                 placeholder_utxo, fee_out, vsize_out);
     mp_unlock();
@@ -1160,13 +1159,16 @@ long tx_accept_block_connect_h(void* mp_area, const unsigned char* block,
         if (blen >= 80) mempool_seq_block(bh, 'C');
         return 0;
     }
-    mp_lock();
+    mp_lock_at(__func__);
     /* fee estimation: roll the block counters first; the policy's confirmed
      * hook then books each mined tx (txacc_note_confirmed), and the forget
      * callback books conflicts as "left unconfirmed" */
+    mp_lock_phase("fest_begin");
     fest_on_block_begin(height);
-    long r = mpool_policy_block_connect(g_pol_state, mp_area, block, blen);
+    long r = mpool_policy_block_connect(g_pol_state, mp_area, block, blen);   /* names its own steps */
+    mp_lock_phase("fest_end");
     fest_on_block_end();
+    mp_lock_phase("seq_C");
     if (blen >= 80) mempool_seq_block_locked(bh, 'C');
     mp_unlock();
     return r;

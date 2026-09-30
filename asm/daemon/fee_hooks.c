@@ -16,8 +16,7 @@
 #include <time.h>
 
 extern void* mp_ext_feeest;                     /* daemon/mempool_cfg.c */
-extern void  mp_lock(void);
-extern void  mp_unlock(void);
+#include "mempool_lock.h"
 
 #define FEE_FLUSH_INTERVAL_S (60L * 60L)       /* Core FEE_FLUSH_INTERVAL{1h} */
 static long g_last_flush;
@@ -50,7 +49,7 @@ void fest_on_forget(const unsigned char* txid){
  * as "left the mempool" (FlushUnconfirmed), then the file is written. */
 void fest_shutdown_flush(void){
     if (!mp_ext_feeest) return;
-    mp_lock();
+    mp_lock_at(__func__);
     unsigned long n = fest_tracked(mp_ext_feeest);
     fest_flush_unconfirmed(mp_ext_feeest);
     int ok = fest_write_file(mp_ext_feeest, "fee_estimates.dat");

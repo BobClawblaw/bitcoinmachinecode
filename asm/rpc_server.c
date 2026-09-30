@@ -1017,6 +1017,14 @@ long rpc_exec_yields(void){ return g_exec_yields; }
 /* The facade and REST name what they dispatch (rpc_esplora.c / rest.c call
  * these through weak references, so their unit tests link without us). */
 void rpc_exec_set_label(const char* method){ g_exec_label = method; }
+/* The mempool lock's log (daemon/mempool_cfg.c, weak there) names the RPC
+ * thread that takes the pool lock by this: the same label as above, empty
+ * when this thread is not dispatching anything. */
+void rpc_exec_current_label(char* out, size_t cap){
+    if (!cap) return;
+    if (!g_exec_label && !g_exec_ctx[0]){ out[0] = 0; return; }
+    exec_label_of(out, cap);
+}
 void rpc_exec_set_context(const char* who, const char* verb, size_t vlen, const char* path, size_t plen){
     if (!who){ g_exec_ctx[0] = 0; return; }
     if (plen > 120) plen = 120;
