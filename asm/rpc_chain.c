@@ -59,6 +59,7 @@
 #include "bitcoin_pow_rules.h"
 #include "mempool_cluster.h"   /* the one linearization/chunking implementation */
 #include "rpc_node.h"     /* rpc_mempool_hooks: getblocktemplate reads the shared pool */
+#include "bmc_thread.h"  /* BMC_TLS_BUF (bmc_osx) */
 #include "script_flags_consts.h"
 #include "block_filter.h"   /* BIP158 basic filters, Core-byte-validated */  /* buried-deployment heights, generated from
                                    * Core's chainparams -- the SAME parse the
@@ -2280,11 +2281,12 @@ static int cmd_getrawtransaction(const rj_val* params, rj_val** res, long* ec, c
          * buffer because another handler runs on another thread meanwhile.
          * Weak: the unit tests link this file without the server. */
         {
-            static __thread u8 mraw[RPC_TXSUBMIT_MAX];
+            static __thread u8* mraw;   /* bmc_osx: heap TLS scratch (bmc_thread.h convention), not a Mach-O TLV array */
+            BMC_TLS_BUF(mraw, RPC_TXSUBMIT_MAX);
             extern void rpc_exec_yield_begin(void) __attribute__((weak));
             extern void rpc_exec_yield_end(void) __attribute__((weak));
             if (rpc_exec_yield_begin) rpc_exec_yield_begin();
-            long mlen = rpc_node_mempool_rawtx(want_wire, mraw, sizeof mraw);
+            long mlen = rpc_node_mempool_rawtx(want_wire, mraw, RPC_TXSUBMIT_MAX);
             if (rpc_exec_yield_end) rpc_exec_yield_end();
             if (mlen > 0){
                 if (verbosity <= 0){
