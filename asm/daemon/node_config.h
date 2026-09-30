@@ -36,6 +36,7 @@ typedef struct {
     int    dead_weight_ticks;
     int    min_usable_peers;     /* never ban the pool below this            */
     int    maxpool;              /* candidate pool drawn from the book       */
+    int    dlc_chunk_blocks;     /* blocks per download request (bmc.dlcchunk; 2026-09-30) */
 
     /* address ingestion limits (anti-eclipse; daemon/addr_ingest.c) */
     int  addr_max_per_response;

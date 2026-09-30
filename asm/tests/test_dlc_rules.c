@@ -29,13 +29,29 @@ int main(void){
     ck("a chain at or above the announced height is accepted", !dlc_chain_falls_short(966140, 966132));
     ck("with no announced height nothing falls short", !dlc_chain_falls_short(5, 0));
     /* ---- Core's download shape (2026-09-10) ---- */
-    ck("124 live peers, cap 64: 64 download (run 19 ran 16)", dlc_workers_for(124, 64, 966211) == 64);
-    ck("12 live peers, cap 64: all 12", dlc_workers_for(12, 64, 966211) == 12);
-    ck("no live peer: still one worker slot", dlc_workers_for(0, 64, 966211) == 1);
-    ck("a cap above the arrays' 64 is 64", dlc_workers_for(500, 200, 966211) == 64);
-    ck("a 40-block handoff: one helper, not 64 (row 3)", dlc_workers_for(124, 64, 40) == 1);
-    ck("a 41-block span: two helpers", dlc_workers_for(124, 64, 41) == 2);
-    ck("a 1,000-block span: 25 helpers", dlc_workers_for(124, 64, 1000) == 25);
+    ck("124 live peers, cap 64: 64 download (run 19 ran 16)", dlc_workers_for(124, 64, 966211, 40) == 64);
+    ck("12 live peers, cap 64: all 12", dlc_workers_for(12, 64, 966211, 40) == 12);
+    ck("no live peer: still one worker slot", dlc_workers_for(0, 64, 966211, 40) == 1);
+    ck("a cap above the arrays' 64 is 64", dlc_workers_for(500, 200, 966211, 40) == 64);
+    ck("a 40-block handoff: one helper, not 64 (row 3)", dlc_workers_for(124, 64, 40, 40) == 1);
+    ck("a 41-block span: two helpers", dlc_workers_for(124, 64, 41, 40) == 2);
+    ck("a 1,000-block span: 25 helpers", dlc_workers_for(124, 64, 1000, 40) == 25);
+    /* 2026-09-30: the span's chunk count follows the chunk size in use, not a literal 40 */
+    ck("16-block chunks: a 40-block handoff is three chunks, three helpers", dlc_workers_for(124, 64, 40, 16) == 3);
+    ck("16-block chunks: a 1,000-block span is 63 chunks", dlc_workers_for(124, 64, 1000, 16) == 63);
+    ck("a chunk size of 0 is read as 1 (no division by zero)", dlc_workers_for(124, 64, 10, 0) == 10);
+    /* 2026-09-30: cursor help asked for 32 chunks staged above the cursor, but
+     * the window caps what can be staged at window/chunk: 1024/40 = 25. Since
+     * the window became Core's 1,024 (09-29) the help could never fire. The
+     * threshold is a third of the chunks the window holds, at least 2, and it
+     * must be reachable for every chunk size the key allows. */
+    ck("cursor help at window 1024, chunk 40: 8 staged (a third of 25)", dlc_cursor_help_min_staged(1024, 40) == 8);
+    ck("cursor help at window 1024, chunk 16: 21 staged", dlc_cursor_help_min_staged(1024, 16) == 21);
+    ck("cursor help never asks for fewer than 2", dlc_cursor_help_min_staged(1024, 1024) == 2);
+    { int reach = 1;
+      for (long c = 4; c <= 64; c++) for (long w = 1024; w <= 4096; w += 1024)
+          if (dlc_cursor_help_min_staged(w, c) > w / c) reach = 0;
+      ck("the threshold is reachable (<= window/chunk) for every chunk 4..64 and window 1024..4096", reach); }
     ck("the window is Core's 1,024 above the connected tip (10 workers x 40 claimed fit inside it)", dlc_window_blocks(10, 40) == 1024);
     ck("...and 8 workers get the same 1,024, not six times their chunks", dlc_window_blocks(8, 40) == 1024);
     ck("...never below what the workers claim at once: 64 x 40 = 2,560", dlc_window_blocks(64, 40) == 2560);

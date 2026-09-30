@@ -54,9 +54,10 @@ static inline int dlc_chain_falls_short(long chain_tip, long announced){
 /* every live peer downloads, up to the operator's cap and the arrays' 64 --
  * and no more than the span has chunks (2026-09-10, row 3: a reorg handoff
  * of forty blocks forked 64 helpers for one chunk) */
-static inline int dlc_workers_for(int nlive, int cap, long span_blocks){
+static inline int dlc_workers_for(int nlive, int cap, long span_blocks, long chunk){
     int n = nlive < cap ? nlive : cap;
-    long chunks = (span_blocks + 39) / 40;
+    if (chunk < 1) chunk = 1;
+    long chunks = (span_blocks + chunk - 1) / chunk;
     if (chunks >= 1 && n > chunks) n = (int)chunks;
     if (n < 1) n = 1;
     if (n > DLC_WORKERS_HARD_MAX) n = DLC_WORKERS_HARD_MAX;
@@ -71,6 +72,17 @@ static inline int dlc_workers_for(int nlive, int cap, long span_blocks){
 static inline long dlc_window_blocks(int nw, long chunk){
     long claimed = (long)nw * chunk;
     return claimed > DLC_BLOCK_DOWNLOAD_WINDOW ? claimed : DLC_BLOCK_DOWNLOAD_WINDOW;
+}
+/* Cursor help (the committer asks a worker to fetch the chunk the apply is
+ * waiting on) needs the pool to have moved on without that chunk: enough
+ * chunks staged above the cursor. It was a fixed 32, which the window caps
+ * at window/chunk -- 25 at 1,024 and 40 -- so from 2026-09-29 (the window
+ * went to Core's 1,024) until 2026-09-30 it could never fire. A third of
+ * the chunks the window holds, never under 2. */
+static inline long dlc_cursor_help_min_staged(long window, long chunk){
+    if (chunk < 1) chunk = 1;
+    long t = window / chunk / 3;
+    return t < 2 ? 2 : t;
 }
 /* the window is anchored to the CONNECTED tip when the engine is in this
  * process (applied_plus1 >= 0), else to the archive's first hole */
