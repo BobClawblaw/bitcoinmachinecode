@@ -636,7 +636,7 @@ long rpc_node_mempool_save(const char* path);   /* txs written, or -1 */
 long rpc_node_mempool_load(const char* path);   /* txs accepted, or -1 */
 
 /* -limitancestorcount / -limitancestorsize, for getmempoolinfo's cluster fields */
-void rpc_node_set_ancestor_limits(long count, long size_kvb);
+void rpc_node_set_cluster_limits(long count, long size_kvb);   /* getmempoolinfo limitcluster* (2026-10-01) */
 /* Record a connection's own facts -- transport, BIP324 session id, our bound
    address -- from the process that holds the socket. getpeerinfo runs
    elsewhere and can only report what reaches the shared table. */

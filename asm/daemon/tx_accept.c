@@ -766,6 +766,13 @@ int tx_policy_init(void){
     unsigned dscb = g_cfg.limitdescendantsize_kvb>0? (unsigned)(g_cfg.limitdescendantsize_kvb*1000): TXACC_MAX_DESC_BYTES;
     unsigned rbf  = g_cfg.mempoolfullrbf ? 1u : 0u;
     mpool_policy_init(g_pol, relay, anc, ancb, dsc, dscb, rbf);
+    /* Core v31.1 accepts by cluster: -limitclustercount/-limitclustersize are
+     * the binding limits; the ancestor/descendant values above refuse nothing
+     * (deprecated in v31.1, wallet coin selection only). 2026-10-01. */
+    { extern void mpool_policy_set_cluster_limits(void*, unsigned, unsigned);
+      unsigned ccount = g_cfg.limitclustercount > 0 ? (unsigned)g_cfg.limitclustercount : 64u;
+      unsigned csize  = g_cfg.limitclustersize_kvb > 0 ? (unsigned)g_cfg.limitclustersize_kvb * 1000u : 101000u;
+      mpool_policy_set_cluster_limits(g_pol, ccount, csize); }
     g_pol_state_for_fees = g_pol_state;
     { extern void mpool_policy_set_confirmed_hook(void (*)(const unsigned char*));
       mpool_policy_set_confirmed_hook(txacc_note_confirmed); }

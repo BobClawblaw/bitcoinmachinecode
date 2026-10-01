@@ -45,6 +45,7 @@ extern void   mpool_policy_init(void* pol, unsigned long long relay_fee_rate,
                                 unsigned max_desc, unsigned max_desc_bytes,
                                 unsigned rbf_enabled);
 extern void mpool_policy_set_acceptnonstd(void*, unsigned);
+extern void mpool_policy_set_cluster_limits(void*, unsigned count, unsigned vbytes);   /* -limitclustercount / -limitclustersize (2026-10-01) */
 extern void mpool_policy_set_baremultisig(void*, unsigned);
 static int test_bare_multisig(void);   /* defined below main */
 extern long   mpool_policy_add(void* pol, void* st, void* mp,
@@ -237,6 +238,120 @@ int main(void){
         long r = mpool_policy_add(pol, stbuf, mp, ctx, n, ctid, ux);
         okv(r != 1, "a child joining 64 independent parents is refused");
         okv(r != 1 && strstr(mpool_policy_reason(pol), "too-large-cluster") != NULL, "...as too-large-cluster (anc/desc limits alone would have let it in)");
+    }
+
+    /* ================================================================
+     * v31.1 accepts by CLUSTER only (2026-10-01). Its validation has no
+     * "too-long-mempool-chain"; -limitancestorcount/-limitdescendantcount are
+     * "deprecated ... replaced by cluster limits ... and only used by wallet
+     * for coin selection", and the ancestor/descendant SIZE limits are gone.
+     * This node refused the 26th transaction of a chain v31.1 accepts: 15 of
+     * 35 children Core held and this node lacked were refused for exactly
+     * that (BlockYard's differential, 2026-10-01). Every case below runs at
+     * the OLD Core defaults (25 / 101 kvB) to show they no longer bind.
+     * ================================================================ */
+    printf("== v31.1: ancestor/descendant limits do not bind acceptance; cluster limits do ==\n");
+    {
+        static unsigned char pol[128];
+        static unsigned char stbuf[1<<21];
+        static unsigned char mp[40 + 4096*80 + 8];
+        static unsigned char mblob[1<<20];
+        static unsigned char ux[40 + 4096*48 + 8];
+        static unsigned char ublob[1<<16];
+        /* one input, `nout` outputs of `each` sat, 22-byte witness-v0 scripts */
+        #define V31_TX(buf, n, prev, pidx, nout, each, tag) do{ \
+            n = 0; buf[n++]=2;buf[n++]=0;buf[n++]=0;buf[n++]=0; \
+            buf[n++]=1; memcpy(buf+n, prev, 32); n+=32; \
+            for (int _b=0;_b<4;_b++) buf[n++]=(unsigned char)((unsigned)(pidx)>>(8*_b)); \
+            buf[n++]=0; memset(buf+n,0xff,4); n+=4; \
+            buf[n++]=(unsigned char)(nout); \
+            for (int _o=0;_o<(nout);_o++){ unsigned long long _v=(each); \
+                for (int _b=0;_b<8;_b++) buf[n++]=(unsigned char)(_v>>(8*_b)); \
+                buf[n++]=22; buf[n++]=0x00; buf[n++]=0x14; memset(buf+n, (tag)+_o, 20); n+=20; } \
+            memset(buf+n, 0, 4); n+=4; }while(0)
+        unsigned char spk[2] = { 0x51, 0x00 };
+        unsigned char tx[64*31 + 64]; unsigned long n;
+        static unsigned char id[70][32];
+
+        /* 1. a 64-transaction chain at the old 25/101kvB defaults: all in; the 65th is too-large-cluster */
+        memset(stbuf, 0, sizeof stbuf);
+        mpool_policy_init(pol, 1000, 25, 101000, 25, 101000, 1);
+        POLICY_STATE_INIT(stbuf, 4096);
+        mpool_init(mp, 4096, mblob, sizeof mblob);
+        utxo_init(ux, 4096, ublob, sizeof ublob);
+        { unsigned char coin[32]; memset(coin, 0xC1, 32);
+          utxo_put(ux, coin, 0, 10000000ULL, 0, 0, spk, 1);
+          int accepted = 0; const char* why = "";
+          for (int i = 0; i < 65; i++){
+              const unsigned char* prev = i ? id[i-1] : coin;
+              V31_TX(tx, n, prev, 0, 1, 10000000ULL - 1000ULL*(i+1), 0x30);
+              memset(id[i], 0xA0, 32); id[i][0] = (unsigned char)i; id[i][1] = 0x31;
+              long r = mpool_policy_add(pol, stbuf, mp, tx, n, id[i], ux);
+              if (r == 1) accepted++; else { why = mpool_policy_reason(pol); break; }
+          }
+          okv(accepted >= 26, "a 26-transaction chain is accepted at limitancestorcount=25 (v31.1 accepts it)");
+          okv(accepted == 64, "...the whole 64-transaction chain is accepted (the cluster limit is the bound)");
+          if (accepted != 64) printf("      accepted %d; stopped with \"%s\"\n", accepted, why);
+          okv(accepted == 64 && strstr(why, "too-large-cluster") != NULL, "...and the 65th is refused as too-large-cluster, not too-long-mempool-chain"); }
+
+        /* 2. one parent, 30 children: descendant count 31 > the old 25 */
+        memset(stbuf, 0, sizeof stbuf);
+        mpool_policy_init(pol, 1000, 25, 101000, 25, 101000, 1);
+        POLICY_STATE_INIT(stbuf, 4096);
+        mpool_init(mp, 4096, mblob, sizeof mblob);
+        utxo_init(ux, 4096, ublob, sizeof ublob);
+        { unsigned char coin[32]; memset(coin, 0xC2, 32);
+          utxo_put(ux, coin, 0, 31000000ULL, 0, 0, spk, 1);
+          V31_TX(tx, n, coin, 0, 30, 1000000ULL, 0x40);
+          memset(id[0], 0xB0, 32);
+          long r = mpool_policy_add(pol, stbuf, mp, tx, n, id[0], ux);
+          int kids = 0; const char* why = "";
+          for (int k = 0; r == 1 && k < 30; k++){
+              V31_TX(tx, n, id[0], k, 1, 990000ULL, 0x60);
+              memset(id[1+k], 0xB1, 32); id[1+k][0] = (unsigned char)k;
+              if (mpool_policy_add(pol, stbuf, mp, tx, n, id[1+k], ux) == 1) kids++; else { why = mpool_policy_reason(pol); break; }
+          }
+          okv(r == 1 && kids == 30, "30 children of one parent are accepted at limitdescendantcount=25");
+          if (kids != 30) printf("      parent %ld, children %d; stopped with \"%s\"\n", r, kids, why); }
+
+        /* 3. -limitclustercount binds at the configured value */
+        memset(stbuf, 0, sizeof stbuf);
+        mpool_policy_init(pol, 1000, 25, 101000, 25, 101000, 1);
+        mpool_policy_set_cluster_limits(pol, 10, 101000);
+        POLICY_STATE_INIT(stbuf, 4096);
+        mpool_init(mp, 4096, mblob, sizeof mblob);
+        utxo_init(ux, 4096, ublob, sizeof ublob);
+        { unsigned char coin[32]; memset(coin, 0xC3, 32);
+          utxo_put(ux, coin, 0, 10000000ULL, 0, 0, spk, 1);
+          int accepted = 0; const char* why = "";
+          for (int i = 0; i < 11; i++){
+              const unsigned char* prev = i ? id[i-1] : coin;
+              V31_TX(tx, n, prev, 0, 1, 10000000ULL - 1000ULL*(i+1), 0x50);
+              memset(id[i], 0xD0, 32); id[i][0] = (unsigned char)i;
+              if (mpool_policy_add(pol, stbuf, mp, tx, n, id[i], ux) == 1) accepted++; else { why = mpool_policy_reason(pol); break; }
+          }
+          okv(accepted == 10 && strstr(why, "too-large-cluster") != NULL, "limitclustercount=10: a 10-chain is accepted, the 11th is too-large-cluster");
+          if (accepted != 10) printf("      accepted %d; stopped with \"%s\"\n", accepted, why); }
+
+        /* 4. -limitclustersize binds at the configured vsize (two ~82 vB transactions vs 150) */
+        memset(stbuf, 0, sizeof stbuf);
+        mpool_policy_init(pol, 1000, 25, 101000, 25, 101000, 1);
+        mpool_policy_set_cluster_limits(pol, 64, 150);
+        POLICY_STATE_INIT(stbuf, 4096);
+        mpool_init(mp, 4096, mblob, sizeof mblob);
+        utxo_init(ux, 4096, ublob, sizeof ublob);
+        { unsigned char coin[32]; memset(coin, 0xC4, 32);
+          utxo_put(ux, coin, 0, 10000000ULL, 0, 0, spk, 1);
+          V31_TX(tx, n, coin, 0, 1, 9990000ULL, 0x70);
+          memset(id[0], 0xE0, 32);
+          long r1 = mpool_policy_add(pol, stbuf, mp, tx, n, id[0], ux);
+          V31_TX(tx, n, id[0], 0, 1, 9980000ULL, 0x71);
+          memset(id[1], 0xE1, 32);
+          long r2 = mpool_policy_add(pol, stbuf, mp, tx, n, id[1], ux);
+          okv(r1 == 1 && r2 != 1 && strstr(mpool_policy_reason(pol), "too-large-cluster") != NULL,
+              "limitclustersize=150 vB: the second transaction of a chain is too-large-cluster");
+          if (!(r1 == 1 && r2 != 1)) printf("      r1=%ld r2=%ld reason \"%s\"\n", r1, r2, mpool_policy_reason(pol)); }
+        #undef V31_TX
     }
     /* ================================================================
      * MEM-3 (audit 2026-09-03): the parent list is no longer truncated.

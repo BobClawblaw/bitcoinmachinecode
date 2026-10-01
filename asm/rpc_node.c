@@ -1088,12 +1088,12 @@ static unsigned long mpc_weight(unsigned long n, unsigned long i, const mp_ent* 
     return w;
 }
 
-/* -limitancestorcount / -limitancestorsize, injected by main.c from the
-   config; defaults are Core's pre-cluster values. See getmempoolinfo. */
-static long g_limit_anc_count = 25, g_limit_anc_size_kvb = 101;
-void rpc_node_set_ancestor_limits(long count, long size_kvb){
-    if (count > 0) g_limit_anc_count = count;
-    if (size_kvb > 0) g_limit_anc_size_kvb = size_kvb;
+/* -limitclustercount / -limitclustersize, injected by main.c from the
+   config; defaults are Core's (64, 101 kvB). See getmempoolinfo. */
+static long g_limit_cluster_count = 64, g_limit_cluster_size_kvb = 101;
+void rpc_node_set_cluster_limits(long count, long size_kvb){
+    if (count > 0) g_limit_cluster_count = count;
+    if (size_kvb > 0) g_limit_cluster_size_kvb = size_kvb;
 }
 static int cmd_getmempoolinfo(rj_val** res){
     long count = 0; unsigned long long bytes = 0, total_fee = 0, blob_used = 0;
@@ -1150,24 +1150,13 @@ static int cmd_getmempoolinfo(rj_val** res){
     /* fullrbf: v31.1 has it, master has dropped it. Core's -mempoolfullrbf
      * became unconditional in v28, so the field is true there and here. */
     rj_obj_set(o, "fullrbf", rj_bool(1));
-    /* THE CLUSTER FIELDS ARE A DOCUMENTED SEMANTIC DIVERGENCE, not a copy.
-     *
-     * Core v31.1 replaced the ancestor/descendant limits with CLUSTER limits:
-     * a cluster is a whole connected component of the mempool graph, and
-     * limitclustercount/limitclustersize bound it. This node still enforces
-     * Core's older -limitancestorcount / -limitancestorsize, which bound a
-     * transaction's ANCESTOR SET, not its component.
-     *
-     * The numbers below are therefore the limits this node actually enforces,
-     * reported under Core's field names because they are the binding
-     * constraint on how large a package here can get. They are NOT cluster
-     * limits, and a caller reasoning about connected components from them
-     * would be wrong. `optimal` is false for the same reason: it means "the
-     * mempool is fully linearised" under cluster mempool, and nothing here
-     * linearises anything, so claiming true would be a lie. Recorded in
-     * docs/CORE_DIVERGENCES.md. */
-    rj_obj_set(o, "limitclustercount", rj_numf("%ld", g_limit_anc_count));
-    rj_obj_set(o, "limitclustersize", rj_numf("%ld", g_limit_anc_size_kvb * 1000));
+    /* The cluster limits this node enforces at acceptance (2026-10-01): Core
+     * v31.1's limitclustercount / limitclustersize, the whole bound since the
+     * ancestor/descendant limits stopped refusing anything. Until then this
+     * reported -limitancestorcount/-size under these names. `optimal` is the
+     * linearization's claim; see below. */
+    rj_obj_set(o, "limitclustercount", rj_numf("%ld", g_limit_cluster_count));
+    rj_obj_set(o, "limitclustersize", rj_numf("%ld", g_limit_cluster_size_kvb * 1000));
     rj_obj_set(o, "optimal", rj_bool(0));
     rj_obj_set(o, "incrementalrelayfee", rj_numf("%.8f", (double)g_incremental_satkvb / 1e8));
     rj_obj_set(o, "unbroadcastcount", rj_numf("%d", 0));
@@ -1175,8 +1164,6 @@ static int cmd_getmempoolinfo(rj_val** res){
      * operator cannot change was the honesty gap the audit called out */
     rj_obj_set(o, "permitbaremultisig", rj_bool(g_status ? g_status->permit_bare_multisig : 1));  /* standard relay policy */
     rj_obj_set(o, "maxdatacarriersize", rj_numf("%d", 100000));
-    /* Master-only cluster-mempool fields (limitclustercount/size, optimal) are
-     * deliberately omitted -- bleeding-edge, no released Core has them. */
     *res = o;
     return 1;
 }

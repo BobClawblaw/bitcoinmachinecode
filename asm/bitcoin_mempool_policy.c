@@ -28,7 +28,9 @@
  *      <=100 evicted ("too many potential replacements"); fees >= replaced
  *      total AND the increment pays for the replacement's own vsize at
  *      incrementalrelayfee ("insufficient fee").
- *   4. ancestor / descendant count+vsize limits ("too-long-mempool-chain").
+ *   4. cluster count+vsize limits ("too-large-cluster"). Core v31.1 accepts
+ *      by cluster only; its ancestor/descendant limits are deprecated (wallet
+ *      coin selection only) and no longer refuse anything (2026-10-01).
  *   5. TrimToSize eviction by descendant PACKAGE: evict argmin of
  *      max(own feerate, with-descendants feerate) together with its whole
  *      descendant set; the removed package feerate + incrementalrelayfee
@@ -136,9 +138,9 @@ extern const unsigned char* mpool_get(void* mp, const unsigned char txid[32],
 #define TRUC_CHILD_MAX_VSIZE   1000
 #define TRUC_ANCESTOR_LIMIT    2
 #define TRUC_DESCENDANT_LIMIT  2
-#define MPOL_PKG_MAX     128      /* descendant-set walk bound: desc_cnt is
-                                   * capped at max_desc (64 by default) by admission,
-                                   * so 128 is comfortable headroom */
+#define MPOL_PKG_MAX     128      /* descendant-set walk bound: a descendant set
+                                   * lies inside its cluster, which admission caps
+                                   * at 64 (MPC_MAX_CLUSTER), so 128 is headroom */
 
 /* ---- package effective-feerate context ----------------------------------
  * Set for the duration of ONE package submission, by the worker, which is
@@ -209,7 +211,12 @@ typedef struct {
                                   * getmempoolinfo REPORTED this as always-1
                                   * while nothing could set it -- advertising
                                   * a policy the operator cannot change. */
+    uint32_t cluster_count;    /* -limitclustercount (Core DEFAULT_CLUSTER_LIMIT 64,
+                                  maximum MAX_CLUSTER_COUNT_LIMIT 64) */
+    uint32_t cluster_vbytes;   /* -limitclustersize in vbytes (Core 101 kvB) */
 } mpol_cfg;
+/* callers hand mpool_policy_init a 128-byte buffer (tx_accept.c g_pol, the tests) */
+_Static_assert(sizeof(mpol_cfg) <= 128, "mpol_cfg must fit the callers' 128-byte buffers");
 
 /* ---------------- policy state layout (flat buffer, zero-init) ------------ */
 /* header (MPOL_HDR bytes):
@@ -585,6 +592,20 @@ void mpool_policy_init(mpol_cfg* pol, uint64_t relay_fee_rate,
     pol->dust_relay_kvb  = 3000;                    /* Core DUST_RELAY_TX_FEE */
     pol->datacarrier_bytes = 100000;                /* Core v31 default */
     pol->permit_bare_multisig = 1;                  /* Core DEFAULT_PERMIT_BAREMULTISIG */
+    pol->cluster_count   = 64;                      /* Core DEFAULT_CLUSTER_LIMIT */
+    pol->cluster_vbytes  = 101000;                  /* Core DEFAULT_CLUSTER_SIZE_LIMIT_KVB */
+}
+/* -limitclustercount / -limitclustersize. The count is capped at 64: Core's
+ * MAX_CLUSTER_COUNT_LIMIT, and the width of this node's cluster bitsets
+ * (MPC_MAX_CLUSTER). max_anc/max_desc and their byte budgets, set by
+ * mpool_policy_init from -limitancestorcount & co, are kept but refuse
+ * nothing: v31.1 deprecated them in favour of these limits. */
+void mpool_policy_set_cluster_limits(void* polv, unsigned count, unsigned vbytes){
+    mpol_cfg* pol = (mpol_cfg*)polv;
+    if (count < 1) count = 1;
+    if (count > 64) count = 64;
+    pol->cluster_count = count;
+    if (vbytes > 0) pol->cluster_vbytes = vbytes;
 }
 
 void mpool_policy_set_incremental(void* polv, unsigned long long satkvb){
@@ -2355,8 +2376,12 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
      * cluster check likewise runs on the post-replacement diagram. Before
      * this, a replacement joining a full cluster it was itself thinning
      * was refused for the size it was about to free. */
+    /* a lone transaction is a cluster of one: it alone may exceed a lowered
+     * -limitclustersize (the default 101 kvB is above the standard maximum) */
+    if (n_par == 0 && vsize > pol->cluster_vbytes){ _mpol_last_reason = "too-large-cluster"; return 0; }
     if (n_par > 0){
-        enum { CLUSTER_LIMIT = 64, CLUSTER_SIZE_LIMIT = 101000 };
+        enum { CLUSTER_LIMIT = 64 };                 /* array bound: Core's maximum */
+        const uint64_t cl_count_limit = pol->cluster_count, cl_size_limit = pol->cluster_vbytes;
         mpol_node* t = mpol_nodes_base(st);
         uint32_t nn = *(uint32_t*)((char*)st+16);
         uint32_t seen[CLUSTER_LIMIT + 1]; int nseen = 0;
@@ -2393,20 +2418,19 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
                 seen[nseen++] = (uint32_t)i; bfs[sp++] = (uint32_t)i; cl_bytes += t[i].size;
             }
         }
-        if (too_big || (uint64_t)nseen + 1 > CLUSTER_LIMIT || cl_bytes + vsize > CLUSTER_SIZE_LIMIT){
+        if (too_big || (uint64_t)nseen + 1 > cl_count_limit || cl_bytes + vsize > cl_size_limit){
             _mpol_last_reason = "too-large-cluster"; return 0;
         }
         #undef MPOL_CL_EVICTED
     }
-    if (anc_cnt > pol->max_anc){ _mpol_last_reason = "too-long-mempool-chain"; return 0; }
-    if (anc_bytes > pol->max_anc_bytes){ _mpol_last_reason = "too-long-mempool-chain"; return 0; }
-    for (uint32_t k=0;k<n_anc;k++){
-        mpol_node* a = &t[anc_list[k]];
-        if ((uint64_t)a->desc_cnt + 1 > pol->max_desc){
-            _mpol_last_reason = "too-long-mempool-chain"; return 0; }
-        if ((uint64_t)a->desc_bytes + vsize > pol->max_desc_bytes){
-            _mpol_last_reason = "too-long-mempool-chain"; return 0; }
-    }
+    /* No ancestor/descendant refusal (2026-10-01). Core v31.1's validation
+     * has no "too-long-mempool-chain": -limitancestorcount and
+     * -limitdescendantcount are "deprecated ... replaced by cluster limits ...
+     * and only used by wallet for coin selection", and the size limits are
+     * gone. Enforcing them here refused the 26th transaction of a chain Core
+     * accepts -- 15 of 35 children BlockYard found Core holding and this node
+     * lacking. The cluster check above is the whole bound. anc_cnt/anc_bytes
+     * are still computed: the entry stores them (ancestorcount/-size). */
 
     /* --- BIP431 TRUC topology (Core SingleTRUCChecks) ----------------------
      * Runs for EVERY transaction, not only v3 ones: half of these rules are
