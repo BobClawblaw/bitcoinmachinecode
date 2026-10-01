@@ -353,6 +353,94 @@ int main(void){
           if (!(r1 == 1 && r2 != 1)) printf("      r1=%ld r2=%ld reason \"%s\"\n", r1, r2, mpool_policy_reason(pol)); }
         #undef V31_TX
     }
+
+    /* ================================================================
+     * v31.1 replacement rules (2026-10-01): rule 5 (100 candidates), rules
+     * 3+4 (PaysForRBF), and the FEERATE-DIAGRAM check (ImprovesFeerateDiagram,
+     * "replacement-failed"). No per-conflict feerate rule: that was Core's
+     * PaysMoreThanConflicts, removed in v31. BlockYard's differential found 14
+     * of 35 children Core held refused here as "insufficient fee" -- the shape
+     * below: the replaced transaction is a high-feerate CHILD of a cheap
+     * parent, so its own feerate (30) is above the replacement's (28) while
+     * its CHUNK (with the parent, 15.5) is below the replacement's chunk
+     * (18.2). Core compares chunks; the old rule compared the two transactions.
+     * Fixtures are non-witness, so vsize == size: 1-in/1-out is 82 vB,
+     * 1-in/3-out 144 vB; the relay and incremental rates are 1 sat/vB.
+     * ================================================================ */
+    printf("== v31.1 replacement: the feerate diagram decides, not the conflict's own feerate ==\n");
+    {
+        static unsigned char pol[128];
+        static unsigned char stbuf[1<<21];
+        static unsigned char mp[40 + 4096*80 + 8];
+        static unsigned char mblob[1<<20];
+        static unsigned char ux[40 + 4096*48 + 8];
+        static unsigned char ublob[1<<16];
+        #define RB_TX(buf, n, prev, pidx, nout, each, tag) do{ \
+            n = 0; buf[n++]=2;buf[n++]=0;buf[n++]=0;buf[n++]=0; \
+            buf[n++]=1; memcpy(buf+n, prev, 32); n+=32; \
+            for (int _b=0;_b<4;_b++) buf[n++]=(unsigned char)((unsigned)(pidx)>>(8*_b)); \
+            buf[n++]=0; memset(buf+n,0xff,4); n+=4; \
+            buf[n++]=(unsigned char)(nout); \
+            for (int _o=0;_o<(nout);_o++){ unsigned long long _v=(each); \
+                for (int _b=0;_b<8;_b++) buf[n++]=(unsigned char)(_v>>(8*_b)); \
+                buf[n++]=22; buf[n++]=0x00; buf[n++]=0x14; memset(buf+n, (tag)+_o, 20); n+=20; } \
+            memset(buf+n, 0, 4); n+=4; }while(0)
+        unsigned char spk[2] = { 0x51, 0x00 };
+        unsigned char tx[256]; unsigned long n;
+        unsigned char coin[32], idA[32], idO[32], idR[32];
+
+        memset(stbuf, 0, sizeof stbuf);
+        mpool_policy_init(pol, 1000, 25, 101000, 25, 101000, 1);
+        POLICY_STATE_INIT(stbuf, 4096);
+        mpool_init(mp, 4096, mblob, sizeof mblob);
+        utxo_init(ux, 4096, ublob, sizeof ublob);
+        memset(coin, 0xF1, 32); utxo_put(ux, coin, 0, 100000ULL, 0, 0, spk, 1);
+        RB_TX(tx, n, coin, 0, 1, 100000ULL - 82, 0x10);          /* A: 82 vB, 82 sat (1 sat/vB) */
+        memset(idA, 0xA1, 32);
+        long rA = mpool_policy_add(pol, stbuf, mp, tx, n, idA, ux);
+        RB_TX(tx, n, idA, 0, 1, 99918ULL - 2460, 0x20);          /* O: 82 vB, 2460 sat (30 sat/vB) */
+        memset(idO, 0xA2, 32);
+        long rO = mpool_policy_add(pol, stbuf, mp, tx, n, idO, ux);
+        okv(rA == 1 && rO == 1, "cheap parent A (1 sat/vB) and its 30 sat/vB child O are in");
+        RB_TX(tx, n, idA, 0, 3, 31962ULL, 0x30);                 /* R: 144 vB, 4032 sat (28 sat/vB), spends A:0 like O */
+        memset(idR, 0xA3, 32);
+        long rR = mpool_policy_add(pol, stbuf, mp, tx, n, idR, ux);
+        okv(rR == 1, "R (28 sat/vB, chunk 18.2) replaces O (30 sat/vB, chunk 15.5): the diagram improves, so v31.1 accepts it");
+        if (rR != 1) printf("      refused as: %s\n", mpool_policy_reason(pol));
+        unsigned long l = 0;
+        okv(rR == 1 && mpool_get(mp, idO, &l) == NULL && mpool_get(mp, idR, &l) != NULL, "...O is evicted and R is in the pool");
+
+        /* the diagram also REFUSES: a replacement at a higher own feerate that
+         * pulls in a cheap unrelated parent P, worsening the top of the diagram */
+        unsigned char coin2[32], coin3[32], idO2[32], idP[32], idR2[32];
+        memset(stbuf, 0, sizeof stbuf);
+        mpool_policy_init(pol, 1000, 25, 101000, 25, 101000, 1);
+        POLICY_STATE_INIT(stbuf, 4096);
+        mpool_init(mp, 4096, mblob, sizeof mblob);
+        utxo_init(ux, 4096, ublob, sizeof ublob);
+        memset(coin2, 0xF2, 32); utxo_put(ux, coin2, 0, 100000ULL, 0, 0, spk, 1);
+        memset(coin3, 0xF3, 32); utxo_put(ux, coin3, 0, 100000ULL, 0, 0, spk, 1);
+        RB_TX(tx, n, coin2, 0, 1, 100000ULL - 820, 0x40);        /* O2: 82 vB, 820 sat (10 sat/vB) */
+        memset(idO2, 0xB1, 32);
+        long r1 = mpool_policy_add(pol, stbuf, mp, tx, n, idO2, ux);
+        RB_TX(tx, n, coin3, 0, 1, 100000ULL - 82, 0x50);          /* P: 82 vB, 82 sat (1 sat/vB), unrelated */
+        memset(idP, 0xB2, 32);
+        long r2 = mpool_policy_add(pol, stbuf, mp, tx, n, idP, ux);
+        okv(r1 == 1 && r2 == 1, "O2 (10 sat/vB) and an unrelated cheap P (1 sat/vB) are in");
+        /* R2 conflicts with O2 (spends coin2) and spends P:0: two inputs */
+        { n = 0; tx[n++]=2;tx[n++]=0;tx[n++]=0;tx[n++]=0; tx[n++]=2;
+          memcpy(tx+n, coin2, 32); n+=32; memset(tx+n,0,4); n+=4; tx[n++]=0; memset(tx+n,0xff,4); n+=4;
+          memcpy(tx+n, idP, 32); n+=32; memset(tx+n,0,4); n+=4; tx[n++]=0; memset(tx+n,0xff,4); n+=4;
+          tx[n++]=1; { unsigned long long v = 100000ULL + 99918ULL - 1600ULL; for (int b=0;b<8;b++) tx[n++]=(unsigned char)(v>>(8*b)); }
+          tx[n++]=22; tx[n++]=0x00; tx[n++]=0x14; memset(tx+n, 0x60, 20); n+=20; memset(tx+n,0,4); n+=4; }
+        memset(idR2, 0xB3, 32);
+        long r3 = mpool_policy_add(pol, stbuf, mp, tx, n, idR2, ux);   /* R2: 123 vB, 1600 sat (13 sat/vB) */
+        okv(r3 != 1, "R2 (13 sat/vB) replacing O2 but joining cheap P is refused (its chunk with P is 8.2 sat/vB, under O2's 10)");
+        okv(r3 != 1 && strstr(mpool_policy_reason(pol), "replacement-failed") != NULL, "...as replacement-failed (rules 3+4 pass)");
+        if (r3 == 1 || !strstr(mpool_policy_reason(pol), "replacement-failed")) printf("      r3=%ld reason \"%s\"\n", r3, mpool_policy_reason(pol));
+        okv(mpool_get(mp, idO2, &l) != NULL, "...and O2 stays in the pool");
+        #undef RB_TX
+    }
     /* ================================================================
      * MEM-3 (audit 2026-09-03): the parent list is no longer truncated.
      *

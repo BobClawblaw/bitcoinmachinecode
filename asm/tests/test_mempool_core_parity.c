@@ -10,13 +10,13 @@
  *      ever removed leaves), the floor lands at package-feerate +
  *      incrementalrelayfee (sat/kvB), and an incoming tx that IS the worst
  *      is refused as "mempool full";
- *   4. RBF, all Core rules: fullrbf ignores signaling; rule 3/4
- *      ("insufficient fee", increment priced at the replacement's OWN
- *      vsize); conflicts evicted WITH descendants and the descendants'
- *      fees counted; disjointness ("bad-txns-spends-conflicting-tx");
- *      no new unconfirmed inputs ("replacement-adds-unconfirmed");
- *      classic signaling of the REPLACED tx when fullrbf is off
- *      ("txn-mempool-conflict");
+ *   4. RBF, Core v31.1's rules (2026-10-01): rule 3/4 ("insufficient
+ *      fee", increment priced at the replacement's OWN vsize); conflicts
+ *      evicted WITH descendants and the descendants' fees counted;
+ *      disjointness ("bad-txns-spends-conflicting-tx"); the feerate-diagram
+ *      check ("replacement-failed"). v31.1 dropped the no-new-unconfirmed
+ *      rule, the per-conflict feerate rule and BIP125 signaling (full RBF
+ *      is unconditional): the cases that pinned them now expect acceptance;
  *   5. block-connect reconciliation: a confirmed tx leaves ALONE (its
  *      child stays), a tx conflicting with a block spend leaves WITH its
  *      child, and the rolling floor decays after the block (white-box
@@ -500,7 +500,9 @@ int main(void){
          * 5,000 it replaces, and the 7,000 increment covers its own ~6.4 kvB
          * at the incremental rate. */
         ck("MEM-7 a bigger-but-cheaper-per-byte replacement is REFUSED", r == 0);
-        ckr("...as", pol, "insufficient fee");
+        /* v31.1: PaysMoreThanConflicts is gone; the feerate-diagram check
+         * refuses it, as Core does (2026-10-01; was "insufficient fee") */
+        ckr("...as", pol, "replacement-failed");
         { unsigned long l;
           ck("MEM-7 the original was NOT evicted by the refused replacement",
              mpool_get(mp, sm, &l) != NULL); }
@@ -532,8 +534,10 @@ int main(void){
         ck("spend-of-conflicting-tx refused", r == 0);
         ckr("...as", pol, "bad-txns-spends-conflicting-tx"); }
 
-      /* no new unconfirmed inputs: replacement adds a spend of ANOTHER
-       * pool tx's output -> "replacement-adds-unconfirmed" */
+      /* a replacement that adds a spend of ANOTHER pool tx's output: v31.1
+       * removed "no new unconfirmed inputs" (HasNoNewUnconfirmed); this one
+       * improves the diagram (its chunk with V beats W and V alone), so it is
+       * ACCEPTED (2026-10-01; was "replacement-adds-unconfirmed") */
       { u8 w1[32], v1[32];
         oS.v = 1000000-600;
         n = mk(tx, &(txin_t){ .tag=4, .idx=0, .seq=0xffffffffu, .ss=EMPTY, .sslen=0 }, 1, &oS, 1);
@@ -550,8 +554,8 @@ int main(void){
         txout_t o2 = { .v=1000000-9000, .spk=SPK_WPKH, .spklen=22 };
         n = mk(tx, both, 2, &o2, 1); tx_txid(id, tx, n, sc, sizeof sc);
         r = mpool_policy_add(pol, st, mp, tx, n, id, ux);
-        ck("new-unconfirmed-input replacement refused", r == 0);
-        ckr("...as", pol, "replacement-adds-unconfirmed"); }
+        ck("a new-unconfirmed-input replacement that improves the diagram is ACCEPTED (v31.1)", r == 1);
+        if (r != 1) printf("      refused as: %s\n", mpool_policy_reason(pol)); }
 
       /* ---- MEM-14 (audit 2026-09-03): a SIBLING output of a conflict's own
        * parent is not a "new" unconfirmed input.
@@ -593,7 +597,10 @@ int main(void){
         if (r != 1) printf("      refused as: %s\n", mpool_policy_reason(pol)); }
     }
 
-    printf("\n== 4b: classic signaling when fullrbf is OFF ==\n");
+    /* v31.1 has no -mempoolfullrbf: full RBF is unconditional, so a policy
+     * initialised with it "off" still replaces a non-signaling original
+     * (2026-10-01; this section pinned the classic BIP125 rule) */
+    printf("\n== 4b: no signaling requirement, even with the old fullrbf flag off (v31.1) ==\n");
     RESET(1);
     { mpool_policy_init(pol, 1000 /* sat/kvB: 1 sat/vB, as before */, 25, 101000, 25, 101000, 0);   /* fullrbf OFF */
       mpool_policy_set_acceptnonstd(pol, 1);
@@ -607,7 +614,8 @@ int main(void){
       n = mk(tx, &(txin_t){ .tag=1, .idx=0, .seq=0xffffffffu, .ss=EMPTY, .sslen=0 }, 1, &oS, 1);
       tx_txid(id, tx, n, sc, sizeof sc);
       r = mpool_policy_add(pol, st, mp, tx, n, id, ux);
-      ck("its replacement refused", r == 0); ckr("...as", pol, "txn-mempool-conflict");
+      ck("its replacement is ACCEPTED (v31.1: full RBF is unconditional)", r == 1);
+      if (r != 1) printf("      refused as: %s\n", mpool_policy_reason(pol));
       /* signaling original (seq fffffffd): replaceable */
       oS.v = 1000000-500;
       n = mk(tx, &(txin_t){ .tag=2, .idx=0, .seq=0xfffffffdu, .ss=EMPTY, .sslen=0 }, 1, &oS, 1);
