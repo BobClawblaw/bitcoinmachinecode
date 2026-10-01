@@ -1,0 +1,25 @@
+# The only Core oracle: v31.1 release (2026-10-01; replaced the v31.99 dev build).
+# Install: sudo sed "s/__SVCUSER__/$(id -un)/g" config/core-oracle/bitcoin-oracle.service > /etc/systemd/system/bitcoin-oracle.service
+[Unit]
+Description=Bitcoin Core oracle v31.1 (P2P 8333 loopback x16, RPC 8335)
+Documentation=file:///storage/bitcoinmachinecode/docs/OPERATIONS.md
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/storage/core-oracle
+[Service]
+Type=simple
+User=__SVCUSER__
+Group=__SVCUSER__
+ExecStart=/storage/bitcoin-core-v31.1/bin/bitcoind \
+  -conf=/storage/core-oracle/bitcoin.conf \
+  -datadir=/storage/core-oracle
+TimeoutStopSec=900
+KillSignal=SIGTERM
+SendSIGKILL=no
+Restart=always
+RestartSec=15
+OOMScoreAdjust=-500
+LimitNOFILE=65536
+Nice=0
+[Install]
+WantedBy=multi-user.target

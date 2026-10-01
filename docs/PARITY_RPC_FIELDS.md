@@ -16,10 +16,12 @@ documents, name each divergence*. It was never applied to JSON-RPC.
 
 `validation/rpc_field_parity.py` now does that, and should run in the gate.
 
-## Measure against v31.1, not the oracle
+## Measure against v31.1
 
-The verification oracle on this box is a **v31.99 development build**, and
-diffing against it invented work: it reported `inv_buckets` and `tx_send_rate`
+Since 2026-10-01 the box's only Core oracle is the **v31.1 release**
+(`/storage/core-oracle`, RPC 8335; docs/OPERATIONS.md, "The Core oracle"). Until
+then the oracle was a **v31.99 development build**, and diffing against it
+invented work: it reported `inv_buckets` and `tx_send_rate`
 as missing from `getnetworkinfo`, which v31.1 does not have at all, and inflated
 `getpeerinfo` to 76 fields against v31.1's 38.
 
