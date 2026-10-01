@@ -113,6 +113,10 @@ static void mk_hdr(unsigned char h[80], const unsigned char prev[32], int tag){ 
 static void mk_page(int ping, int n, unsigned char (*hdrs)[80]){ unsigned o=0; g_hpage[o++]= ping?0xff:0x00; g_hpage[o++]=(unsigned char)n; for(int i=0;i<n;i++){ memcpy(g_hpage+o,hdrs[i],80); o+=80; g_hpage[o++]=0; } g_hpage_len=o; }
 
 int main(void){
+    /* the staging fixtures below lie on a 40-block grid (the chunk size before
+     * bmc.dlcchunk; the default is 16 since 2026-10-01): the committer's help
+     * chunk and the stage sweep read g_dlc_chunk, so pin it to the fixtures */
+    g_dlc_chunk = 40;
     int l = socket(AF_INET, SOCK_STREAM, 0); int one = 1; setsockopt(l, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
     struct sockaddr_in sa; memset(&sa, 0, sizeof sa); sa.sin_family = AF_INET; sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK); sa.sin_port = 0;
     if (bind(l, (struct sockaddr*)&sa, sizeof sa) != 0 || listen(l, 4) != 0){ perror("listen"); return 1; }
@@ -656,8 +660,15 @@ int main(void){
             ok(ctl3[DLC_CTL_CURSOR_WANT] == -1, "with nothing staged above it, a missing cursor chunk is NOT published (the pool has not moved on)");
             /* the pool has moved on: a third of the window staged ABOVE the cursor, as
              * real files -- the committer recounts the gauge from the directory */
-            for (int k = 0; k <= DLC_CURSOR_HELP_MIN_STAGED; k++) stage_chunk(380 + 40L * k, 40);
-            ctl3[DLC_CTL_STAGED] = DLC_CURSOR_HELP_MIN_STAGED + 1;
+            /* the bar is a third of the chunks the window holds (8 at 1,024 and 40);
+             * it was a fixed 32, which a 1,024 window can never stage -- this test
+             * staged 33 with no window in force, so it never saw that */
+            long saved_window = g_dlc_window;
+            g_dlc_window = DLC_BLOCK_DOWNLOAD_WINDOW;        /* production's window (Core's 1,024), not whatever an earlier case left */
+            long bar = dlc_cursor_help_min_staged(g_dlc_window, g_dlc_chunk);
+            ok(bar <= g_dlc_window / g_dlc_chunk, "the cursor-help bar is reachable inside the window (bar <= window/chunk)");
+            for (long k = 0; k <= bar; k++) stage_chunk(380 + 40L * k, 40);
+            ctl3[DLC_CTL_STAGED] = bar + 1;
             long waited = 0; while (ctl3[DLC_CTL_CURSOR_WANT] != 300 && waited < 5000){ usleep(20000); waited += 20; }
             ok(ctl3[DLC_CTL_CURSOR_WANT] == 300, "with a third of the window staged above it, the missing cursor chunk (300) is published after the delay");
             stage_chunk(300, 40);                          /* the helper delivered it */
@@ -668,6 +679,7 @@ int main(void){
             ctl3[DLC_CTL_STOP_COMMIT] = 1; int st = 0; waitpid(cp, &st, 0);
             ok(WIFEXITED(st) && WEXITSTATUS(st) == 0 && ctl3[DLC_CTL_CURSOR_WANT] == -1, "STOP ends the run and clears the want");
             g_dlc_cursor_help_ms = DLC_CURSOR_HELP_SECS * 1000L;
+            g_dlc_window = saved_window;
             dlc_stage_wipe();
             munmap((void*)ctl3, (DLC_CTL_RING + DLC_RETRY_MAX) * sizeof(long)); }
           ok(g_synced_n == 2, "...and the store was synced once per committed chunk (2), not once per block (80)");
