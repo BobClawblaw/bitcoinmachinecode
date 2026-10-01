@@ -94,9 +94,11 @@ testnet4, signet (public or custom) and regtest.
 - Byte-budgeted pool (`maxmempool`) shared across all node processes, with
   Core's `TrimToSize` feerate eviction, blob compaction, and a dynamic
   `mempoolminfee`.
-- BIP125 replace-by-fee with full-RBF on by default; ancestor/descendant
-  limits and Core v31's cluster limits (64 transactions / 101 kvB) measured
-  on the post-replacement diagram.
+- Replace-by-fee with Core v31.1's rules: full RBF unconditionally, the
+  100-candidate cap, rules 3+4, and the feerate-diagram check
+  (`replacement-failed`). Acceptance is bounded by Core v31's cluster limits
+  (64 transactions / 101 kvB) alone, measured on the post-replacement
+  diagram, and every cluster is linearized optimally (since 2026-10-01).
 - TRUC (BIP431 / v3) topology rules, ephemeral dust, `submitpackage` with
   child-pays-for-parent effective feerate, and 1-parent-1-child (1p1c)
   package relay.
@@ -369,8 +371,11 @@ log echoes the resolved values.
 | `v2transport` | `1` | BIP324 encrypted transport inbound and outbound |
 | `maxmempool` / `mempoolexpiry` | `300` MiB / `336` h | mempool budget and age limit |
 | `minrelaytxfee` / `incrementalrelayfee` / `dustrelayfee` | Core defaults | relay floors, BTC/kvB |
-| `limitancestorcount` / `limitdescendantcount` / `*size` | `64` / `64` / `101` kvB | chain limits; 64 admits the same chains Core's cluster limit admits |
-| `mempoolfullrbf` / `datacarrier` / `datacarriersize` / `permitbaremultisig` / `acceptnonstdtxn` | `1` / `1` / `100000` / `1` / `0` | relay policy |
+| `limitclustercount` / `limitclustersize` | `64` (maximum 64) / `101` kvB | the acceptance limits, as Core v31.1 |
+| `limitancestorcount` / `limitdescendantcount` | `25` / `25` | deprecated in Core v31.1 (wallet coin selection only); refuse nothing |
+| `limitancestorsize` / `limitdescendantsize` | — | no effect; Core's warning is logged |
+| `mempoolfullrbf` | — | not an option in Core v31.1 (full RBF is unconditional); logged as an unknown configuration value |
+| `datacarrier` / `datacarriersize` / `permitbaremultisig` / `acceptnonstdtxn` | `1` / `100000` / `1` / `0` | relay policy |
 | `bytespersigop` | `20` | fee rate is judged against `max(vsize, sigops * bytespersigop / 4)` |
 | `dbcache` | `1024` MiB | UTXO memtable sizing |
 | `par` | `0` (auto) | script-verification threads |

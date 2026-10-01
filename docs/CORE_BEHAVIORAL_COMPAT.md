@@ -44,7 +44,7 @@ The **work list** at the end orders every GAP, PARTIAL and PROOF row.
 |---|---|---|---|
 | Standardness (`IsStandardTx`, script flags, dust, `bytespersigop`) | | same; STANDARD flags forwarded to tapscript (IR-9) | **DONE** |
 | Ancestor / descendant limits, package limits | 25 / 101 KvB | same | **DONE** |
-| RBF | full-RBF default (`mempoolfullrbf`) | config-driven, same default | **DONE** |
+| RBF | v31.1: full RBF unconditional (no `mempoolfullrbf`), rule 5, rules 3+4, feerate-diagram check | the same rules, `replacement-failed` from the diagram check (2026-10-01) | **DONE** |
 | TRUC (v3) incl. sibling eviction, ephemeral dust | | same; proven against real Core on regtest | **DONE** |
 | Package acceptance (1p1c, `submitpackage`) | | same, effective feerate | **DONE** |
 | `TrimToSize`, `mempoolminfee`, expiry, persistence (`mempool.dat`) | | same | **DONE** |
