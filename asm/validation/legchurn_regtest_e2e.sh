@@ -13,7 +13,7 @@
 # on the unfixed binary this script showed four resets in 150 s.
 # Usage: validation/legchurn_regtest_e2e.sh   (RUN_S=n; KEEP=1 keeps the work dir; BMC_BIN overrides the binary)
 set -u
-CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-source/build/bin}; BMC_BIN=${BMC_BIN:-/storage/bitcoinmachinecode/asm/daemon/bmcbitcoind}
+CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-v31.1/bin}; BMC_BIN=${BMC_BIN:-/storage/bitcoinmachinecode/asm/daemon/bmcbitcoind}
 WALLET_CLI=${WALLET_CLI:-/storage/bitcoinmachinecode/asm/daemon/bmc_wallet_cli}
 WORK=${TMPDIR:-/tmp}/bmc-legchurn-e2e-$$; rm -rf "$WORK"; mkdir -p "$WORK/core" "$WORK/bmc/regtest"
 CORE_DIR=$WORK/core; BMC_DIR=$WORK/bmc; CORE_P2P=20974; CORE_RPC=20975; BMC_P2P=20976; BMC_RPC=20977; RUN_S=${RUN_S:-150}

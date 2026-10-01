@@ -45,7 +45,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'lib
 from diffguard import require_sources   # a phase whose stream stayed empty must not read as a pass
 import zmq
 
-CORE_BIN = os.environ.get('CORE_BIN', '/mnt/nvme8tb/core-build/bitcoin-v31.1/build/bin')
+CORE_BIN = os.environ.get('CORE_BIN', '/storage/bitcoin-core-v31.1/bin')
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 BMC_BIN = os.environ.get('BMC_BIN', os.path.join(ROOT, 'asm/daemon/bmcbitcoind'))
 WORK = os.environ.get('WORK', os.path.join(os.environ.get('TMPDIR', '/tmp'), 'bmc-zburst-%d' % os.getpid()))

@@ -26,7 +26,7 @@ def parse(data):
     nprefill,off=varint(data,off)
     return hdr80, nonce, shortids, nprefill
 
-RPC=['/storage/bitcoin-core-source/build/bin/bitcoin-cli','-datadir=/tmp/corecmpt','-rpcuser=u','-rpcpassword=p']
+RPC=['/storage/bitcoin-core-v31.1/bin/bitcoin-cli','-datadir=/tmp/corecmpt','-rpcuser=u','-rpcpassword=p']
 def cli(*a):
     return subprocess.run(RPC+[str(x) for x in a],capture_output=True,text=True).stdout
 

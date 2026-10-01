@@ -11,7 +11,7 @@
 #   cannot detect a cjdns interface either).
 # Needs cjdroute running (its tun up) and IPv6 enabled on this host.
 set -u
-CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-source/build/bin}
+CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-v31.1/bin}
 BMC_BIN=${BMC_BIN:-/storage/bitcoinmachinecode/asm/daemon/bmcbitcoind}
 WALLET_CLI=${WALLET_CLI:-/storage/bitcoinmachinecode/asm/daemon/bmc_wallet_cli}
 WORK=${WORK:-/tmp/cjdns-e2e-$$}

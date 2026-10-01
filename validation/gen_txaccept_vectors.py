@@ -29,7 +29,7 @@ more than thousands of ordinary P2PKH spends, and keep the repo small
 import json, subprocess, sys
 
 CONF="/storage/core-oracle/bitcoin.conf"; DD="/storage/core-oracle"
-CLI="/storage/bitcoin-core-source/build-zmq/bin/bitcoin-cli"
+CLI="/storage/bitcoin-core-v31.1/bin/bitcoin-cli"
 
 def cli(*a):
     r = subprocess.run([CLI, f"-conf={CONF}", f"-datadir={DD}", *a],

@@ -66,7 +66,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ASM = os.path.dirname(HERE)
-DEFAULT_CLI = ("/storage/bitcoin-core-source/build/bin/bitcoin-cli "
+DEFAULT_CLI = ("/storage/bitcoin-core-v31.1/bin/bitcoin-cli "
                "-rpcport=8335 -datadir=/storage/core-oracle").split()
 
 BIP30_HEIGHTS = (91722, 91812, 91842, 91880)

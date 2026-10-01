@@ -12,7 +12,7 @@
 #   validation/muhash_vs_core.sh [-datadir=<ours>] [oracle-cli command...]
 #
 # Defaults: our datadir /storage/bitcoinmachinecode/data; oracle
-# /storage/bitcoin-core-source/build-zmq/bin/bitcoin-cli with
+# /storage/bitcoin-core-v31.1/bin/bitcoin-cli with
 # /storage/core-oracle. Override the oracle with, e.g.:
 #   validation/muhash_vs_core.sh -datadir=/x bitcoin-cli -datadir=/y
 set -u
@@ -20,7 +20,7 @@ HERE=$(cd "$(dirname "$0")/.." && pwd)
 CLI="$HERE/asm/daemon/bmc_cli"
 DD="/storage/bitcoinmachinecode/data"
 case "${1:-}" in -datadir=*) DD="${1#-datadir=}"; shift;; esac
-if [ $# -gt 0 ]; then ORACLE="$*"; else ORACLE="/storage/bitcoin-core-source/build-zmq/bin/bitcoin-cli -conf=/storage/core-oracle/bitcoin.conf -datadir=/storage/core-oracle"; fi
+if [ $# -gt 0 ]; then ORACLE="$*"; else ORACLE="/storage/bitcoin-core-v31.1/bin/bitcoin-cli -conf=/storage/core-oracle/bitcoin.conf -datadir=/storage/core-oracle"; fi
 [ -x "$CLI" ] || { echo "FAIL: no $CLI (build asm/daemon/bmc_cli)"; exit 2; }
 O=$("$CLI" -datadir="$DD" gettxoutsetinfo muhash 2>&1) || { echo "FAIL: our gettxoutsetinfo failed: $(printf '%s' "$O" | head -1)"; exit 1; }
 H=$(printf '%s' "$O" | python3 -c 'import sys,json; print(json.load(sys.stdin)["height"])' 2>/dev/null) || H=""

@@ -15,7 +15,7 @@ import socket, struct, hashlib, time, subprocess, sys
 
 MAGIC = b'\xfa\xbf\xb5\xda'   # regtest
 HOST, PORT = '127.0.0.1', 19444
-RPC = ['/storage/bitcoin-core-source/build/bin/bitcoin-cli','-datadir=/tmp/ffsh','-rpcuser=u','-rpcpassword=p']
+RPC = ['/storage/bitcoin-core-v31.1/bin/bitcoin-cli','-datadir=/tmp/ffsh','-rpcuser=u','-rpcpassword=p']
 
 def sha256d(b): return hashlib.sha256(hashlib.sha256(b).digest()).digest()
 

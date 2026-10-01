@@ -103,7 +103,7 @@ REPORT = os.path.join(HERE, 'bip30_diff_report.json')
 # production install at /storage/bitcoin -- that one is off limits, including
 # for reads, and PART 2 additionally *launches* a regtest node from the binary
 # it names here.
-CORE_BIN_DIR = "/storage/bitcoin-core-source/build/bin"
+CORE_BIN_DIR = "/storage/bitcoin-core-v31.1/bin"
 MAIN_CLI = [CORE_BIN_DIR + "/bitcoin-cli",
             "-conf=/storage/core-oracle/bitcoin.conf",
             "-datadir=/storage/core-oracle"]

@@ -36,7 +36,7 @@
 #   - It never writes to the live replay's datadir. The archive is opened
 #     read-only and COPIED from; nothing is symlinked, because a symlinked
 #     blk*.dat would let an appending writer reach the real archive.
-#   - It never builds in, or writes to, /storage/bitcoin-core-source/build --
+#   - It never builds in, or writes to, /storage/bitcoin-core-v31.1/source/build --
 #     a Core oracle daemon runs from there.
 #   - It refuses to start a timed run if the machine is busy, unless --force.
 #     A tier-3 number taken under contention is worse than no number:
@@ -60,7 +60,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 OUR_ARCHIVE="${OUR_ARCHIVE:-/storage/bitcoinmachinecode/data}"
 CORE_BLOCKS="${CORE_BLOCKS:-/storage/core-oracle/blocks}"
-CORE_BIN="${CORE_BIN:-/storage/bitcoin-core-source/build/bin/bitcoind}"
+CORE_BIN="${CORE_BIN:-/storage/bitcoin-core-v31.1/bin/bitcoind}"
 OUR_BIN="${OUR_BIN:-$REPO_ROOT/asm/daemon/bmcbitcoind}"
 WORK="${WORK:-/storage/bench-tier3}"
 
@@ -91,7 +91,7 @@ say(){ printf '%s\n' "$*"; }
 # Guard rails that apply to every subcommand.
 # --------------------------------------------------------------------------
 case "$WORK" in
-    /storage/bitcoin|/storage/bitcoin/*|/storage/bitcoinmachinecode/data|/storage/bitcoinmachinecode/data/*|/storage/core-oracle|/storage/core-oracle/*|/storage/bitcoin-core-source*)
+    /storage/bitcoin|/storage/bitcoin/*|/storage/bitcoinmachinecode/data|/storage/bitcoinmachinecode/data/*|/storage/core-oracle|/storage/core-oracle/*|/storage/bitcoin-core-v31.1|/storage/bitcoin-core-v31.1/*)
         die "--dest $WORK points at production/oracle state. Refusing." ;;
 esac
 

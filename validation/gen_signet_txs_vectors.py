@@ -20,7 +20,7 @@ Usage: gen_signet_txs_vectors.py <datadir> [count]
 import hashlib, json, os, subprocess, sys
 from coincurve import PublicKey
 
-CLI = "/storage/bitcoin-core-source/build/bin/bitcoin-cli"
+CLI = "/storage/bitcoin-core-v31.1/bin/bitcoin-cli"
 HDR = bytes([0xec, 0xc7, 0xda, 0xa2])
 
 def rpc(datadir, *args):

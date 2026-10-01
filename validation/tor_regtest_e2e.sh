@@ -10,7 +10,7 @@
 # with CORE confirming an inbound peer whose network is "onion".
 # Nothing here is mocked: real tor, real circuits, real Core.
 set -u
-CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-source/build/bin}
+CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-v31.1/bin}
 BMC_BIN=${BMC_BIN:-/storage/bitcoinmachinecode/asm/daemon/bmcbitcoind}
 WALLET_CLI=${WALLET_CLI:-/storage/bitcoinmachinecode/asm/daemon/bmc_wallet_cli}
 WORK=${WORK:-/tmp/tor-e2e-$$}

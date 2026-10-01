@@ -33,7 +33,7 @@ import re, sys, os
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-HDR = "/storage/bitcoin-core-source/src/script/script_error.h"
+HDR = "/storage/bitcoin-core-v31.1/source/src/script/script_error.h"
 ASM = os.path.join(REPO_ROOT, "asm", "bitcoin_interp.asm")
 CHDR = os.path.join(REPO_ROOT, "asm", "script_error_codes.h")
 

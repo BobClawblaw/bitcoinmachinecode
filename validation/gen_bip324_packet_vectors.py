@@ -12,7 +12,7 @@ in_multiply repeats the contents up to megabytes; both forms are carried
 through so the test can check whichever the vector supplies.
 """
 import os, re, sys
-CORE = "/storage/bitcoin-core-source/src/test/bip324_tests.cpp"
+CORE = "/storage/bitcoin-core-v31.1/source/src/test/bip324_tests.cpp"
 src = open(sys.argv[1] if len(sys.argv) > 1 else CORE).read()
 
 S = r'((?:"[0-9a-f]*"\s*)*)'          # possibly-empty run of adjacent literals
