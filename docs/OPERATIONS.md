@@ -475,6 +475,7 @@ make daemon/bmcbitcoind          # safe while the old binary runs: ld unlinks fi
 # the three build audits (each is also a prerequisite of `make test`)
 make prereq-check             # every file a recipe uses is a declared prerequisite
 make link-check               # every rule links the files defining the symbols it needs
+make header-check             # every rule that compiles daemon/main.c lists the headers it includes
 make runlist-check            # every test is gated or declared manual with a reason
 make abi-check                # SysV stack-alignment audit of asm->C call sites
 
