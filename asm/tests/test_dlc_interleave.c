@@ -335,8 +335,8 @@ int main(void){
          * pass leaves behind -- bounded by a chunk here, never a download's
          * worth (the pre-step-1 loop left all NB) */
         printf("     connected tip at the gate: %ld (lag %ld)\n", gate_applied, (NB-1) - gate_applied);
-        ckm("the connected tip at the gate is within a chunk of the archive tip (lag bounded)", (NB-1) - gate_applied <= DLC_CHUNK_BLOCKS);
-        ckm("...and far past where the pre-step-1 loop left it (-1)", gate_applied >= NB - 1 - DLC_CHUNK_BLOCKS);
+        ckm("the connected tip at the gate is within a chunk of the archive tip (lag bounded)", (NB-1) - gate_applied <= g_dlc_chunk);
+        ckm("...and far past where the pre-step-1 loop left it (-1)", gate_applied >= NB - 1 - g_dlc_chunk);
         /* the sample trace: did applied rise while blocks were still missing? */
         long ns = g_ns, first_rise = -1, best_gap = -1, ooo = 0;
         for(long i=0;i<ns;i++){

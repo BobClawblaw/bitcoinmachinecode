@@ -4991,7 +4991,17 @@ static int dl_pool_from_book(void* ab, char out[][DL_POOL_SLOT], int nitems){
  * work and took minutes to even trigger; 40 blocks (~50-60MB near the tip)
  * with a proportionally shorter budget gives a ~4x faster detect-and-replace
  * cycle at ~4x lower cost per miss. */
-#define DLC_CHUNK_BLOCKS 40
+/* 2026-09-30: the chunk is a runtime value, bmc.dlcchunk (default 16, 4..64; 40 until 2026-10-01),
+ * set once per pass before any worker or the committer forks. Run 31 found
+ * that inside Core's 1,024-block window ten workers holding 40-block chunks
+ * leave two or three chunks of headroom each, so one late chunk starves the
+ * apply; finer requests are the lever (Core: 16 in flight per peer). The
+ * staging buffer is sized for the largest allowed chunk. */
+#define DLC_CHUNK_BLOCKS_MAX 64
+/* default 16 since 2026-10-01: two A/Bs to 300,000 (validation/ab_dlcchunk.sh),
+ * one in each order, reached it 19.5% and 14.1% sooner than at 40, the gain
+ * concentrated at 200k-300k (-23%, -25%) */
+static long g_dlc_chunk = 16;
 static long g_dlc_pool_idle_pct = -1;   /* pool-wide share of worker wall-clock blocked in the socket read (2026-09-11); -1 until a chunk completes */
 /* Draw from the WHOLE address book, not a 512 slice of it. Measured
  * 2026-08-18: the book held 1,974 peers, the pool was capped at 512, the
@@ -5209,7 +5219,7 @@ static double dlc_effective_floor(double median_bps){
  * blocks against run 9's 86k). 4096 is the same slack Core gives itself;
  * the archive is still consolidated behind it (holes bounded, the connect
  * never more than the window behind the download). */
-/* 2026-09-10: the window is dlc_window_blocks(nw, DLC_CHUNK_BLOCKS), anchored
+/* 2026-09-10: the window is dlc_window_blocks(nw, g_dlc_chunk), anchored
  * to the CONNECTED tip (dlc_window_anchor), Core's shape; 2026-09-29: and
  * Core's SIZE, 1,024 -- it had been six times the claimed chunks, never under
  * 4,096, and run 30 sat at that edge for the whole sync. */
@@ -5230,7 +5240,7 @@ enum { DLC_CTL_CLAIM = 0, DLC_CTL_RETRY_HEAD = 1, DLC_CTL_RETRY_TAIL = 2, DLC_CT
         * tick, in place of a line per event (2026-09-07: the rotation and
         * window lines alone were 540 lines in six minutes of run 13) */
        DLC_CTL_N_ROTATE = 6, DLC_CTL_N_WAIT = 7, DLC_CTL_N_HELP = 8, DLC_CTL_N_FAIL = 9, DLC_CTL_N_ABANDON = 10,
-       DLC_CTL_SPAN_START = 11,           /* the pass's first height: the claim grid is start + k*DLC_CHUNK_BLOCKS */
+       DLC_CTL_SPAN_START = 11,           /* the pass's first height: the claim grid is start + k*g_dlc_chunk */
        /* the in-order committer (2026-09-08): the committed contiguous tip it
         * publishes, the staged-not-yet-committed chunk gauge, the chunks it
         * has appended, and the parent's "workers are gone: drain and exit" */
@@ -5250,7 +5260,9 @@ enum { DLC_CTL_CLAIM = 0, DLC_CTL_RETRY_HEAD = 1, DLC_CTL_RETRY_TAIL = 2, DLC_CT
  * chunks staged above the cursor. A 40-block chunk is 40 MB at height
  * 490,000 and takes a worker a minute; a bare clock fires duplicate
  * downloads of chunks whose owner is still delivering them. */
-#define DLC_CURSOR_HELP_MIN_STAGED 32
+/* (the staged-chunk bar is dlc_cursor_help_min_staged(window, chunk) since
+ * 2026-09-30: this was a fixed 32, above the 25 chunks a 1,024 window can
+ * stage at 40 blocks, so from 09-29 the help could never fire) */
 /* (2026-09-08, later the same day: 10 s and 8 chunks fired 39 helps in 21
  * minutes of run 18 at height 500,000 -- most of them on chunks whose owner
  * was still delivering. A third of the window staged above the cursor and
@@ -5273,7 +5285,7 @@ static double dlc_ema_after_failure(double ema){ return ema > 0.0 ? ema * 0.5 : 
 static long dlc_fail_backoff_ms(int attempt){ long ms = 200L * (attempt < 1 ? 1 : attempt); return ms > 2000 ? 2000 : ms; }
 static long dlc_help_chunk_lo(long first_hole, long span_start){
     if(first_hole < span_start) return span_start;
-    return span_start + ((first_hole - span_start) / DLC_CHUNK_BLOCKS) * DLC_CHUNK_BLOCKS;
+    return span_start + ((first_hole - span_start) / g_dlc_chunk) * g_dlc_chunk;
 }
 /* The anchor is scanned by the parent only. The first cut had a blocked
  * worker rescan index.dat itself, and those reads landed in the worker's
@@ -5330,7 +5342,7 @@ static long dlc_retry_pop(volatile long* ctl){
  * tests/test_dialhelper to run it on a scratch directory. */
 #define DLC_STAGE_DIR "stage"
 #define DLC_STAGE_REC_HDR 44u                 /* [u64 height][u32 len][hash 32] then the raw block */
-#define DLC_STAGE_MAX_BYTES ((size_t)DLC_CHUNK_BLOCKS * ((4u << 20) + DLC_STAGE_REC_HDR) + 4096)
+#define DLC_STAGE_MAX_BYTES ((size_t)DLC_CHUNK_BLOCKS_MAX * ((4u << 20) + DLC_STAGE_REC_HDR) + 4096)
 extern long store_append_shared(void* st, long height, const unsigned char hash[32], const unsigned char* raw, unsigned len);   /* bitcoin_store.asm */
 static int g_stage_fd = -1;                   /* the worker's open staging file, per process */
 static pid_t g_dlc_committer = 0;             /* the committer's pid while dl_catchup runs */
@@ -5374,7 +5386,7 @@ static long dlc_stage_sweep(long cursor, volatile long* ctl){
     while ((e = readdir(d))){
         long lo; if (sscanf(e->d_name, "c%ld.chunk", &lo) != 1 || strstr(e->d_name, ".tmp")) continue;
         char p[320]; snprintf(p, sizeof p, DLC_STAGE_DIR "/%s", e->d_name);
-        if (lo + DLC_CHUNK_BLOCKS - 1 < cursor){ if (unlink(p) == 0) removed++; }
+        if (lo + g_dlc_chunk - 1 < cursor){ if (unlink(p) == 0) removed++; }
         else kept++;
     }
     closedir(d);
@@ -5473,7 +5485,7 @@ static int dlc_committer_run(volatile long* ctl, long start_h, long end_h, void*
         /* not staged yet: after DLC_CURSOR_HELP_SECS on the same chunk, ask
          * for a helper; a fresh chunk resets the clock */
         if(lo != wait_lo){ wait_lo = lo; wait_ms = 0; ctl[DLC_CTL_CURSOR_WANT] = -1; }
-        else if(wait_ms >= g_dlc_cursor_help_ms && ctl[DLC_CTL_STAGED] >= DLC_CURSOR_HELP_MIN_STAGED && ctl[DLC_CTL_CURSOR_WANT] != lo) ctl[DLC_CTL_CURSOR_WANT] = lo;
+        else if(wait_ms >= g_dlc_cursor_help_ms && ctl[DLC_CTL_STAGED] >= dlc_cursor_help_min_staged(g_dlc_window, g_dlc_chunk) && ctl[DLC_CTL_CURSOR_WANT] != lo) ctl[DLC_CTL_CURSOR_WANT] = lo;
         wait_ms += poll_ms;
         { struct timespec ts = { poll_ms / 1000, (poll_ms % 1000) * 1000000L }; nanosleep(&ts, NULL); }
     }
@@ -6144,7 +6156,7 @@ static long dlc_headers(char live[][DL_POOL_SLOT], int nlive){
     return have>0 ? have : -1;
 }
 
-/* chunk-claiming worker: pulls DLC_CHUNK_BLOCKS-sized pieces from a SHARED
+/* chunk-claiming worker: pulls g_dlc_chunk-sized pieces from a SHARED
  * atomic cursor (mmap'd MAP_SHARED across all forked workers) until the
  * whole [.,end_h] span is claimed -- a worker that lands fast peers just
  * keeps claiming more chunks instead of idling once some static "share" is
@@ -6363,10 +6375,10 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                 if(waited_ticks==0) __sync_fetch_and_add(&next_claim[DLC_CTL_N_WAIT], 1L);
                 usleep(200000); waited_ticks++;
             }
-            if(lo<0) lo=__sync_fetch_and_add(next_claim,(long)DLC_CHUNK_BLOCKS);
+            if(lo<0) lo=__sync_fetch_and_add(next_claim,g_dlc_chunk);
         }
         if(lo>end_h){ if(fd>=0) close(fd); DLC_RELEASE(); break; }
-        long hi=lo+DLC_CHUNK_BLOCKS-1; if(hi>end_h) hi=end_h;
+        long hi=lo+g_dlc_chunk-1; if(hi>end_h) hi=end_h;
         if(dlc_chunk_all_present(lo,hi)) continue;
         mystat->cur_lo=lo; mystat->cur_hi=hi;                          /* getpeerinfo's inflight */
 
@@ -7321,7 +7333,7 @@ static void dlc_stall_tick(volatile long* ctl, volatile dlc_stat_t* stats, pid_t
         }
     }
     fprintf(stderr,"[dlc] w%d %s is stalling the window: chunk [%ld,%ld] is the oldest missing and the window (%ld above %ld) is full -- dropped after %ld s (next timeout %ld s; peer %s)\n",
-            w, stats[w].peer[0] ? (const char*)stats[w].peer : "(connecting)", lo, lo + DLC_CHUNK_BLOCKS - 1, g_dlc_window, anchor,
+            w, stats[w].peer[0] ? (const char*)stats[w].peer : "(connecting)", lo, lo + g_dlc_chunk - 1, g_dlc_window, anchor,
             (long)((now_ms - since) / 1000), dlc_stall_timeout_after(g_dlc_stall_timeout_s, 1), verdict);
     g_dlc_stall_timeout_s = dlc_stall_timeout_after(g_dlc_stall_timeout_s, 1);
     holder = -1; since = now_ms;
@@ -7500,11 +7512,15 @@ static long dl_catchup_run(const char* dir, int min_workers){
         return 0;
     }
     fprintf(stderr,"[dlc] span [%ld,%ld] (%ld heights)\n", start_h, end_h, end_h-start_h+1);
-    int nw = dlc_workers_for(nlive, min_workers, end_h - start_h + 1);   /* a handoff's few dozen blocks do not need 64 helpers (row 3) */
-    g_dlc_window = dlc_window_blocks(nw, DLC_CHUNK_BLOCKS);
+    g_dlc_chunk = g_cfg.dlc_chunk_blocks;                               /* before any fork: workers and the committer inherit it */
+    if(g_dlc_chunk < 1) g_dlc_chunk = 1;
+    if(g_dlc_chunk > DLC_CHUNK_BLOCKS_MAX) g_dlc_chunk = DLC_CHUNK_BLOCKS_MAX;
+    int nw = dlc_workers_for(nlive, min_workers, end_h - start_h + 1, g_dlc_chunk);   /* a handoff's few dozen blocks do not need 64 helpers (row 3) */
+    g_dlc_window = dlc_window_blocks(nw, g_dlc_chunk);
     g_dlc_stall_timeout_s = DLC_STALL_TIMEOUT_MIN_S;
-    fprintf(stderr,"[dlc] Core's shape: %d of %d live peer(s) download at once (cap %d, span %ld), window %ld blocks above the connected tip, stall timeout %ld s\n",
-            nw, nlive, min_workers, end_h - start_h + 1, g_dlc_window, g_dlc_stall_timeout_s);
+    fprintf(stderr,"[dlc] Core's shape: %d of %d live peer(s) download at once (cap %d, span %ld), %ld-block requests, window %ld blocks above the connected tip, stall timeout %ld s, cursor help at %ld staged\n",
+            nw, nlive, min_workers, end_h - start_h + 1, g_dlc_chunk, g_dlc_window, g_dlc_stall_timeout_s,
+            dlc_cursor_help_min_staged(g_dlc_window, g_dlc_chunk));
 
     /* pre-size index.dat GROW-ONLY, create append.lock */
     {
