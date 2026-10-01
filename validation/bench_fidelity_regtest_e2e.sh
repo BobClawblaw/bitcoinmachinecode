@@ -27,7 +27,7 @@
 #   `make runtime` so the helpers sit beside it); KEEP=1 keeps the work dir.
 set -u
 HERE=$(cd "$(dirname "$0")/.." && pwd)
-CORE_BIN=${CORE_BIN:-/mnt/nvme8tb/core-build/bitcoin-v31.1/build/bin}
+CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-v31.1/bin}
 BMC_BIN=${BMC_BIN:-$HERE/asm/daemon/bmcbitcoind}
 BLOCKS=${BLOCKS:-200}; BOOTCATCHUP=${BOOTCATCHUP:-1}; TOL_PCT=${TOL_PCT:-2}
 WORK=${TMPDIR:-/tmp}/bmc-fidelity-e2e-$$; rm -rf "$WORK"; mkdir -p "$WORK/core" "$WORK/bmc/regtest"

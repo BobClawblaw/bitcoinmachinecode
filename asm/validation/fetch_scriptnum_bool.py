@@ -53,7 +53,7 @@ Usage:
       ./lib/libbitcoin_common.a ./lib/libbitcoin_consensus.a ./lib/libbitcoin_util.a \\
       ./lib/libbitcoin_crypto.a ./lib/libbitcoin_clientversion.a \\
       ./src/univalue/libunivalue.a ./src/secp256k1/lib/libsecp256k1.a \\
-      -levent -levent_pthreads          # from /mnt/nvme8tb/core-build/bitcoin-v31.1/build
+      -levent -levent_pthreads          # from /storage/bitcoin-core-v31.1/source/build
   python3 validation/fetch_scriptnum_bool.py > tests/scriptnum_bool_vec.h
 """
 import hashlib, os, subprocess, sys

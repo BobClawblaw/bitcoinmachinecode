@@ -5,7 +5,7 @@ implementation itself was generated from) so the test isn't just checking
 the generator against itself."""
 import re, os
 
-SRC = "/mnt/nvme8tb/core-build/bitcoin-v31.1/src/kernel/chainparams.cpp"
+SRC = "/storage/bitcoin-core-v31.1/source/src/kernel/chainparams.cpp"
 main = re.search(r"class CMainParams : public CChainParams \{.*?\n\};", open(SRC).read(), re.S).group(0)
 
 def height(field):

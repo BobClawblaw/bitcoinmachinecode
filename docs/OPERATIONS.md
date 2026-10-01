@@ -525,7 +525,7 @@ work (docs/PARITY_RPC_FIELDS.md).
 | | |
 |---|---|
 | unit | `bitcoin-oracle` (`config/core-oracle/bitcoin-oracle.service`, `__SVCUSER__` substituted at install as for logrotate): SIGTERM only, `TimeoutStopSec=900`, never SIGKILL -- Core flushes a large chainstate on the way down |
-| binaries | `/storage/bitcoin-core-v31.1/bin` (`bitcoind`, `bitcoin-cli`); source tree `/mnt/nvme8tb/core-build/bitcoin-v31.1` |
+| binaries | `/storage/bitcoin-core-v31.1/bin` (`bitcoind`, `bitcoin-cli`); source tree `/storage/bitcoin-core-v31.1/source` |
 | datadir | `/storage/core-oracle`, config `config/core-oracle/bitcoin.conf`: `txindex`, `coinstatsindex`, `blockfilterindex`, `dbcache=8192` |
 | network | P2P 8333 on 127.0.0.1-16 (the loopback replay benchmarks dial them), RPC 8335, ZMQ 28432 |
 | query | `/storage/bitcoin-core-v31.1/bin/bitcoin-cli -conf=/storage/core-oracle/bitcoin.conf -datadir=/storage/core-oracle getblockcount` |

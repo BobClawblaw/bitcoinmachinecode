@@ -59,7 +59,7 @@ printf 'chain=regtest\nport=%s\nrpcport=%s\nrpcuser=e2e\nrpcpassword=e2epw\nlist
 ONION=pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion
 I2P=c4gfnttsuwqomiygupdqqqyy5y5emnk5c73hrfvatri67prd7vyq.b32.i2p
 CJDNS=fc00:1:2:3::4
-EXPECT_V2_LEN=$(cd /mnt/nvme8tb/core-build/bitcoin-v31.1/test/functional && python3 - "$BMC_DIR/regtest/peers2.dat" "$ONION" "$I2P" "$CJDNS" <<'PYIN'
+EXPECT_V2_LEN=$(cd /storage/bitcoin-core-v31.1/source/test/functional && python3 - "$BMC_DIR/regtest/peers2.dat" "$ONION" "$I2P" "$CJDNS" <<'PYIN'
 import struct, sys, time, socket
 sys.path.insert(0, '.')
 from test_framework.messages import CAddress, msg_addrv2

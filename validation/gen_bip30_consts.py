@@ -29,8 +29,8 @@ convention against the real mainnet genesis hash.
 """
 import re, sys, os
 
-VAL   = "/mnt/nvme8tb/core-build/bitcoin-v31.1/src/validation.cpp"
-PARAM = "/mnt/nvme8tb/core-build/bitcoin-v31.1/src/kernel/chainparams.cpp"
+VAL   = "/storage/bitcoin-core-v31.1/source/src/validation.cpp"
+PARAM = "/storage/bitcoin-core-v31.1/source/src/kernel/chainparams.cpp"
 OUT   = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                      "..", "asm", "daemon", "bip30_consts.h")
 

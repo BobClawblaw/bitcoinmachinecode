@@ -10,13 +10,13 @@
 # WHAT IT WILL NOT DO
 #   - It never touches /storage/bitcoin or bitcoind.service (a production Core
 #     install), and never stops, starts or reconfigures any systemd service.
-#   - It never builds in /mnt/nvme8tb/core-build/bitcoin-v31.1/build. A Core oracle
+#   - It never builds in /storage/bitcoin-core-v31.1/source/build. A Core oracle
 #     daemon runs from that directory and other work depends on it staying up.
 #     Core's benchmarks are built in a SEPARATE, out-of-tree directory
 #     ($CORE_BENCH_DIR, default /storage/core-bench-build) so the oracle's build
-#     is not disturbed. /mnt/nvme8tb/core-build/bitcoin-v31.1 itself is root-owned and
-#     read-only to us, which is also why the build is out-of-tree rather than
-#     the in-tree `build-bench` a writable checkout would use.
+#     is not disturbed. /storage/bitcoin-core-v31.1/source is the oracle's own
+#     tree (its build/ produced the oracle binaries), which is also why the
+#     build is out-of-tree rather than an in-tree `build-bench`.
 #   - It never writes to the live replay's datadir.
 #
 # METHODOLOGY -- see BENCHMARKS.md section "Methodology" for the reasoning.
@@ -52,7 +52,7 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ASM_DIR="$REPO_ROOT/asm"
 
-CORE_SRC="${CORE_SRC:-/mnt/nvme8tb/core-build/bitcoin-v31.1}"
+CORE_SRC="${CORE_SRC:-/storage/bitcoin-core-v31.1/source}"
 CORE_BENCH_DIR="${CORE_BENCH_DIR:-/storage/core-bench-build}"
 CORE_BENCH="$CORE_BENCH_DIR/bin/bench_bitcoin"
 BLOCK_RAW="${BLOCK_RAW:-$CORE_SRC/src/bench/data/block413567.raw}"

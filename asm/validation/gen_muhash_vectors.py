@@ -24,7 +24,7 @@ import subprocess
 import sys
 import tempfile
 
-DEFAULT_CORE = "/mnt/nvme8tb/core-build/bitcoin-v31.1"
+DEFAULT_CORE = "/storage/bitcoin-core-v31.1/source"
 
 
 def build_oracle(core_src, oracle_cpp, out_bin):

@@ -29,7 +29,7 @@ Ground truth is Core. Our own previous answer is never the standard --
 "identical to before" only means something once "identical to Core" holds.
 
 Build the oracle first (from the repo root):
-  SRC=/mnt/nvme8tb/core-build/bitcoin-v31.1; B=$SRC/build
+  SRC=/storage/bitcoin-core-v31.1/source; B=$SRC/build
   g++ -std=c++20 -O1 -I$SRC/src -I$B/src -I$SRC/src/univalue/include \
       -o /tmp/core_verify_oracle validation/core_verify_oracle.cpp \
       -Wl,--start-group $B/lib/libbitcoin_common.a $B/lib/libbitcoin_consensus.a \

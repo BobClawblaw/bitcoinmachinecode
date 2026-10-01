@@ -25,7 +25,7 @@
 # Usage: validation/v311_rpc_gaps_regtest_diff.sh  (KEEP=1 keeps the work dir;
 #        BMC_BIN / CORE_BIN override the binaries)
 set -u
-CORE_BIN=${CORE_BIN:-/mnt/nvme8tb/core-build/bitcoin-v31.1/build/bin}
+CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-v31.1/bin}
 BMC_BIN=${BMC_BIN:-/storage/bitcoinmachinecode/asm/daemon/bmcbitcoind}
 WALLET_CLI=${WALLET_CLI:-$(dirname "$BMC_BIN")/bmc_wallet_cli}
 WORK=${TMPDIR:-/tmp}/bmc-v311-gaps-$$; rm -rf "$WORK"; mkdir -p "$WORK/core" "$WORK/bmc/regtest"

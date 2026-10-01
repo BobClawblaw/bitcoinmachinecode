@@ -36,7 +36,7 @@
 #   - It never writes to the live replay's datadir. The archive is opened
 #     read-only and COPIED from; nothing is symlinked, because a symlinked
 #     blk*.dat would let an appending writer reach the real archive.
-#   - It never builds in, or writes to, /mnt/nvme8tb/core-build/bitcoin-v31.1/build --
+#   - It never builds in, or writes to, /storage/bitcoin-core-v31.1/source/build --
 #     a Core oracle daemon runs from there.
 #   - It refuses to start a timed run if the machine is busy, unless --force.
 #     A tier-3 number taken under contention is worse than no number:
@@ -91,7 +91,7 @@ say(){ printf '%s\n' "$*"; }
 # Guard rails that apply to every subcommand.
 # --------------------------------------------------------------------------
 case "$WORK" in
-    /storage/bitcoin|/storage/bitcoin/*|/storage/bitcoinmachinecode/data|/storage/bitcoinmachinecode/data/*|/storage/core-oracle|/storage/core-oracle/*|/mnt/nvme8tb/core-build/bitcoin-v31.1*)
+    /storage/bitcoin|/storage/bitcoin/*|/storage/bitcoinmachinecode/data|/storage/bitcoinmachinecode/data/*|/storage/core-oracle|/storage/core-oracle/*|/storage/bitcoin-core-v31.1|/storage/bitcoin-core-v31.1/*)
         die "--dest $WORK points at production/oracle state. Refusing." ;;
 esac
 

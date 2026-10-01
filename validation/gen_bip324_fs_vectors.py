@@ -9,7 +9,7 @@ length cipher, and the rekey boundary (msg_idx 500 and 60000 are both far
 past the 224-packet interval).
 """
 import os, re, sys
-CORE = "/mnt/nvme8tb/core-build/bitcoin-v31.1/src/test/crypto_tests.cpp"
+CORE = "/storage/bitcoin-core-v31.1/source/src/test/crypto_tests.cpp"
 src = open(sys.argv[1] if len(sys.argv) > 1 else CORE).read()
 
 def strcat(m):
