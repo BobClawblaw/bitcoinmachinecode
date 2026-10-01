@@ -16,7 +16,7 @@
 # checkout, not a build dependency, and a machine without it must still be
 # able to run the gate.
 set -eu
-CORE_SRC=/storage/bitcoin-core-source
+CORE_SRC=/mnt/nvme8tb/core-build/bitcoin-v31.1
 if [ ! -d "$CORE_SRC/src/kernel" ]; then
     echo "SCRIPT-FLAGS CHECK SKIPPED: no Core source tree at $CORE_SRC"
     exit 0

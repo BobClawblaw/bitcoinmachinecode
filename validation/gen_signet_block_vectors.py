@@ -15,7 +15,7 @@ Usage: gen_signet_block_vectors.py <datadir>
 """
 import json, os, subprocess, sys
 
-CLI = "/storage/bitcoin-core-source/build/bin/bitcoin-cli"
+CLI = "/storage/bitcoin-core-v31.1/bin/bitcoin-cli"
 
 def rpc(d, *a):
     r = subprocess.run([CLI, f"-datadir={d}", *a], capture_output=True,

@@ -8,7 +8,7 @@ built from the spent output and the consensus flag set at a taproot-active
 height (GetBlockScriptFlags: P2SH|WITNESS|TAPROOT + DERSIG/NULLDUMMY/CLTV/CSV).
 
 Build the oracle first (from the repo root):
-  SRC=/storage/bitcoin-core-source; B=$SRC/build
+  SRC=/mnt/nvme8tb/core-build/bitcoin-v31.1; B=$SRC/build
   g++ -std=c++20 -O1 -I$SRC/src -I$B/src -I$SRC/src/univalue/include \
       -o /tmp/core_verify_oracle validation/core_verify_oracle.cpp \
       -Wl,--start-group $B/lib/libbitcoin_common.a $B/lib/libbitcoin_consensus.a \

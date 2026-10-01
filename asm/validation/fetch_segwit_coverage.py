@@ -9,7 +9,7 @@ fetched to a gitignored blob by fetch_segwit_coverage_big.py, not inlined.
 Usage: python3 validation/fetch_segwit_coverage.py > tests/segwit_coverage_vec.h
 """
 import json, subprocess, sys
-CLI = "/storage/bitcoin-core-source/build/bin/bitcoin-cli -conf=/storage/core-oracle/bitcoin.conf -datadir=/storage/core-oracle".split()
+CLI = "/storage/bitcoin-core-v31.1/bin/bitcoin-cli -conf=/storage/core-oracle/bitcoin.conf -datadir=/storage/core-oracle".split()
 def rpc(*a):
     r = subprocess.run(CLI + list(a), capture_output=True, text=True)
     if r.returncode != 0: sys.exit("rpc failed: %s: %s" % (a, r.stderr.strip()))

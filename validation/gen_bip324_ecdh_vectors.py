@@ -12,7 +12,7 @@ That makes these inputs official and the expectations independently derived,
 which is the best available short of the BIP publishing the intermediate.
 """
 import os, re, sys
-CORE = "/storage/bitcoin-core-source"
+CORE = "/mnt/nvme8tb/core-build/bitcoin-v31.1"
 sys.path.insert(0, os.path.join(CORE, "test/functional"))
 from test_framework.crypto.ellswift import ellswift_ecdh_xonly
 from test_framework.key import TaggedHash

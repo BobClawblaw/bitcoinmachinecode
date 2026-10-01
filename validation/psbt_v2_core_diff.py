@@ -18,7 +18,7 @@ import base64, json, os, re, subprocess, sys, tempfile, time, hashlib
 import os as _dg_os, sys as _dg_sys
 _dg_sys.path.insert(0, _dg_os.path.join(_dg_os.path.dirname(_dg_os.path.abspath(__file__)), "lib"))
 from diffguard import require_cases, require_sources
-CORE = os.environ.get("CORE_BIN", "/storage/bitcoin-core-source/build-zmq/bin")
+CORE = os.environ.get("CORE_BIN", "/storage/bitcoin-core-v31.1/bin")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PORT, RPCPORT = int(os.environ.get("PORT_BASE", "18590")), int(os.environ.get("PORT_BASE", "18590")) + 1
 FAILS = []; OK = 0

@@ -10,7 +10,7 @@ items (so the test can drive sv_verify_witness_v0 directly for negatives).
 Usage: python3 validation/fetch_segwit_real.py > tests/segwit_real_vec.h
 Requires the oracle (see project memory: /storage/core-oracle, txindex=1)."""
 import json, subprocess, sys
-CLI = "/storage/bitcoin-core-source/build/bin/bitcoin-cli -conf=/storage/core-oracle/bitcoin.conf -datadir=/storage/core-oracle".split()
+CLI = "/storage/bitcoin-core-v31.1/bin/bitcoin-cli -conf=/storage/core-oracle/bitcoin.conf -datadir=/storage/core-oracle".split()
 def rpc(*a):
     r = subprocess.run(CLI + list(a), capture_output=True, text=True)
     if r.returncode != 0: sys.exit("rpc failed: %s: %s" % (a, r.stderr.strip()))

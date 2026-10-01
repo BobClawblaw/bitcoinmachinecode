@@ -55,7 +55,7 @@ Usage:
 """
 import json, os, subprocess, sys
 
-CLI = ("/storage/bitcoin-core-source/build/bin/bitcoin-cli"
+CLI = ("/storage/bitcoin-core-v31.1/bin/bitcoin-cli"
        " -conf=/storage/core-oracle/bitcoin.conf"
        " -datadir=/storage/core-oracle").split()
 ORACLE = os.environ.get("CORE_VERIFY_ORACLE", "/tmp/core_verify_oracle")

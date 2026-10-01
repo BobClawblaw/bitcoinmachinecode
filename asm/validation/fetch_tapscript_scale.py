@@ -32,7 +32,7 @@ Usage:
 """
 import hashlib, json, struct, subprocess, sys, os
 
-CLI = ("/storage/bitcoin-core-source/build/bin/bitcoin-cli "
+CLI = ("/storage/bitcoin-core-v31.1/bin/bitcoin-cli "
        "-rpcport=8335 -datadir=/storage/core-oracle").split()
 
 TS_INLINE_MAX = 64 * 1024      # raw tx bytes; 42 KB inscription fits, 372 KB does not

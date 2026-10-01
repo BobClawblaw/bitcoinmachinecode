@@ -24,7 +24,7 @@ Blocks:
 """
 import subprocess, sys, os, hashlib
 
-CLI = ["/storage/bitcoin-core-source/build/bin/bitcoin-cli",
+CLI = ["/storage/bitcoin-core-v31.1/bin/bitcoin-cli",
        "-conf=/storage/core-oracle/bitcoin.conf", "-datadir=/storage/core-oracle"]
 OUT = os.path.join(os.path.dirname(__file__), "..", "tests", "fixtures")
 

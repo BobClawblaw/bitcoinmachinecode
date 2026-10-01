@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """gen_sighash_vectors.py -- emit asm/tests/sighash_vec.h from Bitcoin Core's
 own official legacy SignatureHash test fixture
-(/storage/bitcoin-core-source/src/test/data/sighash.json), 500 vectors of
+(/mnt/nvme8tb/core-build/bitcoin-v31.1/src/test/data/sighash.json), 500 vectors of
 (raw_tx, scriptCode, input_index, hashType, expected_hash).
 
 The expected hash in the fixture is displayed in the reversed (txid-style)
@@ -17,7 +17,7 @@ single-byte signature suffixes) -- emitted here as the exact 32-bit pattern.
 import json, os
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SRC = '/storage/bitcoin-core-source/src/test/data/sighash.json'
+SRC = '/mnt/nvme8tb/core-build/bitcoin-v31.1/src/test/data/sighash.json'
 OUT = os.path.join(HERE, '..', 'asm', 'tests', 'sighash_vec.h')
 
 def main():

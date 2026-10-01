@@ -9,7 +9,7 @@ import os as _dg_os, sys as _dg_sys
 _dg_sys.path.insert(0, _dg_os.path.join(_dg_os.path.dirname(_dg_os.path.abspath(__file__)), "lib"))
 from diffguard import require_cases, require_sources
 
-CLI = ["/storage/bitcoin-core-source/build/bin/bitcoin-cli",
+CLI = ["/storage/bitcoin-core-v31.1/bin/bitcoin-cli",
        "-datadir=/storage/core-regtest", "-rpcport=18460", "-rpcwallet=reg"]
 BMC = "http://127.0.0.1:19446/"
 AUTH = base64.b64encode(b"mbmc:mbmcpw").decode()

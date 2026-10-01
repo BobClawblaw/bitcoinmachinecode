@@ -15,8 +15,8 @@ so a silent behaviour change on either side still fails the harness.
 """
 import json, subprocess, time, urllib.request, base64, sys, os, signal
 
-CORE = "/storage/bitcoin-core-source/build/bin/bitcoind"
-CLI  = "/storage/bitcoin-core-source/build/bin/bitcoin-cli"
+CORE = "/storage/bitcoin-core-v31.1/bin/bitcoind"
+CLI  = "/storage/bitcoin-core-v31.1/bin/bitcoin-cli"
 HERE = os.path.dirname(os.path.abspath(__file__))
 BMCD = os.path.join(HERE, "..", "daemon", "bitcoind")
 WORK = os.path.join(os.environ.get("TMPDIR", "/tmp"), "bmc-mpolicy-diff")

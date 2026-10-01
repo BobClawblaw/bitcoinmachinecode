@@ -25,7 +25,7 @@ _dg_sys.path.insert(0, _dg_os.path.join(_dg_os.path.dirname(_dg_os.path.abspath(
 from diffguard import require_cases, require_sources
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CORE = os.environ.get("CORE_BIN", "/storage/bitcoin-core-source/build-zmq/bin")
+CORE = os.environ.get("CORE_BIN", "/storage/bitcoin-core-v31.1/bin")
 PORT, RPCPORT = 18580, 18581
 checks = 0; fails = 0
 def ck(label, cond, detail=""):

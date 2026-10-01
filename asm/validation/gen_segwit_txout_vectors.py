@@ -54,7 +54,7 @@ Usage (from asm/):
 import json, os, subprocess, sys
 
 ORACLE = sys.argv[1] if len(sys.argv) > 1 else "/tmp/core_verify_oracle"
-CLI = ("/storage/bitcoin-core-source/build/bin/bitcoin-cli "
+CLI = ("/storage/bitcoin-core-v31.1/bin/bitcoin-cli "
        "-conf=/storage/core-oracle/bitcoin.conf -datadir=/storage/core-oracle").split()
 
 SIGHASH_ALL, SIGHASH_NONE, SIGHASH_SINGLE = 1, 2, 3

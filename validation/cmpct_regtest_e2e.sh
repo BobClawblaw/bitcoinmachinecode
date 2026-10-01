@@ -10,7 +10,7 @@
 # was verified as a block, failed, and the pass was thrown away (where=8).
 # Usage: validation/cmpct_regtest_e2e.sh   (KEEP=1 keeps the work dir; BMC_BIN overrides the binary)
 set -u
-CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-source/build/bin}; BMC_BIN=${BMC_BIN:-/storage/bitcoinmachinecode/asm/daemon/bmcbitcoind}
+CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-v31.1/bin}; BMC_BIN=${BMC_BIN:-/storage/bitcoinmachinecode/asm/daemon/bmcbitcoind}
 WALLET_CLI=${WALLET_CLI:-/storage/bitcoinmachinecode/asm/daemon/bmc_wallet_cli}
 WORK=${TMPDIR:-/tmp}/bmc-cmpct-e2e-$$; rm -rf "$WORK"; mkdir -p "$WORK/core" "$WORK/bmc/regtest"
 CORE_DIR=$WORK/core; BMC_DIR=$WORK/bmc; CORE_P2P=19944; CORE_RPC=19960; BMC_P2P=19955; BMC_RPC=19946

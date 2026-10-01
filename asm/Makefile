@@ -2680,7 +2680,7 @@ tests/bench_merkle: tests/bench_merkle.c bitcoin_hash.o sha256.o
 # input. cons_verify does strictly LESS than Core's CheckBlock; the file
 # header enumerates exactly what is missing, and BENCHMARKS.md repeats it.
 #   make tests/bench_checkblock && tests/bench_checkblock \
-#     /storage/bitcoin-core-source/src/bench/data/block413567.raw [rounds]
+#     /mnt/nvme8tb/core-build/bitcoin-v31.1/src/bench/data/block413567.raw [rounds]
 tests/bench_checkblock: tests/bench_checkblock.c tests/bench_abi_guard.S $(CONSOBJS)
 	$(CC) $(CFLAGS) -o $@ tests/bench_checkblock.c tests/bench_abi_guard.S $(CONSOBJS)
 
@@ -2692,7 +2692,7 @@ tests/bench_checkblock: tests/bench_checkblock.c tests/bench_abi_guard.S $(CONSO
 # passes on the same build -- it audits RSP alignment, not register
 # preservation, so this class of bug is invisible to it.
 #   make tests/bench_abi_audit && tests/bench_abi_audit \
-#     /storage/bitcoin-core-source/src/bench/data/block413567.raw
+#     /mnt/nvme8tb/core-build/bitcoin-v31.1/src/bench/data/block413567.raw
 # bitcoin_script.o is in the LINK line below but was missing from these
 # prerequisites, so a fresh tree (no stale .o lying around) failed here with
 # "cannot find bitcoin_script.o" -- it only ever built because some LATER
@@ -3664,7 +3664,7 @@ tests/test_abi_stack_align: tests/test_abi_stack_align.c $(ABIALIGNOBJS)
 # tests listed after them never ran -- while the README called `make test`
 # the full gate. Override on the command line to point at your own copy:
 #   make test CORE_BENCH_BLOCK=/path/to/block413567.raw
-CORE_BENCH_BLOCK ?= $(wildcard /storage/bitcoin-core-source/src/bench/data/block413567.raw)
+CORE_BENCH_BLOCK ?= $(wildcard /mnt/nvme8tb/core-build/bitcoin-v31.1/src/bench/data/block413567.raw)
 ABI_AUDIT_BLOCK := $(CORE_BENCH_BLOCK)
 
 callee-saved-check:

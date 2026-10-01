@@ -12,7 +12,7 @@ Usage: gen_signet_vectors.py <datadir> [rpcport] [count]
 import json, os, subprocess, sys
 
 HDR = bytes([0xec, 0xc7, 0xda, 0xa2])
-CLI = "/storage/bitcoin-core-source/build/bin/bitcoin-cli"
+CLI = "/storage/bitcoin-core-v31.1/bin/bitcoin-cli"
 
 def rpc(datadir, *args):
     out = subprocess.run([CLI, f"-datadir={datadir}", *args],

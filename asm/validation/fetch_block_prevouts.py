@@ -32,7 +32,7 @@ import subprocess
 import sys
 
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tests", "fixtures")
-DEFAULT_CLI = ("/storage/bitcoin-core-source/build-zmq/bin/bitcoin-cli "
+DEFAULT_CLI = ("/storage/bitcoin-core-v31.1/bin/bitcoin-cli "
                "-conf=/storage/core-oracle/bitcoin.conf -datadir=/storage/core-oracle")
 
 

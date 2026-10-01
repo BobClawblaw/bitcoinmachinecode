@@ -16,7 +16,7 @@
 #      the whole chain as one burst starting at h=1 with h < n
 #   3. boot: the gate must DECLINE (real gap >> 144), not adopt at "tip 1"
 set -u
-CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-source/build/bin}
+CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-v31.1/bin}
 WT=${WT:-${TMPDIR:-/tmp}/bmc-wt-adoptgate}
 BMC_BIN=${BMC_BIN:-$WT/asm/daemon/bmcbitcoind}
 BUILDER=${BUILDER:-$WT/asm/daemon/bmc_build_block_filters}

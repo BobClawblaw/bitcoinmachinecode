@@ -41,7 +41,7 @@ Usage:
 """
 import sys, os, json, subprocess
 
-CLI = ("/storage/bitcoin-core-source/build/bin/bitcoin-cli"
+CLI = ("/storage/bitcoin-core-v31.1/bin/bitcoin-cli"
        " -conf=/storage/core-oracle/bitcoin.conf"
        " -datadir=/storage/core-oracle").split()
 

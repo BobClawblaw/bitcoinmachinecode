@@ -15,7 +15,7 @@
 #      is byte-identical to Bitcoin Core's for the same block.
 # (5) is the one that matters: 1-4 only prove it wrote something.
 set -u
-CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-source/build/bin}
+CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-v31.1/bin}
 BMC_BIN=${BMC_BIN:-/storage/bitcoinmachinecode/asm/daemon/bmcbitcoind}
 BUILDER=${BUILDER:-/storage/bitcoinmachinecode/asm/daemon/bmc_build_block_filters}
 WALLET_CLI=${WALLET_CLI:-/storage/bitcoinmachinecode/asm/daemon/bmc_wallet_cli}

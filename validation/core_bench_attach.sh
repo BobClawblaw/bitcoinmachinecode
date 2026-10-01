@@ -9,7 +9,7 @@ set -u
 DEST=/mnt/2tbssd/core-bench
 cd "$DEST" || exit 2
 PH=$DEST/phase.log; PROG=$DEST/progress.log
-ORACLE="/storage/bitcoin-core-source/build-zmq/bin/bitcoin-cli -conf=/storage/core-oracle/bitcoin.conf -datadir=/storage/core-oracle"
+ORACLE="/storage/bitcoin-core-v31.1/bin/bitcoin-cli -conf=/storage/core-oracle/bitcoin.conf -datadir=/storage/core-oracle"
 # rpcclienttimeout=0 means "wait forever". gettxoutsetinfo walks the whole UTXO
 # set and can far exceed the 900s default; run 23's capstone reported an EMPTY
 # hash and failed for exactly that class of reason. An empty answer must never

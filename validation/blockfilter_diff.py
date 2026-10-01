@@ -26,7 +26,7 @@ from diffguard import require_cases, require_sources
 
 CONF    = "/storage/core-oracle/bitcoin.conf"
 DATADIR = "/storage/core-oracle"
-CLI     = "/storage/bitcoin-core-source/build-zmq/bin/bitcoin-cli"
+CLI     = "/storage/bitcoin-core-v31.1/bin/bitcoin-cli"
 HERE    = os.path.dirname(os.path.abspath(__file__))
 SHIM    = os.path.join(HERE, "..", "asm", "tests", "bfilter_shim")
 

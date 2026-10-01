@@ -21,7 +21,7 @@
 #   5. abortprivatebroadcast removes a queued tx and reports it;
 #   6. with the option off, both RPCs refuse with Core's text.
 set -u
-CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-source/build-zmq/bin}
+CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-v31.1/bin}
 ROOT=${ROOT:-$(cd "$(dirname "$0")/.." && pwd)}
 BMC_BIN=${BMC_BIN:-$ROOT/asm/daemon/bmcbitcoind}
 WORK=${WORK:-${CLAUDE_JOB_DIR:-/tmp}/tmp/privbcast/e2e-$$}

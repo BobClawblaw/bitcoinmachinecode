@@ -13,7 +13,7 @@
 # Usage: validation/feeest_core_diff.sh [rounds=60]     (KEEP=1 keeps the work dir)
 set -u
 ROUNDS=${1:-60}
-CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-source/build-zmq/bin}
+CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-v31.1/bin}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BMC_BIN=${BMC_BIN:-$ROOT/asm/daemon/bmcbitcoind}
 WALLET_CLI=${WALLET_CLI:-$ROOT/asm/daemon/bmc_wallet_cli}

@@ -18,7 +18,7 @@
 # Until 2026-08-28 this node never offered sendaddrv2 in either role, and
 # its getaddr handler had never answered anyone (bound register clobbered).
 set -u
-CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-source/build/bin}
+CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-v31.1/bin}
 BMC_BIN=${BMC_BIN:-/storage/bitcoinmachinecode/asm/daemon/bmcbitcoind}
 WALLET_CLI=${WALLET_CLI:-/storage/bitcoinmachinecode/asm/daemon/bmc_wallet_cli}
 PROBE=${PROBE:-/storage/bitcoinmachinecode/validation/p2p_inbound_probe.py}
@@ -59,7 +59,7 @@ printf 'chain=regtest\nport=%s\nrpcport=%s\nrpcuser=e2e\nrpcpassword=e2epw\nlist
 ONION=pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion
 I2P=c4gfnttsuwqomiygupdqqqyy5y5emnk5c73hrfvatri67prd7vyq.b32.i2p
 CJDNS=fc00:1:2:3::4
-EXPECT_V2_LEN=$(cd /storage/bitcoin-core-source/test/functional && python3 - "$BMC_DIR/regtest/peers2.dat" "$ONION" "$I2P" "$CJDNS" <<'PYIN'
+EXPECT_V2_LEN=$(cd /mnt/nvme8tb/core-build/bitcoin-v31.1/test/functional && python3 - "$BMC_DIR/regtest/peers2.dat" "$ONION" "$I2P" "$CJDNS" <<'PYIN'
 import struct, sys, time, socket
 sys.path.insert(0, '.')
 from test_framework.messages import CAddress, msg_addrv2
