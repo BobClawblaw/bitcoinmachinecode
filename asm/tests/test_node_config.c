@@ -429,9 +429,22 @@ int main(void){
     if (g_cfg.rpcthreads==4 && g_cfg.rpcworkqueue==8 && g_cfg.rpcservertimeout==5 && g_cfg.n_rpcwhitelist==1 && g_cfg.rpcwhitelistdefault==0 && g_cfg.rpccookieperms==1)
         printf("PASS: rpc server options; a whitelist without ':' refused\n");
     else { printf("FAIL: rpc options (%d %d %d n=%d d=%d p=%d)\n", g_cfg.rpcthreads, g_cfg.rpcworkqueue, g_cfg.rpcservertimeout, g_cfg.n_rpcwhitelist, g_cfg.rpcwhitelistdefault, g_cfg.rpccookieperms); failures++; }
-    if (g_cfg.limitclustercount==30 && g_cfg.limitancestorcount==30 && g_cfg.limitdescendantcount==30 && g_cfg.limitclustersize_kvb==50 && g_cfg.limitancestorsize_kvb==50)
-        printf("PASS: limitclustercount/size map onto the ancestor and descendant limits\n");
-    else { printf("FAIL: cluster limits\n"); failures++; }
+    /* v31.1 (2026-10-01): the cluster limits are their own options; they used
+     * to be copied onto the ancestor/descendant limits, a different rule */
+    if (g_cfg.limitclustercount==30 && g_cfg.limitclustersize_kvb==50 && g_cfg.limitancestorcount==25 && g_cfg.limitdescendantcount==25)
+        printf("PASS: limitclustercount/size set the cluster limits and leave the deprecated ancestor/descendant counts alone\n");
+    else { printf("FAIL: cluster limits (cluster %ld/%ld anc %ld desc %ld)\n", (long)g_cfg.limitclustercount, (long)g_cfg.limitclustersize_kvb, (long)g_cfg.limitancestorcount, (long)g_cfg.limitdescendantcount); failures++; }
+    /* limitclustercount above Core's MAX_CLUSTER_COUNT_LIMIT (64) is refused */
+    node_config_load("/nonexistent/reset.conf");
+    wr("bmc_clu.conf", "limitclustercount=65\n");
+    node_config_load("bmc_clu.conf");
+    { int c65 = g_cfg.limitclustercount;
+      wr("bmc_clu.conf", "limitclustercount=64\n");
+      node_config_load("bmc_clu.conf");
+      if (c65 == 64 && g_cfg.limitclustercount == 64) printf("PASS: limitclustercount=65 refused (Core's maximum is 64); 64 applies\n");
+      else { printf("FAIL: limitclustercount bound (65 -> %d, 64 -> %d)\n", c65, g_cfg.limitclustercount); failures++; } }
+    unlink("bmc_clu.conf");
+    node_config_load("/nonexistent/reset.conf");
     /* includeconf: relative to the main file, once, not from an included file */
     wr("inc_main.conf", "maxconnections=77\nincludeconf=inc_a.conf\n");
     wr("inc_a.conf", "maxconnections=88\ndbcache=2048\nincludeconf=inc_b.conf\n");

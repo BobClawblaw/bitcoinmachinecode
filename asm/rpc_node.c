@@ -1088,12 +1088,12 @@ static unsigned long mpc_weight(unsigned long n, unsigned long i, const mp_ent* 
     return w;
 }
 
-/* -limitancestorcount / -limitancestorsize, injected by main.c from the
-   config; defaults are Core's pre-cluster values. See getmempoolinfo. */
-static long g_limit_anc_count = 25, g_limit_anc_size_kvb = 101;
-void rpc_node_set_ancestor_limits(long count, long size_kvb){
-    if (count > 0) g_limit_anc_count = count;
-    if (size_kvb > 0) g_limit_anc_size_kvb = size_kvb;
+/* -limitclustercount / -limitclustersize, injected by main.c from the
+   config; defaults are Core's (64, 101 kvB). See getmempoolinfo. */
+static long g_limit_cluster_count = 64, g_limit_cluster_size_kvb = 101;
+void rpc_node_set_cluster_limits(long count, long size_kvb){
+    if (count > 0) g_limit_cluster_count = count;
+    if (size_kvb > 0) g_limit_cluster_size_kvb = size_kvb;
 }
 static int cmd_getmempoolinfo(rj_val** res){
     long count = 0; unsigned long long bytes = 0, total_fee = 0, blob_used = 0;
@@ -1150,33 +1150,20 @@ static int cmd_getmempoolinfo(rj_val** res){
     /* fullrbf: v31.1 has it, master has dropped it. Core's -mempoolfullrbf
      * became unconditional in v28, so the field is true there and here. */
     rj_obj_set(o, "fullrbf", rj_bool(1));
-    /* THE CLUSTER FIELDS ARE A DOCUMENTED SEMANTIC DIVERGENCE, not a copy.
-     *
-     * Core v31.1 replaced the ancestor/descendant limits with CLUSTER limits:
-     * a cluster is a whole connected component of the mempool graph, and
-     * limitclustercount/limitclustersize bound it. This node still enforces
-     * Core's older -limitancestorcount / -limitancestorsize, which bound a
-     * transaction's ANCESTOR SET, not its component.
-     *
-     * The numbers below are therefore the limits this node actually enforces,
-     * reported under Core's field names because they are the binding
-     * constraint on how large a package here can get. They are NOT cluster
-     * limits, and a caller reasoning about connected components from them
-     * would be wrong. `optimal` is false for the same reason: it means "the
-     * mempool is fully linearised" under cluster mempool, and nothing here
-     * linearises anything, so claiming true would be a lie. Recorded in
-     * docs/CORE_DIVERGENCES.md. */
-    rj_obj_set(o, "limitclustercount", rj_numf("%ld", g_limit_anc_count));
-    rj_obj_set(o, "limitclustersize", rj_numf("%ld", g_limit_anc_size_kvb * 1000));
-    rj_obj_set(o, "optimal", rj_bool(0));
+    /* The cluster limits this node enforces at acceptance (2026-10-01): Core
+     * v31.1's limitclustercount / limitclustersize, the whole bound since the
+     * ancestor/descendant limits stopped refusing anything. Until then this
+     * reported -limitancestorcount/-size under these names. */
+    rj_obj_set(o, "limitclustercount", rj_numf("%ld", g_limit_cluster_count));
+    rj_obj_set(o, "limitclustersize", rj_numf("%ld", g_limit_cluster_size_kvb * 1000));
+    /* every cluster is linearized optimally when it is read (2026-10-01) */
+    rj_obj_set(o, "optimal", rj_bool(1));
     rj_obj_set(o, "incrementalrelayfee", rj_numf("%.8f", (double)g_incremental_satkvb / 1e8));
     rj_obj_set(o, "unbroadcastcount", rj_numf("%d", 0));
     /* the real policy value, not a literal: reporting a setting the
      * operator cannot change was the honesty gap the audit called out */
     rj_obj_set(o, "permitbaremultisig", rj_bool(g_status ? g_status->permit_bare_multisig : 1));  /* standard relay policy */
     rj_obj_set(o, "maxdatacarriersize", rj_numf("%d", 100000));
-    /* Master-only cluster-mempool fields (limitclustercount/size, optimal) are
-     * deliberately omitted -- bleeding-edge, no released Core has them. */
     *res = o;
     return 1;
 }
@@ -1907,15 +1894,12 @@ static int mpc_lookup_bulk(void* ctx, const unsigned char txid[32], mpc_entry* o
  * (sigops-adjusted WEIGHT, not vsize) and fees.chunk (the chunk's summed
  * MODIFIED fee). 1 with *fee and *weight set, 0 when there is no honest answer.
  *
- * Linearization: ancestor-score greedy, then Core's PostLinearize (see
- * mempool_cluster.h). Core v31.1 searches for the optimum with a
- * spanning-forest algorithm; the two agree wherever the greedy+post result is
- * optimal, which PostLinearize guarantees for chains and trees (at most one
- * parent, or at most one child, per member) and which covers the CPFP, chain
- * and diamond shapes pinned in the tests. A cluster where they differ is one
- * where Core found a strictly better chunking than greedy -- the number here
- * would then be a valid chunking, not Core's. Recorded in
- * docs/PARITY_RPC_FIELDS.md.
+ * Linearization: OPTIMAL (mpc_linearize_optimal, 2026-10-01), then Core's
+ * PostLinearize for connected chunks (see mempool_cluster.h). The optimal
+ * diagram is unique, so the chunk feerates here are Core's wherever Core's
+ * spanning-forest search reaches its optimum. Until 2026-10-01 this was
+ * ancestor-score greedy, and BlockYard's differential found it short of Core
+ * in 2 of 246 clusters (5.03 sat/vB where Core had 5.70; 6.01 against 6.20).
  *
  * Under the pool lock (the caller holds it). With the bulk chunk cache the
  * first member to ask pays for the cluster and every other member reads the
@@ -1937,7 +1921,7 @@ static int mpe_chunk_of(const unsigned char txid[32], unsigned long long* fee,
     int ok = mpc_build_cluster(0, (bulk && self_k >= 0) ? mpc_lookup_bulk : mpc_lookup_here,
                                txid, &cl) == 0
           && !cl.truncated && cl.n >= 1
-          && mpc_linearize_ancestor_score(&cl, lin) == 0
+          && mpc_linearize_optimal(&cl, lin) == 0        /* 2026-10-01: was ancestor-score greedy */
           && mpc_post_linearize(&cl, lin) == 0
           && mpc_chunk_linearization(&cl, lin, &ch) == 0;
     if (!ok){
@@ -3826,11 +3810,13 @@ static int cmd_getmempoolcluster(const rj_val* params, rj_val** res, long* ec, c
     }
 
     int lin[MPC_MAX_CLUSTER];
-    if (mpc_linearize_ancestor_score(&cl, lin) != 0){
+    if (mpc_linearize_optimal(&cl, lin) != 0){
         *ec = -1; *em = "the cluster could not be linearized (not a DAG?)"; return 0; }
     /* Post-linearization is equal-or-better by construction and makes the chunks
-     * CONNECTED, which the greedy alone does not guarantee. A disconnected chunk
-     * is not wrong arithmetic, but it is not a chunk Core would report. */
+     * CONNECTED, which the optimal search alone does not guarantee (two
+     * independent parts of equal feerate can be emitted together). A
+     * disconnected chunk is not wrong arithmetic, but it is not a chunk Core
+     * would report. 2026-10-01: the search is optimal; it was greedy. */
     mpc_post_linearize(&cl, lin);
     mpc_chunking ch;
     if (mpc_chunk_linearization(&cl, lin, &ch) != 0){

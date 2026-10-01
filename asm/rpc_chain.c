@@ -1506,7 +1506,8 @@ static int cmd_getblocktemplate(const rj_val* params, rj_val** res, long* ec, co
                         if (cl.m[q].ancestors & ((uint64_t)1 << m)) cl.m[m].descendants |= (uint64_t)1 << q;
 
                 int lin[MPC_MAX_CLUSTER]; mpc_chunking mch;
-                if (mpc_linearize_ancestor_score(&cl, lin) == 0 &&
+                /* optimal, then PostLinearize for connected chunks (2026-10-01) */
+                if (mpc_linearize_optimal(&cl, lin) == 0 &&
                     (mpc_post_linearize(&cl, lin), 1) &&
                     mpc_chunk_linearization(&cl, lin, &mch) == 0){
                     for (int ci2 = 0; ci2 < mch.n; ci2++){

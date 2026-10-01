@@ -125,10 +125,11 @@ class RefPolicy:
         for p in parents: anc|=self.ancestors_of(p); anc.add(p)
         anc_cnt=1+len(anc)
         anc_bytes=len(tx)+sum(self.nodes[a]['size'] for a in anc)
-        if anc_cnt>self.max_anc or anc_bytes>self.max_anc_bytes: return 0,"anc"
-        for a in anc:
-            if self.nodes[a]['des']+1>self.max_desc: return 0,"desc"
-            if self.nodes[a]['des_bytes']+len(tx)>self.max_desc_bytes: return 0,"desc"
+        # Core v31.1 accepts by CLUSTER only (2026-10-01): -limitancestorcount
+        # and -limitdescendantcount are deprecated (wallet coin selection only)
+        # and refuse nothing; the size limits are gone. max_anc/max_desc are
+        # kept as configuration the scenarios pass through, not as rules.
+        # These fixtures are far below the 64-transaction cluster limit.
         # commit
         for c in conf:
             del self.nodes[c]
@@ -249,7 +250,7 @@ s["steps"].append(("add",t.hex(),sha256d(t).hex(),0))
 s["steps"].append(("present",tidE2.hex(),1))
 scenarios.append(s)
 
-# ---- S2: ancestor limit (max_anc=3) -----------------------------------------
+# ---- S2: a chain past -limitancestorcount=3 is ACCEPTED (v31.1: deprecated) --
 s=dict(name="ancestor", relay=1, max_anc=3, max_anc_bytes=1<<30,
        max_desc=1000, max_desc_bytes=1<<30, rbf=1, utxo=[(COIN_A.hex(),0,100000)], steps=[])
 mp=RefPolicy(relay=1,max_anc=3)
@@ -261,11 +262,11 @@ s["steps"].append(("add",t.hex(),idC1.hex(),1))
 t=mk_tx([(idC1,0)],[(70000,b'\x51')]); idC2=sha256d(t); r,_=mp.add(t,idC2,"x"); assert r==1
 s["steps"].append(("add",t.hex(),idC2.hex(),1))   # depth 3 == max_anc -> ok
 t=mk_tx([(idC2,0)],[(60000,b'\x51')]); idC3=sha256d(t)
-r,_=mp.add(t,idC3,"x"); assert r==0 and _=="anc",(r,_)
-s["steps"].append(("add",t.hex(),idC3.hex(),0))   # depth 4 > 3 -> reject
+r,_=mp.add(t,idC3,"x"); assert r==1,(r,_)
+s["steps"].append(("add",t.hex(),idC3.hex(),1))   # depth 4 > 3 -> still accepted (was refused before 2026-10-01)
 scenarios.append(s)
 
-# ---- S3: descendant limit (max_desc=2) ---------------------------------------
+# ---- S3: a third descendant past -limitdescendantcount=2 is ACCEPTED (v31.1) --
 s=dict(name="descendant", relay=1, max_anc=1000, max_anc_bytes=1<<30,
        max_desc=2, max_desc_bytes=1<<30, rbf=1, utxo=[(COIN_C.hex(),0,100000)], steps=[])
 mp=RefPolicy(relay=1,max_desc=2)
@@ -275,8 +276,8 @@ r,_=mp.add(t,idR,"x"); assert r==1; s["steps"].append(("add",t.hex(),idR.hex(),1
 t=mk_tx([(idR,0)],[(30000,b'\x51')]); idDa=sha256d(t)
 r,_=mp.add(t,idDa,"x"); assert r==1; s["steps"].append(("add",t.hex(),idDa.hex(),1))  # R desc=2
 t=mk_tx([(idR,1)],[(30000,b'\x51')])
-r,_=mp.add(t,sha256d(t),"x"); assert r==0 and _=="desc",(r,_)
-s["steps"].append(("add",t.hex(),sha256d(t).hex(),0))   # R desc would be 3
+r,_=mp.add(t,sha256d(t),"x"); assert r==1,(r,_)
+s["steps"].append(("add",t.hex(),sha256d(t).hex(),1))   # R desc 3 > 2 -> still accepted (was refused before 2026-10-01)
 scenarios.append(s)
 
 # ---- S4: fee estimator ------------------------------------------------------
