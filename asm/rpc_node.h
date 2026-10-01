@@ -629,6 +629,9 @@ int rpc_node_dispatch(const char* method, const rj_val* params,
 /* bumpfee (rpc_wallet_ops.c): raw bytes of one mempool tx, copied out under
  * the pool lock. Returns length or -1 (absent, or no pool in this process). */
 long rpc_node_mempool_rawtx(const unsigned char txid_wire[32], unsigned char* out, unsigned long cap);
+/* many at once, one pool-lock hold per slice (2026-10-01); see rpc_node.c */
+typedef struct { int present; long long fee; unsigned char* raw; unsigned long len; } rpc_mp_item;
+long rpc_node_mempool_many(const unsigned char (*txid_wire)[32], long n, rpc_mp_item* out);
 
 /* -persistmempool: the daemon's boot and shutdown hooks. Same code the
  * savemempool/importmempool RPCs use, so the two cannot drift. */
