@@ -113,16 +113,29 @@ def main():
         if rb[0] * rc[1] != rc[0] * rb[1]: disagree.append((t, rb, rc))
     print(f"\n2. shared transactions with chunk feerates on both: {compared}; disagreeing: {len(disagree)}")
 
-    # 3. same cluster members or not
-    seen, same, diff = set(), [], []
+    # 3. same cluster members or not. Each disagreement is re-read from both
+    # nodes back to back first: the step-2 reads are seconds apart (all of
+    # bmc's entries, then all of Core's), and a cluster being fee-bumped by
+    # same-size replacements meanwhile shows up as "same members, different
+    # chunk" with bmc always lower (2026-10-01: six members of one cluster read
+    # 544, then 2028, then 2245 sat over ~6,690 weight within minutes).
+    seen, same, diff, churn = set(), [], [], 0
     for t, rb, rc in disagree:
         if t in seen: continue
+        try:
+            rb2, rc2 = chunk_rate(bmc.call("getmempoolentry", t)), chunk_rate(core.call("getmempoolentry", t))
+        except Exception:
+            churn += 1; seen.add(t); continue                  # left a pool in between
+        if rb2 and rc2 and rb2[0] * rc2[1] == rc2[0] * rb2[1]:
+            churn += 1; seen.add(t); continue
+        if rb2 and rc2: rb, rc = rb2, rc2
         cb, cc = bmc.call("getmempoolcluster", t), core.call("getmempoolcluster", t)
         mb = {x for ch in cb.get("chunks", []) for x in ch.get("txs", [])}
         mc = {x for ch in cc.get("chunks", []) for x in ch.get("txs", [])}
         seen |= mb | mc
         (same if mb == mc else diff).append((t, rb, rc, len(mb), len(mc)))
-    print(f"3. disagreeing clusters: {len(same) + len(diff)} -- same members (chunked differently): {len(same)}, different members: {len(diff)}")
+    print(f"3. disagreements that agree when re-read back to back (the pools changed between reads): {churn}")
+    print(f"   still disagreeing, by cluster: {len(same) + len(diff)} -- same members (chunked differently): {len(same)}, different members: {len(diff)}")
     for label, rows in (("same members", same), ("different members", diff)):
         for t, rb, rc, nb, nc in rows[:a.examples]:
             print(f"   {label}: {t}  bmc {rb[0]*4/rb[1]:.2f} sat/vB ({nb} tx)  Core {rc[0]*4/rc[1]:.2f} sat/vB ({nc} tx)")
