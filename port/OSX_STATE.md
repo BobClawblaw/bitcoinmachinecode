@@ -4,6 +4,13 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-10-01 (17:00Z) — main #361 merged (`246d3202`): the download chunk is a setting, default 16; cursor help fires again
+
+Shared C only (`dlc_rules.h`, `main.c`, `node_config.*`, four tests, `validation/ab_dlcchunk.sh`), a clean merge, no port step. `bmc.dlcchunk` (4..64) defaults to 16 after two A/Bs to 300,000 in both orders (19.5% and 14.1% faster than 40); the committer's cursor help had been dead since the window became Core's 1,024 on 09-29 (its bar of 32 staged chunks could not be reached at 25 per window) and is a third of the window's chunks now. Tests run here: `test_dlc_rules`, `test_node_config`, `test_dialhelper`, `test_mempool_lock_log`, `test_rpc_responsive` PASS; `test_dlc_interleave` SKIP (Linux-only, as always). Nothing in the batch the Mac had not already gated apart from main's own gated code.
+- **Deploy:** `246d3202` on both nodes (snapshots `bmcbitcoind.pre-246d3202`); signet 17:12Z, tip 324,523; mainnet 17:12Z, tip 969,467 = mempool.space's hash. At the tip the chunk size changes nothing until the next restart with a gap.
+- **A deploy mistake, corrected:** the signet node was started from a shell command that the session later stopped, and the stop's signal took the node's process group with it — a clean shutdown at 17:00:23Z (`signal 15`, mempool saved), restarted at 17:12Z, 12 minutes off. Start a node from its own short command, never from one that waits on anything afterwards.
+- Still no `[mempool] pool lock:` line on the Mac (≈100 blocks on the convoy-aware line).
+
 ## 2026-10-01 (00:00Z) — the pool-lock wait line tells a convoy from a holder (shared C, `530e6826`)
 
 x86's resume asked for it: their first lines were waits of ~1.2 s let in by releases that had held 0–3 ms — a convoy of short holds the last-releaser line could not name. The lock's page now counts every take, each release made while anyone waits keeps the convoy's longest hold and its site (reset by the last waiter out), and the wait line adds `N other take(s) went by during the wait, the longest of them held M ms (site)`. `test_mempool_lock_log` case E (36 checks): three threads taking 3 ms holds back to back — `waited 374 ms; the holder was convoy_site (held 3 ms); 101 other take(s) went by during the wait, the longest of them held 3 ms`, no hold line from anyone. Note item 23 for the x86 side; OPERATIONS.md and FEATURE_GAPS.md RPC-12 updated.
