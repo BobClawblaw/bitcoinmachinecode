@@ -53,7 +53,7 @@ from diffguard import require_sources   # a phase that compared no events must n
 COMPARED = {}                            # phase -> events compared (core side)
 import zmq
 
-CORE_BIN = os.environ.get('CORE_BIN', '/mnt/nvme8tb/core-build/bitcoin-v31.1/build/bin')
+CORE_BIN = os.environ.get('CORE_BIN', '/storage/bitcoin-core-v31.1/bin')
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 BMC_BIN = os.environ.get('BMC_BIN', os.path.join(ROOT, 'asm/daemon/bmcbitcoind'))
 WORK = os.environ.get('WORK', os.path.join(os.environ.get('TMPDIR', '/tmp'), 'bmc-zseq-%d' % os.getpid()))

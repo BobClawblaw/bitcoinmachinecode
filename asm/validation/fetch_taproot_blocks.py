@@ -43,9 +43,9 @@ import sys, os, json, subprocess
 
 # CORE_CLI overrides the oracle command (2026-09-27): any bitcoin-cli-compatible
 # command line, e.g. a stand-in that speaks JSON-RPC to a local Core with
-# txindex. Unset, the scratch oracle on the x86 box.
+# txindex. Unset, the v31.1 oracle on the x86 box.
 CLI = (os.environ.get("CORE_CLI") or
-       "/storage/bitcoin-core-source/build/bin/bitcoin-cli"
+       "/storage/bitcoin-core-v31.1/bin/bitcoin-cli"
        " -conf=/storage/core-oracle/bitcoin.conf"
        " -datadir=/storage/core-oracle").split()
 

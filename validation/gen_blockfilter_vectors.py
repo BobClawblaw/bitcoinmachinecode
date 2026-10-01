@@ -22,7 +22,7 @@ import json, subprocess, sys, os
 
 CONF = "/storage/core-oracle/bitcoin.conf"
 DATADIR = "/storage/core-oracle"
-CLI = "/storage/bitcoin-core-source/build-zmq/bin/bitcoin-cli"
+CLI = "/storage/bitcoin-core-v31.1/bin/bitcoin-cli"
 
 HEIGHTS = [
     1,          # the very first spendable coinbase

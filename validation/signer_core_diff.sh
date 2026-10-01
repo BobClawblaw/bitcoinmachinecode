@@ -11,7 +11,7 @@
 # Needs the scratch Core build (never the production install).
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-B=${CORE_BIN:-/storage/bitcoin-core-source/build/bin}
+B=${CORE_BIN:-/storage/bitcoin-core-v31.1/bin}
 TMP=$(mktemp -d /tmp/signer_core_diff.XXXX)
 cd "$ROOT/asm" || exit 1
 CMD=$(make -n -B tests/test_rpc_signraw 2>/dev/null | grep -E "^(cc|gcc).*-o tests/test_rpc_signraw " | tail -1)

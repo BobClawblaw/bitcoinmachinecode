@@ -955,6 +955,14 @@ plus straightforward methods on top of it.
   (`minrelaytxfee`/`incrementalrelayfee`/`limitancestor{count,size}`/
   `limitdescendant{count,size}`/`mempoolfullrbf`). Divergence from Core:
   individual-leaf eviction, not descendant-package eviction.
+  **2026-10-01, Core v31.1 policy:** acceptance is bounded by the cluster
+  limits alone (`limitclustercount`/`limitclustersize`); the ancestor and
+  descendant counts are deprecated and refuse nothing, their size options
+  have no effect, `mempoolfullrbf` is an unknown value. Replacements follow
+  v31.1 (no per-conflict, no-new-unconfirmed or signaling rule; the
+  feerate-diagram check), and clusters are linearized optimally. Found by
+  BlockYard's differential: 15 of 35 missing children refused by the chain
+  limit, 14 by the per-conflict rule, 2 of 246 clusters chunked below Core.
 
 ## Indexing
 

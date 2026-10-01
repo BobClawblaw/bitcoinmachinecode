@@ -834,14 +834,18 @@ long node_config_load(const char* path){
             applied++; }
         else if(!strcmp(key,"limitancestorcount")){
             t=clamp_int(IV,1,10000,key,&bad); if(t>=0){ g_cfg.limitancestorcount=t; applied++; } }
-        else if(!strcmp(key,"limitancestorsize")){   /* Core: kvB */
-            t=clamp_int(IV,1,100000,key,&bad); if(t>=0){ g_cfg.limitancestorsize_kvb=t; applied++; } }
+        else if(!strcmp(key,"limitancestorsize")){   /* Core v31.1: no effect, warned */
+            fprintf(stderr,"[config] Option 'limitancestorsize' is given but ancestor size limits have been replaced with cluster size limits (see limitclustersize). This option has no effect.\n");
+            applied++; }
         else if(!strcmp(key,"limitdescendantcount")){
             t=clamp_int(IV,1,10000,key,&bad); if(t>=0){ g_cfg.limitdescendantcount=t; applied++; } }
-        else if(!strcmp(key,"limitdescendantsize")){ /* Core: kvB */
-            t=clamp_int(IV,1,100000,key,&bad); if(t>=0){ g_cfg.limitdescendantsize_kvb=t; applied++; } }
+        else if(!strcmp(key,"limitdescendantsize")){ /* Core v31.1: no effect, warned */
+            fprintf(stderr,"[config] Option 'limitdescendantsize' is given but descendant size limits have been replaced with cluster size limits (see limitclustersize). This option has no effect.\n");
+            applied++; }
         else if(!strcmp(key,"mempoolfullrbf")){
-            g_cfg.mempoolfullrbf = (IV != 0); applied++; }
+            /* Core v31.1 does not know the option (full RBF is unconditional)
+             * and logs exactly this; the value is not applied. 2026-10-01. */
+            fprintf(stderr,"[config] Ignoring unknown configuration value mempoolfullrbf\n"); }
         else if(!strcmp(key,"dustrelayfee")){  /* Core: BTC/kvB -> sat/kvB */
             double b = atof(val);
             if(b >= 0 && b < 1.0){ g_cfg.dustrelayfee_satkvb = (long)(b*1e8 + 0.5); applied++; }
@@ -1215,11 +1219,12 @@ long node_config_load(const char* path){
             else { fprintf(stderr,"[config] rpccookieperms=%s: expected owner, group or all -- ignoring\n", val); bad++; continue; }
             applied++; }
         else if(!strcmp(key,"limitclustercount")){
-            /* Core v31 bounds a mempool cluster; this mempool's ancestor/descendant
-             * limits are the same bound seen from either end of a chain */
-            t=clamp_int(IV,1,10000,key,&bad); if(t>=0){ g_cfg.limitclustercount=t; g_cfg.limitancestorcount=t; g_cfg.limitdescendantcount=t; applied++; } }
+            /* Core v31.1: the binding acceptance limit, at most
+             * MAX_CLUSTER_COUNT_LIMIT (64). It used to set the ancestor and
+             * descendant limits here, which was a different rule. 2026-10-01. */
+            t=clamp_int(IV,1,64,key,&bad); if(t>=0){ g_cfg.limitclustercount=t; applied++; } }
         else if(!strcmp(key,"limitclustersize")){    /* Core: kvB */
-            t=clamp_int(IV,1,100000,key,&bad); if(t>=0){ g_cfg.limitclustersize_kvb=t; g_cfg.limitancestorsize_kvb=t; g_cfg.limitdescendantsize_kvb=t; applied++; } }
+            t=clamp_int(IV,1,100000,key,&bad); if(t>=0){ g_cfg.limitclustersize_kvb=t; applied++; } }
         else if(!strcmp(key,"checkblockindex")){ g_cfg.checkblockindex = IV?1:0; applied++; }
         else if(!strcmp(key,"checkmempool")){ g_cfg.checkmempool = IV?1:0; applied++; }
         else if(!strcmp(key,"checkaddrman")){ g_cfg.checkaddrman = IV?1:0; applied++; }

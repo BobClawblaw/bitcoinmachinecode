@@ -11,7 +11,7 @@
 #                                      `mempool` message answered with an inv; no feefilter sent to a forcerelay peer
 #   run D: inboundrelaypercent=0     -> Core's connection to us: relaytxes false; ours shows the same
 set -u
-CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-source/build-zmq/bin}
+CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-v31.1/bin}
 ROOT=${ROOT:-$(cd "$(dirname "$0")/.." && pwd)}
 BMC_BIN=${BMC_BIN:-$ROOT/asm/daemon/bmcbitcoind}
 WALLET_CLI=${WALLET_CLI:-$ROOT/asm/daemon/bmc_wallet_cli}

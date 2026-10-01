@@ -125,6 +125,15 @@ int mpc_build_cluster(void* ctx, mpc_lookup_fn look,
  * Writes cl->n indices into lin[]. Returns 0, or -1 on a malformed cluster.  */
 int mpc_linearize_ancestor_score(const mpc_cluster* cl, int* lin);
 
+/* An OPTIMAL linearization (2026-10-01): repeatedly emit the remaining
+ * ancestor-closed subset of highest feerate, found exactly by Dinkelbach's
+ * iteration over minimum cuts. Its chunk diagram is the optimum, which is
+ * unique, so its chunk feerates are Core's wherever Core reaches its optimum.
+ * Supersedes mpc_linearize_ancestor_score + mpc_post_linearize in every
+ * caller; those stay for the tests that compare against them.
+ * Writes cl->n indices into lin[]. Returns 0, or -1 on a malformed cluster. */
+int mpc_linearize_optimal(const mpc_cluster* cl, int* lin);
+
 /* Improve a linearization in place, as Core's PostLinearize does.
  *
  * Two passes, backward then forward. Core's own statement of the guarantees:

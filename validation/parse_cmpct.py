@@ -10,7 +10,7 @@ import struct, sys, hashlib, subprocess, json
 sys.path.insert(0, '/storage/bitcoinmachinecode/validation')
 from bip152_ref import shortid_for
 
-RPC = ['/storage/bitcoin-core-source/build/bin/bitcoin-cli',
+RPC = ['/storage/bitcoin-core-v31.1/bin/bitcoin-cli',
        '-datadir=/tmp/corecmpt','-rpcuser=u','-rpcpassword=p']
 
 def cli(*args):

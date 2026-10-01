@@ -7,7 +7,7 @@ some other valid encoding is not good enough: the branch order and the signs
 have to match libsecp256k1 exactly, or a peer decodes a different key.
 """
 import csv, os, sys
-SRC = "/storage/bitcoin-core-source/test/functional/test_framework/crypto/xswiftec_inv_test_vectors.csv"
+SRC = "/storage/bitcoin-core-v31.1/source/test/functional/test_framework/crypto/xswiftec_inv_test_vectors.csv"
 here = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 src = sys.argv[1] if len(sys.argv) > 1 else (SRC if os.path.exists(SRC) else os.path.join(here, "asm/tests/data_xswiftec_inv.csv"))
 rows = list(csv.DictReader(open(src, newline="")))

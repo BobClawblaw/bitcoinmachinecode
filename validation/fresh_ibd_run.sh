@@ -50,7 +50,7 @@ ZMQPORT=${ZMQPORT:-28484}
 # without editing this file.
 EXTRA_CONF=${EXTRA_CONF:-}
 . "$(dirname "$0")/lib/ibd_harness_lib.sh"
-ORACLE=${ORACLE:-"/storage/bitcoin-core-source/build-zmq/bin/bitcoin-cli -conf=/storage/core-oracle/bitcoin.conf -datadir=/storage/core-oracle"}
+ORACLE=${ORACLE:-"/storage/bitcoin-core-v31.1/bin/bitcoin-cli -conf=/storage/core-oracle/bitcoin.conf -datadir=/storage/core-oracle"}
 PH="$DEST/phase.log"; PROG="$DEST/progress.log"
 ts(){ date -u +%Y-%m-%dT%H:%M:%SZ; }
 ph(){ echo "$(ts) $*" | tee -a "$PH"; }

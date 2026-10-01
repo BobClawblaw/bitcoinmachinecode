@@ -15,7 +15,7 @@
 #
 # Usage: scripts/live_v2_core_check.sh [path-to-bitcoind]
 set -u
-CORE=${1:-/storage/bitcoin-core-source/build/bin/bitcoind}
+CORE=${1:-/storage/bitcoin-core-v31.1/bin/bitcoind}
 CLI=$(dirname "$CORE")/bitcoin-cli
 ASM=$(cd "$(dirname "$0")/../asm" && pwd)
 D=$(mktemp -d)

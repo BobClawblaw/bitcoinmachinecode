@@ -10,7 +10,7 @@
 # walk inside the worker loop. The whole test suite passed: nothing covered
 # the book -> pool -> dial path (2026-08-28 pre-deploy review).
 set -u
-CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-source/build/bin}
+CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-v31.1/bin}
 BMC_BIN=${BMC_BIN:-/storage/bitcoinmachinecode/asm/daemon/bmcbitcoind}
 WALLET_CLI=${WALLET_CLI:-/storage/bitcoinmachinecode/asm/daemon/bmc_wallet_cli}
 WORK=${WORK:-/tmp/bookdial-e2e-$$}

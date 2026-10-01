@@ -11,7 +11,7 @@
 # (a line every 10 min while syncing), <dest>/RESULT at the end.
 set -u
 . "$(dirname "$0")/lib/ibd_harness_lib.sh"
-DEST=${1:?dest dir}; ORACLE=${2:-"/storage/bitcoin-core-source/build-zmq/bin/bitcoin-cli -conf=/storage/core-oracle/bitcoin.conf -datadir=/storage/core-oracle"}
+DEST=${1:?dest dir}; ORACLE=${2:-"/storage/bitcoin-core-v31.1/bin/bitcoin-cli -conf=/storage/core-oracle/bitcoin.conf -datadir=/storage/core-oracle"}
 # RESUME=1 restarts an interrupted run on the datadir it already built: the
 # clone, the build and the configuration are left exactly as they were, the
 # daemon is started again and the same watch resumes. Use it when something

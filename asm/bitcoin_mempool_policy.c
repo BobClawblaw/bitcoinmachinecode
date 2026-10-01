@@ -28,7 +28,9 @@
  *      <=100 evicted ("too many potential replacements"); fees >= replaced
  *      total AND the increment pays for the replacement's own vsize at
  *      incrementalrelayfee ("insufficient fee").
- *   4. ancestor / descendant count+vsize limits ("too-long-mempool-chain").
+ *   4. cluster count+vsize limits ("too-large-cluster"). Core v31.1 accepts
+ *      by cluster only; its ancestor/descendant limits are deprecated (wallet
+ *      coin selection only) and no longer refuse anything (2026-10-01).
  *   5. TrimToSize eviction by descendant PACKAGE: evict argmin of
  *      max(own feerate, with-descendants feerate) together with its whole
  *      descendant set; the removed package feerate + incrementalrelayfee
@@ -136,9 +138,9 @@ extern const unsigned char* mpool_get(void* mp, const unsigned char txid[32],
 #define TRUC_CHILD_MAX_VSIZE   1000
 #define TRUC_ANCESTOR_LIMIT    2
 #define TRUC_DESCENDANT_LIMIT  2
-#define MPOL_PKG_MAX     128      /* descendant-set walk bound: desc_cnt is
-                                   * capped at max_desc (64 by default) by admission,
-                                   * so 128 is comfortable headroom */
+#define MPOL_PKG_MAX     128      /* descendant-set walk bound: a descendant set
+                                   * lies inside its cluster, which admission caps
+                                   * at 64 (MPC_MAX_CLUSTER), so 128 is headroom */
 
 /* ---- package effective-feerate context ----------------------------------
  * Set for the duration of ONE package submission, by the worker, which is
@@ -197,9 +199,10 @@ typedef struct {
     uint64_t relay_fee_rate;   /* min relay feerate, sat per kvB (Core v30 default 100 = 0.1 sat/vB) */
     uint32_t max_anc, max_anc_bytes;    /* counts; vsize budgets */
     uint32_t max_desc, max_desc_bytes;
-    uint32_t rbf_enabled;      /* == Core mempoolfullrbf: replacement allowed
-                                  without the replaced tx signaling BIP125.
-                                  0 => replaced tx must signal (classic). */
+    uint32_t rbf_enabled;      /* was Core -mempoolfullrbf. Unused since
+                                  2026-10-01: v31.1 has no such option and full
+                                  RBF is unconditional. Kept for the callers'
+                                  mpool_policy_init signature. */
     uint32_t accept_nonstd;    /* Core -acceptnonstdtxn: skip standardness */
     uint32_t no_min_size;      /* MEM-23: TEST-ONLY, see mpol_policy_set_min_size */
     uint64_t incremental_fee;  /* incrementalrelayfee, sat/kvB */
@@ -209,7 +212,12 @@ typedef struct {
                                   * getmempoolinfo REPORTED this as always-1
                                   * while nothing could set it -- advertising
                                   * a policy the operator cannot change. */
+    uint32_t cluster_count;    /* -limitclustercount (Core DEFAULT_CLUSTER_LIMIT 64,
+                                  maximum MAX_CLUSTER_COUNT_LIMIT 64) */
+    uint32_t cluster_vbytes;   /* -limitclustersize in vbytes (Core 101 kvB) */
 } mpol_cfg;
+/* callers hand mpool_policy_init a 128-byte buffer (tx_accept.c g_pol, the tests) */
+_Static_assert(sizeof(mpol_cfg) <= 128, "mpol_cfg must fit the callers' 128-byte buffers");
 
 /* ---------------- policy state layout (flat buffer, zero-init) ------------ */
 /* header (MPOL_HDR bytes):
@@ -585,6 +593,20 @@ void mpool_policy_init(mpol_cfg* pol, uint64_t relay_fee_rate,
     pol->dust_relay_kvb  = 3000;                    /* Core DUST_RELAY_TX_FEE */
     pol->datacarrier_bytes = 100000;                /* Core v31 default */
     pol->permit_bare_multisig = 1;                  /* Core DEFAULT_PERMIT_BAREMULTISIG */
+    pol->cluster_count   = 64;                      /* Core DEFAULT_CLUSTER_LIMIT */
+    pol->cluster_vbytes  = 101000;                  /* Core DEFAULT_CLUSTER_SIZE_LIMIT_KVB */
+}
+/* -limitclustercount / -limitclustersize. The count is capped at 64: Core's
+ * MAX_CLUSTER_COUNT_LIMIT, and the width of this node's cluster bitsets
+ * (MPC_MAX_CLUSTER). max_anc/max_desc and their byte budgets, set by
+ * mpool_policy_init from -limitancestorcount & co, are kept but refuse
+ * nothing: v31.1 deprecated them in favour of these limits. */
+void mpool_policy_set_cluster_limits(void* polv, unsigned count, unsigned vbytes){
+    mpol_cfg* pol = (mpol_cfg*)polv;
+    if (count < 1) count = 1;
+    if (count > 64) count = 64;
+    pol->cluster_count = count;
+    if (vbytes > 0) pol->cluster_vbytes = vbytes;
 }
 
 void mpool_policy_set_incremental(void* polv, unsigned long long satkvb){
@@ -1775,7 +1797,7 @@ static int cluster_last_chunk(void* st, const uint32_t* mem, int n, mpol_chunk* 
             if (cl.m[q].ancestors & ((uint64_t)1 << m)) cl.m[m].descendants |= (uint64_t)1 << q;
 
     int lin[MPC_MAX_CLUSTER]; mpc_chunking ch;
-    if (mpc_linearize_ancestor_score(&cl, lin) != 0) return 0;
+    if (mpc_linearize_optimal(&cl, lin) != 0) return 0;   /* 2026-10-01: was ancestor-score greedy */
     mpc_post_linearize(&cl, lin);
     if (mpc_chunk_linearization(&cl, lin, &ch) != 0 || ch.n == 0) return 0;
 
@@ -1786,6 +1808,237 @@ static int cluster_last_chunk(void* st, const uint32_t* mem, int n, mpol_chunk* 
         if (last->members & ((uint64_t)1 << idx)) out->idx[out->n++] = mem[idx];
     }
     return out->n ? 1 : 0;
+}
+
+/* ---- the feerate-diagram check (Core v31.1 ImprovesFeerateDiagram) -------
+ * 2026-10-01. A replacement must strictly improve the mempool's feerate
+ * diagram over the clusters it touches: Core takes every main cluster that
+ * conflicts with staging (those holding an evicted transaction, and those the
+ * new transaction joins through its parents), chunks them, and compares that
+ * diagram against the chunks of the same members after the evictions and the
+ * addition. Sizes here are this node's sigop-adjusted VSIZE where Core uses
+ * sigop-adjusted weight (mempool_cluster.h, docs/CORE_DIVERGENCES.md). */
+typedef struct { uint64_t fee, size; } mpol_ff;
+
+/* one member's position in a member list, by node index: open addressing */
+static int mpol_pos_find(const uint32_t* key, const int* val, uint32_t mask, uint32_t node){
+    for (uint32_t h = (node * 2654435761u) & mask; ; h = (h + 1) & mask){
+        if (key[h] == 0xFFFFFFFFu) return -1;
+        if (key[h] == node) return val[h];
+    }
+}
+
+/* Chunk feerates of the components formed by `mem` (pool node indices) plus,
+ * when with_new, one new transaction whose in-pool parents are new_par.
+ * Appends (fee, size) per chunk to out. Returns the count, or -1 when a
+ * component exceeds MPC_MAX_CLUSTER or memory runs out (uncalculable). */
+static int mpol_chunks_of(void* st, const uint32_t* mem, int n, int with_new,
+                          uint64_t new_fee, uint64_t new_size, const uint32_t* new_par, int n_new_par,
+                          mpol_ff* out, int cap){
+    mpol_node* t = mpol_nodes_base(st);
+    int total = n + (with_new ? 1 : 0);
+    if (total <= 0) return 0;
+    uint32_t hsz = 16; while (hsz < (uint32_t)total * 2) hsz <<= 1;
+    uint32_t* key = (uint32_t*)malloc(hsz * sizeof *key);
+    int* val = (int*)malloc(hsz * sizeof *val);
+    int* uf = (int*)malloc((size_t)total * sizeof *uf);
+    int* comp = (int*)malloc((size_t)total * sizeof *comp);
+    int rc = -1;
+    if (!key || !val || !uf || !comp) goto done;
+    for (uint32_t h = 0; h < hsz; h++) key[h] = 0xFFFFFFFFu;
+    for (int i = 0; i < n; i++){
+        uint32_t h = (mem[i] * 2654435761u) & (hsz - 1);
+        while (key[h] != 0xFFFFFFFFu) h = (h + 1) & (hsz - 1);
+        key[h] = mem[i]; val[h] = i;
+    }
+    /* components: union-find over parent edges inside the member set */
+    for (int i = 0; i < total; i++) uf[i] = i;
+    #define UF_FIND(x) ({ int _x = (x); while (uf[_x] != _x){ uf[_x] = uf[uf[_x]]; _x = uf[_x]; } _x; })
+    for (int i = 0; i < n; i++)
+        for (uint32_t k = 0; k < t[mem[i]].n_parents; k++){
+            uint32_t pp = mpol_par_at(st, &t[mem[i]], k);
+            int j = pp == 0xFFFFFFFFu ? -1 : mpol_pos_find(key, val, hsz - 1, pp);
+            if (j >= 0){ int a = UF_FIND(i), b = UF_FIND(j); if (a != b) uf[a] = b; }
+        }
+    if (with_new)
+        for (int k = 0; k < n_new_par; k++){
+            int j = mpol_pos_find(key, val, hsz - 1, new_par[k]);
+            if (j >= 0){ int a = UF_FIND(n), b = UF_FIND(j); if (a != b) uf[a] = b; }
+        }
+    for (int i = 0; i < total; i++) comp[i] = UF_FIND(i);
+    #undef UF_FIND
+    int nout = 0;
+    for (int root = 0; root < total; root++){
+        if (comp[root] != root) continue;
+        int pos[MPC_MAX_CLUSTER]; int m = 0;
+        mpc_cluster cl; memset(&cl, 0, sizeof cl);
+        for (int i = 0; i < total; i++){
+            if (comp[i] != root) continue;
+            if (m >= MPC_MAX_CLUSTER) goto done;          /* uncalculable: over the bound */
+            pos[m] = i;
+            cl.m[m].fee    = i < n ? t[mem[i]].fee  : new_fee;
+            cl.m[m].weight = i < n ? t[mem[i]].size : new_size;
+            cl.m[m].ancestors = (uint64_t)1 << m;
+            m++;
+        }
+        cl.n = m;
+        /* direct parent edges within the component */
+        for (int a = 0; a < m; a++){
+            int i = pos[a];
+            if (i < n){
+                for (uint32_t k = 0; k < t[mem[i]].n_parents; k++){
+                    uint32_t pp = mpol_par_at(st, &t[mem[i]], k);
+                    int j = pp == 0xFFFFFFFFu ? -1 : mpol_pos_find(key, val, hsz - 1, pp);
+                    if (j < 0) continue;
+                    for (int b = 0; b < m; b++) if (pos[b] == j){ cl.m[a].ancestors |= (uint64_t)1 << b; break; }
+                }
+            } else {
+                for (int k = 0; k < n_new_par; k++){
+                    int j = mpol_pos_find(key, val, hsz - 1, new_par[k]);
+                    if (j < 0) continue;
+                    for (int b = 0; b < m; b++) if (pos[b] == j){ cl.m[a].ancestors |= (uint64_t)1 << b; break; }
+                }
+            }
+        }
+        for (int pass = 0; pass <= m; pass++){                 /* transitive closure */
+            int changed = 0;
+            for (int a = 0; a < m; a++){
+                uint64_t acc = cl.m[a].ancestors, d = acc;
+                while (d){ int q = __builtin_ctzll(d); d &= d - 1; acc |= cl.m[q].ancestors; }
+                if (acc != cl.m[a].ancestors){ cl.m[a].ancestors = acc; changed = 1; }
+            }
+            if (!changed) break;
+            if (pass == m) goto done;                          /* a cycle */
+        }
+        for (int a = 0; a < m; a++)
+            for (int b = 0; b < m; b++)
+                if (cl.m[b].ancestors & ((uint64_t)1 << a)) cl.m[a].descendants |= (uint64_t)1 << b;
+        int lin[MPC_MAX_CLUSTER]; mpc_chunking ch;
+        if (mpc_linearize_optimal(&cl, lin) != 0) goto done;
+        mpc_post_linearize(&cl, lin);
+        if (mpc_chunk_linearization(&cl, lin, &ch) != 0) goto done;
+        for (int c = 0; c < ch.n; c++){
+            if (nout >= cap) goto done;
+            out[nout].fee = ch.c[c].fee; out[nout].size = ch.c[c].weight; nout++;
+        }
+    }
+    rc = nout;
+done:
+    free(key); free(val); free(uf); free(comp);
+    return rc;
+}
+
+static int mpol_ff_desc(const void* a, const void* b){
+    const mpol_ff* x = a; const mpol_ff* y = b;
+    int c = mpc_feerate_cmp(x->fee, x->size, y->fee, y->size);
+    return c > 0 ? -1 : (c < 0 ? 1 : 0);
+}
+
+/* Core's CompareChunks (util/feefrac.cpp), ported line for line, over two
+ * chunk lists sorted by decreasing feerate. Returns 1 when diagram 0 is
+ * better somewhere and worse nowhere, -1 for the reverse, 0 when equal, and
+ * 2 when each is better somewhere (incomparable). */
+static int mpol_compare_chunks(const mpol_ff* c0, int n0, const mpol_ff* c1, int n1){
+    const mpol_ff* chunk[2] = { c0, c1 }; int cnt[2] = { n0, n1 };
+    int next[2] = { 0, 0 };
+    __int128 af[2] = { 0, 0 }, as[2] = { 0, 0 };       /* accumulated fee / size */
+    int better[2] = { 0, 0 };
+    for (;;){
+        int done0 = next[0] == cnt[0], done1 = next[1] == cnt[1];
+        if (done0 && done1) break;
+        #define NP_F(d) (af[d] + (__int128)chunk[d][next[d]].fee)
+        #define NP_S(d) (as[d] + (__int128)chunk[d][next[d]].size)
+        int u = (done0 || done1) ? done0 : (NP_S(0) > NP_S(1));
+        __int128 pf = NP_F(u), ps = NP_S(u);               /* P: next point on side u */
+        __int128 sapf = pf - af[!u], saps = ps - as[!u];   /* slope A->P, A = last point on !u */
+        int cmp;
+        if (done0 || done1){
+            cmp = sapf > 0 ? 1 : (sapf < 0 ? -1 : 0);      /* against a slope of 0 */
+        } else {
+            __int128 bf = NP_F(!u), bs = NP_S(!u);
+            __int128 sabf = bf - af[!u], sabs = bs - as[!u];
+            __int128 l = sapf * sabs, r = sabf * saps;     /* FeeRateCompare(slope_ap, slope_ab) */
+            cmp = l > r ? 1 : (l < r ? -1 : 0);
+            if (bs == ps){ af[!u] += chunk[!u][next[!u]].fee; as[!u] += chunk[!u][next[!u]].size; next[!u]++; }
+        }
+        #undef NP_F
+        #undef NP_S
+        if (cmp > 0) better[u] = 1;
+        if (cmp < 0) better[!u] = 1;
+        af[u] += chunk[u][next[u]].fee; as[u] += chunk[u][next[u]].size; next[u]++;
+        if (better[0] && better[1]) return 2;
+    }
+    return better[0] - better[1];
+}
+
+/* 1: the replacement strictly improves the diagram; 0: it does not;
+ * -1: uncalculable (a component over the cluster bound, or no memory). */
+static int mpol_replacement_improves(void* st, const unsigned char (*evict)[32], int n_evict,
+                                     const unsigned char (*prev)[32], int n_in,
+                                     uint64_t fee, uint64_t vsize){
+    mpol_node* t = mpol_nodes_base(st);
+    uint32_t nn = *(uint32_t*)((char*)st+16);
+    uint32_t *head = 0, *nxt = 0, *chld = 0;
+    if (!mpol_children_build(st, nn, &head, &nxt, &chld)) return -1;
+    int seed_cap = n_evict + n_in, mem_cap = seed_cap * MPC_MAX_CLUSTER + 1;
+    uint32_t* seeds = (uint32_t*)malloc((size_t)(seed_cap ? seed_cap : 1) * sizeof *seeds);
+    uint32_t* mem = (uint32_t*)malloc((size_t)mem_cap * sizeof *mem);
+    uint32_t* after = (uint32_t*)malloc((size_t)mem_cap * sizeof *after);
+    uint32_t* par = (uint32_t*)malloc((size_t)(n_in ? n_in : 1) * sizeof *par);
+    mpol_ff* cb = (mpol_ff*)malloc((size_t)mem_cap * sizeof *cb);
+    mpol_ff* ca = (mpol_ff*)malloc((size_t)mem_cap * sizeof *ca);
+    int rc = -1, n_seed = 0, n_mem = 0, n_par = 0;
+    if (!seeds || !mem || !after || !par || !cb || !ca) goto out;
+    uint32_t* mark = (uint32_t*)((char*)st + MPOL_HDR);
+    uint32_t stamp = *(uint32_t*)((char*)st+20) + 1;
+    if (stamp == 0xFFFFFFFFu) stamp = 1;
+    *(uint32_t*)((char*)st+20) = stamp;
+    for (int e = 0; e < n_evict; e++){ int ci = find_node(st, evict[e]); if (ci >= 0) seeds[n_seed++] = (uint32_t)ci; }
+    for (int i = 0; i < n_in; i++){
+        int pi = find_node(st, prev[i]); if (pi < 0) continue;
+        int dup = 0; for (int k = 0; k < n_par; k++) if (par[k] == (uint32_t)pi){ dup = 1; break; }
+        if (!dup){ par[n_par++] = (uint32_t)pi; seeds[n_seed++] = (uint32_t)pi; }
+    }
+    /* every main cluster the replacement touches: BFS over parent and child edges */
+    for (int sdx = 0; sdx < n_seed; sdx++){
+        uint32_t sd = seeds[sdx];
+        if (mark[sd] == stamp) continue;
+        int base = n_mem;
+        mark[sd] = stamp; mem[n_mem++] = sd;
+        for (int q = base; q < n_mem; q++){
+            uint32_t cur = mem[q];
+            if (n_mem - base > MPC_MAX_CLUSTER) goto out;      /* a cluster over the bound */
+            for (uint32_t k = 0; k < t[cur].n_parents; k++){
+                uint32_t pp = mpol_par_at(st, &t[cur], k);
+                if (pp >= nn || mark[pp] == stamp) continue;
+                if (n_mem >= mem_cap) goto out;
+                mark[pp] = stamp; mem[n_mem++] = pp;
+            }
+            for (uint32_t e = head[cur]; e != MPOL_IDX_NONE; e = nxt[e]){
+                uint32_t c = chld[e];
+                if (mark[c] == stamp) continue;
+                if (n_mem >= mem_cap) goto out;
+                mark[c] = stamp; mem[n_mem++] = c;
+            }
+        }
+    }
+    /* the same members after: evicted ones gone (the new one is added by mpol_chunks_of) */
+    int n_after = 0;
+    for (int i = 0; i < n_mem; i++){
+        int gone = 0;
+        for (int e = 0; e < n_evict && !gone; e++) if (!memcmp(t[mem[i]].txid, evict[e], 32)) gone = 1;
+        if (!gone) after[n_after++] = mem[i];
+    }
+    int nb = mpol_chunks_of(st, mem, n_mem, 0, 0, 0, 0, 0, cb, mem_cap);
+    int na = mpol_chunks_of(st, after, n_after, 1, fee, vsize, par, n_par, ca, mem_cap);
+    if (nb < 0 || na < 0) goto out;
+    qsort(cb, (size_t)nb, sizeof *cb, mpol_ff_desc);
+    qsort(ca, (size_t)na, sizeof *ca, mpol_ff_desc);
+    rc = mpol_compare_chunks(ca, na, cb, nb) == 1 ? 1 : 0;   /* staging (after) must be strictly better */
+out:
+    free(head); free(nxt); free(chld);
+    free(seeds); free(mem); free(after); free(par); free(cb); free(ca);
+    return rc;
 }
 
 /* The worst chunk across all clusters: 1 with *out filled, 0 if the pool is
@@ -1971,10 +2224,9 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
 
     /* --- fee: resolve inputs (mempool outreg first, then confirmed set) ---- */
     unsigned long long sum_in = 0;
-    int unconf_in[MPOL_MAX_IN]; int n_unconf = 0;
     for (int i=0;i<n_in;i++){
         uint64_t v = 0;
-        if (find_outreg(st, prev[i], idx[i], &v)) { sum_in += v; unconf_in[n_unconf++] = i; continue; }
+        if (find_outreg(st, prev[i], idx[i], &v)) { sum_in += v; continue; }
         unsigned long long val; const unsigned char* sp; unsigned long sl;
         if (!utxo || mempool_resolve_confirmed_utxo(utxo, prev[i], idx[i], &val, &sp, &sl)!=1){
             _mpol_last_reason = "bad-txns-inputs-missingorspent"; return 0; }
@@ -2084,24 +2336,9 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
     uint64_t removed_fees = 0;
     if (n_conf > 0){
         mpol_node* t = mpol_nodes_base(st);
-        /* rule 1 (classic; skipped under fullrbf): each REPLACED tx must
-         * signal BIP125 (any input nSequence < 0xfffffffe). Inherited
-         * signaling simplified away -- see header. */
-        if (!pol->rbf_enabled){
-            for (int k=0;k<n_conf;k++){
-                unsigned long clen = 0;
-                const unsigned char* ctx = mpool_get(mp, t[conf_claimers[k]].txid, &clen);
-                int signals = 0;
-                if (ctx){
-                    static unsigned char cprev[MPOL_MAX_IN][32];
-                    static uint32_t cidx[MPOL_MAX_IN], cseq[MPOL_MAX_IN];
-                    mpol_txmeta cm;
-                    int cn = parse_tx(ctx, clen, cprev, cidx, cseq, &cm);
-                    for (int i=0;i<cn;i++) if (cseq[i] < 0xfffffffeu) signals = 1;
-                }
-                if (!signals){ _mpol_last_reason = "txn-mempool-conflict"; return 0; }
-            }
-        }
+        /* No BIP125 signaling requirement (2026-10-01): Core v31.1 has no
+         * -mempoolfullrbf and no "txn-mempool-conflict"; full RBF is
+         * unconditional. pol->rbf_enabled is kept for the callers' ABI. */
         /* build the full eviction set: conflicts + their descendants */
         for (int k=0;k<n_conf;k++){
             int ci = (int)conf_claimers[k];
@@ -2129,76 +2366,16 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
             for (int e=0;e<n_evict;e++)
                 if (!memcmp(prev[i], evict_set[e], 32)){
                     _mpol_last_reason = "bad-txns-spends-conflicting-tx"; return 0; }
-        /* rule 2 (classic): no NEW unconfirmed inputs.
-         *
-         * MEM-14 (audit 2026-09-03): this demanded that the exact OUTPOINT be
-         * claimed by a conflict. Core's HasNoNewUnconfirmed builds
-         * `parents_of_conflicts` -- a set of TXIDs, the parents of the direct
-         * conflicts -- and accepts an unconfirmed input whose prevout txid is
-         * in that set, whatever its index.
-         *
-         * The difference bites a common wallet operation. Unconfirmed parent P
-         * has outputs 0 and 1; the original spends P:0, and a bumpfee
-         * replacement re-selects and spends P:1 as well. P:1 is unconfirmed and
-         * unclaimed, so this refused a replacement Core accepts.
-         *
-         * Loosening only: an input that was already accepted still is, so this
-         * cannot newly reject anything. Confirmed inputs never reach here --
-         * the loop walks n_unconf. Cost is O(conflicts x parents) inside a
-         * path already O(conflicts), under mp_lock. */
-        for (int u=0;u<n_unconf;u++){
-            int i = unconf_in[u];
-            if (find_claim(st, prev[i], idx[i]) >= 0) continue;   /* the outpoint itself is claimed */
-            /* MEM-14: else the prevout's TX must be a parent of some conflict */
-            int from_conflict_parent = 0;
-            { mpol_node* tt = mpol_nodes_base(st);
-              uint32_t nn = *(uint32_t*)((char*)st+16);
-              for (int k=0; k<n_conf && !from_conflict_parent; k++){
-                  uint32_t ci2 = conf_claimers[k];
-                  if (ci2 >= nn) continue;
-                  const mpol_node* cn = &tt[ci2];
-                  for (uint32_t q=0; q<cn->n_parents && !from_conflict_parent; q++){
-                      uint32_t pi = mpol_par_at(st, cn, q);
-                      if (pi < nn && !memcmp(tt[pi].txid, prev[i], 32))
-                          from_conflict_parent = 1;
-                  }
-              } }
-            if (!from_conflict_parent){
-                _mpol_last_reason = "replacement-adds-unconfirmed"; return 0; }
-        }
-        /* ---- MEM-7 (audit 2026-09-03): Core's PaysMoreThanConflicts ----
-         *
-         * Rules 3+4 below are ABSOLUTE-fee rules: pay everything you evict,
-         * plus a bit more. On their own they let a replacement that is far
-         * WORSE for a miner win. The audit's example: T is 200 vB paying
-         * 2,000 sat (10 sat/vB); R is 100,000 vB -- the standard maximum --
-         * paying 102,000 sat, which is 1.02 sat/vB. R pays more in total, so
-         * rules 3+4 passed, T was evicted, and 100 kvB of 1 sat/vB traffic
-         * was relayed in place of a 200 vB transaction at ten times the
-         * feerate. That is miner-incentive-incompatible and Core has rejected
-         * it in every version: PaysMoreThanConflicts pre-v31, and the
-         * feerate-diagram check under the v31 cluster mempool.
-         *
-         * Core compares the replacement's feerate against EACH DIRECT
-         * conflict's, not against the eviction set as a whole (rbf.cpp
-         * iterates iters_conflicting), and rejects unless it is strictly
-         * greater. Descendants are covered by rules 3+4's absolute total.
-         *
-         * Cross-multiplied so there is no division and no rounding: the
-         * comparison fee/vsize > c.fee/c.size becomes fee*c.size >
-         * c.fee*vsize. Both fees are satoshi counts under MAX_MONEY and both
-         * sizes are under 100,000, so the products cannot overflow 64 bits.
-         * A conflict recorded with size 0 would make the comparison
-         * meaningless, so it is treated as unreplaceable rather than as
-         * infinitely cheap. */
-        for (int k=0;k<n_conf;k++){
-            const mpol_node* c = &t[conf_claimers[k]];
-            if (c->size == 0 ||
-                (unsigned long long)fee * c->size <= (unsigned long long)c->fee * vsize){
-                _mpol_last_reason = "insufficient fee";   /* Core's own reason string */
-                return 0;
-            }
-        }
+        /* No "no new unconfirmed inputs" rule (2026-10-01): v31.1 removed
+         * HasNoNewUnconfirmed with the move to cluster mempool -- the
+         * feerate-diagram check below prices a new unconfirmed parent. */
+        /* No per-conflict feerate rule (2026-10-01). It was Core's
+         * PaysMoreThanConflicts, which v31.1 removed: a replacement that is
+         * worse for a miner (the audit's 100 kvB at 1.02 sat/vB displacing
+         * 200 vB at 10 sat/vB, MEM-7) is now refused by the feerate-diagram
+         * check before the commit, as "replacement-failed". BlockYard found
+         * 14 of 35 children Core held and this node lacked refused here as
+         * "insufficient fee". */
         /* rules 3+4 (Core PaysForRBF): pay all replaced fees, and the
          * increment must cover the replacement's own vsize at the
          * incremental relay rate ("insufficient fee"). */
@@ -2355,8 +2532,12 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
      * cluster check likewise runs on the post-replacement diagram. Before
      * this, a replacement joining a full cluster it was itself thinning
      * was refused for the size it was about to free. */
+    /* a lone transaction is a cluster of one: it alone may exceed a lowered
+     * -limitclustersize (the default 101 kvB is above the standard maximum) */
+    if (n_par == 0 && vsize > pol->cluster_vbytes){ _mpol_last_reason = "too-large-cluster"; return 0; }
     if (n_par > 0){
-        enum { CLUSTER_LIMIT = 64, CLUSTER_SIZE_LIMIT = 101000 };
+        enum { CLUSTER_LIMIT = 64 };                 /* array bound: Core's maximum */
+        const uint64_t cl_count_limit = pol->cluster_count, cl_size_limit = pol->cluster_vbytes;
         mpol_node* t = mpol_nodes_base(st);
         uint32_t nn = *(uint32_t*)((char*)st+16);
         uint32_t seen[CLUSTER_LIMIT + 1]; int nseen = 0;
@@ -2393,20 +2574,19 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
                 seen[nseen++] = (uint32_t)i; bfs[sp++] = (uint32_t)i; cl_bytes += t[i].size;
             }
         }
-        if (too_big || (uint64_t)nseen + 1 > CLUSTER_LIMIT || cl_bytes + vsize > CLUSTER_SIZE_LIMIT){
+        if (too_big || (uint64_t)nseen + 1 > cl_count_limit || cl_bytes + vsize > cl_size_limit){
             _mpol_last_reason = "too-large-cluster"; return 0;
         }
         #undef MPOL_CL_EVICTED
     }
-    if (anc_cnt > pol->max_anc){ _mpol_last_reason = "too-long-mempool-chain"; return 0; }
-    if (anc_bytes > pol->max_anc_bytes){ _mpol_last_reason = "too-long-mempool-chain"; return 0; }
-    for (uint32_t k=0;k<n_anc;k++){
-        mpol_node* a = &t[anc_list[k]];
-        if ((uint64_t)a->desc_cnt + 1 > pol->max_desc){
-            _mpol_last_reason = "too-long-mempool-chain"; return 0; }
-        if ((uint64_t)a->desc_bytes + vsize > pol->max_desc_bytes){
-            _mpol_last_reason = "too-long-mempool-chain"; return 0; }
-    }
+    /* No ancestor/descendant refusal (2026-10-01). Core v31.1's validation
+     * has no "too-long-mempool-chain": -limitancestorcount and
+     * -limitdescendantcount are "deprecated ... replaced by cluster limits ...
+     * and only used by wallet for coin selection", and the size limits are
+     * gone. Enforcing them here refused the 26th transaction of a chain Core
+     * accepts -- 15 of 35 children BlockYard found Core holding and this node
+     * lacking. The cluster check above is the whole bound. anc_cnt/anc_bytes
+     * are still computed: the entry stores them (ancestorcount/-size). */
 
     /* --- BIP431 TRUC topology (Core SingleTRUCChecks) ----------------------
      * Runs for EVERY transaction, not only v3 ones: half of these rules are
@@ -2557,6 +2737,19 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
             }
         }
         #undef PKG_VER
+    }
+
+    /* ---- Core v31.1 ImprovesFeerateDiagram (2026-10-01) -------------------
+     * After every eviction is decided (conflicts, their descendants, a TRUC
+     * sibling) and every other rule has passed: the replacement must strictly
+     * improve the feerate diagram of the clusters it touches. Rules 3+4
+     * above are absolute-fee rules; this is the one that refuses a
+     * replacement worse for a miner. Runs for testmempoolaccept too. */
+    if (n_evict > 0){
+        int d = mpol_replacement_improves(st, (const unsigned char (*)[32])evict_set, n_evict,
+                                          (const unsigned char (*)[32])prev, n_in, fee, vsize);
+        if (d < 0){ _mpol_last_reason = "too-large-cluster"; return 0; }   /* a component over the bound */
+        if (d == 0){ _mpol_last_reason = "replacement-failed"; return 0; }
     }
 
     /* ================= commit ============================================ */

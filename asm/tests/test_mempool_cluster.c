@@ -7,6 +7,7 @@
  * chunks that Core keeps apart and change every chunkfee we report. */
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include "../mempool_cluster.h"
 
 /* test-only: locate a txid in a built cluster */
@@ -88,6 +89,40 @@ static int short_lookup(void* c, const unsigned char* id, mpc_entry* o){
     return 1;
 }
 
+
+/* ---- optimal linearization fixtures (2026-10-01) ---- */
+static uint64_t rng_s = 0x9E3779B97F4A7C15ull;
+static uint64_t rng(void){ rng_s ^= rng_s << 13; rng_s ^= rng_s >> 7; rng_s ^= rng_s << 17; return rng_s; }
+/* a random DAG of n members: j < i is a parent of i with probability pct% */
+static void mk_random(mpc_cluster* cl, int n, int pct){
+    memset(cl, 0, sizeof *cl); cl->n = n;
+    for (int i = 0; i < n; i++){
+        cl->m[i].fee = rng() % 20000; cl->m[i].weight = 200 + rng() % 4000;
+        cl->m[i].ancestors = (uint64_t)1 << i;
+        for (int j = 0; j < i; j++)
+            if ((int)(rng() % 100) < pct) cl->m[i].ancestors |= cl->m[j].ancestors;
+    }
+    for (int i = 0; i < n; i++){
+        cl->m[i].descendants = 0;
+        for (int k = 0; k < n; k++) if ((cl->m[k].ancestors >> i) & 1) cl->m[i].descendants |= (uint64_t)1 << k;
+    }
+}
+/* every topological order of cl, each checked against `opt` */
+static int g_orders, g_beaten;
+static void all_orders(const mpc_cluster* cl, const int* opt, int* cur, int depth, uint64_t placed){
+    if (depth == cl->n){
+        g_orders++;
+        if (!mpc_diagram_at_least_as_good(cl, opt, cur)) g_beaten++;
+        return;
+    }
+    for (int i = 0; i < cl->n; i++){
+        if ((placed >> i) & 1) continue;
+        uint64_t need = cl->m[i].ancestors & ~((uint64_t)1 << i);
+        if ((need & placed) != need) continue;
+        cur[depth] = i;
+        all_orders(cl, opt, cur, depth + 1, placed | ((uint64_t)1 << i));
+    }
+}
 int main(void){
     printf("== feerate comparison (Core FeeFrac semantics) ==\n");
     ck("2000/1000 > 1000/1000", mpc_feerate_cmp(2000,1000,1000,1000) > 0);
@@ -527,6 +562,57 @@ int main(void){
         ck("the cluster module uses Core's limit", MPC_MAX_CLUSTER == 64);
     }
 
+
+    /* ---- the optimal linearization (2026-10-01) ----
+     * Greedy ancestor-score + PostLinearize fell short of Core in 2 of 246
+     * clusters in BlockYard's differential. Optimality is checked
+     * independently of the algorithm: for every cluster of up to 7 members,
+     * against EVERY topological order. */
+    {
+        int clusters = 0, bad_topo = 0, beaten = 0, orders = 0;
+        for (int trial = 0; trial < 3000; trial++){
+            mpc_cluster cl; int n = 2 + (int)(rng() % 6); mk_random(&cl, n, 15 + (int)(rng() % 60));
+            int opt[MPC_MAX_CLUSTER], cur[MPC_MAX_CLUSTER];
+            if (mpc_linearize_optimal(&cl, opt) != 0 || !mpc_is_topological(&cl, opt)){ bad_topo++; continue; }
+            g_orders = 0; g_beaten = 0;
+            all_orders(&cl, opt, cur, 0, 0);
+            clusters++; orders += g_orders; beaten += g_beaten;
+        }
+        printf("      %d clusters of 2..7, %d topological orders enumerated\n", clusters, orders);
+        ck("optimal: every result is a valid topological linearization", bad_topo == 0);
+        ck("optimal: no topological order of any cluster beats it anywhere on the diagram", beaten == 0 && clusters == 3000);
+    }
+    {
+        int short_greedy = 0, opt_lost = 0, bad = 0;
+        for (int trial = 0; trial < 3000; trial++){
+            mpc_cluster cl; int n = 8 + (int)(rng() % 17); mk_random(&cl, n, 10 + (int)(rng() % 50));
+            int opt[MPC_MAX_CLUSTER], g[MPC_MAX_CLUSTER];
+            if (mpc_linearize_optimal(&cl, opt) != 0 || !mpc_is_topological(&cl, opt)){ bad++; continue; }
+            if (mpc_linearize_ancestor_score(&cl, g) != 0){ bad++; continue; }
+            mpc_post_linearize(&cl, g);
+            if (!mpc_diagram_at_least_as_good(&cl, opt, g)) opt_lost++;
+            if (!mpc_diagram_at_least_as_good(&cl, g, opt)) short_greedy++;
+        }
+        printf("      clusters of 8..24: greedy+PostLinearize short of the optimum in %d of 3000\n", short_greedy);
+        ck("optimal is never beaten by greedy+PostLinearize (8..24 members)", opt_lost == 0 && bad == 0);
+        ck("...and greedy+PostLinearize does fall short somewhere (the test can tell them apart)", short_greedy > 0);
+    }
+    {
+        /* full 64-member clusters: valid, never worse than greedy, and bounded time */
+        int bad = 0, lost = 0;
+        struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (int trial = 0; trial < 200; trial++){
+            mpc_cluster cl; mk_random(&cl, 64, 2 + (int)(rng() % 10));
+            int opt[MPC_MAX_CLUSTER], g[MPC_MAX_CLUSTER];
+            if (mpc_linearize_optimal(&cl, opt) != 0 || !mpc_is_topological(&cl, opt)){ bad++; continue; }
+            mpc_linearize_ancestor_score(&cl, g); mpc_post_linearize(&cl, g);
+            if (!mpc_diagram_at_least_as_good(&cl, opt, g)) lost++;
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+        printf("      200 clusters of 64: %.2f ms each on average\n", ms / 200);
+        ck("64-member clusters: valid and never worse than greedy+PostLinearize", bad == 0 && lost == 0);
+    }
     printf("\npassed %d, failed %d\n", pass, fail);
     if (fail) { printf("TESTS FAILED (%d failure(s))\n", fail); return 1; }
     printf("ALL TESTS PASSED (0 failures)\n");

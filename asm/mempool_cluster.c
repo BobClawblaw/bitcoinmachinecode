@@ -340,3 +340,138 @@ int mpc_diagram_at_least_as_good(const mpc_cluster* cl, const int* a, const int*
     }
     return 1;
 }
+
+/* ---- optimal linearization (2026-10-01) ------------------------------------
+ *
+ * An optimal linearization is obtained by repeatedly removing the remaining
+ * subset of HIGHEST FEERATE that is closed under ancestors (contains every
+ * remaining ancestor of each member) and emitting it topologically. Each such
+ * set is a chunk of the optimal diagram, and that diagram is unique, so this
+ * agrees with Core's chunk feerates wherever Core's own search reaches the
+ * optimum (its SpanningForestState reports when it does; within its default
+ * budget a 64-transaction cluster normally does).
+ *
+ * The highest-feerate closed set is found exactly. Dinkelbach's iteration
+ * turns "maximise fee(S)/weight(S)" into a sequence of "maximise
+ * fee(S)*W - F*weight(S)" for the current best ratio F/W, each of which is a
+ * maximum-weight CLOSURE problem: a minimum s-t cut, with an infinite edge
+ * from each member to each of its ancestors so a cut cannot keep a member and
+ * drop an ancestor. When the best closure's value is no longer positive, no
+ * closed set beats F/W and the current set is the answer. Every step is exact
+ * integer arithmetic in 128 bits: a fee up to 2.1e15 times a weight sum up to
+ * ~4e5 per member is ~1e21, past 64 bits.
+ *
+ * This replaces ancestor-score greedy + PostLinearize, which BlockYard's
+ * differential caught short of Core in 2 of 246 clusters (5.03 sat/vB where
+ * Core chunked 5.70; 6.01 where Core had 6.20). */
+typedef __int128 mpc_i128;
+#define MPC_FN (MPC_MAX_CLUSTER + 2)
+
+static int mpc_bfs(mpc_i128 cap[MPC_FN][MPC_FN], int nn, int s, int t, int* level)
+{
+    int q[MPC_FN], qh = 0, qt = 0;
+    for (int i = 0; i < nn; i++) level[i] = -1;
+    level[s] = 0; q[qt++] = s;
+    while (qh < qt) {
+        int u = q[qh++];
+        for (int v = 0; v < nn; v++)
+            if (level[v] < 0 && cap[u][v] > 0) { level[v] = level[u] + 1; q[qt++] = v; }
+    }
+    return level[t] >= 0;
+}
+
+static mpc_i128 mpc_dfs(mpc_i128 cap[MPC_FN][MPC_FN], int nn, int u, int t, mpc_i128 f,
+                        const int* level, int* it)
+{
+    if (u == t) return f;
+    for (int* v = &it[u]; *v < nn; (*v)++) {
+        int w = *v;
+        if (cap[u][w] <= 0 || level[w] != level[u] + 1) continue;
+        mpc_i128 d = mpc_dfs(cap, nn, w, t, f < cap[u][w] ? f : cap[u][w], level, it);
+        if (d > 0) { cap[u][w] -= d; cap[w][u] += d; return d; }
+    }
+    return 0;
+}
+
+/* The maximum-weight closed subset of `rem` (weights p[], indexed by member),
+ * as the source side of a minimum cut: the SMALLEST such set. *val is its
+ * total weight (0 when no closed set is positive). */
+static uint64_t mpc_max_closure(const mpc_cluster* cl, uint64_t rem, const mpc_i128* p, mpc_i128* val)
+{
+    mpc_i128 cap[MPC_FN][MPC_FN];
+    int n = cl->n, s = n, t = n + 1, nn = n + 2;
+    memset(cap, 0, sizeof cap);
+    mpc_i128 pos = 0;
+    for (int v = 0; v < n; v++) if ((rem >> v) & 1) { if (p[v] > 0) pos += p[v]; }
+    mpc_i128 inf = pos + 1;
+    for (int v = 0; v < n; v++) {
+        if (!((rem >> v) & 1)) continue;
+        if (p[v] > 0) cap[s][v] = p[v]; else if (p[v] < 0) cap[v][t] = -p[v];
+        uint64_t anc = cl->m[v].ancestors & rem & ~((uint64_t)1 << v);
+        for (int u = 0; u < n; u++) if ((anc >> u) & 1) cap[v][u] = inf;
+    }
+    mpc_i128 flow = 0; int level[MPC_FN], it[MPC_FN];
+    while (mpc_bfs(cap, nn, s, t, level)) {
+        for (int i = 0; i < nn; i++) it[i] = 0;
+        mpc_i128 f;
+        while ((f = mpc_dfs(cap, nn, s, t, inf, level, it)) > 0) flow += f;
+    }
+    /* the source side of the cut: everything still reachable from s */
+    uint64_t side = 0; int q[MPC_FN], qh = 0, qt = 0, seen[MPC_FN] = {0};
+    seen[s] = 1; q[qt++] = s;
+    while (qh < qt) {
+        int u = q[qh++];
+        for (int v = 0; v < nn; v++)
+            if (!seen[v] && cap[u][v] > 0) { seen[v] = 1; q[qt++] = v; if (v < n) side |= (uint64_t)1 << v; }
+    }
+    *val = pos - flow;
+    return side;
+}
+
+int mpc_linearize_optimal(const mpc_cluster* cl, int* lin)
+{
+    if (!cl || !lin || cl->n < 0 || cl->n > MPC_MAX_CLUSTER) return -1;
+    uint64_t rem = (cl->n >= 64) ? ~(uint64_t)0 : (((uint64_t)1 << cl->n) - 1);
+    int out = 0;
+    while (rem) {
+        /* start from the best ancestor set: a closed set, and usually the answer */
+        uint64_t best = 0, bf = 0, bw = 0;
+        for (int i = 0; i < cl->n; i++) {
+            if (!((rem >> i) & 1)) continue;
+            uint64_t set = cl->m[i].ancestors & rem, f, w;
+            if (!((set >> i) & 1)) return -1;
+            mpc_set_totals(cl, set, &f, &w);
+            if (!best || mpc_feerate_cmp(f, w, bf, bw) > 0 ||
+                (mpc_feerate_cmp(f, w, bf, bw) == 0 && w < bw)) { best = set; bf = f; bw = w; }
+        }
+        if (!best) return -1;
+        /* Dinkelbach: improve while some closed set has a higher feerate.
+         * Each round strictly raises F/W over a finite family, so it ends;
+         * the cap is a guard against a malformed cluster, not a budget. */
+        for (int round = 0; round < 4 * MPC_MAX_CLUSTER && bw > 0; round++) {
+            mpc_i128 p[MPC_MAX_CLUSTER], val = 0;
+            for (int v = 0; v < cl->n; v++)
+                p[v] = ((rem >> v) & 1) ? (mpc_i128)cl->m[v].fee * (mpc_i128)bw - (mpc_i128)bf * (mpc_i128)cl->m[v].weight : 0;
+            uint64_t s = mpc_max_closure(cl, rem, p, &val);
+            if (val <= 0 || !s) break;
+            uint64_t f, w; mpc_set_totals(cl, s, &f, &w);
+            if (mpc_feerate_cmp(f, w, bf, bw) <= 0) break;   /* cannot happen when val > 0; a guard */
+            best = s; bf = f; bw = w;
+        }
+        /* emit `best` topologically: lowest index whose in-set ancestors are placed */
+        uint64_t placed = 0, todo = best;
+        while (todo) {
+            int chosen = -1;
+            for (int i = 0; i < cl->n; i++) {
+                if (!((todo >> i) & 1)) continue;
+                uint64_t need = cl->m[i].ancestors & best & ~((uint64_t)1 << i);
+                if ((need & placed) == need) { chosen = i; break; }
+            }
+            if (chosen < 0) return -1;
+            lin[out++] = chosen;
+            placed |= (uint64_t)1 << chosen; todo &= ~((uint64_t)1 << chosen);
+        }
+        rem &= ~best;
+    }
+    return out == cl->n ? 0 : -1;
+}

@@ -7,7 +7,7 @@ set -u
 DEST=/mnt/2tbssd/core-bench
 cd "$DEST" || exit 2
 PH=$DEST/phase.log; PROG=$DEST/progress.log
-ORACLE="/storage/bitcoin-core-source/build-zmq/bin/bitcoin-cli -conf=/storage/core-oracle/bitcoin.conf -datadir=/storage/core-oracle"
+ORACLE="/storage/bitcoin-core-v31.1/bin/bitcoin-cli -conf=/storage/core-oracle/bitcoin.conf -datadir=/storage/core-oracle"
 P2P=8563; RPC=8562
 ts(){ date -u +%Y-%m-%dT%H:%M:%SZ; }
 ph(){ echo "$(ts) $*" | tee -a "$PH"; }

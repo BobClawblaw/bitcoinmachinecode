@@ -475,6 +475,7 @@ make daemon/bmcbitcoind          # safe while the old binary runs: ld unlinks fi
 # the three build audits (each is also a prerequisite of `make test`)
 make prereq-check             # every file a recipe uses is a declared prerequisite
 make link-check               # every rule links the files defining the symbols it needs
+make header-check             # every rule that compiles daemon/main.c lists the headers it includes
 make runlist-check            # every test is gated or declared manual with a reason
 make abi-check                # SysV stack-alignment audit of asm->C call sites
 
@@ -511,6 +512,27 @@ Rollback:
 ln -sfn bmcbitcoind.deploy-<previous> daemon/bmcbitcoind.live
 sudo systemctl restart bmcbitcoind
 ```
+
+## The Core oracle
+
+One Bitcoin Core node is the reference everything here is measured against:
+the IBD harness's capstone, the RPC and REST differentials, the mempool
+differential, the next-block check after a deploy. Since 2026-10-01 it is the
+**v31.1 release**, the version this node targets. A v31.99 development build
+used to sit on these paths; it was retired because diffing against it invented
+work (docs/PARITY_RPC_FIELDS.md).
+
+| | |
+|---|---|
+| unit | `bitcoin-oracle` (`config/core-oracle/bitcoin-oracle.service`, `__SVCUSER__` substituted at install as for logrotate): SIGTERM only, `TimeoutStopSec=900`, never SIGKILL -- Core flushes a large chainstate on the way down |
+| binaries | `/storage/bitcoin-core-v31.1/bin` (`bitcoind`, `bitcoin-cli`); source tree `/storage/bitcoin-core-v31.1/source` |
+| datadir | `/storage/core-oracle`, config `config/core-oracle/bitcoin.conf`: `txindex`, `coinstatsindex`, `blockfilterindex`, `dbcache=8192` |
+| network | P2P 8333 on 127.0.0.1-16 (the loopback replay benchmarks dial them), RPC 8335, ZMQ 28432 |
+| query | `/storage/bitcoin-core-v31.1/bin/bitcoin-cli -conf=/storage/core-oracle/bitcoin.conf -datadir=/storage/core-oracle getblockcount` |
+
+It lives on `/storage`, not on the benchmark NVMe, so it does not compete with
+a timed run for I/O. Manage it with `sudo systemctl {status,restart,stop}
+bitcoin-oracle`; never start a second copy by hand.
 
 ## Verifying a restart
 

@@ -23,7 +23,7 @@
 #
 # Usage: validation/tx_relay_regtest_e2e.sh   (KEEP=1 keeps the work dir; CORE_BIN / BMC_BIN override)
 set -u
-CORE_BIN=${CORE_BIN:-/mnt/nvme8tb/core-build/bitcoin-v31.1/build/bin}; BMC_BIN=${BMC_BIN:-/storage/bitcoinmachinecode/asm/daemon/bmcbitcoind}
+CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-v31.1/bin}; BMC_BIN=${BMC_BIN:-/storage/bitcoinmachinecode/asm/daemon/bmcbitcoind}
 WORK=${TMPDIR:-/tmp}/bmc-txrelay-e2e-$$; rm -rf "$WORK"; mkdir -p "$WORK/core" "$WORK/bmcout/regtest" "$WORK/bmcin/regtest"
 CORE_P2P=19410; CORE_RPC=19420; OUT_P2P=19430; OUT_RPC=19431; IN_P2P=19440; IN_RPC=19441   # Core also binds CORE_P2P+1 (onion)
 for port in $CORE_P2P $((CORE_P2P+1)) $CORE_RPC $OUT_P2P $OUT_RPC $IN_P2P $IN_RPC; do ss -ltn 2>/dev/null | grep -q ":$port " && { echo "port $port in use (another run?)"; exit 2; }; done

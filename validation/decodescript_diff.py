@@ -43,7 +43,7 @@ RPC_USER = os.environ.get("RPC_USER", "x")
 RPC_PASS = os.environ.get("RPC_PASS", "y")
 CORE_CLI = os.environ.get(
     "CORE_CLI",
-    "/storage/bitcoin-core-source/build/bin/bitcoin-cli -rpcport=8335 -datadir=/storage/core-oracle",
+    "/storage/bitcoin-core-v31.1/bin/bitcoin-cli -rpcport=8335 -datadir=/storage/core-oracle",
 ).split()
 
 

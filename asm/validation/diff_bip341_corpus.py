@@ -34,7 +34,7 @@ Ground truth is Core. Our own previous answer is never the standard --
 "identical to before" only means something once "identical to Core" holds.
 
 Build the oracle first (from the repo root):
-  SRC=/storage/bitcoin-core-source; B=$SRC/build
+  SRC=/storage/bitcoin-core-v31.1/source; B=$SRC/build
   cd $B && g++ -std=c++20 -I../src -I./src -I../src/univalue/include \
       -o /tmp/core_verify_oracle_b341 \
       /storage/bitcoinmachinecode/validation/core_verify_oracle.cpp \
@@ -52,7 +52,7 @@ import argparse, json, os, struct, subprocess, sys, tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 ASM = os.path.dirname(HERE)
 REPO = os.path.dirname(ASM)
-CLI = ("/storage/bitcoin-core-source/build/bin/bitcoin-cli "
+CLI = ("/storage/bitcoin-core-v31.1/bin/bitcoin-cli "
        "-rpcport=8335 -datadir=/storage/core-oracle").split()
 
 TAPROOT_ACTIVATION = 709632

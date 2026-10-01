@@ -15,7 +15,7 @@
 # Until 2026-09-18 this node never printed addrlocal (0 of 11 peers on
 # mainnet, Core 10 of 10) and omitted the two times at 0.
 set -u
-CORE_BIN=${CORE_BIN:-/mnt/nvme8tb/core-build/bitcoin-v31.1/build/bin}
+CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-v31.1/bin}
 BMC_BIN=${BMC_BIN:-/storage/bitcoinmachinecode/asm/daemon/bmcbitcoind}
 PEER=${PEER:-/storage/bitcoinmachinecode/validation/version_addr_recv_peer.py}
 WORK=${WORK:-/tmp/addrlocal-e2e-$$}

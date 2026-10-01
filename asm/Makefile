@@ -116,6 +116,22 @@ VERSION_GEN_PY   := gen_version_header.py
 $(VERSION_GEN_H): $(VERSION_INC) $(VERSION_GEN_PY)
 	python3 $(VERSION_GEN_PY) --out $@ --version-inc $(VERSION_INC)
 
+# MAIN_C_HDRS (2026-10-01): every local header daemon/main.c #includes. Every rule
+# that compiles main.c (the daemon and the tests that #include it) lists them, so a
+# header-only edit rebuilds those targets. Before this the daemon listed 5 of 49 and
+# the tests fewer: a revert-check that edited only daemon/dlc_rules.h rebuilt nothing,
+# ran the previous binary and passed. header-check (scripts/makefile_header_audit.py)
+# fails the gate when main.c gains an #include this list or a rule lacks.
+MAIN_C_HDRS := bmc_thread.h daemon/addrbook.h daemon/anchors.h daemon/archive_reindex.h daemon/archive_seed.h daemon/archive_verify.h \
+	daemon/asmap.h daemon/banlist.h daemon/chainparams.h daemon/cmpct_recv.h daemon/ctl_dial.h daemon/dial_memory.h \
+	daemon/dialer.h daemon/dlc_rules.h daemon/hdr_lowwork.h daemon/hdrrules.h daemon/ibd_pipeline.h daemon/inbound_evict.h \
+	daemon/index_repair.h daemon/index_runs.h daemon/index_trail.h daemon/inflight.h daemon/invalid_set.h daemon/log_phase.h \
+	daemon/log_ts.h daemon/mempool_seq.h daemon/net6.h daemon/netaddr.h daemon/netperm.h daemon/node_config.h \
+	daemon/notify.h daemon/peer_timeout.h daemon/private_broadcast.h daemon/relay_policy.h daemon/reorg.h daemon/rpc_acl.h \
+	daemon/secure_zero.h daemon/subnet.h daemon/torcontrol.h daemon/txann.h daemon/utxo_walk.h daemon/v2transport.h \
+	daemon/wallet_pass.h mempool_slot.h rpc_chain.h rpc_node.h rpc_server.h rpc_wallet_ops.h \
+	version_gen.h
+
 # 2026-09-10: WHICH BUILD is answering. bmcmonitor measured two builds on this
 # box giving different answers to getnettotals/getpeerinfo while both reported
 # the same subversion, and concluded the log banner was the only attestation
@@ -269,7 +285,7 @@ fixtures:
 	python3 validation/fetch_tapscript_scale.py --big tests/fixtures
 	python3 validation/fetch_taproot_blocks.py $(TAPROOT_DIFF_HEIGHTS)
 
-.PHONY: all asm test clean abi-check callee-saved-check prereq-check gate-log-selftest link-check link-audit-selftest
+.PHONY: all asm test clean abi-check callee-saved-check prereq-check gate-log-selftest link-check link-audit-selftest header-check header-audit-selftest
 
 # Per-test private working directory helper. Every test that includes it must
 # list it as a prerequisite, or a change to the isolation mechanism silently
@@ -1264,37 +1280,37 @@ DIALSRCS := tests/test_dial_budget.c daemon/private_broadcast.c daemon/utxo_live
     daemon/serve_invbounds.c daemon/serve_rejects.c daemon/relay_policy.c daemon/wallet_pass.c daemon/v2transport.c crypto_bip324_transport.c crypto_bip324.c crypto_bip324_fs.c \
     crypto_chacha20.c crypto_poly1305.c crypto_ellswift_ecdh.c \
     crypto_ellswift.c crypto_ellswift_enc.c crypto_fe_sqrt.c daemon/stale_tip.c daemon/peer_timeout.c daemon/txann.c daemon/tx_handoff.c daemon/inbound_evict.c daemon/anchors.c daemon/archive_seed.c daemon/ibd_pipeline.c daemon/hdr_lowwork.c daemon/invalid_set.c daemon/cmpct_recv.c daemon/banlist.c
-tests/test_dial_budget: addrbook.a $(DIALSRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c
+tests/test_dial_budget: addrbook.a $(DIALSRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c $(MAIN_C_HDRS)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ $(DIALSRCS) $(DAEMONOBJS) $(DAEMON_RPCOBJS) wallet_core.c addrbook.a -lpthread
 
 # test_txoq_ipc -- the gettxout parent<->worker query protocol. Includes
 # daemon/main.c as a TU exactly like test_dial_budget, so it takes the same
 # SRCS list with its own harness swapped in for the dial one.
 TXOQSRCS := $(patsubst tests/test_dial_budget.c,tests/test_txoq_ipc.c,$(DIALSRCS))
-tests/test_txoq_ipc: addrbook.a $(TXOQSRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c
+tests/test_txoq_ipc: addrbook.a $(TXOQSRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c $(MAIN_C_HDRS)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ $(TXOQSRCS) $(DAEMONOBJS) $(DAEMON_RPCOBJS) wallet_core.c addrbook.a -lpthread
 
 # test_sync_budget -- the per-leg sync budget must END the pass (shutdown the
 # socket), not merely set a flag the retry-tolerant read loop swallows. Same
 # main.c-as-a-TU shape as test_dial_budget.
 BUDGETSRCS := $(patsubst tests/test_dial_budget.c,tests/test_sync_budget.c,$(DIALSRCS))
-tests/test_sync_budget: addrbook.a $(BUDGETSRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c
+tests/test_sync_budget: addrbook.a $(BUDGETSRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c $(MAIN_C_HDRS)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ $(BUDGETSRCS) $(DAEMONOBJS) $(DAEMON_RPCOBJS) wallet_core.c addrbook.a -lpthread
 
 # The dlc peer parser accepts "ip[:port]" (it was inet_pton, which rejected every pool entry).
 PEERPARSESRCS := $(patsubst tests/test_dial_budget.c,tests/test_dlc_peer_parse.c,$(DIALSRCS))
-tests/test_dlc_peer_parse: addrbook.a $(PEERPARSESRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c
+tests/test_dlc_peer_parse: addrbook.a $(PEERPARSESRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c $(MAIN_C_HDRS)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ $(PEERPARSESRCS) $(DAEMONOBJS) $(DAEMON_RPCOBJS) wallet_core.c addrbook.a -lpthread
 
 DHSRCS := $(patsubst tests/test_dial_budget.c,tests/test_dialhelper.c,$(DIALSRCS))
-tests/test_dialhelper: addrbook.a $(DHSRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c
+tests/test_dialhelper: addrbook.a $(DHSRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c $(MAIN_C_HDRS)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ $(DHSRCS) $(DAEMONOBJS) $(DAEMON_RPCOBJS) wallet_core.c addrbook.a -lpthread
 
 # test_mux_dial_gate -- 2026-09-24, from bmc_osx 5e71979a: mux_next_peer
 # dialled a host its own candidate loop had ruled out (dial-memory backoff),
 # every pass with a one-host pool. The real mux_next_peer, main.c as a TU.
 MUXGATESRCS := $(patsubst tests/test_dial_budget.c,tests/test_mux_dial_gate.c,$(DIALSRCS))
-tests/test_mux_dial_gate: addrbook.a $(MUXGATESRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c
+tests/test_mux_dial_gate: addrbook.a $(MUXGATESRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c $(MAIN_C_HDRS)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ $(MUXGATESRCS) $(DAEMONOBJS) $(DAEMON_RPCOBJS) wallet_core.c addrbook.a -lpthread
 
 # test_leg_pprev_getheaders -- 2026-09-25 (bmc_osx ad11ac5a + 61eaa0f9): a new
@@ -1302,21 +1318,21 @@ tests/test_mux_dial_gate: addrbook.a $(MUXGATESRCS) daemon/main.c daemon/archive
 # up-to-date peer's best block is known at connect. The real
 # leg_note_installed / leg_on_headers / block_fetch_gate, main.c as a TU.
 PPREVGHSRCS := $(patsubst tests/test_dial_budget.c,tests/test_leg_pprev_getheaders.c,$(DIALSRCS))
-tests/test_leg_pprev_getheaders: addrbook.a $(PPREVGHSRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c $(TEST_TMPDIR_H)
+tests/test_leg_pprev_getheaders: addrbook.a $(PPREVGHSRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c $(TEST_TMPDIR_H) $(MAIN_C_HDRS)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ $(PPREVGHSRCS) $(DAEMONOBJS) $(DAEMON_RPCOBJS) wallet_core.c addrbook.a -lpthread
 
 # inbound I2P: SAM STREAM ACCEPT on the acceptor thread -> the serve loop
 I2PINSRCS := $(patsubst tests/test_dial_budget.c,tests/test_i2p_inbound.c,$(DIALSRCS))
-tests/test_i2p_inbound: addrbook.a tests/i2p_vec.h $(I2PINSRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c
+tests/test_i2p_inbound: addrbook.a tests/i2p_vec.h $(I2PINSRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c $(MAIN_C_HDRS)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ $(I2PINSRCS) $(DAEMONOBJS) $(DAEMON_RPCOBJS) wallet_core.c addrbook.a -lpthread
 
 POOLDIVSRCS := $(patsubst tests/test_dial_budget.c,tests/test_pool_diversity.c,$(DIALSRCS))
-tests/test_pool_diversity: addrbook.a $(POOLDIVSRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c
+tests/test_pool_diversity: addrbook.a $(POOLDIVSRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c $(MAIN_C_HDRS)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ $(POOLDIVSRCS) $(DAEMONOBJS) $(DAEMON_RPCOBJS) wallet_core.c addrbook.a -lpthread
 
 # When the running worker hands a far-behind archive to the parallel downloader.
 TRIGSRCS := $(patsubst tests/test_dial_budget.c,tests/test_parallel_trigger.c,$(DIALSRCS))
-tests/test_parallel_trigger: addrbook.a $(TRIGSRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c
+tests/test_parallel_trigger: addrbook.a $(TRIGSRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c $(MAIN_C_HDRS)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ $(TRIGSRCS) $(DAEMONOBJS) $(DAEMON_RPCOBJS) wallet_core.c addrbook.a -lpthread
 
 # test_dlc_interleave -- step 1 of docs/audits/UTXO_INLINE_BUILD_PERF_SCOPE.md
@@ -1327,27 +1343,27 @@ tests/test_parallel_trigger: addrbook.a $(TRIGSRCS) daemon/main.c daemon/archive
 # interleave seam off: applied stays at -1 until the drain. Same
 # main.c-as-a-TU shape as test_dial_budget.
 INTERLEAVESRCS := $(patsubst tests/test_dial_budget.c,tests/test_dlc_interleave.c,$(DIALSRCS))
-tests/test_dlc_interleave: addrbook.a $(INTERLEAVESRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c $(TEST_TMPDIR_H)
+tests/test_dlc_interleave: addrbook.a $(INTERLEAVESRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c $(TEST_TMPDIR_H) $(MAIN_C_HDRS)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ $(INTERLEAVESRCS) $(DAEMONOBJS) $(DAEMON_RPCOBJS) wallet_core.c addrbook.a -lpthread
 
 BANRACESRCS := $(patsubst tests/test_dial_budget.c,tests/test_ban_expiry_race.c,$(DIALSRCS))
-tests/test_ban_expiry_race: addrbook.a $(BANRACESRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c $(TEST_TMPDIR_H)
+tests/test_ban_expiry_race: addrbook.a $(BANRACESRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c $(TEST_TMPDIR_H) $(MAIN_C_HDRS)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ $(BANRACESRCS) $(DAEMONOBJS) $(DAEMON_RPCOBJS) wallet_core.c addrbook.a -lpthread
 
 BANSLOTSRCS := $(patsubst tests/test_dial_budget.c,tests/test_ban_slot_claim.c,$(DIALSRCS))
-tests/test_ban_slot_claim: addrbook.a $(BANSLOTSRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c $(TEST_TMPDIR_H)
+tests/test_ban_slot_claim: addrbook.a $(BANSLOTSRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c $(TEST_TMPDIR_H) $(MAIN_C_HDRS)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ $(BANSLOTSRCS) $(DAEMONOBJS) $(DAEMON_RPCOBJS) wallet_core.c addrbook.a -lpthread
 
 BANPERSISTSRCS := $(patsubst tests/test_dial_budget.c,tests/test_banlist_persist_race.c,$(DIALSRCS))
-tests/test_banlist_persist_race: addrbook.a $(BANPERSISTSRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h daemon/banlist.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c $(TEST_TMPDIR_H)
+tests/test_banlist_persist_race: addrbook.a $(BANPERSISTSRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h daemon/banlist.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c $(TEST_TMPDIR_H) $(MAIN_C_HDRS)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ $(BANPERSISTSRCS) $(DAEMONOBJS) $(DAEMON_RPCOBJS) wallet_core.c addrbook.a -lpthread
 
 PASSSILENCESRCS := $(patsubst tests/test_dial_budget.c,tests/test_pass_silence_strike.c,$(DIALSRCS))
-tests/test_pass_silence_strike: addrbook.a $(PASSSILENCESRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c $(TEST_TMPDIR_H)
+tests/test_pass_silence_strike: addrbook.a $(PASSSILENCESRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c $(TEST_TMPDIR_H) $(MAIN_C_HDRS)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ $(PASSSILENCESRCS) $(DAEMONOBJS) $(DAEMON_RPCOBJS) wallet_core.c addrbook.a -lpthread
 
 ANNCLAIMSRCS := $(patsubst tests/test_dial_budget.c,tests/test_announce_claim.c,$(DIALSRCS))
-tests/test_announce_claim: addrbook.a $(ANNCLAIMSRCS) daemon/main.c daemon/inflight.h daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c $(TEST_TMPDIR_H)
+tests/test_announce_claim: addrbook.a $(ANNCLAIMSRCS) daemon/main.c daemon/inflight.h daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c $(TEST_TMPDIR_H) $(MAIN_C_HDRS)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ $(ANNCLAIMSRCS) $(DAEMONOBJS) $(DAEMON_RPCOBJS) wallet_core.c addrbook.a -lpthread
 
 # test_dlc_stop_sigign -- the 2026-09-24 m5ultra worker wedge: under the
@@ -1358,7 +1374,7 @@ tests/test_announce_claim: addrbook.a $(ANNCLAIMSRCS) daemon/main.c daemon/infli
 # that ignore SIGTERM plus a long-lived sibling must return promptly.
 # Same main.c-as-a-TU shape as test_dlc_interleave.
 STOPSIGIGNSRCS := $(patsubst tests/test_dial_budget.c,tests/test_dlc_stop_sigign.c,$(DIALSRCS))
-tests/test_dlc_stop_sigign: addrbook.a $(STOPSIGIGNSRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c
+tests/test_dlc_stop_sigign: addrbook.a $(STOPSIGIGNSRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c $(MAIN_C_HDRS)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ $(STOPSIGIGNSRCS) $(DAEMONOBJS) $(DAEMON_RPCOBJS) wallet_core.c addrbook.a -lpthread
 
 # test_txoq_shutdown -- the 2026-09-24 m5ultra 10-minute stop: the worker's
@@ -1367,7 +1383,7 @@ tests/test_dlc_stop_sigign: addrbook.a $(STOPSIGIGNSRCS) daemon/main.c daemon/ar
 # parent exited. The real txoq_service against a parent that never reads
 # must keep servicing, on an 8 KB channel and on the tuned one.
 TXOQSHUTSRCS := $(patsubst tests/test_dial_budget.c,tests/test_txoq_shutdown.c,$(DIALSRCS))
-tests/test_txoq_shutdown: addrbook.a $(TXOQSHUTSRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c
+tests/test_txoq_shutdown: addrbook.a $(TXOQSHUTSRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c $(MAIN_C_HDRS)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ $(TXOQSHUTSRCS) $(DAEMONOBJS) $(DAEMON_RPCOBJS) wallet_core.c addrbook.a -lpthread
 
 # test_dlc_wire_bytes -- defect A of the run-28 bench-fidelity batch
@@ -1378,7 +1394,7 @@ tests/test_txoq_shutdown: addrbook.a $(TXOQSHUTSRCS) daemon/main.c daemon/archiv
 # peer must carry bytessent and its per-message maps. Same main.c-as-a-TU
 # shape as test_dlc_interleave.
 WIREBYTESSRCS := $(patsubst tests/test_dial_budget.c,tests/test_dlc_wire_bytes.c,$(DIALSRCS))
-tests/test_dlc_wire_bytes: addrbook.a $(WIREBYTESSRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c $(TEST_TMPDIR_H)
+tests/test_dlc_wire_bytes: addrbook.a $(WIREBYTESSRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c $(TEST_TMPDIR_H) $(MAIN_C_HDRS)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ $(WIREBYTESSRCS) $(DAEMONOBJS) $(DAEMON_RPCOBJS) wallet_core.c addrbook.a -lpthread
 
 tests/test_cons: tests/test_cons.c $(CONSOBJS)
@@ -2664,7 +2680,7 @@ tests/bench_merkle: tests/bench_merkle.c bitcoin_hash.o sha256.o
 # input. cons_verify does strictly LESS than Core's CheckBlock; the file
 # header enumerates exactly what is missing, and BENCHMARKS.md repeats it.
 #   make tests/bench_checkblock && tests/bench_checkblock \
-#     /storage/bitcoin-core-source/src/bench/data/block413567.raw [rounds]
+#     /storage/bitcoin-core-v31.1/source/src/bench/data/block413567.raw [rounds]
 tests/bench_checkblock: tests/bench_checkblock.c tests/bench_abi_guard.S $(CONSOBJS)
 	$(CC) $(CFLAGS) -o $@ tests/bench_checkblock.c tests/bench_abi_guard.S $(CONSOBJS)
 
@@ -2676,7 +2692,7 @@ tests/bench_checkblock: tests/bench_checkblock.c tests/bench_abi_guard.S $(CONSO
 # passes on the same build -- it audits RSP alignment, not register
 # preservation, so this class of bug is invisible to it.
 #   make tests/bench_abi_audit && tests/bench_abi_audit \
-#     /storage/bitcoin-core-source/src/bench/data/block413567.raw
+#     /storage/bitcoin-core-v31.1/source/src/bench/data/block413567.raw
 # bitcoin_script.o is in the LINK line below but was missing from these
 # prerequisites, so a fresh tree (no stale .o lying around) failed here with
 # "cannot find bitcoin_script.o" -- it only ever built because some LATER
@@ -3512,7 +3528,7 @@ DAEMONSRCS := daemon/main.c daemon/private_broadcast.c daemon/fee_estimator.c da
 # object missing the note silently re-enables an executable stack.
 HARDENFLAGS := -Wl,-z,relro,-z,now
 
-daemon/bmcbitcoind: addrbook.a $(DAEMONSRCS) daemon/archive_reindex.h daemon/utxo_walk.h daemon/reorg.h daemon/txi_format.h mempool_slot.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c
+daemon/bmcbitcoind: addrbook.a $(DAEMONSRCS) daemon/archive_reindex.h daemon/utxo_walk.h daemon/reorg.h daemon/txi_format.h mempool_slot.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c $(MAIN_C_HDRS)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) $(HARDENFLAGS) -o $@ $(DAEMONSRCS) $(DAEMONOBJS) $(DAEMON_RPCOBJS) wallet_core.c addrbook.a -lpthread
 
 # pverify -- parallel block-chain verifier, machine-adaptive worker count.
@@ -3648,7 +3664,7 @@ tests/test_abi_stack_align: tests/test_abi_stack_align.c $(ABIALIGNOBJS)
 # tests listed after them never ran -- while the README called `make test`
 # the full gate. Override on the command line to point at your own copy:
 #   make test CORE_BENCH_BLOCK=/path/to/block413567.raw
-CORE_BENCH_BLOCK ?= $(wildcard /storage/bitcoin-core-source/src/bench/data/block413567.raw)
+CORE_BENCH_BLOCK ?= $(wildcard /storage/bitcoin-core-v31.1/source/src/bench/data/block413567.raw)
 ABI_AUDIT_BLOCK := $(CORE_BENCH_BLOCK)
 
 callee-saved-check:
@@ -3713,6 +3729,16 @@ link-check: $(VERSION_GEN_H)
 link-audit-selftest:
 	python3 ../scripts/makefile_link_audit.py --selftest > /dev/null
 
+# header-check (2026-10-01): every rule that compiles daemon/main.c lists every
+# local header main.c #includes (MAIN_C_HDRS), so a header-only edit rebuilds
+# it. A revert-check that edited only daemon/dlc_rules.h once rebuilt nothing
+# and ran the previous binary. Direct includes only; .PHONY targets skipped.
+header-check: $(VERSION_GEN_H)
+	python3 ../scripts/makefile_header_audit.py --asmdir . --check
+
+header-audit-selftest:
+	python3 ../scripts/makefile_header_audit.py --selftest > /dev/null
+
 .PHONY: gate-log-check gate-log-selftest
 # Audit a FINISHED gate log: did every gated test actually run?
 #   make gate-log-check LOG=/path/to/gate.log
@@ -3751,7 +3777,7 @@ log-literal-check:
 
 
 
-test: abi-check callee-saved-check prereq-check runlist-check runtime-check clean-check san-check script-flags-check log-literal-check link-audit-selftest gate-log-selftest daemon/bmc_build_utxo daemon/bmcbitcoind link-check tests/test_abi_coverage tests/bench_abi_audit tests/test_abi_stack_align tests/test_node_config tests/test_archive_check tests/test_scriptverify_parity tests/test_sha256 tests/test_cry6_sha_paths tests/test_sha512 tests/test_sha1 tests/test_aes tests/test_wallet_crypter tests/test_wallet_store tests/test_cli_prompt tests/test_chainparams tests/test_pow_rules tests/test_coinselect_bnb tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_scalarmul_ct tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_bip32_extkey tests/test_bip32_ckdpub tests/test_bip39 tests/test_bip39_passbound tests/test_sha512_thread_stress tests/test_secret_wipe tests/test_ripemd160 tests/test_ripemd160_thread_stress tests/test_addr tests/test_bech32 tests/test_mempool tests/test_mempool_policy tests/test_mempool_cluster tests/test_msg_sign tests/test_net_policy tests/test_private_broadcast tests/test_wallet_txlog tests/test_lsm_bloomsat tests/test_lsm_pick_budget tests/test_lsm_flush_sparse tests/test_lsm_lost_tombstones tests/test_lsm_lost_tombstones_bad tests/test_utxo_lost_tombstones tests/test_utxo_put_wal_fail tests/test_utxo_wal_reset_fail tests/test_utxo_reload_truncated tests/test_utxo_manifest_bad tests/test_reorg_crash_ordering tests/test_utxo_lost_tombstones_bad tests/test_interp_legacy_spend tests/test_ir10_p2pkh_bounds tests/test_package_policy tests/test_truc_policy \
+test: abi-check callee-saved-check prereq-check runlist-check runtime-check clean-check san-check script-flags-check log-literal-check link-audit-selftest header-audit-selftest header-check gate-log-selftest daemon/bmc_build_utxo daemon/bmcbitcoind link-check tests/test_abi_coverage tests/bench_abi_audit tests/test_abi_stack_align tests/test_node_config tests/test_archive_check tests/test_scriptverify_parity tests/test_sha256 tests/test_cry6_sha_paths tests/test_sha512 tests/test_sha1 tests/test_aes tests/test_wallet_crypter tests/test_wallet_store tests/test_cli_prompt tests/test_chainparams tests/test_pow_rules tests/test_coinselect_bnb tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_scalarmul_ct tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_bip32_extkey tests/test_bip32_ckdpub tests/test_bip39 tests/test_bip39_passbound tests/test_sha512_thread_stress tests/test_secret_wipe tests/test_ripemd160 tests/test_ripemd160_thread_stress tests/test_addr tests/test_bech32 tests/test_mempool tests/test_mempool_policy tests/test_mempool_cluster tests/test_msg_sign tests/test_net_policy tests/test_private_broadcast tests/test_wallet_txlog tests/test_lsm_bloomsat tests/test_lsm_pick_budget tests/test_lsm_flush_sparse tests/test_lsm_lost_tombstones tests/test_lsm_lost_tombstones_bad tests/test_utxo_lost_tombstones tests/test_utxo_put_wal_fail tests/test_utxo_wal_reset_fail tests/test_utxo_reload_truncated tests/test_utxo_manifest_bad tests/test_reorg_crash_ordering tests/test_utxo_lost_tombstones_bad tests/test_interp_legacy_spend tests/test_ir10_p2pkh_bounds tests/test_package_policy tests/test_truc_policy \
 tests/test_ephemeral_dust tests/test_mempool_evict tests/test_mempool_chunks tests/test_mempool_evict_64k tests/test_mempool_finality tests/test_mempool_journal tests/test_mpool_get_once tests/test_mpj_torn_read tests/test_mempool_depart_reasons tests/test_mempool_sequence tests/test_mempool_core_parity tests/test_txtxid tests/test_mempool_persist tests/test_block tests/test_tx tests/test_net tests/test_net_timeouts tests/test_inbound_idle_timeout tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_store_map_magic tests/test_sto11_append_durability tests/test_prune tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_cmpct_fallback tests/test_sync_gate tests/test_sync_dup tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_serve_violation tests/test_serve_block_ctx tests/test_p2p_msgsize tests/test_wallet_pass tests/test_keepup tests/test_p2p_inv tests/test_bip152 tests/test_bip152_loop tests/test_sendheaders_fee tests/test_addrv2_serve tests/test_addr_ingest_parse tests/test_addr_ingest_violation tests/test_sha3 tests/test_base32 tests/test_netaddr tests/test_addrbook tests/test_addrbook_net10 tests/test_stale_tip tests/test_peer_timeout tests/test_txann tests/test_tx_handoff tests/test_inbound_evict tests/test_inbound_rate tests/test_anchors tests/test_ibd_pipeline tests/test_archive_seed tests/test_hdr_lowwork tests/test_coinsel tests/test_invalid_set tests/test_cmpct_recv tests/test_socks5 tests/test_torcontrol tests/test_i2psam tests/test_net6 tests/test_privacy_dns tests/test_chacha20 tests/test_poly1305 tests/test_hkdf tests/test_bip324_fs tests/test_bip324 tests/test_bip324_transport tests/test_v2transport tests/test_fe_sqrt tests/test_pointmul_ct_variants tests/test_ellswift tests/test_ellswift_ecdh tests/test_asmap tests/test_core_parity tests/test_outbound_mux tests/test_redial tests/test_elf_hardening tests/test_pubkey tests/test_sighash tests/test_sighash_oob tests/test_script tests/test_p2pkh tests/test_utxo tests/test_utxo_store tests/test_utxo_wal_buffer tests/test_utxo_torn_tail tests/test_utxo_lsm tests/test_utxo_lsm_dups tests/test_utxo_probe_bound tests/test_utxo_prefetch_race tests/test_utxo_live_count tests/test_sparse_offsets tests/test_compact_async tests/test_compact_leveled tests/test_policy_v31 tests/test_utxo_ckpt_batch tests/test_txval tests/test_multisig tests/test_wallet tests/test_e2e_sighash tests/test_send tests/test_wrpc_addr tests/test_wrpc_utxo tests/test_wrpc_decoderaw tests/test_wrpc_sign tests/test_wrpc_send tests/test_scr_interp_bounds tests/smoke_interp tests/test_interp tests/test_csv_disable_flag tests/test_interp_core_vectors tests/test_tapscript_interp tests/run_batch tests/consensus_shim tests/test_sigops tests/test_scr10_sigops_bounds tests/test_schnorr tests/test_taproot tests/test_taproot_thread_stress tests/test_taproot_sighash tests/test_segwit_sighash tests/test_p2wpkh_real tests/test_mempool_accept_modern tests/test_tx_accept_e2e tests/test_tx_submit tests/test_tx_relay tests/test_txrelay_invscale tests/test_mempool_consensus_verify tests/test_txacc_snapshot_size tests/test_rpc_json tests/test_rpc_amount tests/test_rpc_transport tests/test_rpc_server tests/test_rpc18_ipv6 tests/test_mempool_shared tests/test_mempool_lock_log tests/test_append_linkage tests/test_txindex_tail tests/test_coinstats_index tests/test_coinstats_hist tests/test_coinstats_hist_build tests/test_addr_self tests/test_ctl_dial tests/test_dlc_rules tests/test_leg_close_labels tests/test_dial_memory tests/test_inflight tests/test_utxo_sizing tests/test_compact_policy tests/test_index_repair tests/test_index_runs tests/test_index_trail tests/test_hdr_tree tests/test_bfilter_index tests/test_cfheaders_bounds tests/test_serve_rejects tests/test_secure_lock tests/test_block_strip tests/test_addr_index_tail tests/test_blk_submit tests/test_blk_dryrun tests/test_val_connect tests/test_val_read_tx tests/test_bip68_locks tests/test_hdr_contextual tests/test_tx_bounds_fuzz tests/test_pow_check tests/test_scr5_spkrun tests/test_scr7_cms_bounds tests/test_scr9_policy_flags tests/test_txaccept_corpus tests/test_ir9_tapscript_policy tests/test_ir5_sighash_cache tests/test_rpc_chain tests/test_rpc_chain_growth tests/test_rpc_chaintxstats tests/test_rpc_responsive tests/test_zmq_ring tests/test_zmq_bind tests/test_zmq_thread tests/test_zmq_queue tests/test_rpc_start_policy tests/test_rpc_json_depth tests/test_txrecon tests/test_mempool_persist_wiring tests/test_reindex_chainstate tests/test_archive_trim tests/test_reindex tests/test_descriptor_vectors tests/test_miniscript tests/test_bip340_sign tests/test_signet_solution tests/test_signet_txs tests/test_signet_verify tests/test_signet_block tests/test_netperm tests/test_subnet tests/test_rpc_acl tests/test_cli_conf tests/test_misbehavior_shared tests/test_txoutproof tests/test_rpc_msg tests/test_rpc_rawtx tests/test_rpc_psbtfinal tests/test_psbt_v2 tests/test_txospender_index tests/test_rpc_psbt_taproot tests/test_rpc_control tests/test_wallet_scan tests/test_block_filter tests/test_utxo_snapshot tests/test_rpc_signer tests/test_taproot_parity tests/test_multisig_opcount tests/test_rpc_signraw tests/test_rpc_miniscript_sign tests/test_rpc_node tests/test_rpc_chunk_scale tests/test_rpc_core_fields tests/test_rest tests/test_rpc_esplora tests/test_addr_hist tests/test_rpc_wallet_ops tests/verify_p2sh_shim tests/test_verify_p2sh tests/bip30_shim tests/test_bip30 tests/test_bip30_daemon tests/test_bip30_overwrite tests/test_utxo_unspendable tests/test_txv_parse_diff tests/test_txv_classify_diff tests/test_segwit_classify_diff tests/test_txvb_parse_diff tests/test_txv_pools_diff tests/test_strip_witness_diff tests/test_tapagg_diff tests/test_txv_dispatch_diff tests/test_wv0_drv_diff tests/test_svs_drv_diff tests/test_checksig_diff tests/test_bip143_diff tests/test_taproot_verify_diff tests/test_point_inf tests/test_glv_split tests/test_glv_wnaf tests/test_glv_pointmul tests/test_muhash tests/test_utxo_setinfo tests/test_schnorr_diff tests/test_schnorr_thread_stress tests/test_merkle_batch tests/test_mv_parse_bounds tests/test_money_range tests/test_txv_cs_maxsize tests/test_compact_threshold tests/test_bip341_diff tests/test_musig2 tests/test_musig2_psbt tests/test_rpc_whitelist tests/test_fee_estimator tests/test_psbt_update tests/test_psbt_bounds tests/test_relay_policy tests/test_chainwork tests/test_locator tests/test_prevhash tests/test_truncate tests/test_undo_log tests/test_undo_asm_diff tests/test_reorg tests/test_dial_budget tests/test_sync_budget tests/test_dlc_peer_parse tests/test_dialhelper tests/test_mux_dial_gate tests/test_leg_pprev_getheaders tests/test_i2p_inbound tests/test_pool_diversity tests/test_parallel_trigger tests/test_txoq_ipc tests/test_legacy_sighash tests/test_find_and_delete tests/test_hashtype_e2e tests/test_script_flags tests/test_archive_repair tests/test_archive_truncate_nonmonotonic tests/test_prune_nonmonotonic tests/test_tx_verify_parallel tests/test_utxo_checkpoint tests/diff_add_ct_homog tests/test_nop1_regression tests/test_checkmultisig_findanddelete tests/test_checkmultisig_zero_keys tests/test_checkmultisigverify_pop tests/test_sig_pushonly_75 tests/test_cltv_csv tests/test_apply_block_rollback tests/test_scriptverify_thread_stress tests/test_cross_tx_verify tests/test_txv_many_inputs tests/test_compact_manifest_order tests/test_utxo_compact_gen_tiebreak tests/test_tx_verify_bytepool_realloc tests/test_stack_push_len tests/test_utxo_catchup_crash_resume tests/test_utxo_ghost_resume tests/test_lsm_count_drift tests/test_utxo_recover_gate tests/test_taproot_scriptpath tests/test_mul_carry_regression tests/test_fe_repr tests/test_fe_inline tests/test_point_repr tests/test_ecdsa_inverse tests/test_fe_pow_sqrt tests/test_fe_inv_var tests/test_num3072_inv tests/test_lsm_mmap_diff tests/test_lsm_mm_collide tests/test_utxo_catchup_shutdown tests/test_utxo_catchup_timing tests/test_utxo_crash_recovery tests/test_utxo_crash_recovery_bulk tests/test_lsm_sparse_diff tests/soak_lsm_mm tests/test_ecdsa_glv_switch tests/test_witness_commitment tests/test_compactsize_canonical tests/test_txvb_wprog_stable tests/test_taproot_exception_block tests/test_dersig_encoding tests/test_scr8_der_lax tests/test_verify_core_vectors tests/test_scriptnum_bool tests/test_segwit_real tests/test_segwit_coverage tests/test_tapscript_scale tests/test_block_481827_pool_stack tests/test_segwit_txout_bound tests/test_segwit_bounds_fuzz tests/test_taproot_bounds_fuzz tests/test_taproot_parallel_arena tests/test_taproot_block_diff tests/test_public_tip tests/test_connect_reject tests/test_utxo_tiered_compact tests/test_lsm_flush_sort_diff tests/test_muhash_mul_diff tests/test_mempool_wtxid tests/test_coinstats_bulk_seed tests/test_coinstats_fold_ring tests/test_utxo_probe_diff tests/test_utxo_catchup_bounded tests/test_dlc_interleave tests/test_dlc_stop_sigign tests/test_txoq_shutdown tests/test_dlc_wire_bytes tests/test_banlist_persist tests/test_ban_expiry_race tests/test_ban_slot_claim tests/test_banlist_persist_race tests/test_pass_silence_strike tests/test_announce_claim tests/test_shared_stress tests/test_rpc_esplora_stress tests/test_frontier_append tests/test_append_unshared_frontier tests/test_stop_waits_for_worker
 	@echo "== harness self-test (the instruments that measure this node) =="
 	../validation/test_ibd_harness.sh

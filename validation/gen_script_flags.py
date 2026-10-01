@@ -21,8 +21,8 @@ CLTV/CSV/NULLDUMMY (NULLDUMMY activates with segwit, BIP147) are each
 """
 import re, sys, os
 
-SRC = "/storage/bitcoin-core-source/src/kernel/chainparams.cpp"
-IFACE = "/storage/bitcoin-core-source/src/script/interpreter.h"
+SRC = "/storage/bitcoin-core-v31.1/source/src/kernel/chainparams.cpp"
+IFACE = "/storage/bitcoin-core-v31.1/source/src/script/interpreter.h"
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "..", "asm", "script_flags_consts.inc")
 # The same numbers are needed by C (rpc_chain.c's getdeploymentinfo reports

@@ -16,10 +16,12 @@ documents, name each divergence*. It was never applied to JSON-RPC.
 
 `validation/rpc_field_parity.py` now does that, and should run in the gate.
 
-## Measure against v31.1, not the oracle
+## Measure against v31.1
 
-The verification oracle on this box is a **v31.99 development build**, and
-diffing against it invented work: it reported `inv_buckets` and `tx_send_rate`
+Since 2026-10-01 the box's only Core oracle is the **v31.1 release**
+(`/storage/core-oracle`, RPC 8335; docs/OPERATIONS.md, "The Core oracle"). Until
+then the oracle was a **v31.99 development build**, and diffing against it
+invented work: it reported `inv_buckets` and `tx_send_rate`
 as missing from `getnetworkinfo`, which v31.1 does not have at all, and inflated
 `getpeerinfo` to 76 fields against v31.1's 38.
 
@@ -371,16 +373,16 @@ cost: 80 seconds under the pool lock. The test asserts the count (builds ==
 multi-member clusters), not the time.
 
 **Linearization vs Core.** Core v31.1 linearizes with a spanning-forest
-search that reaches the optimum for clusters this size; this node uses
-ancestor-score greedy followed by Core's PostLinearize. They agree wherever
-greedy + PostLinearize is optimal, which PostLinearize guarantees when every
-member has at most one parent or at most one child (chains, fan-outs, CPFP),
-and which also holds for the diamond tested here. A cluster where they could
-differ needs members with several parents and several children, where the
-best chunk is not an ancestor set that greedy picks and PostLinearize's
-merges do not recover it. There bmc would report a valid chunking that is
-not Core's. No such case is in the tests: none was constructed, so how often
-it happens is unknown. No such cluster turned up on
+search that reaches the optimum for clusters this size. Since 2026-10-01 this
+node linearizes OPTIMALLY too (`mpc_linearize_optimal`: repeated exact
+maximum-feerate closure by minimum cut), then applies PostLinearize for
+connected chunks. The optimal diagram is unique, so chunk feerates agree
+wherever Core reaches its optimum. Before, this was ancestor-score greedy +
+PostLinearize, and BlockYard's differential found it short of Core in 2 of
+246 clusters (5.03 sat/vB where Core had 5.70; 6.01 against 6.20); random
+clusters of 8..24 members showed greedy short in 12 of 3,000. Optimality is
+tested against every topological order of 3,000 random clusters of up to 7
+members. No such cluster turned up on
 production (below). Two smaller known differences: a negative modified fee
 (from `prioritisetransaction`) is clamped to 0 inside a multi-member cluster,
 where Core keeps the sign; a singleton reports it signed, as Core does.
