@@ -1153,11 +1153,11 @@ static int cmd_getmempoolinfo(rj_val** res){
     /* The cluster limits this node enforces at acceptance (2026-10-01): Core
      * v31.1's limitclustercount / limitclustersize, the whole bound since the
      * ancestor/descendant limits stopped refusing anything. Until then this
-     * reported -limitancestorcount/-size under these names. `optimal` is the
-     * linearization's claim; see below. */
+     * reported -limitancestorcount/-size under these names. */
     rj_obj_set(o, "limitclustercount", rj_numf("%ld", g_limit_cluster_count));
     rj_obj_set(o, "limitclustersize", rj_numf("%ld", g_limit_cluster_size_kvb * 1000));
-    rj_obj_set(o, "optimal", rj_bool(0));
+    /* every cluster is linearized optimally when it is read (2026-10-01) */
+    rj_obj_set(o, "optimal", rj_bool(1));
     rj_obj_set(o, "incrementalrelayfee", rj_numf("%.8f", (double)g_incremental_satkvb / 1e8));
     rj_obj_set(o, "unbroadcastcount", rj_numf("%d", 0));
     /* the real policy value, not a literal: reporting a setting the
@@ -1894,15 +1894,12 @@ static int mpc_lookup_bulk(void* ctx, const unsigned char txid[32], mpc_entry* o
  * (sigops-adjusted WEIGHT, not vsize) and fees.chunk (the chunk's summed
  * MODIFIED fee). 1 with *fee and *weight set, 0 when there is no honest answer.
  *
- * Linearization: ancestor-score greedy, then Core's PostLinearize (see
- * mempool_cluster.h). Core v31.1 searches for the optimum with a
- * spanning-forest algorithm; the two agree wherever the greedy+post result is
- * optimal, which PostLinearize guarantees for chains and trees (at most one
- * parent, or at most one child, per member) and which covers the CPFP, chain
- * and diamond shapes pinned in the tests. A cluster where they differ is one
- * where Core found a strictly better chunking than greedy -- the number here
- * would then be a valid chunking, not Core's. Recorded in
- * docs/PARITY_RPC_FIELDS.md.
+ * Linearization: OPTIMAL (mpc_linearize_optimal, 2026-10-01), then Core's
+ * PostLinearize for connected chunks (see mempool_cluster.h). The optimal
+ * diagram is unique, so the chunk feerates here are Core's wherever Core's
+ * spanning-forest search reaches its optimum. Until 2026-10-01 this was
+ * ancestor-score greedy, and BlockYard's differential found it short of Core
+ * in 2 of 246 clusters (5.03 sat/vB where Core had 5.70; 6.01 against 6.20).
  *
  * Under the pool lock (the caller holds it). With the bulk chunk cache the
  * first member to ask pays for the cluster and every other member reads the
@@ -1924,7 +1921,7 @@ static int mpe_chunk_of(const unsigned char txid[32], unsigned long long* fee,
     int ok = mpc_build_cluster(0, (bulk && self_k >= 0) ? mpc_lookup_bulk : mpc_lookup_here,
                                txid, &cl) == 0
           && !cl.truncated && cl.n >= 1
-          && mpc_linearize_ancestor_score(&cl, lin) == 0
+          && mpc_linearize_optimal(&cl, lin) == 0        /* 2026-10-01: was ancestor-score greedy */
           && mpc_post_linearize(&cl, lin) == 0
           && mpc_chunk_linearization(&cl, lin, &ch) == 0;
     if (!ok){
@@ -3813,11 +3810,13 @@ static int cmd_getmempoolcluster(const rj_val* params, rj_val** res, long* ec, c
     }
 
     int lin[MPC_MAX_CLUSTER];
-    if (mpc_linearize_ancestor_score(&cl, lin) != 0){
+    if (mpc_linearize_optimal(&cl, lin) != 0){
         *ec = -1; *em = "the cluster could not be linearized (not a DAG?)"; return 0; }
     /* Post-linearization is equal-or-better by construction and makes the chunks
-     * CONNECTED, which the greedy alone does not guarantee. A disconnected chunk
-     * is not wrong arithmetic, but it is not a chunk Core would report. */
+     * CONNECTED, which the optimal search alone does not guarantee (two
+     * independent parts of equal feerate can be emitted together). A
+     * disconnected chunk is not wrong arithmetic, but it is not a chunk Core
+     * would report. 2026-10-01: the search is optimal; it was greedy. */
     mpc_post_linearize(&cl, lin);
     mpc_chunking ch;
     if (mpc_chunk_linearization(&cl, lin, &ch) != 0){

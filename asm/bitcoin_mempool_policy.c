@@ -1796,7 +1796,7 @@ static int cluster_last_chunk(void* st, const uint32_t* mem, int n, mpol_chunk* 
             if (cl.m[q].ancestors & ((uint64_t)1 << m)) cl.m[m].descendants |= (uint64_t)1 << q;
 
     int lin[MPC_MAX_CLUSTER]; mpc_chunking ch;
-    if (mpc_linearize_ancestor_score(&cl, lin) != 0) return 0;
+    if (mpc_linearize_optimal(&cl, lin) != 0) return 0;   /* 2026-10-01: was ancestor-score greedy */
     mpc_post_linearize(&cl, lin);
     if (mpc_chunk_linearization(&cl, lin, &ch) != 0 || ch.n == 0) return 0;
 
