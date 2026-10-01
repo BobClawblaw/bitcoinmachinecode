@@ -41,7 +41,7 @@ node_config_t g_cfg = {
     .dead_weight_ticks     = 3,
     .min_usable_peers      = 8,
     .maxpool               = 2048,
-    .dlc_chunk_blocks      = 40,
+    .dlc_chunk_blocks      = 16,
     .addr_max_per_response = 256,
     .addr_max_per_netgroup = 16,
     .utxo_bulk_slots_log2  = 22,
@@ -279,7 +279,7 @@ static void set_defaults(void){
     g_cfg.dead_weight_ticks     = 3;
     g_cfg.min_usable_peers      = 8;
     g_cfg.maxpool               = 2048;
-    g_cfg.dlc_chunk_blocks      = 40;
+    g_cfg.dlc_chunk_blocks      = 16;
     g_cfg.addr_max_per_response = 256;
     g_cfg.addr_max_per_netgroup = 16;
     g_cfg.proxyrandomize        = 1;     /* Core DEFAULT_PROXYRANDOMIZE */

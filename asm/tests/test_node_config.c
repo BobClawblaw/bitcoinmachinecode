@@ -190,21 +190,23 @@ int main(void){
         printf("PASS: extension keys applied (feelers=0 ticks=5 netgroup=4)\n");
     else { printf("FAIL: extension keys not applied\n"); failures++; }
 
-    /* 5b. bmc.dlcchunk (2026-09-30): blocks per download request; default 40,
-     * 16 applies, 3 and 65 are refused (the staging buffer holds 64) */
+    /* 5b. bmc.dlcchunk (2026-09-30): blocks per download request; default 16
+     * (40 until 2026-10-01), 24 applies, 3 and 65 are refused (the staging
+     * buffer holds 64). The applied value differs from the default, or the
+     * check could not tell "applied" from "ignored". */
     node_config_load("/nonexistent/reset.conf");
-    if (g_cfg.dlc_chunk_blocks == 40) printf("PASS: bmc.dlcchunk defaults to 40\n");
-    else { printf("FAIL: bmc.dlcchunk default is %d, not 40\n", g_cfg.dlc_chunk_blocks); failures++; }
-    wr("bmc_chunk.conf", "bmc.dlcchunk=16\n");
+    if (g_cfg.dlc_chunk_blocks == 16) printf("PASS: bmc.dlcchunk defaults to 16\n");
+    else { printf("FAIL: bmc.dlcchunk default is %d, not 16\n", g_cfg.dlc_chunk_blocks); failures++; }
+    wr("bmc_chunk.conf", "bmc.dlcchunk=24\n");
     node_config_load("bmc_chunk.conf");
-    if (g_cfg.dlc_chunk_blocks == 16) printf("PASS: bmc.dlcchunk=16 applied\n");
-    else { printf("FAIL: bmc.dlcchunk=16 not applied (%d)\n", g_cfg.dlc_chunk_blocks); failures++; }
+    if (g_cfg.dlc_chunk_blocks == 24) printf("PASS: bmc.dlcchunk=24 applied\n");
+    else { printf("FAIL: bmc.dlcchunk=24 not applied (%d)\n", g_cfg.dlc_chunk_blocks); failures++; }
     wr("bmc_chunk.conf", "bmc.dlcchunk=3\n");
     node_config_load("bmc_chunk.conf");
-    int lo_ok = g_cfg.dlc_chunk_blocks == 40;
+    int lo_ok = g_cfg.dlc_chunk_blocks == 16;
     wr("bmc_chunk.conf", "bmc.dlcchunk=65\n");
     node_config_load("bmc_chunk.conf");
-    if (lo_ok && g_cfg.dlc_chunk_blocks == 40) printf("PASS: bmc.dlcchunk=3 and =65 refused, default kept\n");
+    if (lo_ok && g_cfg.dlc_chunk_blocks == 16) printf("PASS: bmc.dlcchunk=3 and =65 refused, default kept\n");
     else { printf("FAIL: an out-of-range bmc.dlcchunk applied (%d)\n", g_cfg.dlc_chunk_blocks); failures++; }
     unlink("bmc_chunk.conf");
     node_config_load("/nonexistent/reset.conf");

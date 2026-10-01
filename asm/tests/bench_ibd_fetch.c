@@ -6,7 +6,7 @@
  * wave=0 puts the whole chunk in one getdata. The difference is the round
  * trips, which is the only thing that changes between the two runs.
  *
- * Chunk size is 40, the downloader's default (bmc.dlcchunk, 4..64, since 2026-09-30).
+ * Chunk size is 40 here (the downloader's default was 40 until 2026-10-01; bmc.dlcchunk, now 16).
  */
 #include <stdio.h>
 #include <string.h>

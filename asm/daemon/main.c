@@ -4880,14 +4880,17 @@ static int dl_pool_from_book(void* ab, char out[][DL_POOL_SLOT], int nitems){
  * work and took minutes to even trigger; 40 blocks (~50-60MB near the tip)
  * with a proportionally shorter budget gives a ~4x faster detect-and-replace
  * cycle at ~4x lower cost per miss. */
-/* 2026-09-30: the chunk is a runtime value, bmc.dlcchunk (default 40, 4..64),
+/* 2026-09-30: the chunk is a runtime value, bmc.dlcchunk (default 16, 4..64; 40 until 2026-10-01),
  * set once per pass before any worker or the committer forks. Run 31 found
  * that inside Core's 1,024-block window ten workers holding 40-block chunks
  * leave two or three chunks of headroom each, so one late chunk starves the
  * apply; finer requests are the lever (Core: 16 in flight per peer). The
  * staging buffer is sized for the largest allowed chunk. */
 #define DLC_CHUNK_BLOCKS_MAX 64
-static long g_dlc_chunk = 40;
+/* default 16 since 2026-10-01: two A/Bs to 300,000 (validation/ab_dlcchunk.sh),
+ * one in each order, reached it 19.5% and 14.1% sooner than at 40, the gain
+ * concentrated at 200k-300k (-23%, -25%) */
+static long g_dlc_chunk = 16;
 static long g_dlc_pool_idle_pct = -1;   /* pool-wide share of worker wall-clock blocked in the socket read (2026-09-11); -1 until a chunk completes */
 /* Draw from the WHOLE address book, not a 512 slice of it. Measured
  * 2026-08-18: the book held 1,974 peers, the pool was capped at 512, the

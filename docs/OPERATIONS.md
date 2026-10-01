@@ -350,7 +350,8 @@ I2P destination.
 - `bmc.utxocompactthreshold` (default 12) is the run count that triggers a
   background compaction; `bmc.bootcatchup=0` skips the boot-time parallel
   download.
-- `bmc.dlcchunk=<n>` (default 40, 4..64; 2026-09-30) is the blocks per
+- `bmc.dlcchunk=<n>` (default 16, 4..64; 2026-09-30, default 40 until
+  2026-10-01) is the blocks per
   request of the parallel download: each worker asks one peer for a chunk of
   this many blocks in one getdata. Core keeps 16 in flight per peer, refilled
   as each lands. The `[dlc] Core's shape:` line prints the value in use and
