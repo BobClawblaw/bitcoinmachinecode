@@ -50,7 +50,7 @@ static long ms_in(const char* line, const char* key){
     return atol(p + strlen(key));
 }
 
-/* E: convoy threads -- take, hold 3 ms, release, take again at once */
+/* E: six convoy threads -- take, hold 3 ms, release, take again at once */
 static volatile int g_convoy_stop;
 static void* convoy_thread(void* a){
     (void)a;
@@ -173,17 +173,21 @@ int main(void){
 
     /* ---- E: a convoy of 3 ms holds; this thread waits behind it ---- */
     { const char* cl = NULL; long waited = -1;
-      for (int attempt = 0; attempt < 3 && !cl; attempt++){
+      for (int attempt = 0; attempt < 8 && !cl; attempt++){   /* a fair handoff can let the waiter in early; under a loaded suite that happened 3 times running once */
           g_convoy_stop = 0;
-          pthread_t ct[3];
-          for (int i = 0; i < 3; i++) pthread_create(&ct[i], NULL, convoy_thread, NULL);
+          pthread_t ct[6];
+          for (int i = 0; i < 6; i++) pthread_create(&ct[i], NULL, convoy_thread, NULL);
           usleep(30000);                                     /* the convoy is running */
           ev0 = mp_lock_slow_events();
           mp_lock_at("behind_the_convoy");
+          /* read the ring while HOLDING the lock: the convoy threads are
+           * blocked on it, so no line of theirs (under load they wait on
+           * each other long enough to log) can follow ours into the 4-slot
+           * ring before we look -- a full-suite run lost the line that way */
+          mp_lock_slow_log(log, sizeof log);
           mp_unlock();
           g_convoy_stop = 1;
-          for (int i = 0; i < 3; i++) pthread_join(ct[i], NULL);
-          mp_lock_slow_log(log, sizeof log);
+          for (int i = 0; i < 6; i++) pthread_join(ct[i], NULL);
           cl = strstr(log, "[mempool] pool lock: behind_the_convoy (pid ");
           if (cl && mp_lock_slow_events() == ev0) cl = NULL;   /* a stale ring entry */
           if (cl) waited = ms_in(cl, ") waited ");
