@@ -441,6 +441,83 @@ int main(void){
         okv(mpool_get(mp, idO2, &l) != NULL, "...and O2 stays in the pool");
         #undef RB_TX
     }
+
+    /* ================================================================
+     * Eviction's cluster walk (2026-10-01). worst_chunk_excl threaded every
+     * parent's child list through ONE child_next slot per node, so a child
+     * with two parents (C: parents A and B) was relinked into B's list and
+     * A's earlier children (D) fell out of A's walk. The cluster {A,B,C,D}
+     * was then scored as {A,B,C} -- without D, the CPFP child that lifts A --
+     * and eviction took A and C (and D with them) instead of the genuinely
+     * worst chunk X.
+     *   A 113 vB  113 sat (1/vB)  two outputs, for D and C
+     *   B  82 vB 1640 sat (20/vB)
+     *   D  82 vB 4100 sat (50/vB) spends A:0   (inserted BEFORE C)
+     *   C 123 vB 2460 sat (20/vB) spends A:1 and B:0
+     *   X  82 vB 1230 sat (15/vB) unrelated
+     * Correct chunks: {A,D} 21.6, B 20, C 20, X 15 -> X is the worst.
+     * Without D: B 20, {A,C} 10.9 -> {A,C} looked worst.
+     * The blob holds the five (482 raw bytes) and not a sixth; Y (82 vB,
+     * 50/vB) must evict exactly X to fit.
+     * ================================================================ */
+    printf("== eviction scores the WHOLE cluster: a two-parent child does not hide a sibling ==\n");
+    {
+        static unsigned char pol[128];
+        static unsigned char stbuf[1<<21];
+        static unsigned char mp[40 + 64*80 + 8];
+        static unsigned char mblob[500];
+        static unsigned char ux[40 + 4096*48 + 8];
+        static unsigned char ublob[1<<16];
+        #define EV_TX1(buf, n, prev, pidx, nout, each, tag) do{ \
+            n = 0; buf[n++]=2;buf[n++]=0;buf[n++]=0;buf[n++]=0; \
+            buf[n++]=1; memcpy(buf+n, prev, 32); n+=32; \
+            for (int _b=0;_b<4;_b++) buf[n++]=(unsigned char)((unsigned)(pidx)>>(8*_b)); \
+            buf[n++]=0; memset(buf+n,0xff,4); n+=4; \
+            buf[n++]=(unsigned char)(nout); \
+            for (int _o=0;_o<(nout);_o++){ unsigned long long _v=(each); \
+                for (int _b=0;_b<8;_b++) buf[n++]=(unsigned char)(_v>>(8*_b)); \
+                buf[n++]=22; buf[n++]=0x00; buf[n++]=0x14; memset(buf+n, (tag)+_o, 20); n+=20; } \
+            memset(buf+n, 0, 4); n+=4; }while(0)
+        unsigned char spk[2] = { 0x51, 0x00 };
+        unsigned char tx[256]; unsigned long n;
+        unsigned char cA[32], cB[32], cX[32], cY[32], idA[32], idB[32], idC[32], idD[32], idX[32], idY[32];
+        memset(stbuf, 0, sizeof stbuf);
+        mpool_policy_init(pol, 1000, 25, 101000, 25, 101000, 1);
+        POLICY_STATE_INIT(stbuf, 64);
+        mpool_init(mp, 64, mblob, sizeof mblob);
+        utxo_init(ux, 4096, ublob, sizeof ublob);
+        memset(cA, 0xE1, 32); memset(cB, 0xE2, 32); memset(cX, 0xE3, 32); memset(cY, 0xE4, 32);
+        utxo_put(ux, cA, 0, 1000000ULL, 0, 0, spk, 1); utxo_put(ux, cB, 0, 1000000ULL, 0, 0, spk, 1);
+        utxo_put(ux, cX, 0, 1000000ULL, 0, 0, spk, 1); utxo_put(ux, cY, 0, 1000000ULL, 0, 0, spk, 1);
+        long r[6]; unsigned long sz[6];
+        EV_TX1(tx, n, cA, 0, 2, (1000000ULL - 113) / 2, 0x10); sz[0] = n;      /* A: 113 vB; (1000000-113)/2 = 499943 each, fee 114 */
+        memset(idA, 0xA1, 32); r[0] = mpool_policy_add(pol, stbuf, mp, tx, n, idA, ux);
+        EV_TX1(tx, n, cB, 0, 1, 1000000ULL - 1640, 0x20); sz[1] = n;            /* B */
+        memset(idB, 0xB1, 32); r[1] = mpool_policy_add(pol, stbuf, mp, tx, n, idB, ux);
+        EV_TX1(tx, n, idA, 0, 1, 499943ULL - 4100, 0x30); sz[2] = n;            /* D: spends A:0 */
+        memset(idD, 0xD1, 32); r[2] = mpool_policy_add(pol, stbuf, mp, tx, n, idD, ux);
+        { n = 0; tx[n++]=2;tx[n++]=0;tx[n++]=0;tx[n++]=0; tx[n++]=2;                  /* C: spends A:1 and B:0 */
+          memcpy(tx+n, idA, 32); n+=32; tx[n++]=1; tx[n++]=0; tx[n++]=0; tx[n++]=0; tx[n++]=0; memset(tx+n,0xff,4); n+=4;
+          memcpy(tx+n, idB, 32); n+=32; memset(tx+n,0,4); n+=4; tx[n++]=0; memset(tx+n,0xff,4); n+=4;
+          tx[n++]=1; { unsigned long long v = 499943ULL + (1000000ULL - 1640) - 2460; for (int b=0;b<8;b++) tx[n++]=(unsigned char)(v>>(8*b)); }
+          tx[n++]=22; tx[n++]=0x00; tx[n++]=0x14; memset(tx+n, 0x40, 20); n+=20; memset(tx+n,0,4); n+=4; }
+        sz[3] = n; memset(idC, 0xC1, 32); r[3] = mpool_policy_add(pol, stbuf, mp, tx, n, idC, ux);
+        EV_TX1(tx, n, cX, 0, 1, 1000000ULL - 1230, 0x50); sz[4] = n;            /* X */
+        memset(idX, 0xF1, 32); r[4] = mpool_policy_add(pol, stbuf, mp, tx, n, idX, ux);
+        okv(r[0]==1 && r[1]==1 && r[2]==1 && r[3]==1 && r[4]==1, "A, B, D (child of A), C (child of A and B) and X are in");
+        if (!(r[0]==1 && r[1]==1 && r[2]==1 && r[3]==1 && r[4]==1)) printf("      r = %ld %ld %ld %ld %ld (%s)\n", r[0], r[1], r[2], r[3], r[4], mpool_policy_reason(pol));
+        printf("      sizes %lu %lu %lu %lu %lu = %lu raw bytes in a %zu-byte blob\n", sz[0], sz[1], sz[2], sz[3], sz[4],
+               sz[0]+sz[1]+sz[2]+sz[3]+sz[4], sizeof mblob);
+        EV_TX1(tx, n, cY, 0, 1, 1000000ULL - 4100, 0x60);                        /* Y: 82 vB at 50/vB, needs room */
+        memset(idY, 0xF2, 32); r[5] = mpool_policy_add(pol, stbuf, mp, tx, n, idY, ux);
+        unsigned long l = 0;
+        okv(r[5] == 1, "Y (50 sat/vB) is accepted, evicting to fit");
+        if (r[5] != 1) printf("      refused as: %s\n", mpool_policy_reason(pol));
+        okv(mpool_get(mp, idX, &l) == NULL, "X (15 sat/vB, the worst chunk) is the one evicted");
+        okv(mpool_get(mp, idA, &l) != NULL && mpool_get(mp, idC, &l) != NULL && mpool_get(mp, idD, &l) != NULL && mpool_get(mp, idB, &l) != NULL,
+            "A, B, C and D all stay (their cluster's worst chunk is C at 20, not {A,C} at 10.9)");
+        #undef EV_TX1
+    }
     /* ================================================================
      * MEM-3 (audit 2026-09-03): the parent list is no longer truncated.
      *
