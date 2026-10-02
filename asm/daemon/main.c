@@ -1206,6 +1206,7 @@ static int   mux_out_fd[MUX_MAX_OUT];       /* persistent outbound seed fds  */
  * so it gets addrv2-encoded self-announcements (daemon/addr_self.c) */
 static unsigned char mux_out_wants_v2[MUX_MAX_OUT];
 static unsigned char mux_out_kind[MUX_MAX_OUT];         /* CC-4: LEG_FULL / LEG_BLOCK_ONLY */
+static void bo_forget(const char* host);                /* the block-only registry, below (2026-10-01) */
 static unsigned char mux_out_cmpct[MUX_MAX_OUT];        /* CC-2: the peer sent sendcmpct on this leg */
 /* 2026-09-10, Core's shape at the tip: a block announced on the leg since its
  * last pass (inv, or a pushed `headers`: we send sendheaders), and whether the
@@ -1373,6 +1374,7 @@ static void leg_close_ours(int i, const char* reason, const char* detail){
     fprintf(stderr,"[dl:%d] %s connection closed ours/%s after %llds%s%s\n", i, mux_out_host[i][0] ? mux_out_host[i] : "?", reason, leg_age_s(i),
             detail && detail[0] ? " -- " : "", detail ? detail : "");
     if(mux_out_fd[i] >= 0){ bmc_v2_close(mux_out_fd[i]), close(mux_out_fd[i]); mux_out_fd[i] = -1; }
+    if(mux_out_kind[i] == LEG_BLOCK_ONLY) bo_forget(mux_out_host[i]);   /* 2026-10-01: the slot is free for another block-only host */
 }
 static void leg_close_theirs(int i, const char* how, const char* unread){
     if(g_pass_in_child) return;                        /* the parent decides from the report */
@@ -1380,6 +1382,7 @@ static void leg_close_theirs(int i, const char* how, const char* unread){
     fprintf(stderr,"[dl:%d] %s connection closed theirs (%s) after %llds; unread: %s\n", i, mux_out_host[i][0] ? mux_out_host[i] : "?", how, age, unread ? unread : "(nothing)");
     if(g_dialmem && age >= 0 && age <= DM_EARLY_S) dialmem_note_failure(g_dialmem, mux_out_host[i], age <= DM_REFUSED_S ? DM_REFUSED : DM_EARLY_DROP, dialmem_now());
     if(mux_out_fd[i] >= 0){ bmc_v2_close(mux_out_fd[i]), close(mux_out_fd[i]); mux_out_fd[i] = -1; }
+    if(mux_out_kind[i] == LEG_BLOCK_ONLY) bo_forget(mux_out_host[i]);   /* 2026-10-01 */
     mux_out_nextretry[i] = 0;   /* re-dial on the next rotation */
 }
 extern long p2p_ping(unsigned char* out, unsigned long long nonce);
@@ -3084,6 +3087,7 @@ static int outbound_connect_raw(const char* host, int rcv_ms, int out_port){
  * cannot hide a block from us. On shutdown they are written to anchors.dat
  * (Core's format) and dialled first on the next start. */
 static char g_bo_hosts[MAX_BLOCK_RELAY_ONLY][128];
+static long long g_bo_since[MAX_BLOCK_RELAY_ONLY];   /* when registered (2026-10-01) */
 static int  g_bo_n = 0;
 static int host_is_block_only(const char* host){
     for(int i = 0; i < g_bo_n; i++) if(!strcmp(g_bo_hosts[i], host)) return 1;
@@ -3098,8 +3102,35 @@ static int host_is_block_only(const char* host){
  * on its only leg -- Core's getpeerinfo relaytxes=false, not one
  * transaction relayed to us, ever. */
 static int bo_want(void){ if(g_cfg.connect_only) return 0; return g_cfg.max_block_relay_only < MAX_BLOCK_RELAY_ONLY ? g_cfg.max_block_relay_only : MAX_BLOCK_RELAY_ONLY; }
-static void bo_add(const char* host){ if(g_bo_n < MAX_BLOCK_RELAY_ONLY && !host_is_block_only(host)) snprintf(g_bo_hosts[g_bo_n++], sizeof g_bo_hosts[0], "%s", host); }
+static void bo_add(const char* host){
+    if(g_bo_n < MAX_BLOCK_RELAY_ONLY && !host_is_block_only(host)){
+        g_bo_since[g_bo_n] = (long long)time(NULL);
+        snprintf(g_bo_hosts[g_bo_n++], sizeof g_bo_hosts[0], "%s", host); } }
+/* The registry holds exactly the hosts that ARE block-relay-only legs or have
+ * a block-relay-only dial in flight (2026-10-01). It used to keep every host
+ * ever tried, up to MAX_BLOCK_RELAY_ONLY (8): a timed-out dial stayed
+ * "block-only" for the life of the process, so when the full-relay top-up
+ * later reached that host it came up block-relay-only, did not count toward
+ * the full-relay target, and the top-up dialled another -- production held 12
+ * legs against 8 + 2. A failed dial or a closed leg forgets the host; a prune
+ * drops anything neither live nor recently dialled. */
+static void bo_forget(const char* host){
+    for(int i = 0; i < g_bo_n; i++){
+        if(strcmp(g_bo_hosts[i], host)) continue;
+        for(int k = i; k + 1 < g_bo_n; k++){ memcpy(g_bo_hosts[k], g_bo_hosts[k+1], sizeof g_bo_hosts[0]); g_bo_since[k] = g_bo_since[k+1]; }
+        g_bo_n--; return; }
+}
+#define BO_PENDING_S 60      /* a dial helper's connect times out at 10 s; a minute is ample */
+static int bo_host_is_leg(const char* host);
+static void bo_prune(void){
+    long long now = (long long)time(NULL);
+    for(int i = 0; i < g_bo_n; ){
+        if(bo_host_is_leg(g_bo_hosts[i]) || now - g_bo_since[i] < BO_PENDING_S){ i++; continue; }
+        bo_forget(g_bo_hosts[i]);
+    }
+}
 static int legs_block_only(void){ int n = 0; for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && mux_out_kind[k] == LEG_BLOCK_ONLY) n++; return n; }
+static int bo_host_is_leg(const char* host){ for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && !strcmp(mux_out_host[k], host)) return 1; return 0; }
 /* every outbound dial funnels through here: a block-only host gets fRelay=0
  * in the version we send (the byte is per-connection already; see feelers) */
 static int outbound_connect(const char* host, int rcv_ms, int out_port){
@@ -10233,7 +10264,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         { dh_result_t dr; int dfd; char dhost[128];
           while(dh_poll(&dr, &dfd, dhost, sizeof dhost)){
               if(dr.ok && dfd >= 0){ if(!dh_install_leg(dhost, dfd, &dr)) fprintf(stderr, "[dial] %s: background dial landed but the leg was not installed\n", dhost); }
-              else { long bo = g_dialmem ? dialmem_note_failure(g_dialmem, dhost, strstr(dr.why, "handshake") ? DM_REFUSED : DM_CONNECT_FAIL, dialmem_now()) : 0;
+              else { if(host_is_block_only(dhost) && !bo_host_is_leg(dhost)) bo_forget(dhost);   /* 2026-10-01: a failed block-only dial frees its registry slot */
+                     long bo = g_dialmem ? dialmem_note_failure(g_dialmem, dhost, strstr(dr.why, "handshake") ? DM_REFUSED : DM_CONNECT_FAIL, dialmem_now()) : 0;
                      fprintf(stderr, "[dial] %s: background dial failed: %s (not dialled again for %ld min)\n", dhost, dr.why[0] ? dr.why : "?", bo / 60); }
           } }
         /* reserved slots: at least ONE leg per reachable anonymity network,
@@ -10242,7 +10274,11 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         /* CC-4: keep bo_want() block-relay-only legs on clearnet, dialled in the
          * background like the anonymity-network reserved legs below. The host is
          * registered as block-only BEFORE the dial so the version carries fRelay=0. */
-        if((rot % 8)==0 && legs_block_only() < bo_want() && mux_n_out < MUX_MAX_OUT && dh_extra_allowed()){
+        /* 2026-10-01: count the REGISTRY (live block-only legs + dials in
+         * flight), not the live legs: four dials went out in 50 s at boot while
+         * none had landed, and the three that landed made 3 block-only legs */
+        if((rot % 8)==0) bo_prune();
+        if((rot % 8)==0 && g_bo_n < bo_want() && mux_n_out < MUX_MAX_OUT && dh_extra_allowed()){
             static int bo_cursor = 0;                       /* 2026-09-10: rotate through the pool; a refused host is not first again */
             for(int step = 0; step < nsrc; step++){
                 int ci = (bo_cursor + step) % (nsrc > 0 ? nsrc : 1);
@@ -10255,7 +10291,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 bo_add(srcpool[ci]);
                 if(!host_is_block_only(srcpool[ci])) continue;   /* the registry is full: an unregistered dial would come up fRelay=1 */
                 bo_cursor = (ci + 1) % (nsrc > 0 ? nsrc : 1);
-                fprintf(stderr, "[dial] %s: dialing as block-relay-only (%d of %d)\n", srcpool[ci], legs_block_only() + 1, bo_want());
+                fprintf(stderr, "[dial] %s: dialing as block-relay-only (%d of %d, %d live)\n", srcpool[ci], g_bo_n, bo_want(), legs_block_only());
                 dh_start_slot(srcpool[ci], out_port, DH_SLOT_EXTRA);
                 break;
             }
@@ -10293,6 +10329,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             for(int ci=0; ci<nsrc && mux_n_out - legs_anon() - legs_block_only() < MUX_WANT_OUT() + stale_extra && mux_n_out<MUX_MAX_OUT; ci++){
                 if(topup_filled >= 1 || topup_fail >= 4) break;
                 if(leg_is_anon_net(leg_net_of(srcpool[ci]))) continue;   /* the helper owns those */
+                if(host_is_block_only(srcpool[ci])) continue;   /* 2026-10-01: a block-only host (leg or dial in flight) is not a full-relay candidate */
                 int already=0;
                 for(int k=0;k<mux_n_out;k++) if(!strcmp(mux_out_host[k],srcpool[ci])){ already=1; break; }
                 if(already) continue;

@@ -1,3 +1,4 @@
+#include <fcntl.h>
 /* Regression test for the outbound_connect dial-budget hang.
  *
  * Forks a "trickle peer": it accepts a connection then dribbles one byte every
@@ -110,6 +111,35 @@ int main(void){
             } else printf("PASS: refused dial names the errno (\"%s\")\n", why);
         }
     }
+
+    /* ---- the block-relay-only registry (2026-10-01) ----
+     * It kept every host ever tried (up to 8), so a timed-out block-only dial
+     * left a dead host "block-only" for the life of the process; the full-relay
+     * top-up later installed it as block-only, it did not count toward the
+     * full-relay target, and the top-up dialled again (production: 12 legs
+     * against 8 + 2). Now: live legs and recent dials only. */
+    #define BO_CK(c, m) do{ if(c) printf("PASS: %s\n", m); else { printf("FAIL: %s\n", m); failures++; } }while(0)
+    {   g_bo_n = 0; mux_n_out = 0;
+        bo_add("10.0.0.1:8333"); bo_add("10.0.0.2:8333"); bo_add("10.0.0.3:8333");
+        BO_CK(g_bo_n == 3 && host_is_block_only("10.0.0.2:8333"), "three block-only dials registered");
+        /* 10.0.0.1 landed as a leg; all three entries are two minutes old */
+        int lf = open("/dev/null", O_RDONLY);
+        strcpy(mux_out_host[0], "10.0.0.1:8333"); mux_out_fd[0] = lf; mux_out_kind[0] = LEG_BLOCK_ONLY; mux_n_out = 1;
+        long long now = (long long)time(NULL);
+        for(int i = 0; i < g_bo_n; i++) g_bo_since[i] = now - 120;
+        bo_prune();
+        BO_CK(g_bo_n == 1 && host_is_block_only("10.0.0.1:8333"), "prune keeps the live block-only leg");
+        BO_CK(!host_is_block_only("10.0.0.2:8333") && !host_is_block_only("10.0.0.3:8333"),
+              "...and forgets the two stale dials, so the top-up may use them as full-relay hosts");
+        bo_add("10.0.0.4:8333");                                   /* a dial in flight: fresh */
+        bo_prune();
+        BO_CK(g_bo_n == 2 && host_is_block_only("10.0.0.4:8333"), "a dial still in flight (under a minute) is kept");
+        leg_close_ours(0, "test", "");                             /* the block-only leg drops */
+        BO_CK(!host_is_block_only("10.0.0.1:8333") && g_bo_n == 1, "closing a block-only leg frees its registry slot");
+        bo_forget("10.0.0.4:8333");
+        BO_CK(g_bo_n == 0, "a failed dial's forget empties the registry");
+        mux_n_out = 0; }
+    #undef BO_CK
 
     if(failures) printf("\nFAILURES: %d\n", failures);
     else printf("\nALL TESTS PASSED (0 failures)\n");
