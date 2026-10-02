@@ -3250,18 +3250,35 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
                 /* no member was individually validated: `allowed` is OMITTED,
                  * which is exactly how Core marks that */
                 rj_obj_set(e, "package-error", rj_str(pmsg));
-            } else if (r_result[i]){
+            } else if (r_result[i] < 0){
+                /* not evaluated: an earlier member failed and Core's
+                 * AcceptMultipleTransactions stopped there (2026-10-01) --
+                 * Core prints only the txid and wtxid for such a member */
+            } else if (r_result[i] == 1){
                 rj_obj_set(e, "allowed", rj_bool(1));
                 rj_obj_set(e, "vsize", rj_numf("%llu", (unsigned long long)r_vsize[i]));
                 rj_val* f = rj_obj();
                 rj_obj_set(f, "base", mpe_amount(r_fee[i]));
+                if (!eff_vsize && r_vsize[i]){
+                    /* no package aggregate (testmempoolaccept validates each
+                     * member alone): the effective feerate is the member's own
+                     * and it includes only itself, as Core reports for
+                     * PackageTestAccept (2026-10-01) */
+                    rj_obj_set(f, "effective-feerate", mpe_amount(r_fee[i] * 1000ULL / r_vsize[i]));
+                    unsigned char ik[32], wk[32]; char wkhex[65]; rj_val* inc = rj_arr();
+                    if (tx_txid(ik, raw + off[i], lens[i], sc, sizeof sc) == 1){
+                        int sw = lens[i] > 6 && raw[off[i]+4] == 0x00 && raw[off[i]+5] == 0x01;
+                        if (sw && g_mph.sha256d) g_mph.sha256d(wk, raw + off[i], lens[i]); else memcpy(wk, ik, 32);
+                        mpe_hex(wkhex, wk); rj_arr_push(inc, rj_str(wkhex)); }
+                    rj_obj_set(f, "effective-includes", inc);
+                }
                 if (eff_vsize){
                     /* the feerate the package was ACTUALLY weighed against,
                      * and the members whose fee and vsize went into it */
                     rj_obj_set(f, "effective-feerate", mpe_amount(eff_fee * 1000ULL / eff_vsize));
                     rj_val* inc = rj_arr();
                     for (int k = 0; k < n; k++){
-                        if (!r_result[k]) continue;
+                        if (r_result[k] != 1) continue;   /* -1 = not evaluated */
                         unsigned char ik[32], wk[32]; char wkhex[65];
                         if (tx_txid(ik, raw + off[k], lens[k], sc, sizeof sc) != 1) continue;
                         int sw = lens[k] > 6 && raw[off[k]+4] == 0x00 && raw[off[k]+5] == 0x01;

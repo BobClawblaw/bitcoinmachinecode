@@ -8132,6 +8132,25 @@ static int txsub_package(char* msg, unsigned long mcap){
     txacc_package_overlay(NULL, NULL, NULL, 0);
     mpol_package_context(NULL, NULL, NULL, 0);
 
+    /* testmempoolaccept on an array (2026-10-01): Core v31.1 validates it with
+     * PackageTestAccept -- package_feerates=false, allow_replacement=false --
+     * through AcceptMultipleTransactions: each member on its OWN feerate, in
+     * order, and the first failure ends the evaluation, later members getting
+     * no verdict at all (the RPC prints only their txid and wtxid). This ran a
+     * second pass under the package fee context, so a parent below the relay
+     * floor that a child paid for read allowed:true where Core says false. A
+     * TRUC violation stays a package-level answer, below. */
+    if (test_only && !truc_violation){
+        mpol_package_fee_context(0, 0);
+        st->pkg_eff_fee = 0; st->pkg_eff_vsize = 0;       /* per-member effective feerates (the RPC) */
+        int first_fail = -1;
+        for (int i = 0; i < n; i++) if (st->pkg_result[i] != 1){ first_fail = i; break; }
+        if (first_fail < 0){ snprintf(msg, mcap, "success"); return 1; }
+        for (int k = first_fail + 1; k < n; k++){ st->pkg_result[k] = -1; st->pkg_reason[k][0] = 0; }   /* not evaluated */
+        snprintf(msg, mcap, "transaction failed");
+        return 0;
+    }
+
     if (!all_ok){
         mpol_package_fee_context(0, 0);
         st->pkg_eff_fee = tot_fee; st->pkg_eff_vsize = tot_vsize;

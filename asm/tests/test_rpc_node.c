@@ -75,6 +75,7 @@ static const char* g_tw_reason = "min relay fee not met";
 static int g_tw_verdict = 1;      /* what to report back */
 static int g_tw_saw_pkg[8];       /* tx_submit_pkg_n per submission, in order */
 static const char* g_tw_pkg_msg = "success";   /* package-level verdict */
+static int g_tw_first_fail = -1;  /* test-mode package: this member fails, later ones get no verdict */
 /* g_tw_last is captured by the PARENT before pthread_create: reading it in
  * the new thread would race the parent's first submission, which can be
  * staged and the seq bumped before the thread is ever scheduled -- the
@@ -102,10 +103,20 @@ static void* fake_txworker(void* arg){
                              pkg_ok ? (g_tw_verdict == 1 ? "" : g_tw_reason)
                                     : "package-not-validated");
                 }
-                ns->pkg_eff_fee   = 12345ull * (unsigned)pn;
-                ns->pkg_eff_vsize = 200ull   * (unsigned)pn;
+                /* as txsub_package publishes a TEST run since 2026-10-01: no
+                 * package aggregate (Core's PackageTestAccept judges each member
+                 * on its own feerate); a failing member ends the evaluation */
+                ns->pkg_eff_fee = ns->tx_submit_test ? 0 : 12345ull * (unsigned)pn;
+                ns->pkg_eff_vsize = ns->tx_submit_test ? 0 : 200ull * (unsigned)pn;
+                const char* msgout = g_tw_pkg_msg;
+                if (ns->tx_submit_test && pkg_ok && g_tw_first_fail >= 0 && g_tw_first_fail < pn){
+                    ns->pkg_result[g_tw_first_fail] = 0;
+                    snprintf((char*)ns->pkg_reason[g_tw_first_fail], sizeof ns->pkg_reason[0], "%s", g_tw_reason);
+                    for (int k = g_tw_first_fail + 1; k < pn; k++){ ns->pkg_result[k] = -1; ns->pkg_reason[k][0] = 0; }
+                    msgout = "transaction failed";
+                }
                 snprintf((char*)ns->tx_submit_reason, sizeof ns->tx_submit_reason,
-                         "%s", g_tw_pkg_msg);
+                         "%s", msgout);
             } else {
                 snprintf((char*)ns->tx_submit_reason, sizeof ns->tx_submit_reason,
                          "%s", g_tw_verdict == 1 ? "" : g_tw_reason);
@@ -1710,16 +1721,33 @@ int main(void){
         ck("both members allowed", r && r->nitems == 2 &&
            S(r->items[0],"allowed") && !strcmp(S(r->items[0],"allowed"), "1") &&
            S(r->items[1],"allowed") && !strcmp(S(r->items[1],"allowed"), "1"));
-        /* the whole point of package mode: the feerate reported is the
-         * PACKAGE's, not each member's own */
+        /* 2026-10-01: Core's testmempoolaccept on an array (PackageTestAccept,
+         * package_feerates=false) reports each member's OWN feerate, and its
+         * effective-includes names only that member. This used to assert the
+         * PACKAGE feerate -- the behaviour that let a below-floor parent read
+         * allowed:true. (12345 sat / 200 vB happens to equal the old aggregate
+         * 24690 / 400, so the includes count is the discriminating check.) */
         { rj_val* f = r && r->nitems ? rj_obj_get(r->items[0],"fees") : 0;
-          ck("fees.effective-feerate is the package feerate",
+          ck("fees.effective-feerate is the member's own feerate",
              f && S(f,"effective-feerate") &&
-             !strcmp(S(f,"effective-feerate"), "0.00061725"));   /* 24690 sat / 400 vB * 1000 */
+             !strcmp(S(f,"effective-feerate"), "0.00061725"));   /* 12345 sat / 200 vB * 1000 */
           rj_val* inc = f ? rj_obj_get(f,"effective-includes") : 0;
-          ck("effective-includes names both members",
-             inc && inc->typ == RJ_ARR && inc->nitems == 2); }
+          ck("effective-includes names only the member itself",
+             inc && inc->typ == RJ_ARR && inc->nitems == 1); }
         rj_free(r); rj_free(p); }
+
+      /* the first member fails: Core stops there, and the second member gets
+       * NO verdict -- only its txid and wtxid (2026-10-01) */
+      { g_tw_first_fail = 0;
+        char j2[2400]; snprintf(j2, sizeof j2, "[[\"%s\",\"%s\"]]", TX1, TX1);
+        p = rj_parse(j2, strlen(j2));
+        r = NULL; rpc_node_dispatch("testmempoolaccept", p, &r, &ec, &em);
+        ck("first member fails: allowed false with its reason",
+           r && r->nitems == 2 && S(r->items[0],"allowed") && !strcmp(S(r->items[0],"allowed"), "0")
+           && S(r->items[0],"reject-reason") && !strcmp(S(r->items[0],"reject-reason"), "min relay fee not met"));
+        ck("...the second member has NO allowed (not evaluated), but its txid",
+           r && r->nitems == 2 && rj_obj_get(r->items[1],"allowed") == NULL && S(r->items[1],"txid"));
+        rj_free(r); rj_free(p); g_tw_first_fail = -1; }
 
       /* a package-level rejection: no member got an individual verdict, so
        * every entry carries package-error and NO `allowed` -- Core's shape */
