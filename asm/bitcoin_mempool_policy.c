@@ -124,7 +124,12 @@ extern const unsigned char* mpool_get(void* mp, const unsigned char txid[32],
                                    * at most 63 distinct direct parents */
 #define MPOL_OVF_SLOTS     (MPOL_MAX_PARENTS - MPOL_INLINE_PARENTS)
 #define MPOL_OVF_NONE      0xFFFFFFFFu
-#define MPOL_MAX_REPLACEMENTS 100 /* Core MAX_REPLACEMENT_CANDIDATES */
+#define MPOL_MAX_REPLACEMENTS 100 /* Core MAX_REPLACEMENT_CANDIDATES: distinct CLUSTERS of the direct conflicts */
+/* the most a replacement may evict under that rule (2026-10-02): 100 clusters of
+ * at most MPC_MAX_CLUSTER (64) transactions. Until then the 100 was applied to
+ * evicted ENTRIES, so bmc refused replacements v31.1 accepts (two conflicts with
+ * 60 descendants each is 122 entries in 2 clusters). */
+#define MPOL_MAX_EVICT (MPOL_MAX_REPLACEMENTS * 64)
 
 /* ---- BIP431 TRUC (topologically restricted until confirmation) ------------
  * A version=3 transaction buys predictable RBF by accepting a much tighter
@@ -1059,6 +1064,41 @@ static int mpol_children_build(void* st, uint32_t n,
     }
     *head_o = head; *nxt_o = nxt; *chld_o = chld;
     return 1;
+}
+
+/* How many distinct clusters (connected components over parent links) the
+ * given pool nodes span -- Core's CTxMemPool::GetUniqueClusterCount, for the
+ * replacement limit (2026-10-02). Only called with more than 100 direct
+ * conflicts, so the allocation is rare. Returns n (each its own cluster) if
+ * memory runs out, which can only over-count -- i.e. refuse, never admit. */
+static int mpol_conflict_clusters(void* st, const uint32_t* nodes, int n){
+    mpol_node* t = mpol_nodes_base(st);
+    uint32_t nn = *(uint32_t*)((char*)st+16);
+    uint32_t *head = 0, *nxt = 0, *chld = 0;
+    if (!mpol_children_build(st, nn, &head, &nxt, &chld)) return n;
+    unsigned char* seen = (unsigned char*)calloc(nn ? nn : 1, 1);
+    uint32_t* q = (uint32_t*)malloc((size_t)(nn ? nn : 1) * sizeof *q);
+    if (!seen || !q){ free(seen); free(q); free(head); free(nxt); free(chld); return n; }
+    int clusters = 0;
+    for (int k = 0; k < n; k++){
+        uint32_t s0 = nodes[k];
+        if (s0 >= nn || seen[s0]) continue;
+        clusters++;
+        uint32_t qh = 0, qt = 0; q[qt++] = s0; seen[s0] = 1;
+        while (qh < qt){
+            uint32_t v = q[qh++];
+            for (uint32_t j = 0; j < t[v].n_parents; j++){
+                uint32_t pp = mpol_par_at(st, &t[v], j);
+                if (pp < nn && !seen[pp]){ seen[pp] = 1; q[qt++] = pp; }
+            }
+            for (uint32_t e = head[v]; e != MPOL_IDX_NONE; e = nxt[e]){
+                uint32_t c = chld[e];
+                if (!seen[c]){ seen[c] = 1; q[qt++] = c; }
+            }
+        }
+    }
+    free(seen); free(q); free(head); free(nxt); free(chld);
+    return clusters;
 }
 
 /* Collect the DISTINCT in-pool parents of a transaction.
@@ -2164,7 +2204,7 @@ static int worst_chunk(void* st, mpol_chunk* out){
  * Core reports exactly this list, so the information has to survive the
  * call. Reset at the top of every add: a stale list would credit one
  * transaction with a previous transaction's replacements. */
-static unsigned char _mpol_replaced[MPOL_MAX_REPLACEMENTS + MPOL_PKG_MAX][32];
+static unsigned char _mpol_replaced[MPOL_MAX_EVICT + MPOL_PKG_MAX][32];
 static int _mpol_replaced_n;
 
 int mpol_last_replaced(unsigned char* out, int cap){
@@ -2335,7 +2375,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
             if (!seen && n_conf < MPOL_MAX_IN) conf_claimers[n_conf++] = (uint32_t)cl;
         }
     }
-    static unsigned char evict_set[MPOL_MAX_REPLACEMENTS + MPOL_PKG_MAX][32];
+    static unsigned char evict_set[MPOL_MAX_EVICT + MPOL_PKG_MAX][32];
     int n_evict = 0;
     /* Fees of everything this transaction would remove. Hoisted out of the
      * conflict block below because TRUC sibling eviction can add to the set
@@ -2346,10 +2386,17 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
         /* No BIP125 signaling requirement (2026-10-01): Core v31.1 has no
          * -mempoolfullrbf and no "txn-mempool-conflict"; full RBF is
          * unconditional. pol->rbf_enabled is kept for the callers' ABI. */
+        /* Core GetEntriesForConflicts (v31.1): refuse when the direct
+         * conflicts span more than MAX_REPLACEMENT_CANDIDATES distinct
+         * clusters. Each conflict is at most one cluster, so only more than
+         * 100 conflicts need the count. */
+        if (n_conf > MPOL_MAX_REPLACEMENTS &&
+            mpol_conflict_clusters(st, conf_claimers, n_conf) > MPOL_MAX_REPLACEMENTS){
+            _mpol_last_reason = "too many potential replacements"; return 0; }
         /* build the full eviction set: conflicts + their descendants */
         for (int k=0;k<n_conf;k++){
             int ci = (int)conf_claimers[k];
-            if (n_evict >= MPOL_MAX_REPLACEMENTS){
+            if (n_evict >= MPOL_MAX_EVICT){
                 _mpol_last_reason = "too many potential replacements"; return 0; }
             memcpy(evict_set[n_evict++], t[ci].txid, 32);
             removed_fees += t[ci].fee;
@@ -2360,7 +2407,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
                 int dup = 0;
                 for (int e=0;e<n_evict;e++) if (!memcmp(evict_set[e], dts[d], 32)){ dup=1; break; }
                 if (dup) continue;
-                if (n_evict >= MPOL_MAX_REPLACEMENTS){
+                if (n_evict >= MPOL_MAX_EVICT){
                     _mpol_last_reason = "too many potential replacements"; return 0; }
                 int di = find_node(st, dts[d]);
                 if (di >= 0) removed_fees += mpol_nodes_base(st)[di].fee;
@@ -2702,7 +2749,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
                              * it: BIP125 signalling. Core skips that check here
                              * and says why -- a TRUC transaction can only have a
                              * non-signalling descendant through a reorg. */
-                            if (n_evict >= MPOL_MAX_REPLACEMENTS){
+                            if (n_evict >= MPOL_MAX_EVICT){
                                 _mpol_last_reason = "too many potential replacements"; return 0; }
                             uint64_t total_removed = removed_fees + t[si].fee;
                             uint64_t need = fee_at_rate(pol->incremental_fee, vsize);
@@ -3467,11 +3514,13 @@ int mpol_package_rbf_check(mpol_cfg* pol, void* st,
     char chex[65]; pkgrbf_hex(chex, txids + (n-1)*32);             /* Core attributes errors to the child */
     if (n != 2){ snprintf(why, wcap, "package RBF failed: package must be 1-parent-1-child"); return 0; }
     if (has_mempool_parent){ snprintf(why, wcap, "package RBF failed: new transaction cannot have mempool ancestors"); return 0; }
-    if (n_conf > 100){
-        snprintf(why, wcap, "package RBF failed: too many potential replacements, rejecting replacement %s; too many conflicting clusters (%d > %d)", chex, n_conf, 100);
-        return 0; }
+    if (n_conf > MPOL_MAX_REPLACEMENTS){
+        int ncl = mpol_conflict_clusters(st, conf, n_conf);
+        if (ncl > MPOL_MAX_REPLACEMENTS){
+            snprintf(why, wcap, "package RBF failed: too many potential replacements, rejecting replacement %s; too many conflicting clusters (%d > %d)", chex, ncl, MPOL_MAX_REPLACEMENTS);
+            return 0; } }
     /* everything the package would evict: the conflicts and their descendants */
-    static unsigned char evict[100 * MPOL_PKG_MAX][32];
+    static unsigned char evict[MPOL_MAX_EVICT + MPOL_PKG_MAX][32];
     int n_evict = 0; uint64_t conflicting = 0;
     mpol_node* t = mpol_nodes_base(st);
     for (int k = 0; k < n_conf; k++){

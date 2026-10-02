@@ -540,6 +540,66 @@ int main(void){
         okv(mpool_get(mp, idA, &l) == NULL, "...and A is evicted");
         #undef PR_TX
     }
+    /* ================================================================
+     * v31.1's replacement limit counts CLUSTERS (2026-10-02): Core's
+     * GetEntriesForConflicts refuses more than 100 distinct clusters among
+     * the direct conflicts; the evicted set itself is bounded only by the
+     * cluster size. bmc applied the 100 to evicted ENTRIES. Two coins, each
+     * spent by a 61-transaction chain (two clusters, 122 entries), are
+     * replaced by one transaction spending both coins: Core accepts it.
+     * Non-witness 82 vB fixtures at 1 sat/vB, so the chains hold 10004 sat.
+     * ================================================================ */
+    printf("== replacement limit: 100 conflicting clusters, not 100 evicted entries ==\n");
+    {
+        static unsigned char pol[128];
+        static unsigned char stbuf[1<<22];
+        static unsigned char mp[40 + 8192*80 + 8];
+        static unsigned char mblob[1<<21];
+        static unsigned char ux[40 + 4096*48 + 8];
+        static unsigned char ublob[1<<16];
+        #define CL_TX(buf, n, prev, val, tag) do{ \
+            n = 0; buf[n++]=2;buf[n++]=0;buf[n++]=0;buf[n++]=0; \
+            buf[n++]=1; memcpy(buf+n, prev, 32); n+=32; memset(buf+n,0,4); n+=4; \
+            buf[n++]=0; memset(buf+n,0xff,4); n+=4; buf[n++]=1; \
+            { unsigned long long _v=(val); for (int _b=0;_b<8;_b++) buf[n++]=(unsigned char)(_v>>(8*_b)); } \
+            buf[n++]=22; buf[n++]=0x00; buf[n++]=0x14; memset(buf+n, (tag), 20); n+=20; \
+            memset(buf+n, 0, 4); n+=4; }while(0)
+        unsigned char spk[2] = { 0x51, 0x00 };
+        unsigned char tx[256]; unsigned long n;
+        memset(stbuf, 0, sizeof stbuf);
+        mpool_policy_init(pol, 1000, 25, 101000, 25, 101000, 1);
+        POLICY_STATE_INIT(stbuf, 8192);
+        mpool_init(mp, 8192, mblob, sizeof mblob);
+        utxo_init(ux, 4096, ublob, sizeof ublob);
+        unsigned char coin[2][32]; memset(coin[0], 0xE1, 32); memset(coin[1], 0xE2, 32);
+        static unsigned char ids[2][61][32];
+        int all_in = 1;
+        for (int c = 0; c < 2; c++){
+            utxo_put(ux, coin[c], 0, 1000000ULL, 0, 0, spk, 1);
+            unsigned long long val = 1000000ULL;
+            for (int k = 0; k < 61; k++){
+                val -= 82;
+                CL_TX(tx, n, k == 0 ? coin[c] : ids[c][k-1], val, 0x80 + c);
+                memset(ids[c][k], 0, 32); ids[c][k][0] = 0xD0 + c; ids[c][k][1] = (unsigned char)k; ids[c][k][31] = 0x5A;
+                if (mpool_policy_add(pol, stbuf, mp, tx, n, ids[c][k], ux) != 1){
+                    all_in = 0; printf("      chain %d tx %d refused: %s\n", c, k, mpool_policy_reason(pol)); break; }
+            }
+        }
+        okv(all_in, "two 61-transaction chains are in the pool (two clusters, 122 entries)");
+        /* R spends both coins: conflicts with both chain heads, evicts all 122 */
+        { n = 0; tx[n++]=2;tx[n++]=0;tx[n++]=0;tx[n++]=0; tx[n++]=2;
+          for (int c = 0; c < 2; c++){ memcpy(tx+n, coin[c], 32); n+=32; memset(tx+n,0,4); n+=4; tx[n++]=0; memset(tx+n,0xff,4); n+=4; }
+          tx[n++]=1; { unsigned long long v = 2000000ULL - 20000ULL; for (int b=0;b<8;b++) tx[n++]=(unsigned char)(v>>(8*b)); }
+          tx[n++]=22; tx[n++]=0x00; tx[n++]=0x14; memset(tx+n, 0x90, 20); n+=20; memset(tx+n,0,4); n+=4; }
+        unsigned char idR[32]; memset(idR, 0xEF, 32);
+        long r = mpool_policy_add(pol, stbuf, mp, tx, n, idR, ux);
+        okv(r == 1, "R replaces 122 entries in 2 clusters (Core: 2 <= 100 clusters)");
+        if (r != 1) printf("      refused as: %s\n", mpool_policy_reason(pol));
+        unsigned long l = 0;
+        okv(r == 1 && mpool_get(mp, ids[0][60], &l) == NULL && mpool_get(mp, ids[1][0], &l) == NULL,
+            "...and both chains are evicted, tips included");
+        #undef CL_TX
+    }
     printf("== MEM-3: a 30-parent child keeps every parent link ==\n");
     {
         static unsigned char pol[128];
