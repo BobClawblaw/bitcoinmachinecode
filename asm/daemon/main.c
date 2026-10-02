@@ -1301,6 +1301,12 @@ static int leg_tip_recent(void){
     }
     return last_t && dl_announce_allowed(last_t, (long long)time(NULL), g_cfg.maxtipage > 0 ? g_cfg.maxtipage : 86400);
 }
+/* Core: index.nHeight >= m_stop_at_height, and 0 means "no stop". Measured on
+ * v31.1 (2026-10-01): a node restarted with its tip already past the height
+ * shuts down at startup, before the next block -- so no "has the tip moved"
+ * guard. The parent seeds tip_height from the persisted applied height at
+ * boot (-1 on a fresh datadir), so the first read is the real tip. */
+static int stopatheight_reached(long long tip, long stop){ return stop > 0 && tip >= 0 && tip >= stop; }
 static void leg_note_installed(int i){
     mux_out_since[i] = (long long)time(NULL); mux_out_good[i] = 0; g_sync_fail_streak[i] = 0; mux_out_ping_sent[i] = 0; mux_out_pong_at[i] = 0; mux_out_ping_ms[i] = -1;
     mux_out_announced[i] = 0; mux_out_hb[i] = 0; mux_out_hb_since[i] = 0; mux_out_lastpass_ms[i] = 0; g_pass_last_empty[i] = 0;
@@ -8574,6 +8580,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
      * which happened on every stop/restart until 2026-08-22 and once landed
      * between a block's WAL writes and its checkpoint (height 318148). */
     utxo_live_set_shutdown_flag(&g_shutdown_requested);
+    { extern void utxo_live_set_apply_cap(long); utxo_live_set_apply_cap(g_cfg.stopatheight); }   /* -stopatheight: connect nothing above it */
     { extern void rpc_node_set_shutdown_flag(const volatile sig_atomic_t*);
       rpc_node_set_shutdown_flag(&g_shutdown_requested); }   /* the mempool reload must yield to SIGTERM */
     /* 2026-09-10: the dial memory was created by the parallel downloader only,
@@ -9901,6 +9908,11 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             if(mux_out_fd[i]>=0 && mux_out_kind[i] == LEG_BLOCK_ONLY){ extern long txrelay_poll_block_only_leg(int); (void)txrelay_poll_block_only_leg(mux_out_fd[i]); }   /* 2026-09-10: block announcements from block-relay-only legs too */
             if(g_stored_now) stored_break = 1;
             if(apply_first) continue;        /* see APPLY FIRST above */
+            /* -stopatheight (2026-10-01): dlc_span clamps the catch-up, but a
+             * leg pass fetches whatever the peer announces -- the node stored
+             * 9 blocks past the height while the parent noticed. Core stops
+             * fetching too: it shuts down from the tip notification. */
+            if(g_cfg.stopatheight > 0 && *(int*)(store_buf+24) >= g_cfg.stopatheight) continue;
             if(!leg_pass_gate(i, announced_now, now_ms)) continue;   /* 30 s spacing; the relay deferral (never for an announced leg) */
             /* 2026-09-10 (row 1): the pass runs in a helper under its budget;
              * the report comes back through leg_pass_poll on a later rotation.
@@ -11194,6 +11206,18 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
             { extern int mp_quiesce(long) __attribute__((weak)); if (mp_quiesce) mp_quiesce(5000); }
             parent_stop_and_wait(60);
             _exit(1);
+        }
+        /* Core -stopatheight (2026-10-01): once the connected tip reaches the
+         * height, shut down cleanly -- KernelNotifications::blockTip requests
+         * the shutdown at index.nHeight >= m_stop_at_height. We only clamped
+         * the download span, so the node reached the height and then sat
+         * there serving; a benchmark or a test waiting for the exit waited
+         * forever. raise(SIGTERM) is the path `stop` takes. */
+        if(g_cfg.stopatheight > 0 && !g_shutdown_requested && g_node_status &&
+           stopatheight_reached(g_node_status->tip_height, g_cfg.stopatheight)){
+            fprintf(stderr,"[serve] stopatheight=%ld reached (connected tip %lld): shutting down, as Core does\n",
+                    g_cfg.stopatheight, (long long)g_node_status->tip_height);
+            raise(SIGTERM);
         }
         if(g_shutdown_requested){
             fprintf(stderr,"[serve] shutting down (signal %d): tip=%d outbound_legs=%d\n",

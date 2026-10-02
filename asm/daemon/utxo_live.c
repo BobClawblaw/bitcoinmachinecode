@@ -3321,6 +3321,12 @@ static int ckpt_land_on_exit(long max_ms){
 }
 static long catchup_run(void* store_buf, long max_ms, int stop_at_hole);
 long utxo_live_catchup(void* store_buf){ return catchup_run(store_buf, 0, 0); }
+/* -stopatheight (2026-10-01): connect no block above this height (0 = no cap).
+ * Core shuts down from the tip notification at the height, so its connected
+ * tip ends at the height (one more at most, in flight); ours applied whatever
+ * was on disk -- 39 against a stop of 25 on regtest. */
+static long g_apply_cap = 0;
+void utxo_live_set_apply_cap(long h){ g_apply_cap = h > 0 ? h : 0; }
 long utxo_live_catchup_bounded(void* store_buf, long max_ms, int stop_at_hole){
     return catchup_run(store_buf, max_ms, stop_at_hole);
 }
@@ -3364,6 +3370,7 @@ static long catchup_run(void* store_buf, long max_ms, int stop_at_hole){
     if (g_ckpt_last_ms == 0) g_ckpt_last_ms = mono_ms();   /* the first batch is a batch, not a checkpoint on block one */
     store_reload(store_buf);
     long tip = *(int*)((char*)store_buf + 24);
+    if (g_apply_cap > 0 && tip > g_apply_cap) tip = g_apply_cap;   /* -stopatheight */
 
     /* First call after init: if the previous process died between "block
      * N's puts/dels hit the WAL" and "checkpoint N persisted", the reloaded
