@@ -3,13 +3,13 @@
 # on regtest, because tonight's 8-hour mainnet backfill is worthless if the
 # daemon then refuses to adopt the files it produced.
 #
-# What it asserts:
-#   1. with the index MORE than BFI_ADOPT_GAP(144) behind the tip, the live
-#      daemon leaves the files alone and says so.
-#   2. with the index WITHIN 144, the daemon ADOPTS on the next connected
-#      block -- no restart, no downtime.
-#   3. after adopting it CLOSES the residual gap from undo data, reaching the
-#      tip exactly.
+# What it asserts (the policy since b3a13d59, 2026-09-16: undo is kept for
+# every block, so the daemon adopts files at ANY gap and closes it itself;
+# the old "wait until the backfill is within 144" rule is gone):
+#   1. with -blockfilterindex off, the daemon leaves offline-built files alone.
+#   2. restarted with blockfilterindex=1 and the files 200 blocks behind (more
+#      than the old 144 gate), it ADOPTS them and says so.
+#   3. it CLOSES the gap from the archive + undo, reaching the tip exactly.
 #   4. it then MAINTAINS the index as new blocks arrive.
 #   5. every filter it produced -- backfilled, gap-closed and live-appended --
 #      is byte-identical to Bitcoin Core's for the same block.
@@ -19,7 +19,7 @@ CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-v31.1/bin}
 BMC_BIN=${BMC_BIN:-/storage/bitcoinmachinecode/asm/daemon/bmcbitcoind}
 BUILDER=${BUILDER:-/storage/bitcoinmachinecode/asm/daemon/bmc_build_block_filters}
 WALLET_CLI=${WALLET_CLI:-/storage/bitcoinmachinecode/asm/daemon/bmc_wallet_cli}
-WORK=${TMPDIR:-/tmp}/bmc-bfi-proof-$$
+WORK=${WORK:-${TMPDIR:-/tmp}/bmc-bfi-proof-$$}
 CORE_DIR=$WORK/core; BMC_DIR=$WORK/bmc
 CORE_P2P=19644; CORE_RPC=19660; BMC_P2P=19655; BMC_RPC=19646
 FAILURES=0
@@ -111,7 +111,7 @@ echo "== txid index (the filter builder resolves prevouts through it) =="
   || { echo "build_tx_index failed"; tail -5 "$WORK/txi.log"; exit 2; }
 echo "  txindex.dat $(stat -c%s "$BMC_DIR/regtest/txindex.dat" 2>/dev/null || echo 0) bytes"
 
-echo "== 1. index MORE than 144 behind: daemon must NOT adopt =="
+echo "== 1. -blockfilterindex off: the daemon leaves offline-built files alone =="
 FAR=$((TIP-200))
 "$BUILDER" "$BMC_DIR/regtest" $FAR >"$WORK/build1.log" 2>&1 || { echo "builder failed"; tail -5 "$WORK/build1.log"; exit 2; }
 N1=$(idxcount); echo "  built to $N1 (tip $TIP, gap $((TIP-N1)))"
@@ -119,24 +119,25 @@ N1=$(idxcount); echo "  built to $N1 (tip $TIP, gap $((TIP-N1)))"
 core -rpcwallet=e2ecore generatetoaddress 1 "$CADDR" >/dev/null; TIP=$((TIP+1))
 for i in $(seq 30); do [ "$(bmch)" = "$TIP" ] && break; sleep 1; done
 sleep 3
-if grep -q "waiting for the backfill to close in" "$WORK/bmc.log"; then
-  ok "daemon declined to adopt at a $((TIP-N1))-block gap (and said so)"
-else
-  fail "no 'waiting for the backfill' log at a $((TIP-N1))-block gap"; grep -i bfilter "$WORK/bmc.log" | tail -5
-fi
-[ "$(idxcount)" = "$N1" ] || fail "index moved ($N1 -> $(idxcount)) while un-adopted -- the builder was raced"
-ok "index untouched while un-adopted ($N1 records)"
+grep -q '\[bfilter\] index open' "$WORK/bmc.log" && fail "the daemon opened the index with -blockfilterindex off"
+[ "$(idxcount)" = "$N1" ] && ok "index untouched with the option off ($N1 records)" \
+                         || fail "index moved ($N1 -> $(idxcount)) with the option off -- the builder was raced"
 
-echo "== 2+3. close to within 144: daemon must ADOPT and close the gap from undo =="
-NEAR=$((TIP-40))
-"$BUILDER" "$BMC_DIR/regtest" $NEAR >"$WORK/build2.log" 2>&1 || { echo "builder(2) failed"; tail -5 "$WORK/build2.log"; exit 2; }
-N2=$(idxcount); echo "  built to $N2 (tip $TIP, gap $((TIP-N2)))"
-[ $((TIP-N2)) -le 144 ] || fail "gap $((TIP-N2)) still over the adopt threshold; test cannot prove adoption"
+echo "== 2+3. restarted with blockfilterindex=1, $((TIP-N1)) behind: ADOPT and close the gap from undo =="
+for p in $BMC_PIDS; do kill "$p" 2>/dev/null; done
+for i in $(seq 60); do alive=0; for p in $BMC_PIDS; do kill -0 "$p" 2>/dev/null && alive=1; done; [ $alive = 0 ] && break; sleep 1; done
+[ $alive = 0 ] || { echo "bmc did not stop"; exit 2; }
+echo "blockfilterindex=1" >> "$BMC_DIR/bitcoin.conf"
+( cd /storage/bitcoinmachinecode/asm && nohup "$BMC_BIN" serve "$BMC_DIR" > "$WORK/bmc2.log" 2>&1 & )
+for i in $(seq 40); do grep -q 'JSON-RPC server' "$WORK/bmc2.log" && break; sleep 1; done
+BMC_PIDS=$(pgrep -f "serve $BMC_DIR" | tr '\n' ' ')
+grep -q 'JSON-RPC server' "$WORK/bmc2.log" || { echo "bmc RPC never came back"; exit 2; }
 core -rpcwallet=e2ecore generatetoaddress 1 "$CADDR" >/dev/null; TIP=$((TIP+1))
 for i in $(seq 30); do [ "$(bmch)" = "$TIP" ] && break; sleep 1; done
-sleep 4
-if grep -q "ADOPTED at" "$WORK/bmc.log"; then ok "daemon ADOPTED: $(grep -m1 'ADOPTED at' "$WORK/bmc.log" | sed 's/^.*\[bfilter\] //')"
-else fail "daemon did not adopt at a $((TIP-N2))-block gap"; grep -i bfilter "$WORK/bmc.log" | tail -8; fi
+for i in $(seq 30); do [ "$(idxcount)" = "$((TIP+1))" ] && break; sleep 1; done
+if grep -q "\[bfilter\] index open at $N1 records" "$WORK/bmc2.log"; then
+  ok "daemon ADOPTED the files: $(grep -m1 '\[bfilter\] index open' "$WORK/bmc2.log" | sed 's/^.*\[bfilter\] //')"
+else fail "daemon did not adopt the $N1-record files"; grep -a bfilter "$WORK/bmc2.log" | tail -8; fi
 N3=$(idxcount)
 # record i is height i, so "caught up" is tip+1 records -- genesis included
 [ "$N3" = "$((TIP+1))" ] && ok "gap closed from undo data: $N3 records == heights 0..$TIP" \
@@ -161,7 +162,11 @@ def cli(*a):
     return subprocess.run([corebin+'/bitcoin-cli','-datadir='+coredir,'-rpcport='+corerpc,
                            '-rpcuser=e2e','-rpcpassword=e2epw',*a],capture_output=True,text=True).stdout.strip()
 # sample across all three provenances: backfilled, gap-closed, live-appended
-heights=sorted(set([1,far//2,far-1,far,far+5,tip-45,tip-40,tip-39,tip-20,tip-4,tip-3,tip-1,tip]))
+heights=sorted(set([1,far//2,far-1,far,far+5,tip-45,tip-40,tip-39,tip-20,tip-4,tip-3,tip-1,tip]
+                   # the 12 spend blocks (201..212): the filters that need undo
+                   # data for their prevout scripts -- every other block is a
+                   # lone coinbase and its filter is 4 bytes
+                   + list(range(201, 213))))
 heights=[h for h in heights if 0<=h<n]
 bad=0; checked=0
 for h in heights:
