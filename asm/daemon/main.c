@@ -1437,6 +1437,12 @@ static void leg_ping_tick(int k, long long now){
  * pass that tried something. */
 #define CONNECT_RETRY_FLOOR_MS 5500L
 #define ADDNODE_RETRY_FLOOR_MS 60000L
+/* the gap before a dead slot is looked at again (2026-10-01): under connect=
+ * Core retries its -connect peers every <= 5.5 s (ThreadOpenConnections), so a
+ * restarted peer is back within seconds; the 30 s pool rotation is for
+ * addrman-picked peers. Every dead-slot stamp goes through here -- fixing the
+ * rotation's alone was not enough: the liveness close stamped its own 30 s. */
+static long long redial_gap_ms(void){ return g_cfg.connect_only ? CONNECT_RETRY_FLOOR_MS : REDIAL_BACKOFF_MS; }
 
 /* ---- runtime peer control (RPC ctl_* channel) ---------------------------
  * The worker owns the legs, so it owns these. The parent asks; this decides.
@@ -6987,7 +6993,7 @@ static long leg_pass_poll(int* stored_leg, const char* srcpool[], int nsrc, int 
                 { int st; dl_kill_reap(g_pass[i].pid, &st, "pass helper"); } close(g_pass[i].fd); g_pass[i].pid = 0;
                 g_pass_crashed++;
                 leg_close_ours(i, "sync-budget", "the pass helper overran its budget and was killed");
-                mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i] = dh_now_ms() + REDIAL_BACKOFF_MS;
+                mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i] = dh_now_ms() + redial_gap_ms();
             }
             continue;
         }
@@ -7002,19 +7008,19 @@ static long leg_pass_poll(int* stored_leg, const char* srcpool[], int nsrc, int 
             if(WIFSIGNALED(st)) snprintf(d, sizeof d, "the pass helper died on signal %d without a report", WTERMSIG(st));
             else snprintf(d, sizeof d, "the pass helper ended (exit %d) without a report", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
             leg_close_ours(i, "pass-crashed", d);
-            mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i] = dh_now_ms() + REDIAL_BACKOFF_MS;
+            mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i] = dh_now_ms() + redial_gap_ms();
             continue;
         }
         if(r.budget_fired){
             char d[80]; snprintf(d, sizeof d, "the pass exceeded %us%s (where=%d)", g_pass[i].budget_s, g_pass[i].budget_s > (unsigned)DL_BUDGET_SECS ? ", the only-leg budget" : "", r.fail_code);
             leg_close_ours(i, "sync-budget", d);
-            mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i] = dh_now_ms() + REDIAL_BACKOFF_MS;
+            mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i] = dh_now_ms() + redial_gap_ms();
             continue;
         }
         inflight_release_leg(&g_inflight, i);            /* the announced block's claim, if this pass carried one */
         long n = leg_pass_finish(i, &r, blob, got);
         if(n > 0){ stored += n; if(stored_leg) *stored_leg = i; }
-        else if(mux_out_fd[i] < 0){ mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i] = dh_now_ms() + REDIAL_BACKOFF_MS; }   /* the bookkeeping closed it */
+        else if(mux_out_fd[i] < 0){ mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i] = dh_now_ms() + redial_gap_ms(); }   /* the bookkeeping closed it */
     }
     return stored;
 }
@@ -9834,7 +9840,14 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             }
             if(mux_out_fd[i]<0){
                 /* dead slot: re-dial (rate-limited), same logic as serve_mux */
-                if(now_ms>=mux_out_nextretry[i]){ mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i]=now_ms+REDIAL_BACKOFF_MS; }
+                /* 2026-10-01: under connect= the slot comes back on Core's
+                 * schedule -- ThreadOpenConnections retries each -connect peer
+                 * every <= 5.5 s -- not the 30 s pool rotation: a Core peer
+                 * that restarted was redialled once while it was still down,
+                 * then left for 30 s (the regtest bumpfee run missed a block
+                 * by it). The dial gate's CONNECT_RETRY_FLOOR_MS holds the
+                 * same floor; this stamp no longer sits on top of it. */
+                if(now_ms>=mux_out_nextretry[i]){ mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i]=now_ms+redial_gap_ms(); }
                 continue;
             }
             /* Cheap liveness check BEFORE syncing: a peer that cleanly closed
@@ -9855,7 +9868,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
              * dial. 2026-09-17: one implementation, shared with the sweep. */
             if(leg_check_gone(i)){
                 mux_next_peer(i, srcpool, nsrc, out_port);
-                mux_out_nextretry[i]=now_ms+REDIAL_BACKOFF_MS;
+                mux_out_nextretry[i]=now_ms+redial_gap_ms();
                 continue;
             }
             /* ---- transaction relay (receive side) -------------------------
@@ -9891,7 +9904,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                      * was disconnected and the slot re-dialled immediately,
                      * over and over. dh_now_ms() is the monotonic clock every
                      * other timestamp here uses. */
-                    mux_out_nextretry[i] = dh_now_ms() + REDIAL_BACKOFF_MS;
+                    mux_out_nextretry[i] = dh_now_ms() + redial_gap_ms();
                     continue;
                 }
                 { extern void txrelay_publish_orphans(void); txrelay_publish_orphans(); }
@@ -10312,7 +10325,11 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
               if(dr.ok && dfd >= 0){ if(!dh_install_leg(dhost, dfd, &dr)) fprintf(stderr, "[dial] %s: background dial landed but the leg was not installed\n", dhost); }
               else { if(host_is_block_only(dhost) && !bo_host_is_leg(dhost)) bo_forget(dhost);   /* 2026-10-01: a failed block-only dial frees its registry slot */
                      long bo = g_dialmem ? dialmem_note_failure(g_dialmem, dhost, strstr(dr.why, "handshake") ? DM_REFUSED : DM_CONNECT_FAIL, dialmem_now()) : 0;
-                     fprintf(stderr, "[dial] %s: background dial failed: %s (not dialled again for %ld min)\n", dhost, dr.why[0] ? dr.why : "?", bo / 60); }
+                     char dip[128]; ctl_ip_only(dhost, dip, sizeof dip);
+                     int mk = node_config_manual_kind(dip);   /* manual peers are exempt from the dial memory (the dial gate) */
+                     if(mk) fprintf(stderr, "[dial] %s: background dial failed: %s (a %s peer: redialled within %.1f s, as Core does)\n", dhost, dr.why[0] ? dr.why : "?",
+                                    mk == 2 ? "connect=" : "addnode=", (mk == 2 ? CONNECT_RETRY_FLOOR_MS : ADDNODE_RETRY_FLOOR_MS) / 1000.0);
+                     else fprintf(stderr, "[dial] %s: background dial failed: %s (not dialled again for %ld min)\n", dhost, dr.why[0] ? dr.why : "?", bo / 60); }
           } }
         /* reserved slots: at least ONE leg per reachable anonymity network,
          * dialled in the background, on top of the clearnet legs (Core keeps
@@ -11560,7 +11577,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
         long long now_ms = dh_now_ms();
         for(int i=0;i<mux_n_out;i++){
             if(mux_out_fd[i]<0){                          /* dead slot: re-dial (rate-limited) */
-                if(now_ms >= mux_out_nextretry[i]){ mux_next_peer(i, peers, pool_len, out_port); mux_out_nextretry[i]=now_ms+REDIAL_BACKOFF_MS; }
+                if(now_ms >= mux_out_nextretry[i]){ mux_next_peer(i, peers, pool_len, out_port); mux_out_nextretry[i]=now_ms+redial_gap_ms(); }
                 continue;
             }
             short ev = pfds[poll_idx].revents;
@@ -11572,7 +11589,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                 char unread[200]; leg_drain_unread(mux_out_fd[i], unread, sizeof unread);
                 leg_close_theirs(i, how, unread);
                 mux_next_peer(i, peers, pool_len, out_port);
-                mux_out_nextretry[i]=now_ms+REDIAL_BACKOFF_MS;
+                mux_out_nextretry[i]=now_ms+redial_gap_ms();
                 poll_idx++;
                 continue;
             }

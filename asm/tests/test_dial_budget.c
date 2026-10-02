@@ -139,6 +139,14 @@ int main(void){
         bo_forget("10.0.0.4:8333");
         BO_CK(g_bo_n == 0, "a failed dial's forget empties the registry");
         mux_n_out = 0; }
+    /* ---- the dead-slot redial gap (2026-10-01): Core retries -connect peers
+     * every <= 5.5 s; a restarted connect= peer waited 30 s here ---- */
+    { int save = g_cfg.connect_only;
+      g_cfg.connect_only = 1;
+      BO_CK(redial_gap_ms() == 5500, "under connect= a dead slot is looked at again within Core's 5.5 s");
+      g_cfg.connect_only = 0;
+      BO_CK(redial_gap_ms() == 30000, "without connect= the pool rotation keeps its 30 s");
+      g_cfg.connect_only = save; }
     #undef BO_CK
 
     if(failures) printf("\nFAILURES: %d\n", failures);
