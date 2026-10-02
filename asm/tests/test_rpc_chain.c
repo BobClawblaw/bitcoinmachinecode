@@ -806,6 +806,19 @@ int main(void){
     ck("chaininfo.warnings is empty array", G(r,"warnings") && G(r,"warnings")->typ == RJ_ARR && G(r,"warnings")->nitems == 0);
     ck_str("chaininfo first key", r && r->nmembers ? r->members[0].key : NULL, "chain");
     rj_free(r);
+    /* Core latches IBD false (m_cached_is_ibd, 2026-10-01): once the worker
+     * has left IBD, a tip older than maxtipage does not put the node back */
+    { extern void rpc_chain_set_ibd_left_ptr(const volatile int*);
+      static volatile int left = 0;
+      rpc_chain_set_ibd_left_ptr(&left);
+      r = call("getblockchaininfo", "[]", &ec, &em);
+      ck_str("chaininfo.initialblockdownload, not yet left (2009 tip)", S(r,"initialblockdownload"), "1");
+      rj_free(r);
+      left = 1;
+      r = call("getblockchaininfo", "[]", &ec, &em);
+      ck_str("chaininfo.initialblockdownload latched false after leaving, despite the 2009 tip", S(r,"initialblockdownload"), "0");
+      rj_free(r);
+      rpc_chain_set_ibd_left_ptr(NULL); }
 
     /* ---- getrawtransaction ---- */
     { char p[256];

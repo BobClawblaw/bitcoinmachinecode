@@ -8422,6 +8422,20 @@ static int dl_announce_allowed(unsigned long tip_time, long long now, long maxti
  * tip block per inv would be an 8 MB read per message; this is a load. */
 static int g_dl_in_ibd = 1;
 static int dl_in_ibd_cached(void){ return g_dl_in_ibd; }
+/* Core's IBD latch (2026-10-01): UpdateIBDStatus sets m_cached_is_ibd false
+ * the first time the tip is recent and never back. Every writer of
+ * g_dl_in_ibd passes its tip-age answer through here; the latch is published
+ * for getblockchaininfo (node_status ibd_left). */
+static int g_dl_ibd_left = 0;
+static int dl_ibd_latch(int tip_is_old){
+    if(!tip_is_old && !g_dl_ibd_left){
+        g_dl_ibd_left = 1;
+        if(g_node_status) g_node_status->ibd_left = 1;
+        fprintf(stderr,"[dl] leaving initial block download (latching to false, as Core does)\n");
+    }
+    if(g_dl_ibd_left && g_node_status) g_node_status->ibd_left = 1;   /* republished: no boot-order dependence on the zeroed block */
+    return g_dl_ibd_left ? 0 : tip_is_old;
+}
 /* the Core rule again, for the history repair: the tip is older than maxtipage */
 static int dl_tip_is_ibd(void){
     static unsigned char hb[8u<<20]; long tip = *(int*)(store_buf+24); if (tip < 0) return 1;
@@ -8442,6 +8456,7 @@ static void dl_new_block_choke(void){
         if(store_read_at(store_buf, (unsigned long)now_tip, thb, (long)sizeof thb) >= 80){
             unsigned long tip_time = (unsigned long)thb[68] | ((unsigned long)thb[69]<<8) | ((unsigned long)thb[70]<<16) | ((unsigned long)thb[71]<<24);
             in_ibd = !dl_announce_allowed(tip_time, (long long)time(NULL), g_cfg.maxtipage > 0 ? g_cfg.maxtipage : 86400);
+            in_ibd = dl_ibd_latch(in_ibd);                          /* latched, as Core's m_cached_is_ibd */
             g_dl_in_ibd = in_ibd;                                   /* 2026-09-29: the tx relay reads this */
             if(in_ibd){ if(!ibd_said){ ibd_said = 1; fprintf(stderr,"[dl] per-block lines and tip announcements are off while the tip is older than maxtipage (initial block download; Core relays no blocks in IBD) -- they resume at the tip\n"); } }
             else {
@@ -10229,7 +10244,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
              * is closed, or the tx-accept path never came up, say so in the
              * heartbeat line, with the count of announcements dropped. */
             char relaybuf[64]; relaybuf[0]=0;
-            { int ib = dl_tip_is_ibd();
+            { int ib = dl_ibd_latch(dl_tip_is_ibd());
               if(ib != g_dl_in_ibd){
                   fprintf(stderr, ib ? "[dl] tx announcements are dropped from here: the tip is older than maxtipage (initial block download)\n"
                                      : "[dl] tx announcements are taken again: the tip is within maxtipage (the flag had stood at 'in IBD' since boot or the last stale tip)\n");
@@ -12110,7 +12125,7 @@ int main(int argc, char** argv){
     { extern int par_script_threads(void);              /* 2026-09-29: said at boot, as Core says "Script verification uses N additional threads" */
       fprintf(stderr,"[boot] script verification: %d thread(s) including the caller (par=%d; Core's cap is 15 workers + the caller)\n", par_script_threads(), g_cfg.par); }
     if(store_init(store_buf)!=1){ fprintf(stderr,"store_init failed\n"); return 1; }
-    { extern int (*txrelay_in_ibd_hook)(void); txrelay_in_ibd_hook = dl_in_ibd_cached; g_dl_in_ibd = dl_tip_is_ibd(); }   /* 2026-09-29: Core takes no tx announcements in IBD */
+    { extern int (*txrelay_in_ibd_hook)(void); txrelay_in_ibd_hook = dl_in_ibd_cached; g_dl_in_ibd = dl_ibd_latch(dl_tip_is_ibd()); }   /* 2026-09-29: Core takes no tx announcements in IBD */
     /* Before ANY append can happen, in the parent -- so the serve loop's
      * tip appends and the boot catch-up are covered as well as the download.
      * Children inherit it across fork. */
@@ -12659,6 +12674,8 @@ int main(int argc, char** argv){
                  g_node_status->tip_height = ph < stt ? ph : stt; }
                { extern void serve_set_connected_tip_ptr(const volatile long long*);
                  serve_set_connected_tip_ptr(&g_node_status->connected_tip); }
+               { extern void rpc_chain_set_ibd_left_ptr(const volatile int*);
+                 rpc_chain_set_ibd_left_ptr(&g_node_status->ibd_left); }   /* Core's latched IBD state */
                g_node_status->start_time = (long long)time(NULL);
                /* MUST be set explicitly: the status block is zeroed shared
                 * memory, and net_active == 0 means "networking disabled" --

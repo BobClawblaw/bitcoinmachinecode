@@ -506,6 +506,13 @@ typedef struct {
      * unchanged. */
     volatile long long        dl_wire_sent;
     volatile long long        dl_wire_recv;
+    /* Core's m_cached_is_ibd, latched (2026-10-01): set by the download
+     * worker the first time it connects a tip within maxtipage, never
+     * cleared for the life of the process. getblockchaininfo and the tx relay
+     * read "not in IBD" from here; v31.1's UpdateIBDStatus latches the same
+     * way, so an old tip later does not put the node back into IBD.
+     * Appended: every offset above is unchanged. */
+    volatile int              ibd_left;
 } node_status_t;
 #define NODE_TIP_UNTRACKED (-2LL)
 

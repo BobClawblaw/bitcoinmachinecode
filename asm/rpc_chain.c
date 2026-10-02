@@ -222,6 +222,10 @@ void rpc_chain_set_gbt_policy(long maxweight, long reserved, long minfee_satkvb,
     g_gbt_version = version; g_gbt_printpriority = printpriority;
 }
 void rpc_chain_set_maxtipage(long seconds){ g_maxtipage = seconds < 0 ? 0 : seconds; }
+/* node_status_t.ibd_left: Core's latched IBD state (2026-10-01). NULL in
+ * harnesses without a worker: the tip-age rule alone, as before. */
+static const volatile int* g_ibd_left = NULL;
+void rpc_chain_set_ibd_left_ptr(const volatile int* p){ g_ibd_left = p; }
 /* 3.1 (UTXO_INLINE_CONNECT_SCOPE, 2026-09-06): the tip every chain RPC reports
  * is the CONNECTED tip. refresh() below is the one place the stored tip is
  * read for getblockcount, getbestblockhash, getblockchaininfo.blocks,
@@ -1959,7 +1963,9 @@ static int cmd_getblockchaininfo(rj_val** res, long* ec, const char** em){
     double prog = hh >= 0 ? (double)(tip + 1) / (double)(hh + 1) : 1.0;
     if (prog > 1.0) prog = 1.0;
     rj_obj_set(o, "verificationprogress", rj_double(prog));
-    rj_obj_set(o, "initialblockdownload", rj_bool((time_t)t < time(NULL) - g_maxtipage));   /* -maxtipage */
+    /* -maxtipage, latched as Core's m_cached_is_ibd: once the node has left
+     * IBD it does not go back (v31.1 UpdateIBDStatus) */
+    rj_obj_set(o, "initialblockdownload", rj_bool(!(g_ibd_left && *g_ibd_left) && (time_t)t < time(NULL) - g_maxtipage));
     u8 cw[16]; if (chainwork_at(tip, cw)){ chainwork_hex(cw, hx); rj_obj_set(o, "chainwork", rj_str(hx)); }
     rj_obj_set(o, "size_on_disk", rj_numf("%lld", size_on_disk()));
     int pruned = g_prune_mib != 0 || ST_PRUNE_H(CUR_ST) > 0;
