@@ -714,6 +714,12 @@ static int txacc_script_verify(void* mp_area, const u8* tx, unsigned long txlen,
                           mp_area, &r) == 1)
         return 1;
     *rout = r ? r : "script verification failed";
+    /* Core's mempool names (2026-10-01): the verifier is shared with block
+     * connection, whose log keeps the descriptive text; admission answers
+     * with Core's reason strings (Consensus::CheckTxInputs). submitpackage's
+     * per-member errors are compared with Core's word for word. */
+    if (r && !strcmp(r, "input references a missing/already-spent UTXO")) *rout = "bad-txns-inputs-missingorspent";
+    else if (r && !strcmp(r, "immature coinbase spend (100-block rule)")) *rout = "bad-txns-premature-spend-of-coinbase";
     return 0;
 }
 
@@ -917,7 +923,7 @@ long tx_accept_validate(void* mp_area, const u8 txid[32], const u8* tx, unsigned
     {
         const char* r = 0;
         if (!txacc_script_verify(mp_area, tx, txlen, &r)){
-            if (r && strstr(r, "missing/already-spent")) g_alog.rej_missing++;
+            if (r && !strcmp(r, "bad-txns-inputs-missingorspent")) g_alog.rej_missing++;   /* txacc_script_verify's Core name */
             else {
                 g_alog.rej_invalid++;
                 snprintf(g_alog.last_invalid, sizeof g_alog.last_invalid, "%s", r ? r : "?");
@@ -972,9 +978,55 @@ long txacc_snapshot_count(void){
     return (g_ready && g_table) ? utxo_count(g_table) : -1;
 }
 
+/* Core v31.1 TX_RECONSIDERABLE (2026-10-01: the RBF fee verdicts added).
+ * The fee floors, AND ReplacementChecks' "insufficient fee" (PaysForRBF) and
+ * "replacement-failed" (the feerate diagram) -- "Result may change in a
+ * package context", as Core says: a parent that cannot replace alone may
+ * replace with its child (package RBF). Missing from this list, a replacing
+ * parent ended submitpackage before the package was ever evaluated. */
 int txacc_fee_reconsiderable(const char* reason){
     return reason && (!strcmp(reason, "min relay fee not met") ||
-                      !strcmp(reason, "mempool min fee not met"));
+                      !strcmp(reason, "mempool min fee not met") ||
+                      !strcmp(reason, "insufficient fee") ||
+                      !strcmp(reason, "replacement-failed"));
+}
+/* the aggregate fee floor and an entry's fee/vsize, under the pool lock (submitpackage) */
+int txacc_package_floor_check(unsigned long long fee, unsigned long long vsize, char* why, unsigned long wcap){
+    extern int mpol_package_floor_check(void*, void*, uint64_t, uint64_t, char*, unsigned long);
+    if (why && wcap) why[0] = 0;
+    if (!g_ready || !g_pol_ready) return 1;
+    mp_lock_at(__func__);
+    int r = mpol_package_floor_check(g_pol, g_pol_state, fee, vsize, why, wcap);
+    mp_unlock();
+    return r;
+}
+int txacc_entry_fee_vsize(const u8 txid[32], unsigned long long* fee, unsigned long long* vsize){
+    extern int mpol_entry_fee_vsize(void*, const unsigned char*, uint64_t*, uint64_t*);
+    if (!g_ready || !g_pol_ready) return 0;
+    uint64_t f = 0, v = 0;
+    mp_lock_at(__func__);
+    int r = mpol_entry_fee_vsize(g_pol_state, txid, &f, &v);
+    mp_unlock();
+    if (fee) *fee = f;
+    if (vsize) *vsize = v;
+    return r;
+}
+/* submitpackage's package RBF (Core PackageRBFChecks), under the pool lock.
+ * -1 nothing to replace, 1 go ahead, 0 refused with Core's package_msg. */
+int txacc_package_rbf_check(const u8* const* txs, const unsigned long* lens, const u8* txids, int n,
+                            unsigned long long pkg_fee, unsigned long long pkg_vsize,
+                            unsigned long long parent_fee, unsigned long long parent_vsize,
+                            char* why, unsigned long wcap){
+    extern int mpol_package_rbf_check(void*, void*, const unsigned char* const*, const unsigned long*,
+                                      const unsigned char*, int, uint64_t, uint64_t, uint64_t, uint64_t,
+                                      char*, unsigned long);
+    if (why && wcap) why[0] = 0;
+    if (!g_ready || !g_pol_ready) return -1;
+    mp_lock_at(__func__);
+    int r = mpol_package_rbf_check(g_pol, g_pol_state, txs, lens, txids, n,
+                                   pkg_fee, pkg_vsize, parent_fee, parent_vsize, why, wcap);
+    mp_unlock();
+    return r;
 }
 
 /* tx_accept_validate_p2p: the RELAY path's entry. Same verdict classes as
@@ -1004,7 +1056,7 @@ long tx_accept_validate_p2p(void* mp_area, const u8 txid[32], const u8* tx,
     {
         const char* r = 0;
         if (!txacc_script_verify(mp_area, tx, txlen, &r)){
-            if (r && strstr(r, "missing/already-spent")){ g_alog.rej_missing++; return -25; }
+            if (r && !strcmp(r, "bad-txns-inputs-missingorspent")){ g_alog.rej_missing++; return -25; }   /* the orphan class */
             g_alog.rej_invalid++;
             snprintf(g_alog.last_invalid, sizeof g_alog.last_invalid, "%s", r ? r : "?");
             /* MEM-10: a script failure is FINAL -- no descendant makes an

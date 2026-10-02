@@ -123,6 +123,12 @@ typedef struct {
      * Written by the worker and its pass children; inbound children leave
      * it at -1. Appended: every offset above is unchanged. */
     volatile long             best_known_height;
+    /* 2026-10-01: what kind of outbound connection this is, for getpeerinfo's
+     * connection_type: 0 outbound-full-relay, 1 block-relay-only, 2 manual
+     * (addnode, or a -connect peer). Every outbound leg used to report
+     * outbound-full-relay, so production's two block-relay-only legs were
+     * invisible. Written when the worker fills the slot. Appended. */
+    volatile int              conn_type;
 } rpc_peer_t;
 
 /* Shared live-node status. POD, fixed size, lives in a MAP_SHARED region so
@@ -500,6 +506,19 @@ typedef struct {
      * unchanged. */
     volatile long long        dl_wire_sent;
     volatile long long        dl_wire_recv;
+    /* Core's m_cached_is_ibd, latched (2026-10-01): set by the download
+     * worker the first time it connects a tip within maxtipage, never
+     * cleared for the life of the process. getblockchaininfo and the tx relay
+     * read "not in IBD" from here; v31.1's UpdateIBDStatus latches the same
+     * way, so an old tip later does not put the node back into IBD.
+     * Appended: every offset above is unchanged. */
+    volatile int              ibd_left;
+    /* submitpackage's package_msg in full (2026-10-01): Core's package RBF
+     * messages carry a txid and two amounts -- ~200 characters, more than
+     * tx_submit_reason holds. Empty unless the package path wrote one; the
+     * RPC prefers it (pkg_msg, above, is 128 bytes and unused by the
+     * package path). Appended: every offset above is unchanged. */
+    char                      pkg_msg_full[320];
 } node_status_t;
 #define NODE_TIP_UNTRACKED (-2LL)
 

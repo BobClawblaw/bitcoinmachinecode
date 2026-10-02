@@ -1206,6 +1206,7 @@ static int   mux_out_fd[MUX_MAX_OUT];       /* persistent outbound seed fds  */
  * so it gets addrv2-encoded self-announcements (daemon/addr_self.c) */
 static unsigned char mux_out_wants_v2[MUX_MAX_OUT];
 static unsigned char mux_out_kind[MUX_MAX_OUT];         /* CC-4: LEG_FULL / LEG_BLOCK_ONLY */
+static void bo_forget(const char* host);                /* the block-only registry, below (2026-10-01) */
 static unsigned char mux_out_cmpct[MUX_MAX_OUT];        /* CC-2: the peer sent sendcmpct on this leg */
 /* 2026-09-10, Core's shape at the tip: a block announced on the leg since its
  * last pass (inv, or a pushed `headers`: we send sendheaders), and whether the
@@ -1300,6 +1301,12 @@ static int leg_tip_recent(void){
     }
     return last_t && dl_announce_allowed(last_t, (long long)time(NULL), g_cfg.maxtipage > 0 ? g_cfg.maxtipage : 86400);
 }
+/* Core: index.nHeight >= m_stop_at_height, and 0 means "no stop". Measured on
+ * v31.1 (2026-10-01): a node restarted with its tip already past the height
+ * shuts down at startup, before the next block -- so no "has the tip moved"
+ * guard. The parent seeds tip_height from the persisted applied height at
+ * boot (-1 on a fresh datadir), so the first read is the real tip. */
+static int stopatheight_reached(long long tip, long stop){ return stop > 0 && tip >= 0 && tip >= stop; }
 static void leg_note_installed(int i){
     mux_out_since[i] = (long long)time(NULL); mux_out_good[i] = 0; g_sync_fail_streak[i] = 0; mux_out_ping_sent[i] = 0; mux_out_pong_at[i] = 0; mux_out_ping_ms[i] = -1;
     mux_out_announced[i] = 0; mux_out_hb[i] = 0; mux_out_hb_since[i] = 0; mux_out_lastpass_ms[i] = 0; g_pass_last_empty[i] = 0;
@@ -1373,6 +1380,7 @@ static void leg_close_ours(int i, const char* reason, const char* detail){
     fprintf(stderr,"[dl:%d] %s connection closed ours/%s after %llds%s%s\n", i, mux_out_host[i][0] ? mux_out_host[i] : "?", reason, leg_age_s(i),
             detail && detail[0] ? " -- " : "", detail ? detail : "");
     if(mux_out_fd[i] >= 0){ bmc_v2_close(mux_out_fd[i]), close(mux_out_fd[i]); mux_out_fd[i] = -1; }
+    if(mux_out_kind[i] == LEG_BLOCK_ONLY) bo_forget(mux_out_host[i]);   /* 2026-10-01: the slot is free for another block-only host */
 }
 static void leg_close_theirs(int i, const char* how, const char* unread){
     if(g_pass_in_child) return;                        /* the parent decides from the report */
@@ -1380,6 +1388,7 @@ static void leg_close_theirs(int i, const char* how, const char* unread){
     fprintf(stderr,"[dl:%d] %s connection closed theirs (%s) after %llds; unread: %s\n", i, mux_out_host[i][0] ? mux_out_host[i] : "?", how, age, unread ? unread : "(nothing)");
     if(g_dialmem && age >= 0 && age <= DM_EARLY_S) dialmem_note_failure(g_dialmem, mux_out_host[i], age <= DM_REFUSED_S ? DM_REFUSED : DM_EARLY_DROP, dialmem_now());
     if(mux_out_fd[i] >= 0){ bmc_v2_close(mux_out_fd[i]), close(mux_out_fd[i]); mux_out_fd[i] = -1; }
+    if(mux_out_kind[i] == LEG_BLOCK_ONLY) bo_forget(mux_out_host[i]);   /* 2026-10-01 */
     mux_out_nextretry[i] = 0;   /* re-dial on the next rotation */
 }
 extern long p2p_ping(unsigned char* out, unsigned long long nonce);
@@ -1428,6 +1437,12 @@ static void leg_ping_tick(int k, long long now){
  * pass that tried something. */
 #define CONNECT_RETRY_FLOOR_MS 5500L
 #define ADDNODE_RETRY_FLOOR_MS 60000L
+/* the gap before a dead slot is looked at again (2026-10-01): under connect=
+ * Core retries its -connect peers every <= 5.5 s (ThreadOpenConnections), so a
+ * restarted peer is back within seconds; the 30 s pool rotation is for
+ * addrman-picked peers. Every dead-slot stamp goes through here -- fixing the
+ * rotation's alone was not enough: the liveness close stamped its own 30 s. */
+static long long redial_gap_ms(void){ return g_cfg.connect_only ? CONNECT_RETRY_FLOOR_MS : REDIAL_BACKOFF_MS; }
 
 /* ---- runtime peer control (RPC ctl_* channel) ---------------------------
  * The worker owns the legs, so it owns these. The parent asks; this decides.
@@ -3084,6 +3099,7 @@ static int outbound_connect_raw(const char* host, int rcv_ms, int out_port){
  * cannot hide a block from us. On shutdown they are written to anchors.dat
  * (Core's format) and dialled first on the next start. */
 static char g_bo_hosts[MAX_BLOCK_RELAY_ONLY][128];
+static long long g_bo_since[MAX_BLOCK_RELAY_ONLY];   /* when registered (2026-10-01) */
 static int  g_bo_n = 0;
 static int host_is_block_only(const char* host){
     for(int i = 0; i < g_bo_n; i++) if(!strcmp(g_bo_hosts[i], host)) return 1;
@@ -3098,8 +3114,35 @@ static int host_is_block_only(const char* host){
  * on its only leg -- Core's getpeerinfo relaytxes=false, not one
  * transaction relayed to us, ever. */
 static int bo_want(void){ if(g_cfg.connect_only) return 0; return g_cfg.max_block_relay_only < MAX_BLOCK_RELAY_ONLY ? g_cfg.max_block_relay_only : MAX_BLOCK_RELAY_ONLY; }
-static void bo_add(const char* host){ if(g_bo_n < MAX_BLOCK_RELAY_ONLY && !host_is_block_only(host)) snprintf(g_bo_hosts[g_bo_n++], sizeof g_bo_hosts[0], "%s", host); }
+static void bo_add(const char* host){
+    if(g_bo_n < MAX_BLOCK_RELAY_ONLY && !host_is_block_only(host)){
+        g_bo_since[g_bo_n] = (long long)time(NULL);
+        snprintf(g_bo_hosts[g_bo_n++], sizeof g_bo_hosts[0], "%s", host); } }
+/* The registry holds exactly the hosts that ARE block-relay-only legs or have
+ * a block-relay-only dial in flight (2026-10-01). It used to keep every host
+ * ever tried, up to MAX_BLOCK_RELAY_ONLY (8): a timed-out dial stayed
+ * "block-only" for the life of the process, so when the full-relay top-up
+ * later reached that host it came up block-relay-only, did not count toward
+ * the full-relay target, and the top-up dialled another -- production held 12
+ * legs against 8 + 2. A failed dial or a closed leg forgets the host; a prune
+ * drops anything neither live nor recently dialled. */
+static void bo_forget(const char* host){
+    for(int i = 0; i < g_bo_n; i++){
+        if(strcmp(g_bo_hosts[i], host)) continue;
+        for(int k = i; k + 1 < g_bo_n; k++){ memcpy(g_bo_hosts[k], g_bo_hosts[k+1], sizeof g_bo_hosts[0]); g_bo_since[k] = g_bo_since[k+1]; }
+        g_bo_n--; return; }
+}
+#define BO_PENDING_S 60      /* a dial helper's connect times out at 10 s; a minute is ample */
+static int bo_host_is_leg(const char* host);
+static void bo_prune(void){
+    long long now = (long long)time(NULL);
+    for(int i = 0; i < g_bo_n; ){
+        if(bo_host_is_leg(g_bo_hosts[i]) || now - g_bo_since[i] < BO_PENDING_S){ i++; continue; }
+        bo_forget(g_bo_hosts[i]);
+    }
+}
 static int legs_block_only(void){ int n = 0; for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && mux_out_kind[k] == LEG_BLOCK_ONLY) n++; return n; }
+static int bo_host_is_leg(const char* host){ for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && !strcmp(mux_out_host[k], host)) return 1; return 0; }
 /* every outbound dial funnels through here: a block-only host gets fRelay=0
  * in the version we send (the byte is per-connection already; see feelers) */
 static int outbound_connect(const char* host, int rcv_ms, int out_port){
@@ -3352,6 +3395,12 @@ static void rpc_fill_peer_slot_ex(int slot, const char* host, int already_claime
     rpc_peer_from_version(pr, p, len);
     { extern int rp_version_frelay(const unsigned char*, long);
       pr->relaytxes = rp_version_frelay(p, len) != 0; }   /* Core relaytxes: the peer's fRelay */
+    /* connection_type (2026-10-01): a host registered block-relay-only (CC-4)
+     * gets fRelay=0 from us and relays no transactions -- Core reports such a
+     * peer relaytxes false; addnode and -connect peers are Core's "manual" */
+    if (host && host_is_block_only(host)){ pr->conn_type = 1; pr->relaytxes = 0; }
+    else if (host && (g_cfg.connect_only || ctl_dial_listed(host))) pr->conn_type = 2;
+    else pr->conn_type = 0;
     /* RPC-3: a fresh, never-reused id for this connection. Assigned before
      * `used` so a reader that sees the slot live always sees a real id. */
     pr->nodeid = __sync_fetch_and_add(&g_node_status->next_nodeid, 1);
@@ -6944,7 +6993,7 @@ static long leg_pass_poll(int* stored_leg, const char* srcpool[], int nsrc, int 
                 { int st; dl_kill_reap(g_pass[i].pid, &st, "pass helper"); } close(g_pass[i].fd); g_pass[i].pid = 0;
                 g_pass_crashed++;
                 leg_close_ours(i, "sync-budget", "the pass helper overran its budget and was killed");
-                mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i] = dh_now_ms() + REDIAL_BACKOFF_MS;
+                mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i] = dh_now_ms() + redial_gap_ms();
             }
             continue;
         }
@@ -6959,19 +7008,19 @@ static long leg_pass_poll(int* stored_leg, const char* srcpool[], int nsrc, int 
             if(WIFSIGNALED(st)) snprintf(d, sizeof d, "the pass helper died on signal %d without a report", WTERMSIG(st));
             else snprintf(d, sizeof d, "the pass helper ended (exit %d) without a report", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
             leg_close_ours(i, "pass-crashed", d);
-            mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i] = dh_now_ms() + REDIAL_BACKOFF_MS;
+            mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i] = dh_now_ms() + redial_gap_ms();
             continue;
         }
         if(r.budget_fired){
             char d[80]; snprintf(d, sizeof d, "the pass exceeded %us%s (where=%d)", g_pass[i].budget_s, g_pass[i].budget_s > (unsigned)DL_BUDGET_SECS ? ", the only-leg budget" : "", r.fail_code);
             leg_close_ours(i, "sync-budget", d);
-            mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i] = dh_now_ms() + REDIAL_BACKOFF_MS;
+            mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i] = dh_now_ms() + redial_gap_ms();
             continue;
         }
         inflight_release_leg(&g_inflight, i);            /* the announced block's claim, if this pass carried one */
         long n = leg_pass_finish(i, &r, blob, got);
         if(n > 0){ stored += n; if(stored_leg) *stored_leg = i; }
-        else if(mux_out_fd[i] < 0){ mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i] = dh_now_ms() + REDIAL_BACKOFF_MS; }   /* the bookkeeping closed it */
+        else if(mux_out_fd[i] < 0){ mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i] = dh_now_ms() + redial_gap_ms(); }   /* the bookkeeping closed it */
     }
     return stored;
 }
@@ -7971,6 +8020,9 @@ static int txsub_worker_ready(void){
     return 1;
 }
 
+static int txsub_package_accept(const unsigned char* const* txs, const unsigned long* lens,
+                                const unsigned char* txids, const unsigned long long* vsz, int n,
+                                char* msg, unsigned long mcap);   /* Core AcceptPackage, below */
 /* ==== submitpackage: validate a package, then commit it =====================
  * Core's shape, reduced to what this node can honestly do.
  *
@@ -8039,6 +8091,7 @@ static int txsub_package(char* msg, unsigned long mcap){
       if (p != end){ snprintf(msg, mcap, "package-contains-unparseable-transaction"); return 0; } }
 
     st->pkg_replaced_n = 0;
+    st->pkg_msg_full[0] = 0;
     const int test_only = st->tx_submit_test ? 1 : 0;
     const char* why = "";
     static unsigned long long vsz[RPC_PKG_MAX];
@@ -8052,6 +8105,10 @@ static int txsub_package(char* msg, unsigned long mcap){
         }
         return 0;
     }
+
+    /* 2026-10-01: a real submission follows Core's AcceptPackage
+     * (txsub_package_accept); what follows is testmempoolaccept's dry run */
+    if (!test_only) return txsub_package_accept(txs, lens, txids, vsz, n, msg, mcap);
 
     /* ---- pass 1: dry run with the overlay, to learn the real fees -------- */
     unsigned long long tot_fee = 0, tot_vsize = 0;
@@ -8094,6 +8151,25 @@ static int txsub_package(char* msg, unsigned long mcap){
     }
     txacc_package_overlay(NULL, NULL, NULL, 0);
     mpol_package_context(NULL, NULL, NULL, 0);
+
+    /* testmempoolaccept on an array (2026-10-01): Core v31.1 validates it with
+     * PackageTestAccept -- package_feerates=false, allow_replacement=false --
+     * through AcceptMultipleTransactions: each member on its OWN feerate, in
+     * order, and the first failure ends the evaluation, later members getting
+     * no verdict at all (the RPC prints only their txid and wtxid). This ran a
+     * second pass under the package fee context, so a parent below the relay
+     * floor that a child paid for read allowed:true where Core says false. A
+     * TRUC violation stays a package-level answer, below. */
+    if (test_only && !truc_violation){
+        mpol_package_fee_context(0, 0);
+        st->pkg_eff_fee = 0; st->pkg_eff_vsize = 0;       /* per-member effective feerates (the RPC) */
+        int first_fail = -1;
+        for (int i = 0; i < n; i++) if (st->pkg_result[i] != 1){ first_fail = i; break; }
+        if (first_fail < 0){ snprintf(msg, mcap, "success"); return 1; }
+        for (int k = first_fail + 1; k < n; k++){ st->pkg_result[k] = -1; st->pkg_reason[k][0] = 0; }   /* not evaluated */
+        snprintf(msg, mcap, "transaction failed");
+        return 0;
+    }
 
     if (!all_ok){
         mpol_package_fee_context(0, 0);
@@ -8144,51 +8220,163 @@ static int txsub_package(char* msg, unsigned long mcap){
         return all_pass;
     }
 
-    /* ---- pass 2: commit, with the package feerate in effect -------------- */
+    /* not reached: a real submission returned through txsub_package_accept */
+    return 0;
+}
+
+/* submitpackage, the real submission (2026-10-01): Core v31.1
+ * MemPoolAccept::AcceptPackage. Until now every member was committed under
+ * the PACKAGE's feerate, so a parent that pays its own way also paid for its
+ * child (Core: its fees "should only be used once"), and a parent that had to
+ * REPLACE something could never do it with its child's help -- there was no
+ * package RBF. Core's algorithm, step for step:
+ *   1. each member alone, in order: already in the mempool -> valid as it
+ *      is; valid alone -> committed now, its fee used once; refused for a
+ *      fee reason or a missing input (its parent is a fee-refused member) ->
+ *      kept for step 2; refused for anything else -> the package has failed
+ *      ("transaction failed"), and the remaining members are still tried
+ *      alone, as Core does;
+ *   2. the kept members, two or more, as a package (AcceptMultipleTransactions):
+ *      prechecks with the package in view, the aggregate fee floor, package
+ *      RBF when a member conflicts, then the commit -- with the package
+ *      feerate and, for a replacement, the package's fee and vsize in force.
+ *      One kept member is the step-1 verdict again (Core re-runs it alone).
+ * Per-member results: 1 valid alone (own feerate), 2 valid in the package
+ * evaluation (package feerate over those members), 3 already in the mempool
+ * (no effective feerate, as Core reports MEMPOOL_ENTRY). */
+static int txsub_package_accept(const unsigned char* const* txs, const unsigned long* lens,
+                                const unsigned char* txids, const unsigned long long* vsz, int n,
+                                char* msg, unsigned long mcap){
+    extern void mpol_package_fee_context(unsigned long long, unsigned long long);
+    extern void mpol_package_context(const unsigned char* const*, const unsigned long*, const unsigned char*, int);
+    extern void mpol_package_rbf_context(int);
+    extern void txacc_package_overlay(const unsigned char* const*, const unsigned long*, const unsigned char*, int);
+    extern long tx_accept_test_reason(void*, const unsigned char*, const unsigned char*, unsigned long, char*,
+                                      unsigned long, unsigned long long*, unsigned long long*);
+    extern int  txacc_fee_reconsiderable(const char* reason);
+    extern int  txacc_entry_fee_vsize(const unsigned char txid[32], unsigned long long*, unsigned long long*);
+    extern int  txacc_package_floor_check(unsigned long long, unsigned long long, char*, unsigned long);
+    extern int  txacc_package_rbf_check(const unsigned char* const*, const unsigned long*, const unsigned char*, int,
+                                        unsigned long long, unsigned long long, unsigned long long, unsigned long long,
+                                        char*, unsigned long);
+    extern int  mpol_last_replaced(unsigned char* out, int cap);
+    node_status_t* st = g_node_status;
+    st->pkg_eff_fee = 0; st->pkg_eff_vsize = 0;
+    /* a package-level message: in full in pkg_msg_full (the RPC prefers it), and
+     * as much as fits in the caller's buffer */
+    #define TXSUB_PKG_MSG(text) do{ snprintf((char*)st->pkg_msg_full, sizeof st->pkg_msg_full, "%s", (text)); \
+        size_t l_ = strlen((const char*)st->pkg_msg_full); if (l_ >= mcap) l_ = mcap - 1; \
+        memcpy(msg, (const char*)st->pkg_msg_full, l_); msg[l_] = 0; }while(0)
+    /* fold whatever the member just committed displaced into the union */
+    #define TXSUB_NOTE_REPLACED() do{ \
+        unsigned char rep_[RPC_PKG_REPLACED_MAX][32]; \
+        int nrep_ = mpol_last_replaced((unsigned char*)rep_, RPC_PKG_REPLACED_MAX); \
+        for (int k_ = 0; k_ < nrep_; k_++){ int dup_ = 0; \
+            for (int q_ = 0; q_ < st->pkg_replaced_n; q_++) \
+                if (!memcmp((const void*)st->pkg_replaced[q_], rep_[k_], 32)){ dup_ = 1; break; } \
+            if (dup_) continue; \
+            if (st->pkg_replaced_n >= RPC_PKG_REPLACED_MAX) break; \
+            memcpy((void*)st->pkg_replaced[st->pkg_replaced_n++], rep_[k_], 32); } }while(0)
+
+    /* ---- 1. each member alone ------------------------------------------- */
+    int eval[RPC_PKG_MAX]; int n_eval = 0, quit_early = 0;
+    for (int i = 0; i < n; i++){
+        unsigned long ml = 0; unsigned long long fee = 0, avs = 0;
+        st->pkg_fee[i] = 0; st->pkg_vsize[i] = vsz[i]; st->pkg_reason[i][0] = 0;
+        if (mpool_get(txsub_pool(), txids + i*32, &ml)){
+            txacc_entry_fee_vsize(txids + i*32, &fee, &avs);
+            st->pkg_result[i] = 3; st->pkg_fee[i] = fee; if (avs) st->pkg_vsize[i] = avs;
+            continue;
+        }
+        char r[128]; r[0] = 0; int relayed = 0;
+        long rc = tx_accept_test_reason(txsub_pool(), txids + i*32, txs[i], lens[i], r, sizeof r, &fee, &avs);
+        st->pkg_fee[i] = fee; if (avs) st->pkg_vsize[i] = avs;
+        if (rc == 1) rc = txsub_accept_and_relay(txsub_pool(), txs[i], lens[i], mux_out_fd, mux_n_out, r, sizeof r, &relayed);
+        if (rc == 1){
+            st->pkg_result[i] = 1;
+            walletnotify_tx(txs[i], (long)lens[i]);
+            TXSUB_NOTE_REPLACED();
+            continue;
+        }
+        st->pkg_result[i] = 0;
+        snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "%s", r);
+        if (n == 1 || !(txacc_fee_reconsiderable(r) || rc == -25)) quit_early = 1;   /* not something a package can change */
+        else eval[n_eval++] = i;
+    }
+    if (quit_early || n_eval == 1){ snprintf(msg, mcap, "transaction failed"); return 0; }
+    if (n_eval == 0){ snprintf(msg, mcap, "success"); return 1; }
+
+    /* ---- 2. the kept members as a package -------------------------------- */
+    static const unsigned char* etx[RPC_PKG_MAX];
+    static unsigned long elen[RPC_PKG_MAX];
+    static unsigned char eid[RPC_PKG_MAX*32];
+    unsigned long long efee[RPC_PKG_MAX], evs[RPC_PKG_MAX];
+    for (int k = 0; k < n_eval; k++){ etx[k] = txs[eval[k]]; elen[k] = lens[eval[k]]; memcpy(eid + k*32, txids + eval[k]*32, 32); }
+    /* prechecks with the package in view: the overlay lets a member resolve
+     * an earlier member; a fee-only verdict is what the package may change */
+    unsigned long long tot_fee = 0, tot_vsize = 0;
+    int bad = -1, truc = 0; char badr[128]; badr[0] = 0;
+    mpol_package_context(etx, elen, eid, n_eval);
+    txacc_package_overlay(etx, elen, eid, n_eval);
+    for (int k = 0; k < n_eval; k++){
+        char r[128]; r[0] = 0; unsigned long long fee = 0, avs = 0;
+        long rc = tx_accept_test_reason(txsub_pool(), eid + k*32, etx[k], elen[k], r, sizeof r, &fee, &avs);
+        efee[k] = fee; evs[k] = avs ? avs : vsz[eval[k]];
+        if (rc == 1 || txacc_fee_reconsiderable(r)){ tot_fee += fee; tot_vsize += evs[k]; continue; }
+        if (!strcmp(r, "TRUC-violation")) truc = 1;
+        bad = k; snprintf(badr, sizeof badr, "%s", r); break;
+    }
+    txacc_package_overlay(NULL, NULL, NULL, 0);
+    mpol_package_context(NULL, NULL, NULL, 0);
+    if (truc){ snprintf(msg, mcap, "TRUC-violation"); return 0; }      /* package-level; members keep their step-1 verdicts */
+    if (bad >= 0){
+        snprintf((char*)st->pkg_reason[eval[bad]], sizeof st->pkg_reason[0], "%s", badr);
+        snprintf(msg, mcap, "transaction failed"); return 0; }
+    /* the aggregate fee floor (CheckFeeRate over the package) -- attributed
+     * to the last member, as Core's FeeFailure result is */
+    { char why[160];
+      if (!txacc_package_floor_check(tot_fee, tot_vsize, why, sizeof why)){
+          size_t l_ = strlen(why); if (l_ >= sizeof st->pkg_reason[0]) l_ = sizeof st->pkg_reason[0] - 1;
+          memcpy((char*)st->pkg_reason[eval[n_eval-1]], why, l_); st->pkg_reason[eval[n_eval-1]][l_] = 0;
+          snprintf(msg, mcap, "transaction failed"); return 0; } }
+    /* package RBF (PackageRBFChecks) when a member conflicts */
+    int rbf = -1;
+    { char why[320];
+      rbf = txacc_package_rbf_check(etx, elen, eid, n_eval, tot_fee, tot_vsize, efee[0], evs[0], why, sizeof why);
+      if (rbf == 0){ TXSUB_PKG_MSG(why); return 0; } }
+    /* commit (SubmitPackage) under the package feerate and, for a
+     * replacement, the package's fee and vsize */
     int committed = 1;
     mpol_package_fee_context(tot_fee, tot_vsize);
-    mpol_package_context(txs, lens, txids, n);
-    txacc_package_overlay(txs, lens, txids, n);
-    for (int i = 0; i < n; i++){
-        char r[128]; r[0] = 0; int relayed = 0;
-        int rc = txsub_accept_and_relay(txsub_pool(), txs[i], lens[i],
-                                        mux_out_fd, mux_n_out, r, sizeof r, &relayed);
+    mpol_package_context(etx, elen, eid, n_eval);
+    txacc_package_overlay(etx, elen, eid, n_eval);
+    if (rbf == 1) mpol_package_rbf_context(1);
+    for (int k = 0; k < n_eval; k++){
+        int i = eval[k]; char r[128]; r[0] = 0; int relayed = 0;
+        int rc = txsub_accept_and_relay(txsub_pool(), etx[k], elen[k], mux_out_fd, mux_n_out, r, sizeof r, &relayed);
         if (rc == 1){
-            st->pkg_result[i] = 1; st->pkg_reason[i][0] = 0;
-            walletnotify_tx(txs[i], (long)lens[i]);
-            /* whatever THIS member displaced by RBF, folded into the
-             * package-wide union Core reports at the top level. Read
-             * immediately: the next member's accept overwrites it. */
-            extern int mpol_last_replaced(unsigned char* out, int cap);
-            unsigned char rep[RPC_PKG_REPLACED_MAX][32];
-            int nrep = mpol_last_replaced((unsigned char*)rep, RPC_PKG_REPLACED_MAX);
-            for (int k = 0; k < nrep; k++){
-                int dup = 0;
-                for (int q = 0; q < st->pkg_replaced_n; q++)
-                    if (!memcmp((const void*)st->pkg_replaced[q], rep[k], 32)){ dup = 1; break; }
-                if (dup) continue;
-                if (st->pkg_replaced_n >= RPC_PKG_REPLACED_MAX) break;
-                memcpy((void*)st->pkg_replaced[st->pkg_replaced_n++], rep[k], 32);
-            }
-        }
-        else {
+            st->pkg_result[i] = 2; st->pkg_reason[i][0] = 0; st->pkg_fee[i] = efee[k]; st->pkg_vsize[i] = evs[k];
+            walletnotify_tx(etx[k], (long)elen[k]);
+            TXSUB_NOTE_REPLACED();
+        } else {
             st->pkg_result[i] = 0;
             snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "%s", r);
             committed = 0;
         }
     }
-    /* ALWAYS cleared: a fee context left set would relax the floor for
-     * ordinary single-transaction traffic, and an overlay left set would let
-     * an unrelated transaction resolve against a package member. */
+    /* ALWAYS cleared: a context left set would relax the floors (or the RBF
+     * rules) for ordinary single-transaction traffic */
+    mpol_package_rbf_context(0);
     txacc_package_overlay(NULL, NULL, NULL, 0);
     mpol_package_context(NULL, NULL, NULL, 0);
     mpol_package_fee_context(0, 0);
-
+    #undef TXSUB_NOTE_REPLACED
+    #undef TXSUB_PKG_MSG
     st->pkg_eff_fee = tot_fee; st->pkg_eff_vsize = tot_vsize;
     snprintf(msg, mcap, "%s", committed ? "success" : "transaction failed");
     if (committed)
-        fprintf(stderr, "[dl] submitpackage: %d tx accepted, package fee %llu sat over %llu vB\n",
-                n, (unsigned long long)tot_fee, (unsigned long long)tot_vsize);
+        fprintf(stderr, "[dl] submitpackage: %d tx accepted as a package%s, package fee %llu sat over %llu vB\n",
+                n_eval, rbf == 1 ? " (package RBF)" : "", tot_fee, tot_vsize);
     return committed;
 }
 
@@ -8360,6 +8548,20 @@ static int dl_announce_allowed(unsigned long tip_time, long long now, long maxti
  * tip block per inv would be an 8 MB read per message; this is a load. */
 static int g_dl_in_ibd = 1;
 static int dl_in_ibd_cached(void){ return g_dl_in_ibd; }
+/* Core's IBD latch (2026-10-01): UpdateIBDStatus sets m_cached_is_ibd false
+ * the first time the tip is recent and never back. Every writer of
+ * g_dl_in_ibd passes its tip-age answer through here; the latch is published
+ * for getblockchaininfo (node_status ibd_left). */
+static int g_dl_ibd_left = 0;
+static int dl_ibd_latch(int tip_is_old){
+    if(!tip_is_old && !g_dl_ibd_left){
+        g_dl_ibd_left = 1;
+        if(g_node_status) g_node_status->ibd_left = 1;
+        fprintf(stderr,"[dl] leaving initial block download (latching to false, as Core does)\n");
+    }
+    if(g_dl_ibd_left && g_node_status) g_node_status->ibd_left = 1;   /* republished: no boot-order dependence on the zeroed block */
+    return g_dl_ibd_left ? 0 : tip_is_old;
+}
 /* the Core rule again, for the history repair: the tip is older than maxtipage */
 static int dl_tip_is_ibd(void){
     static unsigned char hb[8u<<20]; long tip = *(int*)(store_buf+24); if (tip < 0) return 1;
@@ -8380,6 +8582,7 @@ static void dl_new_block_choke(void){
         if(store_read_at(store_buf, (unsigned long)now_tip, thb, (long)sizeof thb) >= 80){
             unsigned long tip_time = (unsigned long)thb[68] | ((unsigned long)thb[69]<<8) | ((unsigned long)thb[70]<<16) | ((unsigned long)thb[71]<<24);
             in_ibd = !dl_announce_allowed(tip_time, (long long)time(NULL), g_cfg.maxtipage > 0 ? g_cfg.maxtipage : 86400);
+            in_ibd = dl_ibd_latch(in_ibd);                          /* latched, as Core's m_cached_is_ibd */
             g_dl_in_ibd = in_ibd;                                   /* 2026-09-29: the tx relay reads this */
             if(in_ibd){ if(!ibd_said){ ibd_said = 1; fprintf(stderr,"[dl] per-block lines and tip announcements are off while the tip is older than maxtipage (initial block download; Core relays no blocks in IBD) -- they resume at the tip\n"); } }
             else {
@@ -8518,6 +8721,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
      * which happened on every stop/restart until 2026-08-22 and once landed
      * between a block's WAL writes and its checkpoint (height 318148). */
     utxo_live_set_shutdown_flag(&g_shutdown_requested);
+    { extern void utxo_live_set_apply_cap(long); utxo_live_set_apply_cap(g_cfg.stopatheight); }   /* -stopatheight: connect nothing above it */
     { extern void rpc_node_set_shutdown_flag(const volatile sig_atomic_t*);
       rpc_node_set_shutdown_flag(&g_shutdown_requested); }   /* the mempool reload must yield to SIGTERM */
     /* 2026-09-10: the dial memory was created by the parallel downloader only,
@@ -9389,6 +9593,23 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     result = txsub_accept_and_relay(txsub_pool(),
                                  (const unsigned char*)g_node_status->tx_submit_buf, tlen,
                                  mux_out_fd, mux_n_out, reason, sizeof reason, &relayed);
+                    /* Core BroadcastTransaction (2026-10-01): a txid already in
+                     * the mempool is not an error -- Core skips the submission,
+                     * reannounces the mempool's copy and returns the txid. This
+                     * answered -27 "txn-already-in-mempool", so a transaction
+                     * that reached us by relay a moment before the client sent
+                     * it read as a failure (feeest_core_diff, once relay from
+                     * Core started working). */
+                    if(result == -27 && strstr(reason, "already-in-mempool")){
+                        extern int tx_txid(unsigned char* out, const unsigned char* tx, unsigned long txlen, unsigned char* scratch, unsigned long scratchcap);
+                        extern void txrelay_announce_own(const unsigned char txid[32]);
+                        static unsigned char ascratch[2000*81 + 8]; unsigned char tid[32]; unsigned long ml = 0;
+                        if(tx_txid(tid, (const unsigned char*)g_node_status->tx_submit_buf, tlen, ascratch, sizeof ascratch) &&
+                           mpool_get(txsub_pool(), tid, &ml)){
+                            txrelay_announce_own(tid);
+                            result = 1; reason[0] = 0;
+                        }
+                    }
                     /* every mempool.dat reload streams through this channel:
                      * 4,470 lines in two minutes after deploy j. One line per
                      * 5 s; the count rides along. */
@@ -9756,7 +9977,14 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             }
             if(mux_out_fd[i]<0){
                 /* dead slot: re-dial (rate-limited), same logic as serve_mux */
-                if(now_ms>=mux_out_nextretry[i]){ mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i]=now_ms+REDIAL_BACKOFF_MS; }
+                /* 2026-10-01: under connect= the slot comes back on Core's
+                 * schedule -- ThreadOpenConnections retries each -connect peer
+                 * every <= 5.5 s -- not the 30 s pool rotation: a Core peer
+                 * that restarted was redialled once while it was still down,
+                 * then left for 30 s (the regtest bumpfee run missed a block
+                 * by it). The dial gate's CONNECT_RETRY_FLOOR_MS holds the
+                 * same floor; this stamp no longer sits on top of it. */
+                if(now_ms>=mux_out_nextretry[i]){ mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i]=now_ms+redial_gap_ms(); }
                 continue;
             }
             /* Cheap liveness check BEFORE syncing: a peer that cleanly closed
@@ -9777,7 +10005,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
              * dial. 2026-09-17: one implementation, shared with the sweep. */
             if(leg_check_gone(i)){
                 mux_next_peer(i, srcpool, nsrc, out_port);
-                mux_out_nextretry[i]=now_ms+REDIAL_BACKOFF_MS;
+                mux_out_nextretry[i]=now_ms+redial_gap_ms();
                 continue;
             }
             /* ---- transaction relay (receive side) -------------------------
@@ -9813,7 +10041,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                      * was disconnected and the slot re-dialled immediately,
                      * over and over. dh_now_ms() is the monotonic clock every
                      * other timestamp here uses. */
-                    mux_out_nextretry[i] = dh_now_ms() + REDIAL_BACKOFF_MS;
+                    mux_out_nextretry[i] = dh_now_ms() + redial_gap_ms();
                     continue;
                 }
                 { extern void txrelay_publish_orphans(void); txrelay_publish_orphans(); }
@@ -9845,6 +10073,11 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             if(mux_out_fd[i]>=0 && mux_out_kind[i] == LEG_BLOCK_ONLY){ extern long txrelay_poll_block_only_leg(int); (void)txrelay_poll_block_only_leg(mux_out_fd[i]); }   /* 2026-09-10: block announcements from block-relay-only legs too */
             if(g_stored_now) stored_break = 1;
             if(apply_first) continue;        /* see APPLY FIRST above */
+            /* -stopatheight (2026-10-01): dlc_span clamps the catch-up, but a
+             * leg pass fetches whatever the peer announces -- the node stored
+             * 9 blocks past the height while the parent noticed. Core stops
+             * fetching too: it shuts down from the tip notification. */
+            if(g_cfg.stopatheight > 0 && *(int*)(store_buf+24) >= g_cfg.stopatheight) continue;
             if(!leg_pass_gate(i, announced_now, now_ms)) continue;   /* 30 s spacing; the relay deferral (never for an announced leg) */
             /* 2026-09-10 (row 1): the pass runs in a helper under its budget;
              * the report comes back through leg_pass_poll on a later rotation.
@@ -10161,7 +10394,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
              * is closed, or the tx-accept path never came up, say so in the
              * heartbeat line, with the count of announcements dropped. */
             char relaybuf[64]; relaybuf[0]=0;
-            { int ib = dl_tip_is_ibd();
+            { int ib = dl_ibd_latch(dl_tip_is_ibd());
               if(ib != g_dl_in_ibd){
                   fprintf(stderr, ib ? "[dl] tx announcements are dropped from here: the tip is older than maxtipage (initial block download)\n"
                                      : "[dl] tx announcements are taken again: the tip is within maxtipage (the flag had stood at 'in IBD' since boot or the last stale tip)\n");
@@ -10227,8 +10460,13 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         { dh_result_t dr; int dfd; char dhost[128];
           while(dh_poll(&dr, &dfd, dhost, sizeof dhost)){
               if(dr.ok && dfd >= 0){ if(!dh_install_leg(dhost, dfd, &dr)) fprintf(stderr, "[dial] %s: background dial landed but the leg was not installed\n", dhost); }
-              else { long bo = g_dialmem ? dialmem_note_failure(g_dialmem, dhost, strstr(dr.why, "handshake") ? DM_REFUSED : DM_CONNECT_FAIL, dialmem_now()) : 0;
-                     fprintf(stderr, "[dial] %s: background dial failed: %s (not dialled again for %ld min)\n", dhost, dr.why[0] ? dr.why : "?", bo / 60); }
+              else { if(host_is_block_only(dhost) && !bo_host_is_leg(dhost)) bo_forget(dhost);   /* 2026-10-01: a failed block-only dial frees its registry slot */
+                     long bo = g_dialmem ? dialmem_note_failure(g_dialmem, dhost, strstr(dr.why, "handshake") ? DM_REFUSED : DM_CONNECT_FAIL, dialmem_now()) : 0;
+                     char dip[128]; ctl_ip_only(dhost, dip, sizeof dip);
+                     int mk = node_config_manual_kind(dip);   /* manual peers are exempt from the dial memory (the dial gate) */
+                     if(mk) fprintf(stderr, "[dial] %s: background dial failed: %s (a %s peer: redialled within %.1f s, as Core does)\n", dhost, dr.why[0] ? dr.why : "?",
+                                    mk == 2 ? "connect=" : "addnode=", (mk == 2 ? CONNECT_RETRY_FLOOR_MS : ADDNODE_RETRY_FLOOR_MS) / 1000.0);
+                     else fprintf(stderr, "[dial] %s: background dial failed: %s (not dialled again for %ld min)\n", dhost, dr.why[0] ? dr.why : "?", bo / 60); }
           } }
         /* reserved slots: at least ONE leg per reachable anonymity network,
          * dialled in the background, on top of the clearnet legs (Core keeps
@@ -10236,7 +10474,11 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         /* CC-4: keep bo_want() block-relay-only legs on clearnet, dialled in the
          * background like the anonymity-network reserved legs below. The host is
          * registered as block-only BEFORE the dial so the version carries fRelay=0. */
-        if((rot % 8)==0 && legs_block_only() < bo_want() && mux_n_out < MUX_MAX_OUT && dh_extra_allowed()){
+        /* 2026-10-01: count the REGISTRY (live block-only legs + dials in
+         * flight), not the live legs: four dials went out in 50 s at boot while
+         * none had landed, and the three that landed made 3 block-only legs */
+        if((rot % 8)==0) bo_prune();
+        if((rot % 8)==0 && g_bo_n < bo_want() && mux_n_out < MUX_MAX_OUT && dh_extra_allowed()){
             static int bo_cursor = 0;                       /* 2026-09-10: rotate through the pool; a refused host is not first again */
             for(int step = 0; step < nsrc; step++){
                 int ci = (bo_cursor + step) % (nsrc > 0 ? nsrc : 1);
@@ -10249,7 +10491,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 bo_add(srcpool[ci]);
                 if(!host_is_block_only(srcpool[ci])) continue;   /* the registry is full: an unregistered dial would come up fRelay=1 */
                 bo_cursor = (ci + 1) % (nsrc > 0 ? nsrc : 1);
-                fprintf(stderr, "[dial] %s: dialing as block-relay-only (%d of %d)\n", srcpool[ci], legs_block_only() + 1, bo_want());
+                fprintf(stderr, "[dial] %s: dialing as block-relay-only (%d of %d, %d live)\n", srcpool[ci], g_bo_n, bo_want(), legs_block_only());
                 dh_start_slot(srcpool[ci], out_port, DH_SLOT_EXTRA);
                 break;
             }
@@ -10287,6 +10529,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             for(int ci=0; ci<nsrc && mux_n_out - legs_anon() - legs_block_only() < MUX_WANT_OUT() + stale_extra && mux_n_out<MUX_MAX_OUT; ci++){
                 if(topup_filled >= 1 || topup_fail >= 4) break;
                 if(leg_is_anon_net(leg_net_of(srcpool[ci]))) continue;   /* the helper owns those */
+                if(host_is_block_only(srcpool[ci])) continue;   /* 2026-10-01: a block-only host (leg or dial in flight) is not a full-relay candidate */
                 int already=0;
                 for(int k=0;k<mux_n_out;k++) if(!strcmp(mux_out_host[k],srcpool[ci])){ already=1; break; }
                 if(already) continue;
@@ -11133,6 +11376,18 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
             parent_stop_and_wait(60);
             _exit(1);
         }
+        /* Core -stopatheight (2026-10-01): once the connected tip reaches the
+         * height, shut down cleanly -- KernelNotifications::blockTip requests
+         * the shutdown at index.nHeight >= m_stop_at_height. We only clamped
+         * the download span, so the node reached the height and then sat
+         * there serving; a benchmark or a test waiting for the exit waited
+         * forever. raise(SIGTERM) is the path `stop` takes. */
+        if(g_cfg.stopatheight > 0 && !g_shutdown_requested && g_node_status &&
+           stopatheight_reached(g_node_status->tip_height, g_cfg.stopatheight)){
+            fprintf(stderr,"[serve] stopatheight=%ld reached (connected tip %lld): shutting down, as Core does\n",
+                    g_cfg.stopatheight, (long long)g_node_status->tip_height);
+            raise(SIGTERM);
+        }
         if(g_shutdown_requested){
             fprintf(stderr,"[serve] shutting down (signal %d): tip=%d outbound_legs=%d\n",
                     (int)g_shutdown_requested, *(int*)(store_buf+24), mux_n_out);
@@ -11459,7 +11714,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
         long long now_ms = dh_now_ms();
         for(int i=0;i<mux_n_out;i++){
             if(mux_out_fd[i]<0){                          /* dead slot: re-dial (rate-limited) */
-                if(now_ms >= mux_out_nextretry[i]){ mux_next_peer(i, peers, pool_len, out_port); mux_out_nextretry[i]=now_ms+REDIAL_BACKOFF_MS; }
+                if(now_ms >= mux_out_nextretry[i]){ mux_next_peer(i, peers, pool_len, out_port); mux_out_nextretry[i]=now_ms+redial_gap_ms(); }
                 continue;
             }
             short ev = pfds[poll_idx].revents;
@@ -11471,7 +11726,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                 char unread[200]; leg_drain_unread(mux_out_fd[i], unread, sizeof unread);
                 leg_close_theirs(i, how, unread);
                 mux_next_peer(i, peers, pool_len, out_port);
-                mux_out_nextretry[i]=now_ms+REDIAL_BACKOFF_MS;
+                mux_out_nextretry[i]=now_ms+redial_gap_ms();
                 poll_idx++;
                 continue;
             }
@@ -12024,7 +12279,7 @@ int main(int argc, char** argv){
     { extern int par_script_threads(void);              /* 2026-09-29: said at boot, as Core says "Script verification uses N additional threads" */
       fprintf(stderr,"[boot] script verification: %d thread(s) including the caller (par=%d; Core's cap is 15 workers + the caller)\n", par_script_threads(), g_cfg.par); }
     if(store_init(store_buf)!=1){ fprintf(stderr,"store_init failed\n"); return 1; }
-    { extern int (*txrelay_in_ibd_hook)(void); txrelay_in_ibd_hook = dl_in_ibd_cached; g_dl_in_ibd = dl_tip_is_ibd(); }   /* 2026-09-29: Core takes no tx announcements in IBD */
+    { extern int (*txrelay_in_ibd_hook)(void); txrelay_in_ibd_hook = dl_in_ibd_cached; g_dl_in_ibd = dl_ibd_latch(dl_tip_is_ibd()); }   /* 2026-09-29: Core takes no tx announcements in IBD */
     /* Before ANY append can happen, in the parent -- so the serve loop's
      * tip appends and the boot catch-up are covered as well as the download.
      * Children inherit it across fork. */
@@ -12573,6 +12828,8 @@ int main(int argc, char** argv){
                  g_node_status->tip_height = ph < stt ? ph : stt; }
                { extern void serve_set_connected_tip_ptr(const volatile long long*);
                  serve_set_connected_tip_ptr(&g_node_status->connected_tip); }
+               { extern void rpc_chain_set_ibd_left_ptr(const volatile int*);
+                 rpc_chain_set_ibd_left_ptr(&g_node_status->ibd_left); }   /* Core's latched IBD state */
                g_node_status->start_time = (long long)time(NULL);
                /* MUST be set explicitly: the status block is zeroed shared
                 * memory, and net_active == 0 means "networking disabled" --

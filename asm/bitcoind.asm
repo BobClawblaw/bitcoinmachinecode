@@ -174,16 +174,13 @@ node_handshake:
     call p2p_write
     cmp  rax, 24
     jl   .fail
-    ; BIP339: advertise wtxid-based relay (after version, before verack). We
-    ; announce our own txs by txid (universally understood), so we keep no
-    ; per-leg negotiation state -- this only tells the peer it MAY announce
-    ; to us by wtxid, which the relay drain now accepts (MSG_WTX invs).
-    mov  rdi, r12
-    lea  rsi, [rel _wtxidrelay]
-    mov  rdx, 10
-    xor  ecx, ecx
-    xor  r8d, r8d
-    call p2p_write
+    ; BIP339 wtxidrelay is NOT sent (2026-10-01). Sending it negotiated
+    ; wtxid relay with every modern peer, and Core then drops MSG_TX
+    ; announcements from that peer (net_processing: "Ignore INVs that don't
+    ; match wtxidrelay setting") -- yet we announce our transactions by txid
+    ; (tx_relay.c, txann.c), so none of them reached a Core peer. Without it,
+    ; peers announce to us by txid too (MSG_TX), which the relay drain handles.
+    ; Announcing by wtxid is the parity follow-up (FEATURE_GAPS).
 .read:
     ; p2p_read(fd, cmd[12], payload, cap, &plen)
     mov  rdi, r12
@@ -405,13 +402,8 @@ node_accept_handshake:
     call p2p_write
     cmp  rax, 24
     jl   .fail
-    ; BIP339 wtxidrelay -- after version, before verack (same as outbound)
-    mov  rdi, r12
-    lea  rsi, [rel _wtxidrelay]
-    mov  rdx, 10
-    xor  ecx, ecx
-    xor  r8d, r8d
-    call p2p_write
+    ; BIP339 wtxidrelay is NOT sent (2026-10-01): see node_handshake -- with
+    ; it negotiated, Core ignores our MSG_TX announcements to this peer.
     ; BIP155 sendaddrv2 -- also before verack, gated on the peer's version
     ; exactly as in node_handshake (the peer's version is already in hand
     ; here, at [rbp-0x300])

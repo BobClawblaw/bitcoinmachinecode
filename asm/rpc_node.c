@@ -398,10 +398,15 @@ static void peer_common_fields(rj_val* o, const rpc_peer_t* p)
      * printed as 0.0 would read as a perfect link. Omitted, like Core. */
     if (p->min_ping_us > 0)
         rj_obj_set(o, "minping", rj_numf("%.6f", (double)p->min_ping_us / 1e6));
-    /* connection_type: what this node actually runs. Core also has
-     * block-relay-only, manual, feeler and addr-fetch; none of those exist
-     * here, so none are claimed. */
-    rj_obj_set(o, "connection_type", rj_str(p->inbound ? "inbound" : "outbound-full-relay"));
+    /* connection_type: inbound, or the outbound kind the worker recorded
+     * (2026-10-01: block-relay-only and manual exist here and were all
+     * reported as outbound-full-relay). Feeler and addr-fetch connections are
+     * not held in a peer slot, so they never appear, as in Core's listing of
+     * a short-lived feeler. */
+    { const char* ct = p->inbound ? "inbound"
+                     : p->conn_type == 1 ? "block-relay-only"
+                     : p->conn_type == 2 ? "manual" : "outbound-full-relay";
+      rj_obj_set(o, "connection_type", rj_str(ct)); }
     /* Core's per-message byte breakdown. A peer that has exchanged nothing
      * of a kind gets no entry for it, which is what Core does. The maps
      * themselves are ALWAYS present -- Core pushes both objects even when
@@ -3086,7 +3091,7 @@ static int cmd_submitpackage(const rj_val* params, rj_val** res, long* ec, const
     static int  r_result[RPC_PKG_MAX];
     static unsigned long long r_fee[RPC_PKG_MAX], r_vsize[RPC_PKG_MAX];
     static char r_reason[RPC_PKG_MAX][64];
-    char pmsg[128]; pmsg[0] = 0;
+    char pmsg[320]; pmsg[0] = 0;
     unsigned long long eff_fee = 0, eff_vsize = 0;
     static unsigned char replaced[RPC_PKG_REPLACED_MAX][32];
     int n_replaced = 0;
@@ -3097,7 +3102,8 @@ static int cmd_submitpackage(const rj_val* params, rj_val** res, long* ec, const
             r_vsize[i]  = st->pkg_vsize[i];
             snprintf(r_reason[i], sizeof r_reason[i], "%s", (const char*)st->pkg_reason[i]);
         }
-        snprintf(pmsg, sizeof pmsg, "%s", (const char*)st->tx_submit_reason);
+        snprintf(pmsg, sizeof pmsg, "%s", st->pkg_msg_full[0] ? (const char*)st->pkg_msg_full   /* the full package_msg (2026-10-01) */
+                                                         : (const char*)st->tx_submit_reason);
         eff_fee = st->pkg_eff_fee; eff_vsize = st->pkg_eff_vsize;
         n_replaced = st->pkg_replaced_n;
         if (n_replaced > RPC_PKG_REPLACED_MAX) n_replaced = RPC_PKG_REPLACED_MAX;
@@ -3121,16 +3127,26 @@ static int cmd_submitpackage(const rj_val* params, rj_val** res, long* ec, const
         rj_val* e = rj_obj();
         rj_obj_set(e, "txid", rj_str(thex));
         rj_obj_set(e, "vsize", rj_numf("%llu", (unsigned long long)r_vsize[i]));
-        if (r_result[i]){
+        if (r_result[i] > 0){
+            /* 2026-10-01, Core AcceptPackage's three valid kinds (the worker's
+             * txsub_package_accept): 1 accepted alone -- its own feerate,
+             * including only itself; 2 accepted in the package evaluation --
+             * the package feerate over those members; 3 already in the
+             * mempool -- base fee only (Core: "unknown whether package
+             * feerate was used when it was originally submitted"). */
             rj_val* f = rj_obj();
             rj_obj_set(f, "base", mpe_amount(r_fee[i]));
-            if (eff_vsize){
+            if (r_result[i] == 1 && r_vsize[i]){
+                rj_obj_set(f, "effective-feerate", mpe_amount(r_fee[i] * 1000ULL / r_vsize[i]));
+                rj_val* inc = rj_arr(); rj_arr_push(inc, rj_str(whex));
+                rj_obj_set(f, "effective-includes", inc);
+            } else if (r_result[i] == 2 && eff_vsize){
                 /* Core reports this per KvB, as an amount */
                 unsigned long long per_kvb = eff_fee * 1000ULL / eff_vsize;
                 rj_obj_set(f, "effective-feerate", mpe_amount(per_kvb));
                 rj_val* inc = rj_arr();
                 for (int k = 0; k < n; k++){
-                    if (!r_result[k]) continue;
+                    if (r_result[k] != 2) continue;
                     unsigned char wk[32]; char wkhex[65];
                     tx_wtxid(wk, raw + off[k], tlen[k]);
                     mpe_hex(wkhex, wk);
@@ -3281,18 +3297,35 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
                 /* no member was individually validated: `allowed` is OMITTED,
                  * which is exactly how Core marks that */
                 rj_obj_set(e, "package-error", rj_str(pmsg));
-            } else if (r_result[i]){
+            } else if (r_result[i] < 0){
+                /* not evaluated: an earlier member failed and Core's
+                 * AcceptMultipleTransactions stopped there (2026-10-01) --
+                 * Core prints only the txid and wtxid for such a member */
+            } else if (r_result[i] == 1){
                 rj_obj_set(e, "allowed", rj_bool(1));
                 rj_obj_set(e, "vsize", rj_numf("%llu", (unsigned long long)r_vsize[i]));
                 rj_val* f = rj_obj();
                 rj_obj_set(f, "base", mpe_amount(r_fee[i]));
+                if (!eff_vsize && r_vsize[i]){
+                    /* no package aggregate (testmempoolaccept validates each
+                     * member alone): the effective feerate is the member's own
+                     * and it includes only itself, as Core reports for
+                     * PackageTestAccept (2026-10-01) */
+                    rj_obj_set(f, "effective-feerate", mpe_amount(r_fee[i] * 1000ULL / r_vsize[i]));
+                    unsigned char ik[32], wk[32]; char wkhex[65]; rj_val* inc = rj_arr();
+                    if (tx_txid(ik, raw + off[i], lens[i], sc, sizeof sc) == 1){
+                        int sw = lens[i] > 6 && raw[off[i]+4] == 0x00 && raw[off[i]+5] == 0x01;
+                        if (sw && g_mph.sha256d) g_mph.sha256d(wk, raw + off[i], lens[i]); else memcpy(wk, ik, 32);
+                        mpe_hex(wkhex, wk); rj_arr_push(inc, rj_str(wkhex)); }
+                    rj_obj_set(f, "effective-includes", inc);
+                }
                 if (eff_vsize){
                     /* the feerate the package was ACTUALLY weighed against,
                      * and the members whose fee and vsize went into it */
                     rj_obj_set(f, "effective-feerate", mpe_amount(eff_fee * 1000ULL / eff_vsize));
                     rj_val* inc = rj_arr();
                     for (int k = 0; k < n; k++){
-                        if (!r_result[k]) continue;
+                        if (r_result[k] != 1) continue;   /* -1 = not evaluated */
                         unsigned char ik[32], wk[32]; char wkhex[65];
                         if (tx_txid(ik, raw + off[k], lens[k], sc, sizeof sc) != 1) continue;
                         int sw = lens[k] > 6 && raw[off[k]+4] == 0x00 && raw[off[k]+5] == 0x01;

@@ -117,6 +117,10 @@ addnode=127.0.0.1:$BMC_P2P
 EOC
 cat > "$BMC_DIR/bitcoin.conf" <<EOC
 chain=regtest
+printtoconsole=1
+# network-specific keys (port, rpcport, connect, onion, bind) apply on regtest only
+# inside [regtest] -- Core's rule, and this node's since 2026-09-04 (DMN-4)
+[regtest]
 port=$BMC_P2P
 rpcport=$BMC_RPC
 rpcuser=e2e
