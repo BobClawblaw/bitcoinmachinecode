@@ -99,6 +99,10 @@ fallbackfee=0.0001
 EOF
 cat > "$BMC_DIR/bitcoin.conf" <<EOF
 chain=regtest
+printtoconsole=1
+# network-specific keys (port, rpcport, connect, onion, bind) apply on regtest only
+# inside [regtest] -- Core's rule, and this node's since 2026-09-04 (DMN-4)
+[regtest]
 port=$BMC_P2P
 rpcport=$BMC_RPC
 rpcuser=e2e
@@ -365,7 +369,8 @@ PKGPY
 PKGEOF
 if [ -n "${P_TXID:-}" ]; then
   PKG_DEST=$(core -rpcwallet=e2ecore getnewaddress)
-  P_CH=$((P_VAL - 100))                       # 100 sat on ~141 vB: below the floor
+  P_CH=$((P_VAL - 10))                        # 10 sat on ~141 vB (~0.07 sat/vB): below Core v30+'s
+                                              # 0.1 sat/vB floor (it was 100 sat when the floor was 1 sat/vB)
   P_CH_BTC=$(python3 -c "print('%.8f'%($P_CH/1e8))")
   PRAW=$(bmc createrawtransaction "[[{\"txid\":\"$P_TXID\",\"vout\":0,\"sequence\":4294967293}],{\"$CHANGE\":$P_CH_BTC}]" | jq_ "d['result']")
   PSIGNED=$(bmc signrawtransactionwithwallet "[\"$PRAW\"]" | jq_ "d['result']['hex'] if d['result'].get('complete') else sys.exit('parent signing incomplete')")
@@ -414,9 +419,15 @@ print(len(r), ','.join(str(e.get('allowed')) for e in r),
   [ "$TMA_OURS" = "$TMA_CORE" ] \
     && ok "testmempoolaccept package mode agrees with Core: $TMA_OURS" \
     || fail "testmempoolaccept package mode: ours=[$TMA_OURS] core=[$TMA_CORE]"
+  # Core v31.1 validates a testmempoolaccept array with PackageTestAccept:
+  # package_feerates=false, so the below-floor parent fails on its OWN feerate
+  # and evaluation stops there -- the child gets no verdict (allowed absent).
+  # This asserted "True,True" until 2026-10-01, which was our package-feerate
+  # dry run and the opposite of Core's answer. submitpackage, below, is where
+  # the child pays for the parent.
   case "$TMA_OURS" in
-    "2 True,True"*) ok "the child spending an in-array parent is allowed" ;;
-    *)              fail "package mode did not allow the pair: $TMA_OURS" ;;
+    "2 False,None"*) ok "the below-floor parent is judged alone and the child is not evaluated (Core's PackageTestAccept)" ;;
+    *)               fail "package mode did not answer Core's way: $TMA_OURS" ;;
   esac
 
   PKG=$(bmc submitpackage "[[\"$PSIGNED\",\"$CSIGNED\"]]")
@@ -629,7 +640,7 @@ echo "== the OFFLINE utxo builder agrees with the live writer on genesis =="
 # built by the tool was one coin richer than one built by the node -- the two
 # writers disagreed about what the UTXO set IS. A dry run over the regtest
 # archive proves the skip on real blocks, without building a store.
-BU=${BUILD_UTXO:-$(dirname "$BMC_BIN")/build_utxo}
+BU=${BUILD_UTXO:-$(dirname "$BMC_BIN")/bmc_build_utxo}   # renamed bmc_build_utxo on 2026-09-07
 if [ -x "$BU" ]; then
   BUOUT=$("$BU" "$BMC_DIR/regtest" 16 1 --dry-run 0 0 2>&1 | grep -E "genesis_skipped|total tx=")
   case "$BUOUT" in
