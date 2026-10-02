@@ -9473,6 +9473,23 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     result = txsub_accept_and_relay(txsub_pool(),
                                  (const unsigned char*)g_node_status->tx_submit_buf, tlen,
                                  mux_out_fd, mux_n_out, reason, sizeof reason, &relayed);
+                    /* Core BroadcastTransaction (2026-10-01): a txid already in
+                     * the mempool is not an error -- Core skips the submission,
+                     * reannounces the mempool's copy and returns the txid. This
+                     * answered -27 "txn-already-in-mempool", so a transaction
+                     * that reached us by relay a moment before the client sent
+                     * it read as a failure (feeest_core_diff, once relay from
+                     * Core started working). */
+                    if(result == -27 && strstr(reason, "already-in-mempool")){
+                        extern int tx_txid(unsigned char* out, const unsigned char* tx, unsigned long txlen, unsigned char* scratch, unsigned long scratchcap);
+                        extern void txrelay_announce_own(const unsigned char txid[32]);
+                        static unsigned char ascratch[2000*81 + 8]; unsigned char tid[32]; unsigned long ml = 0;
+                        if(tx_txid(tid, (const unsigned char*)g_node_status->tx_submit_buf, tlen, ascratch, sizeof ascratch) &&
+                           mpool_get(txsub_pool(), tid, &ml)){
+                            txrelay_announce_own(tid);
+                            result = 1; reason[0] = 0;
+                        }
+                    }
                     /* every mempool.dat reload streams through this channel:
                      * 4,470 lines in two minutes after deploy j. One line per
                      * 5 s; the count rides along. */
