@@ -459,6 +459,87 @@ int main(void){
      * 24, comfortably inside the 63 that v31's 64-transaction cluster limit
      * allows, so it must be ACCEPTED and fully linked.
      * ================================================================ */
+    /* ================================================================
+     * package RBF (2026-10-01): Core v31.1 MemPoolAccept::PackageRBFChecks.
+     * A (10 sat/vB) is in the pool; P conflicts with A paying 1 sat/vB, so it
+     * cannot replace A alone; C, P's child, pays 30 sat/vB. Together they
+     * replace A: 2542 sat over 164 vB pays A's 820 plus the 164-sat increment,
+     * out-pays P (15.5 > 1 sat/vB) and improves the diagram. Non-witness
+     * fixtures (82 vB each); relay and incremental rates are 1 sat/vB.
+     * ================================================================ */
+    printf("== package RBF: a parent that cannot replace alone replaces with its child ==\n");
+    {
+        extern int mpol_package_rbf_check(void*, void*, const unsigned char* const*, const unsigned long*,
+                                          const unsigned char*, int, unsigned long long, unsigned long long,
+                                          unsigned long long, unsigned long long, char*, unsigned long);
+        extern void mpol_package_fee_context(unsigned long long, unsigned long long);
+        extern void mpol_package_rbf_context(int);
+        static unsigned char pol[128];
+        static unsigned char stbuf[1<<21];
+        static unsigned char mp[40 + 4096*80 + 8];
+        static unsigned char mblob[1<<20];
+        static unsigned char ux[40 + 4096*48 + 8];
+        static unsigned char ublob[1<<16];
+        #define PR_TX(buf, n, prev, val, tag) do{ \
+            n = 0; buf[n++]=2;buf[n++]=0;buf[n++]=0;buf[n++]=0; \
+            buf[n++]=1; memcpy(buf+n, prev, 32); n+=32; memset(buf+n,0,4); n+=4; \
+            buf[n++]=0; memset(buf+n,0xff,4); n+=4; buf[n++]=1; \
+            { unsigned long long _v=(val); for (int _b=0;_b<8;_b++) buf[n++]=(unsigned char)(_v>>(8*_b)); } \
+            buf[n++]=22; buf[n++]=0x00; buf[n++]=0x14; memset(buf+n, (tag), 20); n+=20; \
+            memset(buf+n, 0, 4); n+=4; }while(0)
+        unsigned char spk[2] = { 0x51, 0x00 };
+        static unsigned char ta[256], tp[256], tc[256]; unsigned long na, np, nc;
+        unsigned char coin[32], idA[32], ids[64];
+        memset(stbuf, 0, sizeof stbuf);
+        mpool_policy_init(pol, 1000, 25, 101000, 25, 101000, 1);
+        POLICY_STATE_INIT(stbuf, 4096);
+        mpool_init(mp, 4096, mblob, sizeof mblob);
+        utxo_init(ux, 4096, ublob, sizeof ublob);
+        memset(coin, 0xF4, 32); utxo_put(ux, coin, 0, 100000ULL, 0, 0, spk, 1);
+        PR_TX(ta, na, coin, 100000ULL - 820, 0x70);              /* A: 820 sat, 10 sat/vB */
+        memset(idA, 0xC1, 32);
+        okv(mpool_policy_add(pol, stbuf, mp, ta, na, idA, ux) == 1, "A (10 sat/vB) is in the pool");
+        memset(ids, 0xC2, 32); memset(ids + 32, 0xC3, 32);       /* P's and C's txids */
+        PR_TX(tp, np, coin, 100000ULL - 82, 0x71);               /* P: conflicts with A, 82 sat */
+        PR_TX(tc, nc, ids, 100000ULL - 82 - 2460, 0x72);         /* C: spends P:0, 2460 sat */
+        const unsigned char* txs[2] = { tp, tc }; unsigned long lens[2] = { np, nc };
+        char why[320];
+        long rp = mpool_policy_test(pol, stbuf, mp, tp, np, ids, ux, NULL, NULL);
+        okv(rp != 1 && !strcmp(mpool_policy_reason(pol), "insufficient fee"), "P alone cannot replace A (insufficient fee)");
+        int r = mpol_package_rbf_check(pol, stbuf, txs, lens, ids, 2, 2542, 164, 82, 82, why, sizeof why);
+        okv(r == 1, "P + C pass PackageRBFChecks (2542 sat / 164 vB against A's 820)");
+        if (r != 1) printf("      r=%d why=\"%s\"\n", r, why);
+        /* Core's messages, word for word */
+        r = mpol_package_rbf_check(pol, stbuf, txs, lens, ids, 2, 500, 164, 82, 82, why, sizeof why);
+        okv(r == 0 && !strcmp(why, "package RBF failed: insufficient anti-DoS fees, rejecting replacement "
+                                    "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3, "
+                                    "less fees than conflicting txs; 0.000005 < 0.0000082"),
+            "under A's fee: Core's 'less fees than conflicting txs' (FormatMoney amounts, the child's txid)");
+        if (r != 0) printf("      r=%d\n", r); else if (strstr(why, "less fees") == NULL || strstr(why, "0.000005 <") == NULL) printf("      why=\"%s\"\n", why);
+        r = mpol_package_rbf_check(pol, stbuf, txs, lens, ids, 2, 900, 164, 82, 82, why, sizeof why);
+        okv(r == 0 && strstr(why, "not enough additional fees to relay; 0.0000008 < 0.00000164") != NULL,
+            "over A's fee but under the 164-sat increment: 'not enough additional fees to relay'");
+        r = mpol_package_rbf_check(pol, stbuf, txs, lens, ids, 2, 1000, 164, 1100, 82, why, sizeof why);
+        okv(r == 0 && !strcmp(why, "package RBF failed: package feerate is less than or equal to parent feerate, "
+                                    "package feerate 0.00006097 BTC/kvB <= parent feerate is 0.00013414 BTC/kvB"),
+            "a child paying only the anti-DoS fee: 'package feerate is less than or equal to parent feerate'");
+        r = mpol_package_rbf_check(pol, stbuf, txs, lens, ids, 1, 82, 82, 82, 82, why, sizeof why);
+        okv(r == 0 && !strcmp(why, "package RBF failed: package must be 1-parent-1-child"), "a conflicting package of one: not 1-parent-1-child");
+        r = mpol_package_rbf_check(pol, stbuf, txs + 1, lens + 1, ids + 32, 1, 2460, 82, 2460, 82, why, sizeof why);
+        okv(r == -1, "no member conflicts with the pool: no package RBF (-1)");
+        /* the commit side: under the package context P replaces A */
+        mpol_package_fee_context(2542, 164);
+        mpol_package_rbf_context(1);
+        long cp = mpool_policy_add(pol, stbuf, mp, tp, np, ids, ux);
+        long cc = mpool_policy_add(pol, stbuf, mp, tc, nc, ids + 32, ux);
+        mpol_package_rbf_context(0);
+        mpol_package_fee_context(0, 0);
+        unsigned long l = 0;
+        okv(cp == 1 && cc == 1, "under the package context P and C are admitted");
+        if (cp != 1 || cc != 1) printf("      cp=%ld cc=%ld reason \"%s\"\n", cp, cc, mpool_policy_reason(pol));
+        okv(mpool_get(mp, idA, &l) == NULL, "...and A is evicted");
+        #undef PR_TX
+    }
     printf("== MEM-3: a 30-parent child keeps every parent link ==\n");
     {
         static unsigned char pol[128];

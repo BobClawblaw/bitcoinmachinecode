@@ -154,6 +154,13 @@ extern const unsigned char* mpool_get(void* mp, const unsigned char txid[32],
  * single-transaction traffic, so mpol_package_fee_context(0,0) is the reset
  * and the package path calls it on every exit. */
 static uint64_t g_pkg_fee = 0, g_pkg_vsize = 0;
+/* Package RBF (2026-10-01): set by the worker for the commit pass of a
+ * package that passed mpol_package_rbf_check. While set, a member's
+ * replacement is priced on the PACKAGE's fee and vsize (g_pkg_fee/vsize) --
+ * rules 3+4 and the diagram -- as Core's PackageRBFChecks prices the
+ * aggregate; the parent alone pays too little by construction. */
+static int g_pkg_rbf_on = 0;
+void mpol_package_rbf_context(int on){ g_pkg_rbf_on = on ? 1 : 0; }
 
 /* ---- package MEMBERSHIP context -----------------------------------------
  * The fee context above says what the package pays; this says who is in it.
@@ -2306,15 +2313,17 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
        * (fee_at_rate). MEM-16 (audit 2026-09-03) had made this truncate, from
        * an older Core's GetFee; v31.1 uses FeeFrac::EvaluateFeeUp, so the
        * truncation admitted transactions Core refuses (141 vB at 14 sat). */
-      { uint64_t need = fee_at_rate((uint64_t)pol->relay_fee_rate, eff_vsize);
-        if (eff_fee < need){
-            _mpol_last_reason = "min relay fee not met"; return 0; } }
+      /* Core CheckFeeRate's order (2026-10-01): the dynamic floor first,
+       * then the relay floor -- when both fail Core names the mempool's */
       /* dynamic floor (sat/kvB, rolling decay) -- Core "mempool min fee not met" */
       uint64_t fl = mpool_policy_min_fee_ex(st, pol->incremental_fee);
       if (fl > 0){
           uint64_t need = fee_at_rate(fl, eff_vsize);
           if (eff_fee < need){ _mpol_last_reason = "mempool min fee not met"; return 0; }
-      } }
+      }
+      { uint64_t need = fee_at_rate((uint64_t)pol->relay_fee_rate, eff_vsize);
+        if (eff_fee < need){
+            _mpol_last_reason = "min relay fee not met"; return 0; } } }
 
     /* --- conflicts + RBF (Core ReplacementChecks / classic BIP125) --------- */
     int n_conf = 0;
@@ -2377,9 +2386,11 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
         /* rules 3+4 (Core PaysForRBF): pay all replaced fees, and the
          * increment must cover the replacement's own vsize at the
          * incremental relay rate ("insufficient fee"). */
-        if (fee < removed_fees){ _mpol_last_reason = "insufficient fee"; return 0; }
-        { uint64_t need = fee_at_rate(pol->incremental_fee, vsize);
-          if (fee - removed_fees < need){ _mpol_last_reason = "insufficient fee"; return 0; } }
+        { uint64_t rf = (g_pkg_rbf_on && g_pkg_vsize) ? g_pkg_fee   : fee;     /* package RBF: the aggregate */
+          uint64_t rv = (g_pkg_rbf_on && g_pkg_vsize) ? g_pkg_vsize : vsize;
+          if (rf < removed_fees){ _mpol_last_reason = "insufficient fee"; return 0; }
+          uint64_t need = fee_at_rate(pol->incremental_fee, rv);
+          if (rf - removed_fees < need){ _mpol_last_reason = "insufficient fee"; return 0; } }
     }
 
     /* --- ancestor / descendant limits (vsize budgets) ---------------------- */
@@ -2742,8 +2753,10 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
      * above are absolute-fee rules; this is the one that refuses a
      * replacement worse for a miner. Runs for testmempoolaccept too. */
     if (n_evict > 0){
+        int pr = g_pkg_rbf_on && g_pkg_vsize;      /* package RBF: the package is one chunk (feerate > parent's) */
         int d = mpol_replacement_improves(st, (const unsigned char (*)[32])evict_set, n_evict,
-                                          (const unsigned char (*)[32])prev, n_in, fee, vsize);
+                                          (const unsigned char (*)[32])prev, n_in,
+                                          pr ? g_pkg_fee : fee, pr ? g_pkg_vsize : vsize);
         if (d < 0){ _mpol_last_reason = "too-large-cluster"; return 0; }   /* a component over the bound */
         if (d == 0){ _mpol_last_reason = "replacement-failed"; return 0; }
     }
@@ -3363,6 +3376,139 @@ long mpool_policy_n_parents(void* st, const unsigned char txid[32]){
     return self < 0 ? -1 : (long)t[self].n_parents;
 }
 int mpol_in_package_context(void){ return g_pkg_n > 0; }
+
+/* ---- package RBF: Core v31.1 MemPoolAccept::PackageRBFChecks -----------
+ * (2026-10-01) For the package-evaluation step of submitpackage, after the
+ * members' prechecks and the aggregate fee floor. Returns -1 when no member
+ * conflicts with the mempool (no package RBF), 1 when the replacement may go
+ * ahead, 0 when it is refused -- `why` then holds Core's package_msg,
+ * reason + ", " + debug exactly as PackageValidationState::ToString prints
+ * it. The rules, in Core's order:
+ *   - the package is 1 parent + 1 child;
+ *   - neither has an in-mempool parent (a cluster larger than 2);
+ *   - at most MAX_REPLACEMENT_CANDIDATES (100) direct conflicts -- Core
+ *     counts distinct CLUSTERS; each conflict is at most one cluster, so this
+ *     can only refuse what Core would also refuse at > 100 clusters, and it
+ *     refuses 101+ conflicts sharing a cluster that Core would allow;
+ *   - PaysForRBF over the package's fee and vsize;
+ *   - package feerate > parent feerate (the child is not just paying the
+ *     anti-DoS fee);
+ *   - the feerate diagram improves, with the package as one chunk -- exact,
+ *     since it has no mempool ancestors and out-pays its parent. */
+/* Core CheckFeeRate over a package's aggregate (AcceptMultipleTransactions,
+ * package_feerates): 1 ok, 0 refused with Core's state string in `why`. */
+int mpol_package_floor_check(mpol_cfg* pol, void* st, uint64_t fee, uint64_t vsize,
+                             char* why, unsigned long wcap){
+    if (why && wcap) why[0] = 0;
+    uint64_t fl = mpool_policy_min_fee_ex(st, pol->incremental_fee);
+    if (fl > 0){
+        uint64_t need = fee_at_rate(fl, vsize);
+        if (fee < need){ snprintf(why, wcap, "mempool min fee not met, %llu < %llu", (unsigned long long)fee, (unsigned long long)need); return 0; }
+    }
+    uint64_t need = fee_at_rate((uint64_t)pol->relay_fee_rate, vsize);
+    if (fee < need){ snprintf(why, wcap, "min relay fee not met, %llu < %llu", (unsigned long long)fee, (unsigned long long)need); return 0; }
+    return 1;
+}
+/* a mempool entry's fee and vsize (submitpackage reports them for a member
+ * already in the mempool, Core's MempoolTx result) */
+int mpol_entry_fee_vsize(void* st, const unsigned char txid[32], uint64_t* fee, uint64_t* vsize){
+    int i = st ? find_node(st, txid) : -1;
+    if (i < 0) return 0;
+    mpol_node* t = mpol_nodes_base(st);
+    if (fee) *fee = t[i].fee;
+    if (vsize) *vsize = t[i].size;
+    return 1;
+}
+static void pkgrbf_money(char* out, size_t cap, uint64_t sat){    /* Core FormatMoney */
+    char b[40]; int n = snprintf(b, sizeof b, "%llu.%08llu", (unsigned long long)(sat / 100000000ULL), (unsigned long long)(sat % 100000000ULL));
+    while (n > 2 && b[n-1] == '0' && b[n-3] >= '0' && b[n-3] <= '9') b[--n] = 0;
+    snprintf(out, cap, "%s", b);
+}
+static void pkgrbf_feerate(char* out, size_t cap, uint64_t fee, uint64_t vsize){   /* CFeeRate::ToString */
+    uint64_t k = vsize ? fee * 1000 / vsize : 0;                                    /* GetFeePerK: rounded down */
+    snprintf(out, cap, "%llu.%08llu BTC/kvB", (unsigned long long)(k / 100000000ULL), (unsigned long long)(k % 100000000ULL));
+}
+static void pkgrbf_hex(char out[65], const unsigned char txid[32]){
+    static const char H[] = "0123456789abcdef";
+    for (int k = 0; k < 32; k++){ out[k*2] = H[txid[31-k] >> 4]; out[k*2+1] = H[txid[31-k] & 15]; }
+    out[64] = 0;
+}
+int mpol_package_rbf_check(mpol_cfg* pol, void* st,
+                           const unsigned char* const* txs, const unsigned long* lens,
+                           const unsigned char* txids, int n,
+                           uint64_t pkg_fee, uint64_t pkg_vsize,
+                           uint64_t parent_fee, uint64_t parent_vsize,
+                           char* why, unsigned long wcap){
+    if (why && wcap) why[0] = 0;
+    if (n <= 0 || !st) return -1;
+    static unsigned char prev[MPOL_MAX_IN][32];
+    static uint32_t idx[MPOL_MAX_IN], seq[MPOL_MAX_IN];
+    static unsigned char outer[2 * MPOL_MAX_IN][32];   /* inputs from outside the package (a package RBF is 2 txs) */
+    int n_outer = 0;
+    uint32_t conf[MPOL_MAX_IN * 2]; int n_conf = 0;
+    int has_mempool_parent = 0;
+    for (int m = 0; m < n; m++){
+        mpol_txmeta meta;
+        int ni = parse_tx(txs[m], lens[m], prev, idx, seq, &meta);
+        if (ni < 0) return -1;
+        for (int i = 0; i < ni; i++){
+            int internal = 0;
+            for (int q = 0; q < n; q++) if (!memcmp(prev[i], txids + q*32, 32)){ internal = 1; break; }
+            if (internal) continue;
+            if (n_outer < (int)(sizeof outer / sizeof outer[0])) memcpy(outer[n_outer++], prev[i], 32);
+            if (find_node(st, prev[i]) >= 0) has_mempool_parent = 1;
+            int cl = find_claim(st, prev[i], idx[i]);
+            if (cl < 0) continue;
+            int seen = 0; for (int k = 0; k < n_conf; k++) if (conf[k] == (uint32_t)cl){ seen = 1; break; }
+            if (!seen && n_conf < (int)(sizeof conf / sizeof conf[0])) conf[n_conf++] = (uint32_t)cl;
+        }
+    }
+    if (n_conf == 0) return -1;                                    /* nothing to replace */
+    char chex[65]; pkgrbf_hex(chex, txids + (n-1)*32);             /* Core attributes errors to the child */
+    if (n != 2){ snprintf(why, wcap, "package RBF failed: package must be 1-parent-1-child"); return 0; }
+    if (has_mempool_parent){ snprintf(why, wcap, "package RBF failed: new transaction cannot have mempool ancestors"); return 0; }
+    if (n_conf > 100){
+        snprintf(why, wcap, "package RBF failed: too many potential replacements, rejecting replacement %s; too many conflicting clusters (%d > %d)", chex, n_conf, 100);
+        return 0; }
+    /* everything the package would evict: the conflicts and their descendants */
+    static unsigned char evict[100 * MPOL_PKG_MAX][32];
+    int n_evict = 0; uint64_t conflicting = 0;
+    mpol_node* t = mpol_nodes_base(st);
+    for (int k = 0; k < n_conf; k++){
+        int ci = (int)conf[k];
+        int dup = 0; for (int e = 0; e < n_evict; e++) if (!memcmp(evict[e], t[ci].txid, 32)){ dup = 1; break; }
+        if (!dup && n_evict < (int)(sizeof evict / sizeof evict[0])){ memcpy(evict[n_evict++], t[ci].txid, 32); conflicting += t[ci].fee; }
+        static unsigned char dts[MPOL_PKG_MAX][32];
+        int nd = collect_descendant_txids(st, ci, dts, MPOL_PKG_MAX);
+        for (int d = 0; d < nd; d++){
+            int dd = 0; for (int e = 0; e < n_evict; e++) if (!memcmp(evict[e], dts[d], 32)){ dd = 1; break; }
+            if (dd || n_evict >= (int)(sizeof evict / sizeof evict[0])) continue;
+            int di = find_node(st, dts[d]);
+            if (di >= 0) conflicting += t[di].fee;
+            memcpy(evict[n_evict++], dts[d], 32);
+        }
+    }
+    /* PaysForRBF(original_fees, replacement_fees, replacement_vsize) */
+    if (pkg_fee < conflicting){
+        char a[40], b[40]; pkgrbf_money(a, sizeof a, pkg_fee); pkgrbf_money(b, sizeof b, conflicting);
+        snprintf(why, wcap, "package RBF failed: insufficient anti-DoS fees, rejecting replacement %s, less fees than conflicting txs; %s < %s", chex, a, b);
+        return 0; }
+    { uint64_t add = pkg_fee - conflicting, need = fee_at_rate(pol->incremental_fee, pkg_vsize);
+      if (add < need){
+          char a[40], b[40]; pkgrbf_money(a, sizeof a, add); pkgrbf_money(b, sizeof b, need);
+          snprintf(why, wcap, "package RBF failed: insufficient anti-DoS fees, rejecting replacement %s, not enough additional fees to relay; %s < %s", chex, a, b);
+          return 0; } }
+    /* package feerate <= parent feerate, compared exactly (FeeRateCompare) */
+    if ((unsigned __int128)pkg_fee * parent_vsize <= (unsigned __int128)parent_fee * pkg_vsize){
+        char a[48], b[48]; pkgrbf_feerate(a, sizeof a, pkg_fee, pkg_vsize); pkgrbf_feerate(b, sizeof b, parent_fee, parent_vsize);
+        snprintf(why, wcap, "package RBF failed: package feerate is less than or equal to parent feerate, package feerate %s <= parent feerate is %s", a, b);
+        return 0; }
+    int d = mpol_replacement_improves(st, (const unsigned char (*)[32])evict, n_evict,
+                                      (const unsigned char (*)[32])outer, n_outer, pkg_fee, pkg_vsize);
+    if (d < 0){ snprintf(why, wcap, "too-large-cluster"); return 0; }
+    if (d == 0){ snprintf(why, wcap, "package RBF failed: insufficient feerate: does not improve feerate diagram"); return 0; }
+    return 1;
+}
 
 long mpool_policy_set_sigops(void* st, const unsigned char txid[32], unsigned int cost){
     if (!st || *(uint32_t*)st != MPOL_MAGIC) return 0;

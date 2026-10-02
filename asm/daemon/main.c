@@ -8020,6 +8020,9 @@ static int txsub_worker_ready(void){
     return 1;
 }
 
+static int txsub_package_accept(const unsigned char* const* txs, const unsigned long* lens,
+                                const unsigned char* txids, const unsigned long long* vsz, int n,
+                                char* msg, unsigned long mcap);   /* Core AcceptPackage, below */
 /* ==== submitpackage: validate a package, then commit it =====================
  * Core's shape, reduced to what this node can honestly do.
  *
@@ -8088,6 +8091,7 @@ static int txsub_package(char* msg, unsigned long mcap){
       if (p != end){ snprintf(msg, mcap, "package-contains-unparseable-transaction"); return 0; } }
 
     st->pkg_replaced_n = 0;
+    st->pkg_msg_full[0] = 0;
     const int test_only = st->tx_submit_test ? 1 : 0;
     const char* why = "";
     static unsigned long long vsz[RPC_PKG_MAX];
@@ -8101,6 +8105,10 @@ static int txsub_package(char* msg, unsigned long mcap){
         }
         return 0;
     }
+
+    /* 2026-10-01: a real submission follows Core's AcceptPackage
+     * (txsub_package_accept); what follows is testmempoolaccept's dry run */
+    if (!test_only) return txsub_package_accept(txs, lens, txids, vsz, n, msg, mcap);
 
     /* ---- pass 1: dry run with the overlay, to learn the real fees -------- */
     unsigned long long tot_fee = 0, tot_vsize = 0;
@@ -8212,51 +8220,163 @@ static int txsub_package(char* msg, unsigned long mcap){
         return all_pass;
     }
 
-    /* ---- pass 2: commit, with the package feerate in effect -------------- */
+    /* not reached: a real submission returned through txsub_package_accept */
+    return 0;
+}
+
+/* submitpackage, the real submission (2026-10-01): Core v31.1
+ * MemPoolAccept::AcceptPackage. Until now every member was committed under
+ * the PACKAGE's feerate, so a parent that pays its own way also paid for its
+ * child (Core: its fees "should only be used once"), and a parent that had to
+ * REPLACE something could never do it with its child's help -- there was no
+ * package RBF. Core's algorithm, step for step:
+ *   1. each member alone, in order: already in the mempool -> valid as it
+ *      is; valid alone -> committed now, its fee used once; refused for a
+ *      fee reason or a missing input (its parent is a fee-refused member) ->
+ *      kept for step 2; refused for anything else -> the package has failed
+ *      ("transaction failed"), and the remaining members are still tried
+ *      alone, as Core does;
+ *   2. the kept members, two or more, as a package (AcceptMultipleTransactions):
+ *      prechecks with the package in view, the aggregate fee floor, package
+ *      RBF when a member conflicts, then the commit -- with the package
+ *      feerate and, for a replacement, the package's fee and vsize in force.
+ *      One kept member is the step-1 verdict again (Core re-runs it alone).
+ * Per-member results: 1 valid alone (own feerate), 2 valid in the package
+ * evaluation (package feerate over those members), 3 already in the mempool
+ * (no effective feerate, as Core reports MEMPOOL_ENTRY). */
+static int txsub_package_accept(const unsigned char* const* txs, const unsigned long* lens,
+                                const unsigned char* txids, const unsigned long long* vsz, int n,
+                                char* msg, unsigned long mcap){
+    extern void mpol_package_fee_context(unsigned long long, unsigned long long);
+    extern void mpol_package_context(const unsigned char* const*, const unsigned long*, const unsigned char*, int);
+    extern void mpol_package_rbf_context(int);
+    extern void txacc_package_overlay(const unsigned char* const*, const unsigned long*, const unsigned char*, int);
+    extern long tx_accept_test_reason(void*, const unsigned char*, const unsigned char*, unsigned long, char*,
+                                      unsigned long, unsigned long long*, unsigned long long*);
+    extern int  txacc_fee_reconsiderable(const char* reason);
+    extern int  txacc_entry_fee_vsize(const unsigned char txid[32], unsigned long long*, unsigned long long*);
+    extern int  txacc_package_floor_check(unsigned long long, unsigned long long, char*, unsigned long);
+    extern int  txacc_package_rbf_check(const unsigned char* const*, const unsigned long*, const unsigned char*, int,
+                                        unsigned long long, unsigned long long, unsigned long long, unsigned long long,
+                                        char*, unsigned long);
+    extern int  mpol_last_replaced(unsigned char* out, int cap);
+    node_status_t* st = g_node_status;
+    st->pkg_eff_fee = 0; st->pkg_eff_vsize = 0;
+    /* a package-level message: in full in pkg_msg_full (the RPC prefers it), and
+     * as much as fits in the caller's buffer */
+    #define TXSUB_PKG_MSG(text) do{ snprintf((char*)st->pkg_msg_full, sizeof st->pkg_msg_full, "%s", (text)); \
+        size_t l_ = strlen((const char*)st->pkg_msg_full); if (l_ >= mcap) l_ = mcap - 1; \
+        memcpy(msg, (const char*)st->pkg_msg_full, l_); msg[l_] = 0; }while(0)
+    /* fold whatever the member just committed displaced into the union */
+    #define TXSUB_NOTE_REPLACED() do{ \
+        unsigned char rep_[RPC_PKG_REPLACED_MAX][32]; \
+        int nrep_ = mpol_last_replaced((unsigned char*)rep_, RPC_PKG_REPLACED_MAX); \
+        for (int k_ = 0; k_ < nrep_; k_++){ int dup_ = 0; \
+            for (int q_ = 0; q_ < st->pkg_replaced_n; q_++) \
+                if (!memcmp((const void*)st->pkg_replaced[q_], rep_[k_], 32)){ dup_ = 1; break; } \
+            if (dup_) continue; \
+            if (st->pkg_replaced_n >= RPC_PKG_REPLACED_MAX) break; \
+            memcpy((void*)st->pkg_replaced[st->pkg_replaced_n++], rep_[k_], 32); } }while(0)
+
+    /* ---- 1. each member alone ------------------------------------------- */
+    int eval[RPC_PKG_MAX]; int n_eval = 0, quit_early = 0;
+    for (int i = 0; i < n; i++){
+        unsigned long ml = 0; unsigned long long fee = 0, avs = 0;
+        st->pkg_fee[i] = 0; st->pkg_vsize[i] = vsz[i]; st->pkg_reason[i][0] = 0;
+        if (mpool_get(txsub_pool(), txids + i*32, &ml)){
+            txacc_entry_fee_vsize(txids + i*32, &fee, &avs);
+            st->pkg_result[i] = 3; st->pkg_fee[i] = fee; if (avs) st->pkg_vsize[i] = avs;
+            continue;
+        }
+        char r[128]; r[0] = 0; int relayed = 0;
+        long rc = tx_accept_test_reason(txsub_pool(), txids + i*32, txs[i], lens[i], r, sizeof r, &fee, &avs);
+        st->pkg_fee[i] = fee; if (avs) st->pkg_vsize[i] = avs;
+        if (rc == 1) rc = txsub_accept_and_relay(txsub_pool(), txs[i], lens[i], mux_out_fd, mux_n_out, r, sizeof r, &relayed);
+        if (rc == 1){
+            st->pkg_result[i] = 1;
+            walletnotify_tx(txs[i], (long)lens[i]);
+            TXSUB_NOTE_REPLACED();
+            continue;
+        }
+        st->pkg_result[i] = 0;
+        snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "%s", r);
+        if (n == 1 || !(txacc_fee_reconsiderable(r) || rc == -25)) quit_early = 1;   /* not something a package can change */
+        else eval[n_eval++] = i;
+    }
+    if (quit_early || n_eval == 1){ snprintf(msg, mcap, "transaction failed"); return 0; }
+    if (n_eval == 0){ snprintf(msg, mcap, "success"); return 1; }
+
+    /* ---- 2. the kept members as a package -------------------------------- */
+    static const unsigned char* etx[RPC_PKG_MAX];
+    static unsigned long elen[RPC_PKG_MAX];
+    static unsigned char eid[RPC_PKG_MAX*32];
+    unsigned long long efee[RPC_PKG_MAX], evs[RPC_PKG_MAX];
+    for (int k = 0; k < n_eval; k++){ etx[k] = txs[eval[k]]; elen[k] = lens[eval[k]]; memcpy(eid + k*32, txids + eval[k]*32, 32); }
+    /* prechecks with the package in view: the overlay lets a member resolve
+     * an earlier member; a fee-only verdict is what the package may change */
+    unsigned long long tot_fee = 0, tot_vsize = 0;
+    int bad = -1, truc = 0; char badr[128]; badr[0] = 0;
+    mpol_package_context(etx, elen, eid, n_eval);
+    txacc_package_overlay(etx, elen, eid, n_eval);
+    for (int k = 0; k < n_eval; k++){
+        char r[128]; r[0] = 0; unsigned long long fee = 0, avs = 0;
+        long rc = tx_accept_test_reason(txsub_pool(), eid + k*32, etx[k], elen[k], r, sizeof r, &fee, &avs);
+        efee[k] = fee; evs[k] = avs ? avs : vsz[eval[k]];
+        if (rc == 1 || txacc_fee_reconsiderable(r)){ tot_fee += fee; tot_vsize += evs[k]; continue; }
+        if (!strcmp(r, "TRUC-violation")) truc = 1;
+        bad = k; snprintf(badr, sizeof badr, "%s", r); break;
+    }
+    txacc_package_overlay(NULL, NULL, NULL, 0);
+    mpol_package_context(NULL, NULL, NULL, 0);
+    if (truc){ snprintf(msg, mcap, "TRUC-violation"); return 0; }      /* package-level; members keep their step-1 verdicts */
+    if (bad >= 0){
+        snprintf((char*)st->pkg_reason[eval[bad]], sizeof st->pkg_reason[0], "%s", badr);
+        snprintf(msg, mcap, "transaction failed"); return 0; }
+    /* the aggregate fee floor (CheckFeeRate over the package) -- attributed
+     * to the last member, as Core's FeeFailure result is */
+    { char why[160];
+      if (!txacc_package_floor_check(tot_fee, tot_vsize, why, sizeof why)){
+          size_t l_ = strlen(why); if (l_ >= sizeof st->pkg_reason[0]) l_ = sizeof st->pkg_reason[0] - 1;
+          memcpy((char*)st->pkg_reason[eval[n_eval-1]], why, l_); st->pkg_reason[eval[n_eval-1]][l_] = 0;
+          snprintf(msg, mcap, "transaction failed"); return 0; } }
+    /* package RBF (PackageRBFChecks) when a member conflicts */
+    int rbf = -1;
+    { char why[320];
+      rbf = txacc_package_rbf_check(etx, elen, eid, n_eval, tot_fee, tot_vsize, efee[0], evs[0], why, sizeof why);
+      if (rbf == 0){ TXSUB_PKG_MSG(why); return 0; } }
+    /* commit (SubmitPackage) under the package feerate and, for a
+     * replacement, the package's fee and vsize */
     int committed = 1;
     mpol_package_fee_context(tot_fee, tot_vsize);
-    mpol_package_context(txs, lens, txids, n);
-    txacc_package_overlay(txs, lens, txids, n);
-    for (int i = 0; i < n; i++){
-        char r[128]; r[0] = 0; int relayed = 0;
-        int rc = txsub_accept_and_relay(txsub_pool(), txs[i], lens[i],
-                                        mux_out_fd, mux_n_out, r, sizeof r, &relayed);
+    mpol_package_context(etx, elen, eid, n_eval);
+    txacc_package_overlay(etx, elen, eid, n_eval);
+    if (rbf == 1) mpol_package_rbf_context(1);
+    for (int k = 0; k < n_eval; k++){
+        int i = eval[k]; char r[128]; r[0] = 0; int relayed = 0;
+        int rc = txsub_accept_and_relay(txsub_pool(), etx[k], elen[k], mux_out_fd, mux_n_out, r, sizeof r, &relayed);
         if (rc == 1){
-            st->pkg_result[i] = 1; st->pkg_reason[i][0] = 0;
-            walletnotify_tx(txs[i], (long)lens[i]);
-            /* whatever THIS member displaced by RBF, folded into the
-             * package-wide union Core reports at the top level. Read
-             * immediately: the next member's accept overwrites it. */
-            extern int mpol_last_replaced(unsigned char* out, int cap);
-            unsigned char rep[RPC_PKG_REPLACED_MAX][32];
-            int nrep = mpol_last_replaced((unsigned char*)rep, RPC_PKG_REPLACED_MAX);
-            for (int k = 0; k < nrep; k++){
-                int dup = 0;
-                for (int q = 0; q < st->pkg_replaced_n; q++)
-                    if (!memcmp((const void*)st->pkg_replaced[q], rep[k], 32)){ dup = 1; break; }
-                if (dup) continue;
-                if (st->pkg_replaced_n >= RPC_PKG_REPLACED_MAX) break;
-                memcpy((void*)st->pkg_replaced[st->pkg_replaced_n++], rep[k], 32);
-            }
-        }
-        else {
+            st->pkg_result[i] = 2; st->pkg_reason[i][0] = 0; st->pkg_fee[i] = efee[k]; st->pkg_vsize[i] = evs[k];
+            walletnotify_tx(etx[k], (long)elen[k]);
+            TXSUB_NOTE_REPLACED();
+        } else {
             st->pkg_result[i] = 0;
             snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "%s", r);
             committed = 0;
         }
     }
-    /* ALWAYS cleared: a fee context left set would relax the floor for
-     * ordinary single-transaction traffic, and an overlay left set would let
-     * an unrelated transaction resolve against a package member. */
+    /* ALWAYS cleared: a context left set would relax the floors (or the RBF
+     * rules) for ordinary single-transaction traffic */
+    mpol_package_rbf_context(0);
     txacc_package_overlay(NULL, NULL, NULL, 0);
     mpol_package_context(NULL, NULL, NULL, 0);
     mpol_package_fee_context(0, 0);
-
+    #undef TXSUB_NOTE_REPLACED
+    #undef TXSUB_PKG_MSG
     st->pkg_eff_fee = tot_fee; st->pkg_eff_vsize = tot_vsize;
     snprintf(msg, mcap, "%s", committed ? "success" : "transaction failed");
     if (committed)
-        fprintf(stderr, "[dl] submitpackage: %d tx accepted, package fee %llu sat over %llu vB\n",
-                n, (unsigned long long)tot_fee, (unsigned long long)tot_vsize);
+        fprintf(stderr, "[dl] submitpackage: %d tx accepted as a package%s, package fee %llu sat over %llu vB\n",
+                n_eval, rbf == 1 ? " (package RBF)" : "", tot_fee, tot_vsize);
     return committed;
 }
 

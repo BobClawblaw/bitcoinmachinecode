@@ -163,7 +163,9 @@ int main(void){
         long r = tx_accept_validate_reason(mp_area, idm, txm, (unsigned long)nm,
                                            reason, sizeof reason);
         ck("rejected as missing inputs (-25)", r == -25);
-        ck("...with the resolve-stage reason", strstr(reason, "missing/already-spent") != NULL);
+        /* Core's name for it (2026-10-01): admission answers with
+         * Consensus::CheckTxInputs' reason, not the block log's text */
+        ck("...with Core's reason, bad-txns-inputs-missingorspent", strcmp(reason, "bad-txns-inputs-missingorspent") == 0);
     }
 
     printf("\n== 4: coinbase maturity anchored on the tip ==\n");
@@ -179,7 +181,8 @@ int main(void){
         long r = tx_accept_validate_reason(mp_area, idc, txcb, (unsigned long)nc,
                                            reason, sizeof reason);
         ck("immature spend rejected", r != 1);
-        ck("...as immature", strstr(reason, "immature") != NULL);
+        ck("...as immature, in Core's words (bad-txns-premature-spend-of-coinbase)",
+           strcmp(reason, "bad-txns-premature-spend-of-coinbase") == 0);
         tx_accept_set_tip(300);   /* conf 201 >= 100 */
         ck("mature spend accepted",
            tx_accept_validate(mp_area, idc, txcb, (unsigned long)nc) == 1);

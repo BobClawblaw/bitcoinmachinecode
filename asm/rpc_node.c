@@ -3055,7 +3055,7 @@ static int cmd_submitpackage(const rj_val* params, rj_val** res, long* ec, const
     static int  r_result[RPC_PKG_MAX];
     static unsigned long long r_fee[RPC_PKG_MAX], r_vsize[RPC_PKG_MAX];
     static char r_reason[RPC_PKG_MAX][64];
-    char pmsg[128]; pmsg[0] = 0;
+    char pmsg[320]; pmsg[0] = 0;
     unsigned long long eff_fee = 0, eff_vsize = 0;
     static unsigned char replaced[RPC_PKG_REPLACED_MAX][32];
     int n_replaced = 0;
@@ -3066,7 +3066,8 @@ static int cmd_submitpackage(const rj_val* params, rj_val** res, long* ec, const
             r_vsize[i]  = st->pkg_vsize[i];
             snprintf(r_reason[i], sizeof r_reason[i], "%s", (const char*)st->pkg_reason[i]);
         }
-        snprintf(pmsg, sizeof pmsg, "%s", (const char*)st->tx_submit_reason);
+        snprintf(pmsg, sizeof pmsg, "%s", st->pkg_msg_full[0] ? (const char*)st->pkg_msg_full   /* the full package_msg (2026-10-01) */
+                                                         : (const char*)st->tx_submit_reason);
         eff_fee = st->pkg_eff_fee; eff_vsize = st->pkg_eff_vsize;
         n_replaced = st->pkg_replaced_n;
         if (n_replaced > RPC_PKG_REPLACED_MAX) n_replaced = RPC_PKG_REPLACED_MAX;
@@ -3090,16 +3091,26 @@ static int cmd_submitpackage(const rj_val* params, rj_val** res, long* ec, const
         rj_val* e = rj_obj();
         rj_obj_set(e, "txid", rj_str(thex));
         rj_obj_set(e, "vsize", rj_numf("%llu", (unsigned long long)r_vsize[i]));
-        if (r_result[i]){
+        if (r_result[i] > 0){
+            /* 2026-10-01, Core AcceptPackage's three valid kinds (the worker's
+             * txsub_package_accept): 1 accepted alone -- its own feerate,
+             * including only itself; 2 accepted in the package evaluation --
+             * the package feerate over those members; 3 already in the
+             * mempool -- base fee only (Core: "unknown whether package
+             * feerate was used when it was originally submitted"). */
             rj_val* f = rj_obj();
             rj_obj_set(f, "base", mpe_amount(r_fee[i]));
-            if (eff_vsize){
+            if (r_result[i] == 1 && r_vsize[i]){
+                rj_obj_set(f, "effective-feerate", mpe_amount(r_fee[i] * 1000ULL / r_vsize[i]));
+                rj_val* inc = rj_arr(); rj_arr_push(inc, rj_str(whex));
+                rj_obj_set(f, "effective-includes", inc);
+            } else if (r_result[i] == 2 && eff_vsize){
                 /* Core reports this per KvB, as an amount */
                 unsigned long long per_kvb = eff_fee * 1000ULL / eff_vsize;
                 rj_obj_set(f, "effective-feerate", mpe_amount(per_kvb));
                 rj_val* inc = rj_arr();
                 for (int k = 0; k < n; k++){
-                    if (!r_result[k]) continue;
+                    if (r_result[k] != 2) continue;
                     unsigned char wk[32]; char wkhex[65];
                     tx_wtxid(wk, raw + off[k], tlen[k]);
                     mpe_hex(wkhex, wk);
