@@ -874,6 +874,16 @@ static int classify_spk(const unsigned char* s, unsigned long n){
 }
 
 /* Core GetDustThreshold + CFeeRate::GetFee (never 0 for a nonzero rate). */
+/* Core v31.1 CFeeRate::GetFee: FeeFrac::EvaluateFeeUp, i.e. the fee for
+ * `vsize` at `rate_kvb` sat/kvB ROUNDED UP -- ceil(rate * vsize / 1000).
+ * Measured on v31.1 (2026-10-01): 141 vB at 100 sat/kvB is refused at 14 sat
+ * ("min relay fee not met, 14 < 15") and accepted at 15. Every feerate-to-fee
+ * conversion in this file goes through here: the relay floor, the dynamic
+ * mempool floor, the RBF increment, the TRUC sibling increment and the dust
+ * threshold (GetDustThreshold is dustRelayFee.GetFee(size)). */
+static uint64_t fee_at_rate(uint64_t rate_kvb, uint64_t vsize){
+    return (rate_kvb * vsize + 999) / 1000;
+}
 static uint64_t dust_threshold(unsigned long spk_len, int spk_type, uint64_t rate_kvb){
     /* serialized txout size: 8 (value) + compactsize(spk_len) + spk_len */
     uint64_t sz = 8 + (spk_len < 0xfd ? 1 : 3) + spk_len;
@@ -890,9 +900,7 @@ static uint64_t dust_threshold(unsigned long spk_len, int spk_type, uint64_t rat
                    spk_type == SPK_WITNESS_V1_TAP || spk_type == SPK_WITNESS_UNKNOWN ||
                    spk_type == SPK_ANCHOR);
     sz += witness ? (32 + 4 + 1 + (107/4) + 4) : (32 + 4 + 1 + 107 + 4);
-    uint64_t fee = rate_kvb * sz / 1000;
-    if (fee == 0 && rate_kvb > 0) fee = 1;
-    return fee;
+    return fee_at_rate(rate_kvb, sz);
 }
 
 /* Returns NULL if standard, else Core's reason string. */
@@ -2294,27 +2302,17 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
       uint64_t eff_vsize = g_pkg_vsize ? g_pkg_vsize : vsize;
       /* min relay floor over VSIZE (Core "min relay fee not met"). vsize is
        * already the sigop-adjusted size -- see the top of this function. */
-      /* MEM-16 (audit 2026-09-03): this was `eff_fee * 1000 < eff_vsize *
-       * rate`, which is fee < rate*vsize/1000 computed EXACTLY -- i.e. a
-       * ceiling. Core's CFeeRate::GetFee truncates and only then floors at 1:
-       *
-       *     nFee = nSatoshisPerK * num_bytes / 1000;
-       *     if (nFee == 0 && num_bytes != 0 && nSatoshisPerK > 0) nFee = 1;
-       *
-       * At minrelaytxfee 100 sat/kvB and vsize 115 that is 11 sat for Core
-       * and was 12 here, so this node refused to relay transactions Core
-       * relays. The dynamic floor immediately below ALREADY used Core's
-       * rounding, so the two floors disagreed with each other -- which is the
-       * clearest sign this was an oversight rather than a choice. */
-      { uint64_t need = (uint64_t)pol->relay_fee_rate * eff_vsize / 1000;
-        if (need == 0 && eff_vsize != 0 && pol->relay_fee_rate > 0) need = 1;
+      /* 2026-10-01: rounded UP, as v31.1's CFeeRate::GetFee does
+       * (fee_at_rate). MEM-16 (audit 2026-09-03) had made this truncate, from
+       * an older Core's GetFee; v31.1 uses FeeFrac::EvaluateFeeUp, so the
+       * truncation admitted transactions Core refuses (141 vB at 14 sat). */
+      { uint64_t need = fee_at_rate((uint64_t)pol->relay_fee_rate, eff_vsize);
         if (eff_fee < need){
             _mpol_last_reason = "min relay fee not met"; return 0; } }
       /* dynamic floor (sat/kvB, rolling decay) -- Core "mempool min fee not met" */
       uint64_t fl = mpool_policy_min_fee_ex(st, pol->incremental_fee);
       if (fl > 0){
-          uint64_t need = fl * eff_vsize / 1000;
-          if (need == 0) need = 1;
+          uint64_t need = fee_at_rate(fl, eff_vsize);
           if (eff_fee < need){ _mpol_last_reason = "mempool min fee not met"; return 0; }
       } }
 
@@ -2380,8 +2378,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
          * increment must cover the replacement's own vsize at the
          * incremental relay rate ("insufficient fee"). */
         if (fee < removed_fees){ _mpol_last_reason = "insufficient fee"; return 0; }
-        { uint64_t need = pol->incremental_fee * vsize / 1000;
-          if (need == 0) need = 1;
+        { uint64_t need = fee_at_rate(pol->incremental_fee, vsize);
           if (fee - removed_fees < need){ _mpol_last_reason = "insufficient fee"; return 0; } }
     }
 
@@ -2697,8 +2694,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
                             if (n_evict >= MPOL_MAX_REPLACEMENTS){
                                 _mpol_last_reason = "too many potential replacements"; return 0; }
                             uint64_t total_removed = removed_fees + t[si].fee;
-                            uint64_t need = pol->incremental_fee * vsize / 1000;
-                            if (need == 0) need = 1;
+                            uint64_t need = fee_at_rate(pol->incremental_fee, vsize);
                             if (fee < total_removed){
                                 _mpol_last_reason = "insufficient fee"; return 0; }
                             if (fee - total_removed < need){
