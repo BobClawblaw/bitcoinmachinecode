@@ -2242,6 +2242,28 @@ int rpc_chain_txospender_lookup(const unsigned char txid_wire[32], unsigned vout
     return 0;
 }
 
+/* The block hash of a CONFIRMED transaction, from the txid index alone
+ * (2026-10-01). getrawtransaction consults the mempool first (Core's order),
+ * which takes the pool lock; a caller that already knows the transaction is
+ * not in the mempool -- the facade's batch, which just looked -- passes this
+ * hash so the lookup goes straight to the index. 1 with out_disp (64 hex + NUL),
+ * 0 when the index does not hold it. */
+int rpc_chain_tx_blockhash(const char* txid_disp, char out_disp[65]){
+    u8 disp[32], wire[32];
+    if (!txid_disp || strlen(txid_disp) != 64) return 0;
+    for (int i = 0; i < 32; i++){
+        unsigned v = 0;
+        if (sscanf(txid_disp + 2*i, "%2x", &v) != 1) return 0;
+        disp[i] = (u8)v;
+    }
+    for (int i = 0; i < 32; i++) wire[i] = disp[31-i];
+    long th; u32 toff, tlen; u8 rec[48];
+    if (!txi_lookup(wire, &th, &toff, &tlen)) return 0;
+    if (!read_idx_rec(th, rec)) return 0;
+    hex_rev(out_disp, rec, 32); out_disp[64] = 0;
+    return 1;
+}
+
 static const char GENESIS_CB_TXID[] = "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b";
 static int cmd_getrawtransaction(const rj_val* params, rj_val** res, long* ec, const char** em){
     long tip = refresh();

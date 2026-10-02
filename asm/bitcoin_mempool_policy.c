@@ -1775,8 +1775,14 @@ static int worst_package(void* st){
 typedef struct { uint32_t idx[CHUNK_MAX_CLUSTER]; int n; uint64_t fee, size; } mpol_chunk;
 
 /* the connected component containing node `seed` (indices), via parent links
- * in both directions using a caller-built child adjacency */
-static int cluster_members(void* st, uint32_t seed, const uint32_t* child_head, const uint32_t* child_next,
+ * and a caller-built child adjacency: PER-EDGE lists, as mpol_children_build
+ * makes them -- head[node] is the node's first edge, nxt[edge] the next edge of
+ * the same parent, chld[edge] that edge's child. (2026-10-01: these were lists
+ * threaded through ONE next slot per child node, so a child with two parents
+ * was relinked into the second parent's list and the first parent's earlier
+ * children fell out of its walk -- eviction scored a cluster without them.) */
+static int cluster_members(void* st, uint32_t seed, const uint32_t* child_head, const uint32_t* edge_next,
+                           const uint32_t* edge_child,
                            uint32_t* stamp_mark, uint32_t stamp, uint32_t* out, int cap){
     mpol_node* t = mpol_nodes_base(st);
     int n = 0, sp = 0; uint32_t stack[CHUNK_MAX_CLUSTER + 1];
@@ -1791,7 +1797,8 @@ static int cluster_members(void* st, uint32_t seed, const uint32_t* child_head, 
             if (sp >= CHUNK_MAX_CLUSTER) return -1;
             stamp_mark[pp] = stamp; stack[sp++] = pp;
         }
-        for (uint32_t c = child_head[cur]; c != 0xFFFFFFFFu; c = child_next[c]){
+        for (uint32_t e = child_head[cur]; e != 0xFFFFFFFFu; e = edge_next[e]){
+            uint32_t c = edge_child[e];
             if (stamp_mark[c] == stamp) continue;
             if (sp >= CHUNK_MAX_CLUSTER) return -1;
             stamp_mark[c] = stamp; stack[sp++] = c;
@@ -2140,8 +2147,24 @@ static int worst_chunk_excl(void* st, mpol_chunk* out,
      * links it too). A failed grow degrades exactly the way the old ceiling
      * did, which is the honest fallback: the caller's `worst_chunk() == 0`
      * arm is still there. */
-    static uint32_t *child_head, *child_next, *mark;
-    static uint32_t work_cap;
+    static uint32_t *child_head, *mark, *edge_next, *edge_child;
+    static uint32_t work_cap, edge_cap;
+    uint64_t n_edges = 0;
+    for (uint32_t i = 0; i < n; i++) n_edges += t[i].n_parents;
+    if (n_edges > 0xFFFFFFF0u) return 0;
+    if (n_edges > edge_cap){
+        uint32_t want = edge_cap ? edge_cap : 65536;
+        while (want < n_edges){
+            if (want > 0x80000000u){ want = (uint32_t)n_edges; break; }
+            want *= 2;
+        }
+        uint32_t* en = realloc(edge_next,  (size_t)want * sizeof *en);
+        uint32_t* ec = realloc(edge_child, (size_t)want * sizeof *ec);
+        if (en) edge_next = en;
+        if (ec) edge_child = ec;
+        if (!en || !ec) return 0;                         /* caller reports "mempool full", as for the node arrays */
+        edge_cap = want;
+    }
     if (n > work_cap){
         uint32_t want = work_cap ? work_cap : 65536;
         while (want < n){
@@ -2149,30 +2172,32 @@ static int worst_chunk_excl(void* st, mpol_chunk* out,
             want *= 2;
         }
         uint32_t* nh = realloc(child_head, (size_t)want * sizeof *nh);
-        uint32_t* nn = realloc(child_next, (size_t)want * sizeof *nn);
         uint32_t* nm = realloc(mark,       (size_t)want * sizeof *nm);
         /* Keep whichever grew: realloc'ing the survivors on a partial failure
          * would leak the ones that succeeded, and the arrays are independent. */
         if (nh) child_head = nh;
-        if (nn) child_next = nn;
         if (nm) mark       = nm;
-        if (!nh || !nn || !nm) return 0;                  /* as before: caller reports "mempool full" */
+        if (!nh || !nm) return 0;                         /* as before: caller reports "mempool full" */
         work_cap = want;
     }
-    for (uint32_t i = 0; i < n; i++){ child_head[i] = 0xFFFFFFFFu; child_next[i] = 0xFFFFFFFFu; mark[i] = 0; }
-    for (uint32_t i = 0; i < n; i++)
-        for (uint32_t k = 0; k < t[i].n_parents; k++){
-            uint32_t pp = mpol_par_at(st, &t[i], k);
-            if (pp == 0xFFFFFFFFu || pp >= n) continue;
-            child_next[i] = child_head[pp]; child_head[pp] = i;   /* a node may be pushed once per parent link: harmless for the walk */
-        }
+    for (uint32_t i = 0; i < n; i++){ child_head[i] = 0xFFFFFFFFu; mark[i] = 0; }
+    /* one EDGE per parent link (2026-10-01): a child with two parents sits in
+     * both parents' lists. The old lists threaded child_next through the
+     * child node itself, so its second parent link overwrote the first. */
+    { uint32_t e = 0;
+      for (uint32_t i = 0; i < n; i++)
+          for (uint32_t k = 0; k < t[i].n_parents; k++){
+              uint32_t pp = mpol_par_at(st, &t[i], k);
+              if (pp == 0xFFFFFFFFu || pp >= n) continue;
+              edge_child[e] = i; edge_next[e] = child_head[pp]; child_head[pp] = e; e++;
+          } }
     int have = 0; mpol_chunk best; best.n = 0; best.fee = 0; best.size = 1;
     uint32_t stamp = 1;
     static uint32_t mem[CHUNK_MAX_CLUSTER + 1];
     for (uint32_t i = 0; i < n; i++){
         if (mark[i]) continue;
         stamp++;
-        int cn = cluster_members(st, i, child_head, child_next, mark, stamp, mem, CHUNK_MAX_CLUSTER);
+        int cn = cluster_members(st, i, child_head, edge_next, edge_child, mark, stamp, mem, CHUNK_MAX_CLUSTER);
         mpol_chunk c;
         if (cn < 0){
             /* too wide: per-leaf worst inside this cluster, marks already set for the visited part */

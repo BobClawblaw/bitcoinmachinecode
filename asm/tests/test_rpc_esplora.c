@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include "../rpc_esplora.h"
 #include "../rpc_json.h"
+#include "../rpc_node.h"           /* rpc_mp_item, for the batched mempool read */
 static int fails = 0, checks = 0;
 static void ok(int c, const char* w){ checks++; printf("  %s %s\n", c ? "ok " : "FAIL", w); if (!c) fails++; }
 extern void sha256d(unsigned char out[32], const void* data, unsigned long len);
@@ -27,6 +28,34 @@ int wallet_validate_address(const char* addr, int* type, unsigned char* ver, uns
     (void)ver; (void)prog; if (!strcmp(addr, "bc1qaddrA")){ *type = 2; memcpy(h160, KEY_A, 20); return 1; } return 0;
 }
 static int g_tail_on = 0, g_tail_add_only = 0, g_mp_on = 0;
+/* ---- the facade's batched mempool read (2026-10-01) ----
+ * Strong definitions of the two helpers rpc_esplora.c references weakly. Off
+ * (the default) the batch returns -1 and the facade takes the per-transaction
+ * path, so every other case here is unchanged. "Raw bytes" are the txid's own
+ * 64 characters; decoderawtransaction below maps them back to the JSON. */
+static int g_batch_on = 0, g_pool_takes = 0;
+static const char* MPX[] = { "4444444444444444444444444444444444444444444444444444444444444444",
+                             "6666666666666666666666666666666666666666666666666666666666666666",
+                             "7777777777777777777777777777777777777777777777777777777777777777" };
+long rpc_node_mempool_many(const unsigned char (*w)[32], long n, rpc_mp_item* out){
+    if (!g_batch_on) return -1;
+    g_pool_takes += (int)((n + 255) / 256);                 /* one pool-lock hold per slice */
+    long found = 0;
+    for (long i = 0; i < n; i++){
+        char d[65]; for (int b = 0; b < 32; b++) snprintf(d + 2*b, 3, "%02x", w[i][31 - b]);
+        out[i].present = 0; out[i].raw = 0; out[i].len = 0; out[i].fee = 0;
+        for (int k = 0; k < 3; k++) if (!strcmp(d, MPX[k])){
+            out[i].raw = (unsigned char*)malloc(64); memcpy(out[i].raw, d, 64); out[i].len = 64;
+            out[i].present = 1; out[i].fee = 500; found++; }
+    }
+    return found;
+}
+int rpc_chain_tx_blockhash(const char* t, char out[65]){
+    if (!g_batch_on) return 0;
+    if (!strcmp(t, TX2) || !strcmp(t, TX3) || !strcmp(t, "5555555555555555555555555555555555555555555555555555555555555555")){
+        snprintf(out, 65, "%s", BH); return 1; }
+    return 0;
+}
 long axt_read_events(int type, const unsigned char hash[32], long min_height,
                      int (*cb)(void*, int, const unsigned char*, unsigned, unsigned long long, unsigned), void* ctx){
     if (!(g_tail_on || g_tail_add_only) || type != 2 || memcmp(hash, KEY_A, 20)) return 0;
@@ -83,7 +112,18 @@ int rpc_dispatch(const char* method, const rj_val* params, const rpc_wallet* w, 
             "{\"txid\":\"" TX2 "\",\"version\":2,\"locktime\":699999,\"size\":222,\"weight\":561,\"fee\":0.00000377,\"vin\":[{\"txid\":\"" TX3 "\",\"vout\":1,\"scriptSig\":{\"hex\":\"\"},\"txinwitness\":[\"3044aa\",\"02bb\"],\"sequence\":4294967293,\"prevout\":{\"generated\":false,\"height\":699990,\"value\":0.03612294,\"scriptPubKey\":{\"hex\":\"00146ffe291a\",\"type\":\"witness_v0_keyhash\",\"address\":\"bc1qprev\"}}}],\"vout\":[{\"value\":0.03611917,\"n\":0,\"scriptPubKey\":{\"hex\":\"76a914aa88ac\",\"type\":\"pubkeyhash\",\"address\":\"1test\"}},{\"value\":0.00000000,\"n\":1,\"scriptPubKey\":{\"hex\":\"6a04deadbeef\",\"type\":\"nulldata\"}}]},"
             "{\"txid\":\"" TX3 "\",\"version\":2,\"locktime\":0,\"size\":50,\"weight\":200,\"vin\":[{\"txid\":\"" TX1 "\",\"vout\":0,\"scriptSig\":{\"hex\":\"51\"},\"sequence\":0}],\"vout\":[{\"value\":1.5,\"n\":0,\"scriptPubKey\":{\"hex\":\"51\",\"type\":\"nonstandard\"}}]}]}", blk);
         *result = rj_parse(buf, strlen(buf)); free(buf); return 1; }
+    if (!strcmp(method, "decoderawtransaction")){
+        /* the batch's decode: the "raw bytes" are a txid's characters, hex-encoded */
+        char id[65] = ""; if (p0 && strlen(p0) == 128){ for (int b = 0; b < 64; b++){ unsigned v; sscanf(p0 + 2*b, "%2x", &v); id[b] = (char)v; } id[64] = 0; }
+        /* a third argument: the real decode touches no pool, so this re-entry is not counted as a take */
+        rj_val* a = rj_arr(); rj_arr_push(a, rj_str(id)); rj_arr_push(a, rj_num("1")); rj_arr_push(a, rj_str("decode"));
+        int ok2 = rpc_dispatch("getrawtransaction", a, w, result, ec, em); rj_free(a); return ok2; }
+    if (!strcmp(method, "getrawtransaction") && params && params->nitems < 3) g_pool_takes++;   /* mempool first: a pool-lock take */
+    if (!strcmp(method, "getmempoolentry")) g_pool_takes++;
     if (!strcmp(method, "getrawtransaction")){
+        if (p0 && !strcmp(p0, "7777777777777777777777777777777777777777777777777777777777777777")){   /* unconfirmed, spends the unconfirmed 0x44..:0 */
+            const char* t = "{\"txid\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"version\":2,\"locktime\":0,\"size\":110,\"weight\":440,\"vin\":[{\"txid\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"vout\":0,\"scriptSig\":{\"hex\":\"\"},\"sequence\":0}],\"vout\":[{\"value\":0.029,\"n\":0,\"scriptPubKey\":{\"hex\":\"0014dd\",\"type\":\"witness_v0_keyhash\",\"address\":\"bc1qnext\"}}]}";
+            *result = J(t); return 1; }
         if (p0 && !strcmp(p0, TX2)){
             if (p1 == 0){ *result = rj_str("0200aa"); return 1; }            if (g_big){ char* big = malloc(1300000); memset(big, 'a', 1200000); big[1200000] = 0;
                 char* t = malloc(1400000); snprintf(t, 1400000, "{\"txid\":\"" TX2 "\",\"version\":2,\"locktime\":0,\"size\":1,\"weight\":4,\"fee\":0.00000001,\"blockhash\":\"" BH "\",\"vin\":[{\"txid\":\"" TX3 "\",\"vout\":0,\"scriptSig\":{\"hex\":\"\"},\"txinwitness\":[\"%s\"],\"sequence\":0}],\"vout\":[]}", big);
@@ -274,6 +314,30 @@ int main(void){
       ok(f && !rj_obj_get(f, "8"),   "a target with no answer at all is omitted too");
       ok(f && !rj_obj_get(f, "1008"), "...and so is the longest one");
       rj_free(f); }
+
+    /* ---- POST /internal/mempool/txs batched (2026-10-01) ----
+     * The same request through the per-transaction path and the batched one:
+     * byte-identical JSON, and the pool-lock takes fall from 3 per transaction
+     * (getrawtransaction, getmempoolentry, one per input's prevout) to one per
+     * slice for the transactions and one for their parents. 0x77.. spends the
+     * unconfirmed 0x44..:0 (a parent in the pool); 0x44.. and 0x66.. spend
+     * confirmed parents (resolved by block hash, no pool lock). */
+    { const char* body = "[\"4444444444444444444444444444444444444444444444444444444444444444\",\"6666666666666666666666666666666666666666666666666666666666666666\",\"7777777777777777777777777777777777777777777777777777777777777777\"]";
+      g_mp_on = 1;
+      g_batch_on = 0; g_pool_takes = 0;
+      rj_val* a = POST("/internal/mempool/txs", body); char* sa = g_out ? strndup(g_out, g_outlen) : 0; int takes_old = g_pool_takes;
+      g_batch_on = 1; g_pool_takes = 0;
+      rj_val* b = POST("/internal/mempool/txs", body); char* sb = g_out ? strndup(g_out, g_outlen) : 0; int takes_new = g_pool_takes;
+      ok(a && b && a->nitems == 3 && b->nitems == 3, "POST /internal/mempool/txs: all three transactions, both paths");
+      ok(sa && sb && !strcmp(sa, sb), "...the batched reply is byte-identical to the per-transaction one (fee, prevouts from pool and index)");
+      if (sa && sb && strcmp(sa, sb)) printf("      per-tx: %.300s\n      batch : %.300s\n", sa, sb);
+      ok(takes_old == 9 && takes_new == 2, "...pool-lock takes: 9 per-transaction (3 x 3) -> 2 batched (one slice of txs, one of parents)");
+      if (!(takes_old == 9 && takes_new == 2)) printf("      takes per-tx %d, batched %d\n", takes_old, takes_new);
+      rj_val* v7 = (b && b->nitems == 3) ? rj_obj_get(b->items[2], "vin") : 0;
+      rj_val* p7 = (v7 && v7->nitems) ? v7->items[0] : 0;
+      ok(p7 && rj_obj_get(p7, "prevout") && !strcmp(S(rj_obj_get(p7, "prevout"), "value"), "3000000"), "...0x77..'s prevout came from its unconfirmed parent in the pool (3,000,000 sat)");
+      rj_free(a); rj_free(b); free(sa); free(sb);
+      g_batch_on = 0; g_mp_on = 0; }
 
     free(g_out);
     printf("\n%s (%d checks, %d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", checks, fails);
