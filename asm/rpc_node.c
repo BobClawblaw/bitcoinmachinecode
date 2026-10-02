@@ -1005,6 +1005,42 @@ long rpc_node_mempool_rawtx(const unsigned char txid_wire[32], unsigned char* ou
     return r;
 }
 
+/* Many mempool transactions at once (2026-10-01): raw bytes and base fee for
+ * each, copied out under ONE pool-lock hold per slice of RPC_MP_MANY_SLICE.
+ * The Esplora facade's POST /internal/mempool/txs looked each transaction up
+ * through three or more RPCs, each taking the pool lock, so a batch of N cost
+ * about N x (2 + inputs) takes; the lock's log showed the result -- 1-2 s waits
+ * for the worker's tx_accept with no hold over 1 s, a convoy of short takes
+ * (mempool.space re-syncing after a restart). The slice bound keeps one hold
+ * short enough that the worker is not starved the other way.
+ * out[i].raw is malloc'd (caller frees) when out[i].present. Returns how many
+ * were present, or -1 when this process has no pool hooks. */
+#define RPC_MP_MANY_SLICE 256
+long rpc_node_mempool_many(const unsigned char (*txid_wire)[32], long n, rpc_mp_item* out){
+    if (!g_mph.mp || !g_mph.get) return -1;
+    long found = 0;
+    for (long i = 0; i < n; i++){ out[i].present = 0; out[i].raw = 0; out[i].len = 0; out[i].fee = 0; }
+    for (long s = 0; s < n; s += RPC_MP_MANY_SLICE){
+        long e = s + RPC_MP_MANY_SLICE < n ? s + RPC_MP_MANY_SLICE : n;
+        mpl();
+        for (long i = s; i < e; i++){
+            unsigned long len = 0;
+            const unsigned char* tx = g_mph.get(g_mph.mp, txid_wire[i], &len);
+            if (!tx || !len) continue;
+            unsigned char* c = (unsigned char*)malloc(len);
+            if (!c) continue;
+            memcpy(c, tx, len);
+            out[i].raw = c; out[i].len = len; out[i].present = 1; found++;
+            mp_entry_info inf;
+            if (g_mph.polstate && g_mph.pol_entry_info && g_mph.pol_entry_info(g_mph.polstate, txid_wire[i], &inf))
+                out[i].fee = (long long)inf.fee;       /* fees.base, as getmempoolentry reports it */
+            else out[i].fee = -1;
+        }
+        mpu();
+    }
+    return found;
+}
+
 /* Slot layout per mempool_slot.h / bitcoin_mempool.asm's header (same walk
  * daemon/reorg.c uses): +0 n, +8 mask, +16 blob, then MPOOL_SLOT_BYTES slots
  * at +40 -- [+0 len][+8 txid[32]][+40 blob_off][+48 wtxid[32]], len==~0

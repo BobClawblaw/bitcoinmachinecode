@@ -2052,7 +2052,16 @@ int main(void){
           rj_free(a); rj_free(b);
       }
       ck("every fixture tx resolves by txid alone", all);
-      ck("...and byte-identically to the blockhash path (one render path)", same); }
+      ck("...and byte-identically to the blockhash path (one render path)", same);
+      /* 2026-10-01: rpc_chain_tx_blockhash, the facade batch's index-only
+       * lookup (getrawtransaction would consult the mempool first) */
+      { extern int rpc_chain_tx_blockhash(const char*, char[65]);
+        int right = 1; char bh[65];
+        for (int i = 0; i < 4; i++)
+            if (!rpc_chain_tx_blockhash(ids[i], bh) || strcmp(bh, blks[i])){ right = 0; printf("      (%.16s -> %s, want %s)\n", ids[i], bh, blks[i]); }
+        ck("rpc_chain_tx_blockhash: every fixture tx's block hash, from the index alone", right);
+        ck("...and 0 for a txid the index does not hold, or a malformed one",
+           !rpc_chain_tx_blockhash("0000000000000000000000000000000000000000000000000000000000000001", bh) && !rpc_chain_tx_blockhash("zz", bh)); } }
 
     { /* 2026-09-19 (run-28 bench fidelity, defect B): an index CONFIGURED OFF
        * is Core without the option, whatever files the datadir holds. The

@@ -218,7 +218,8 @@ static const char* S(const rj_val* o, const char* k){ rj_val* v = o ? rj_obj_get
  * that covers the txid walk, or the pair is not one snapshot. The fake lock
  * records whether it is held when the sequence is asked for. */
 static int g_fk_locked = 0, g_fk_seq_under_lock = -1;
-static void fk_lock(void){ g_fk_locked = 1; }
+static int g_fk_lock_n = 0;
+static void fk_lock(void){ g_fk_locked = 1; g_fk_lock_n++; }
 static void fk_unlock(void){ g_fk_locked = 0; }
 static unsigned long long fk_seq(void){ g_fk_seq_under_lock = g_fk_locked; return 42; }
 
@@ -574,6 +575,27 @@ int main(void){
         h.mp = pool; h.maxbytes = 8388608; h.count = mpool_count;
         h.lock = fk_lock; h.unlock = fk_unlock; h.mempool_sequence = fk_seq;
         rpc_node_set_mempool(&h); }
+
+      /* ---- rpc_node_mempool_many (2026-10-01): the facade's batched read.
+       * 602 txids (the two in the pool, 600 absent) cost ceil(602/256) = 3
+       * pool-lock takes, not 602; present ones come back byte for byte. ---- */
+      { static unsigned char ids[602][32]; static rpc_mp_item items[602];
+        memcpy(ids[0], lid, 32); memcpy(ids[1], wid, 32);
+        for (int i = 2; i < 602; i++){ memset(ids[i], 0x3C, 32); ids[i][0] = (unsigned char)i; ids[i][1] = (unsigned char)(i >> 8); }
+        extern const unsigned char* mpool_get(void*, const unsigned char*, unsigned long*);
+        rpc_mempool_hooks hm; memset(&hm, 0, sizeof hm);              /* this block's hooks add get; restored below */
+        hm.mp = pool; hm.maxbytes = 8388608; hm.count = mpool_count; hm.get = mpool_get;
+        hm.lock = fk_lock; hm.unlock = fk_unlock; hm.mempool_sequence = fk_seq;
+        rpc_node_set_mempool(&hm);
+        int before = g_fk_lock_n;
+        long got = rpc_node_mempool_many((const unsigned char (*)[32])ids, 602, items);
+        ck("mempool_many: the two pool transactions found, 600 absent ones not", got == 2 && items[0].present && items[1].present && !items[2].present && !items[601].present);
+        ck("mempool_many: the bytes are the pool's, byte for byte", items[0].len == (unsigned long)lln && !memcmp(items[0].raw, ltx, lln)
+                                                                  && items[1].len == (unsigned long)wln && !memcmp(items[1].raw, wtx, wln));
+        ck("mempool_many: 602 lookups took the pool lock 3 times (one per 256-slice), and released it", g_fk_lock_n - before == 3 && g_fk_locked == 0);
+        if (g_fk_lock_n - before != 3) printf("      lock takes: %d\n", g_fk_lock_n - before);
+        for (int i = 0; i < 602; i++) free(items[i].raw);
+        hm.get = 0; rpc_node_set_mempool(&hm); }                        /* back to the hooks the cases below expect */
 
       /* ---- gettxspendingprevout (Core lists it under Blockchain; the pool
        * enumeration lives here). LHEX spends outpoint (wire txid
