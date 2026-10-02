@@ -287,6 +287,23 @@ int main(void){
     r = NULL; rc = rpc_node_dispatch("getpeerinfo", NULL, &r, &ec, &em);
     ck("getpeerinfo dispatched to array", rc == 1 && r && r->typ == RJ_ARR);
     ck("getpeerinfo has 2 peers", r && r->nitems == 2);
+    /* 2026-10-01: connection_type follows the slot's recorded kind; every
+     * outbound leg used to say outbound-full-relay, hiding production's
+     * block-relay-only legs */
+    { st.peers[3].conn_type = 1; st.peers[3].relaytxes = 0; st.peers[0].conn_type = 2;
+      rj_val* r2 = NULL; long ec2 = 0; const char* em2 = NULL;
+      rpc_node_dispatch("getpeerinfo", NULL, &r2, &ec2, &em2);
+      const char *t0 = 0, *t3 = 0, *rl3 = 0;
+      for (size_t i = 0; r2 && i < r2->nitems; i++){
+          const char* a = S(r2->items[i], "addr");
+          if (a && !strcmp(a, "1.2.3.4:8333")) t0 = S(r2->items[i], "connection_type");
+          if (a && !strcmp(a, "5.6.7.8:8333")){ t3 = S(r2->items[i], "connection_type"); rl3 = S(r2->items[i], "relaytxes"); }
+      }
+      ck("a block-relay-only leg reports connection_type block-relay-only", t3 && !strcmp(t3, "block-relay-only"));
+      ck("...with relaytxes false, as Core shows it", rl3 && !strcmp(rl3, "0"));
+      ck("an addnode leg reports connection_type manual", t0 && !strcmp(t0, "manual"));
+      if (r2) rj_free(r2);
+      st.peers[3].conn_type = 0; st.peers[0].conn_type = 0; }
     /* every peer gets the shared fields, not just download workers: the two
      * builders used to emit different field sets from the same RPC. */
     { rj_val* p0 = (r && r->nitems) ? r->items[0] : NULL;

@@ -3352,6 +3352,12 @@ static void rpc_fill_peer_slot_ex(int slot, const char* host, int already_claime
     rpc_peer_from_version(pr, p, len);
     { extern int rp_version_frelay(const unsigned char*, long);
       pr->relaytxes = rp_version_frelay(p, len) != 0; }   /* Core relaytxes: the peer's fRelay */
+    /* connection_type (2026-10-01): a host registered block-relay-only (CC-4)
+     * gets fRelay=0 from us and relays no transactions -- Core reports such a
+     * peer relaytxes false; addnode and -connect peers are Core's "manual" */
+    if (host && host_is_block_only(host)){ pr->conn_type = 1; pr->relaytxes = 0; }
+    else if (host && (g_cfg.connect_only || ctl_dial_listed(host))) pr->conn_type = 2;
+    else pr->conn_type = 0;
     /* RPC-3: a fresh, never-reused id for this connection. Assigned before
      * `used` so a reader that sees the slot live always sees a real id. */
     pr->nodeid = __sync_fetch_and_add(&g_node_status->next_nodeid, 1);

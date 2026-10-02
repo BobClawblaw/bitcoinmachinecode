@@ -398,10 +398,15 @@ static void peer_common_fields(rj_val* o, const rpc_peer_t* p)
      * printed as 0.0 would read as a perfect link. Omitted, like Core. */
     if (p->min_ping_us > 0)
         rj_obj_set(o, "minping", rj_numf("%.6f", (double)p->min_ping_us / 1e6));
-    /* connection_type: what this node actually runs. Core also has
-     * block-relay-only, manual, feeler and addr-fetch; none of those exist
-     * here, so none are claimed. */
-    rj_obj_set(o, "connection_type", rj_str(p->inbound ? "inbound" : "outbound-full-relay"));
+    /* connection_type: inbound, or the outbound kind the worker recorded
+     * (2026-10-01: block-relay-only and manual exist here and were all
+     * reported as outbound-full-relay). Feeler and addr-fetch connections are
+     * not held in a peer slot, so they never appear, as in Core's listing of
+     * a short-lived feeler. */
+    { const char* ct = p->inbound ? "inbound"
+                     : p->conn_type == 1 ? "block-relay-only"
+                     : p->conn_type == 2 ? "manual" : "outbound-full-relay";
+      rj_obj_set(o, "connection_type", rj_str(ct)); }
     /* Core's per-message byte breakdown. A peer that has exchanged nothing
      * of a kind gets no entry for it, which is what Core does. The maps
      * themselves are ALWAYS present -- Core pushes both objects even when

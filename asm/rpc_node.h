@@ -123,6 +123,12 @@ typedef struct {
      * Written by the worker and its pass children; inbound children leave
      * it at -1. Appended: every offset above is unchanged. */
     volatile long             best_known_height;
+    /* 2026-10-01: what kind of outbound connection this is, for getpeerinfo's
+     * connection_type: 0 outbound-full-relay, 1 block-relay-only, 2 manual
+     * (addnode, or a -connect peer). Every outbound leg used to report
+     * outbound-full-relay, so production's two block-relay-only legs were
+     * invisible. Written when the worker fills the slot. Appended. */
+    volatile int              conn_type;
 } rpc_peer_t;
 
 /* Shared live-node status. POD, fixed size, lives in a MAP_SHARED region so
