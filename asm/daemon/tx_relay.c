@@ -87,6 +87,12 @@ extern long tx_accept_test_reason(void* mp, const u8* txid, const u8* tx, unsign
                                   char* reason, unsigned long rcap, unsigned long long* fee,
                                   unsigned long long* vsize_out);
 extern int  txacc_fee_reconsiderable(const char* reason);
+extern int  txacc_package_floor_check(unsigned long long fee, unsigned long long vsize, char* why, unsigned long wcap);
+extern int  txacc_package_rbf_check(const u8* const* txs, const unsigned long* lens, const u8* txids, int n,
+                                    unsigned long long pkg_fee, unsigned long long pkg_vsize,
+                                    unsigned long long parent_fee, unsigned long long parent_vsize,
+                                    char* why, unsigned long wcap);
+extern void mpol_package_rbf_context(int on);
 
 extern long strip_witness(const unsigned char* tx, long long txlen,
                           unsigned char* out, long cap);   /* MEM-24 */
@@ -757,19 +763,21 @@ static int txr_submit_1p1c(void* mp, const u8* parent, unsigned long plen,
     u8 txids[64];
     unsigned long long vsz[2];
     const char* why = "";
+    int rbf = -1;
 
     if (!mpol_package_well_formed(txs, lens, 2, txids, vsz, &why)) return 0;
 
     /* pass 1: dry run under the overlay, to learn the real fees. The overlay
      * is what lets the child resolve its prevout against a parent that is
      * not in the mempool yet. */
-    unsigned long long tot_fee = 0, tot_vsize = 0;
+    unsigned long long tot_fee = 0, tot_vsize = 0, pfee = 0, pvs = 0;
     int all_ok = 1;
     mpol_package_context(txs, lens, txids, 2);
     txacc_package_overlay(txs, lens, txids, 2);
     for (int i = 0; i < 2; i++){
         char r[128]; r[0] = 0; unsigned long long fee = 0, avs = 0;
         long rc = tx_accept_test_reason(mp, txids + i*32, txs[i], lens[i], r, sizeof r, &fee, &avs);
+        if (i == 0){ pfee = fee; pvs = avs ? avs : vsz[0]; }   /* the parent's own feerate, for package RBF */
         /* the SIGOP-ADJUSTED vsize, as Core's package feerate uses: vsz[] is
          * the structural walker's figure and cannot count sigops (they need
          * the UTXO view), so it only stands in when the policy layer was
@@ -781,16 +789,28 @@ static int txr_submit_1p1c(void* mp, const u8* parent, unsigned long plen,
     mpol_package_context(NULL, NULL, NULL, 0);
     if (!all_ok) return 0;
 
+    /* 2026-10-02: the aggregate floor, then package RBF -- Core's 1p1c goes
+     * through the same AcceptPackage as submitpackage, so a parent that must
+     * REPLACE a mempool transaction can do it with its child's fee
+     * (PackageRBFChecks). Without this the commit priced the parent's
+     * replacement on its own fee and refused it. */
+    { char why[320];
+      if (!txacc_package_floor_check(tot_fee, tot_vsize, why, sizeof why)) return 0;
+      rbf = txacc_package_rbf_check(txs, lens, txids, 2, tot_fee, tot_vsize, pfee, pvs, why, sizeof why);
+      if (rbf == 0) return 0; }
+
     /* pass 2: commit with the package feerate in effect */
     int committed = 1;
     mpol_package_fee_context(tot_fee, tot_vsize);
     mpol_package_context(txs, lens, txids, 2);
     txacc_package_overlay(txs, lens, txids, 2);
+    if (rbf == 1) mpol_package_rbf_context(1);
     for (int i = 0; i < 2; i++)
         if (tx_accept_validate_p2p(mp, txids + i*32, txs[i], lens[i]) != 1) committed = 0;
     /* ALWAYS cleared, on every path: a fee context left set would relax the
      * floor for ordinary single-transaction relay, and an overlay left set
      * would let an unrelated transaction resolve against a package member. */
+    mpol_package_rbf_context(0);
     txacc_package_overlay(NULL, NULL, NULL, 0);
     mpol_package_context(NULL, NULL, NULL, 0);
     mpol_package_fee_context(0, 0);

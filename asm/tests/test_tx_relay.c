@@ -222,6 +222,7 @@ static void send_invwtx(int peer_fd, const u8 wtxid[32]){
     p2p_write(peer_fd, "inv", 3, inv, 37);
 }
 
+static u8 g_p9[32], g_c9[32];   /* case 9's pair, replaced in case 10b */
 int main(void){
     tt_isolate();
     const msend_t* s  = &modern_spends[0];
@@ -653,6 +654,7 @@ int main(void){
         ck("parent + child accepted as a package", acc == 2);
         ck("under-paying parent pooled", mpool_get(mp_area, pid, &ml) != NULL);
         ck("child pooled", mpool_get(mp_area, cid, &ml) != NULL);
+        memcpy(g_p9, pid, 32); memcpy(g_c9, cid, 32);   /* case 10b replaces this pair */
     }
 
     printf("\n== 10: 1p1c -- parent arrives first, is refetched for its child ==\n");
@@ -696,6 +698,39 @@ int main(void){
         ck("parent + child accepted as a package", acc == 2);
         ck("under-paying parent pooled", mpool_get(mp_area, pid, &ml) != NULL);
         ck("child pooled", mpool_get(mp_area, cid, &ml) != NULL);
+    }
+
+    printf("\n== 10b: 1p1c package RBF -- the child pays for its parent's replacement (Core PackageRBFChecks) ==\n");
+    {
+        drain_peer(sp[1]);
+        static u8 rp[4096], rc10[4096];
+        unsigned long long tval[1] = { 10000000ull };
+        unsigned long tidx[1] = { 0 };
+        u8 to_h[20]; wallet_key_h160(to_h, cpf_dpriv);
+        /* P' spends case 9's coin (cpf_tid:0) for 20 sat: over the floor, but
+         * nowhere near the 5010 sat of case 9's parent + child it conflicts
+         * with, so alone it is "insufficient fee" -- reconsiderable */
+        long pn = wallet_send_tx(rp, sizeof rp, (u8(*)[32])cpf_tid, tidx, tval, 1,
+                                 to_h, 10000000ull - 20ull, 20ull, cpf_priv, 0);
+        ck("replacing parent signed", pn > 0);
+        u8 pid[32]; tx_txid(pid, rp, (unsigned long)pn, tb, sizeof tb);
+        unsigned long long cval[1] = { 10000000ull - 20ull };
+        long cn = wallet_send_tx(rc10, sizeof rc10, (u8(*)[32])pid, tidx, cval, 1,
+                                 to_h, 10000000ull - 20ull - 20000ull, 20000ull, cpf_dpriv, 0);
+        ck("child paying 20000 sat signed", cn > 0);
+        u8 cid[32]; tx_txid(cid, rc10, (unsigned long)cn, tb, sizeof tb);
+        unsigned long ml = 0;
+        p2p_write(sp[1], "tx", 2, rc10, (unsigned)cn);
+        long acc = txrelay_poll_leg(sp[0], mp_area, 200);
+        ck("child alone: parked", acc == 0 && mpool_get(mp_area, cid, &ml) == NULL);
+        drain_peer(sp[1]);
+        p2p_write(sp[1], "tx", 2, rp, (unsigned)pn);
+        acc = txrelay_poll_leg(sp[0], mp_area, 200);
+        ck("the pair replaces case 9's parent + child as a package", acc == 2);
+        ck("...the replacing parent is pooled", mpool_get(mp_area, pid, &ml) != NULL);
+        ck("...and its child", mpool_get(mp_area, cid, &ml) != NULL);
+        ck("...case 9's parent is evicted", mpool_get(mp_area, g_p9, &ml) == NULL);
+        ck("...and so is its child", mpool_get(mp_area, g_c9, &ml) == NULL);
     }
 
     printf("\n== 11: the package fee context does not leak ==\n");
