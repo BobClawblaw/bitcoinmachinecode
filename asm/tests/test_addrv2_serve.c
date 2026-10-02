@@ -189,7 +189,10 @@ int main(void){
     book3();
     pid_t s1 = spawn_server();
     int fdA = raw_client(70016, 0, &off, &wt);
-    ck("wtxidrelay offered (BIP339, unchanged)", wt == 1);
+    /* 2026-10-01: NOT offered. With BIP339 negotiated, Core drops our MSG_TX
+     * announcements (we announce by txid), so none of our transactions
+     * reached a Core peer; see node_handshake's note */
+    ck("wtxidrelay NOT offered (our txid announcements must be honoured)", wt == 0);
     ck("sendaddrv2 offered before verack (BIP155)", off == 1 && g_saw_verack == 1);
 
     printf("\n== 2. peer WITHOUT sendaddrv2: legacy addr, byte-equal to Core's msg_addr ==\n");
@@ -253,7 +256,7 @@ int main(void){
     long wants = -1;
     int seen = outbound_case(70016, 1, &wants);
     ck("outbound handshake completed", seen < 0x100);
-    ck("we sent wtxidrelay before our verack", (seen & 1) == 1);
+    ck("we did NOT send wtxidrelay (2026-10-01: Core would drop our MSG_TX invs)", (seen & 1) == 0);
     ck("we sent sendaddrv2 before our verack (70016 peer)", (seen & 2) == 2);
     cki("peer's sendaddrv2 recorded in g_peer_wants_addrv2", wants, 1);
     seen = outbound_case(70015, 0, &wants);

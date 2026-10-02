@@ -138,8 +138,11 @@ int main(void){
     cki("captured UA bytes", memcmp(g_peer_version_payload+81, "/Satoshi:27.1.0/", 16)==0, 1);
     close(fd);
     { int st=0; waitpid(pid,&st,0);
-      cki("BIP339: wtxidrelay sent after version, before verack (child saw it)",
-          WIFEXITED(st) && (WEXITSTATUS(st) & 1)==0, 1);
+      /* 2026-10-01: NOT sent -- with BIP339 negotiated, Core drops our MSG_TX
+       * announcements (node_handshake's note). The child sets bit 0 when it did
+       * NOT see wtxidrelay; requiring a clean exit keeps a crash from passing. */
+      cki("BIP339: wtxidrelay NOT sent (our txid announcements must be honoured)",
+          WIFEXITED(st) && (WEXITSTATUS(st) & 1)==1, 1);
       cki("BIP155: sendaddrv2 offered after version, before verack (peer is 70016)",
           WIFEXITED(st) && (WEXITSTATUS(st) & 2)==0, 1); }
     close(ls);
