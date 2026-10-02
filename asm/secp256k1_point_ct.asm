@@ -1245,4 +1245,664 @@ point_scalar_mul_glv_ct:
     pop  rbp
     ret
 
+
+; ============================================================================
+; JACOBIAN CONSTANT-TIME GLV MULTIPLY (2026-10-02) -- libsecp256k1's
+; secp256k1_ecmult_const (ecmult_const_impl.h, v31.1's subtree), ported.
+;
+; WHY A SECOND ROUTINE
+;   point_scalar_mul_glv_ct above spends 24 of the BIP324 ECDH's 31 us in the
+;   Renes-Costello-Batina complete formulas: 84 ns a double, 117 an add.
+;   libsecp256k1 reaches the same constant-time property with cheaper
+;   Jacobian formulas, by arranging that the exceptional cases either cannot
+;   occur or are absorbed by cmov:
+;     * signed odd digits (Hamburg's sign-bit trick): every 5-bit group
+;       selects +-(2i+1)P, never the identity, so no add ever takes infinity
+;       as its table operand and the accumulator is seeded from the top group
+;       instead of from infinity;
+;     * gej_add_ge, Brier-Joye's unified add (7M + 5S), which is correct for
+;       a == b, handles a == -b (Z3 = 0) and y1 == -y2 with x1 != x2 (the
+;       beta case) by cmov-ing an alternative lambda, and a = infinity by a
+;       final cmov of b; and
+;     * the Jacobian double (point_double, 2M + 5S, no branch), which needs
+;       no exception at all on a prime-order curve with a = 0.
+;   The table holds odd multiples of the PUBLIC point; like libsecp256k1's
+;   it is built with the ordinary mixed add (point_add_mixed_zr, whose only
+;   branches are the doubling / opposite / infinity cases that distinct odd
+;   multiples of one point on a prime-order curve never reach), on the
+;   isomorphic curve with one shared Z (no inversion).
+;
+; SCALAR RECODING (ecmult_const's comment, abridged)
+;   C_l(v, A) = sum((2 v[i] - 1) 2^i A, i < l) = (2v + 1 - 2^l) A. With
+;   s = (q + K)/2 mod n, K = (2^130 - 2^129 - 1)(1 + lambda) mod n,
+;   s = s1 + lambda s2 (sc_split_lambda), v1 = s1 + 2^128, v2 = s2 + 2^128
+;   (both in [0, 2^129)): q A = C_130(v1, A) + C_130(v2, lambda A).
+;   26 groups of 5 bits; a group with top bit b4 and low bits b selects
+;   table entry (b4 ? b : ~b) & 15 and negates y when b4 == 0.
+;   125 doubles + 51 adds against the routine above's 132 + 66 (+28 table).
+;
+; CONSTANT TIME: the digit reaches a compare (the table scan) and a mask
+;   (the y negation) only; the scalar's bits are read at offsets that depend
+;   on the group counter only; gej_add_ge's two case flags select by cmov.
+; ============================================================================
+extern point_double            ; secp256k1_point.asm: Jacobian, straight-line
+extern point_add_mixed_zr      ; secp256k1_point.asm: table build only
+extern sc_add
+section .rodata
+align 16
+CTJ_K:      dq 0xB5C2C1DCDE9798D9, 0x589AE84826BA29E4, 0xC2BDD6BF7C118D6B, 0xA4E88A7DCB13034E
+CTJ_2P128:  dq 0, 0, 1, 0
+CTJ_NH1:    dq 0xDFE92F46681B20A1, 0x5D576E7357A4501D, 0xFFFFFFFFFFFFFFFF, 0x7FFFFFFFFFFFFFFF
+section .text
+
+; V := V / 2 mod p (V canonical): add p when odd, shift the 257-bit sum
+; right by one. Straight-line; uses rax, rcx.
+%macro FE_HALF 0
+    mov  rax, r8
+    and  eax, 1
+    neg  rax                       ; all-ones iff V is odd
+    mov  rcx, 0xFFFFFFFEFFFFFC2F   ; p limb 0 (limbs 1..3 are all-ones)
+    and  rcx, rax
+    add  r8,  rcx
+    adc  r9,  rax
+    adc  r10, rax
+    adc  r11, rax
+    rcr  r11, 1
+    rcr  r10, 1
+    rcr  r9,  1
+    rcr  r8,  1
+%endmacro
+
+; rax := (V == 0) ? -1 : 0, from the four limbs in r8..r11
+%macro V_ZERO_MASK 0
+    mov  rax, r8
+    or   rax, r9
+    or   rax, r10
+    or   rax, r11
+    neg  rax                       ; CF = (rax != 0)
+    sbb  rax, rax
+    not  rax
+%endmacro
+
+; [%1] := [%3] where the mask at [%2] is nonzero (4 limbs); rcx, r8, r9
+%macro FE_CMOV_NZ 3
+    mov  rcx, [%2]
+%assign off 0
+%rep 4
+    mov  r8, [%1+off]
+    mov  r9, [%3+off]
+    test rcx, rcx
+    cmovnz r8, r9
+    mov  [%1+off], r8
+%assign off off+8
+%endrep
+%endmacro
+; [%1] := [%3] where the mask at [%2] is zero
+%macro FE_CMOV_Z 3
+    mov  rcx, [%2]
+%assign off 0
+%rep 4
+    mov  r8, [%1+off]
+    mov  r9, [%3+off]
+    test rcx, rcx
+    cmovz r8, r9
+    mov  [%1+off], r8
+%assign off off+8
+%endrep
+%endmacro
+%macro V_ZERO 0
+    xor  r8d, r8d
+    xor  r9d, r9d
+    xor  r10d, r10d
+    xor  r11d, r11d
+%endmacro
+
+; ----------------------------------------------------------------------------
+; pointj_add_ge_ct(r[12], a[12], b[8]) : r = a + b, a Jacobian (Z = 0 is
+;   infinity), b affine and NOT infinity. libsecp256k1's secp256k1_gej_add_ge
+;   (group_impl.h) line for line; its comment carries the derivation and the
+;   case analysis. Result infinity is Z3 = 0 (X3, Y3 unspecified), which the
+;   next pointj_add_ge_ct's a-is-infinity cmov and point_double both accept.
+;   r may alias a. 7 fe_mul + 5 fe_sqr, no branch.
+; Slots: zz -0x50 u2 -0x70 s2 -0x90 t -0xb0 m -0xd0 rr -0xf0 malt -0x110
+;   tt -0x130 rralt -0x150 n -0x170 q -0x190 z3 -0x1b0 x3 -0x1d0 y3 -0x1f0
+;   degenerate mask -0x1f8, a-infinity mask -0x200. sub rsp, 0x1d8.
+; ----------------------------------------------------------------------------
+global pointj_add_ge_ct
+pointj_add_ge_ct:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub  rsp, 0x1d8
+    mov  r12, rdi
+    mov  r13, rsi
+    mov  r14, rdx
+    FE_C_INIT
+
+    FE_LD r13+64
+    V_ZERO_MASK
+    mov  [rbp-0x200], rax          ; a is infinity
+
+    lea  rdi, [rbp-0x50]
+    lea  rsi, [r13+64]
+    call fe_sqr                    ; zz = Z1^2
+    lea  rdi, [rbp-0x70]
+    mov  rsi, r14
+    lea  rdx, [rbp-0x50]
+    call fe_mul                    ; u2 = X2*Z1^2
+    lea  rdi, [rbp-0x90]
+    lea  rsi, [r14+32]
+    lea  rdx, [rbp-0x50]
+    call fe_mul                    ; s2 = Y2*Z1^2
+    lea  rdi, [rbp-0x90]
+    mov  rsi, rdi
+    lea  rdx, [r13+64]
+    call fe_mul                    ; s2 = S2 = Y2*Z1^3
+    FE_LD r13
+    FE_ADDM rbp-0x70
+    FE_ST rbp-0xb0                 ; t = T = U1 + U2
+    FE_LD r13+32
+    FE_ADDM rbp-0x90
+    FE_ST rbp-0xd0                 ; m = M = S1 + S2
+    V_ZERO_MASK
+    mov  [rbp-0x1f8], rax          ; degenerate = (M == 0)
+    lea  rdi, [rbp-0xf0]
+    lea  rsi, [rbp-0xb0]
+    call fe_sqr                    ; rr = T^2
+    V_ZERO
+    FE_SUBM rbp-0x70
+    FE_ST rbp-0x110                ; malt = -U2
+    lea  rdi, [rbp-0x130]
+    mov  rsi, r13
+    lea  rdx, [rbp-0x110]
+    call fe_mul                    ; tt = -U1*U2
+    FE_LD rbp-0xf0
+    FE_ADDM rbp-0x130
+    FE_ST rbp-0xf0                 ; rr = R = T^2 - U1*U2
+    FE_LD r13+32
+    FE_DBL
+    FE_ST rbp-0x150                ; rralt = 2*S1 (= S1 - S2 when degenerate)
+    FE_LD rbp-0x110
+    FE_ADDM r13
+    FE_ST rbp-0x110                ; malt = U1 - U2
+    FE_CMOV_Z rbp-0x150, rbp-0x1f8, rbp-0xf0   ; !degenerate: rralt = rr
+    FE_CMOV_Z rbp-0x110, rbp-0x1f8, rbp-0xd0   ; !degenerate: malt = m
+    lea  rdi, [rbp-0x170]
+    lea  rsi, [rbp-0x110]
+    call fe_sqr                    ; n = Malt^2
+    V_ZERO
+    FE_SUBM rbp-0xb0
+    FE_ST rbp-0x190                ; q = -T
+    lea  rdi, [rbp-0x190]
+    mov  rsi, rdi
+    lea  rdx, [rbp-0x170]
+    call fe_mul                    ; q = Q = -T*Malt^2
+    lea  rdi, [rbp-0x170]
+    mov  rsi, rdi
+    call fe_sqr                    ; n = Malt^4
+    FE_CMOV_NZ rbp-0x170, rbp-0x1f8, rbp-0xd0  ; degenerate: n = M (= 0)
+    lea  rdi, [rbp-0xb0]
+    lea  rsi, [rbp-0x150]
+    call fe_sqr                    ; t = Ralt^2
+    lea  rdi, [rbp-0x1b0]
+    lea  rsi, [r13+64]
+    lea  rdx, [rbp-0x110]
+    call fe_mul                    ; Z3 = Malt*Z1
+    FE_LD rbp-0xb0
+    FE_ADDM rbp-0x190
+    FE_ST rbp-0x1d0                ; X3 = Ralt^2 + Q
+    FE_DBL
+    FE_ADDM rbp-0x190
+    FE_ST rbp-0xb0                 ; t = 2*X3 + Q
+    lea  rdi, [rbp-0xb0]
+    mov  rsi, rdi
+    lea  rdx, [rbp-0x150]
+    call fe_mul                    ; t = Ralt*(2*X3 + Q)
+    FE_LD rbp-0xb0
+    FE_ADDM rbp-0x170
+    FE_ST rbp-0xb0                 ; t += M^3*Malt
+    V_ZERO
+    FE_SUBM rbp-0xb0
+    FE_HALF
+    FE_ST rbp-0x1f0                ; Y3 = -t/2
+
+    ; a infinity: r = (b.x, b.y, 1). a is not read past this point (r may alias it).
+    mov  rcx, [rbp-0x200]
+%assign off 0
+%rep 4
+    mov  r8, [rbp-0x1d0+off]
+    mov  r9, [r14+off]
+    test rcx, rcx
+    cmovnz r8, r9
+    mov  [r12+off], r8
+    mov  r8, [rbp-0x1f0+off]
+    mov  r9, [r14+32+off]
+    test rcx, rcx
+    cmovnz r8, r9
+    mov  [r12+32+off], r8
+%assign off off+8
+%endrep
+    mov  r8, [rbp-0x1b0]
+    mov  r9d, 1
+    test rcx, rcx
+    cmovnz r8, r9
+    mov  [r12+64], r8
+    xor  r9d, r9d
+%assign off 8
+%rep 3
+    mov  r8, [rbp-0x1b0+off]
+    test rcx, rcx
+    cmovnz r8, r9
+    mov  [r12+64+off], r8
+%assign off off+8
+%endrep
+
+    add  rsp, 0x1d8
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
+; ----------------------------------------------------------------------------
+; sc_half_ct(r[4], a[4]) : r = a/2 mod n, a < n. libsecp256k1's
+;   secp256k1_scalar_half: (a >> 1) + (a odd ? n//2 + 1 : 0), no overflow.
+; ----------------------------------------------------------------------------
+sc_half_ct:
+    mov  r8,  [rsi+0]
+    mov  r9,  [rsi+8]
+    mov  r10, [rsi+16]
+    mov  r11, [rsi+24]
+    mov  rax, r8
+    and  eax, 1
+    neg  rax                       ; mask
+    shrd r8, r9, 1
+    shrd r9, r10, 1
+    shrd r10, r11, 1
+    shr  r11, 1
+    mov  rcx, [rel CTJ_NH1+0]
+    and  rcx, rax
+    mov  rdx, [rel CTJ_NH1+8]
+    and  rdx, rax
+    mov  rsi, [rel CTJ_NH1+16]
+    and  rsi, rax
+    and  rax, [rel CTJ_NH1+24]
+    add  r8,  rcx
+    adc  r9,  rdx
+    adc  r10, rsi
+    adc  r11, rax
+    mov  [rdi+0],  r8
+    mov  [rdi+8],  r9
+    mov  [rdi+16], r10
+    mov  [rdi+24], r11
+    ret
+
+; ---- point_scalar_mul_glvj_ct frame (rbp-relative) ----
+;   R -0x90 (96)  T -0xd0 (64: x, y)  NY -0xf0 (32)  S -0x110  V1 -0x130
+;   V2 -0x150  D -0x1b0 (96)  AI -0x210 (96)  ZG -0x230  ZS -0x250
+;   TMP -0x270  kptr -0x278  scan selection -0x280  neg mask -0x290
+;   ZR -0x490 (16 x 32)  TA -0x890 (16 x 64)  TL -0xc90 (16 x 64)
+;   sub rsp, 0xc68 (== 8 mod 16): rsp = rbp - 0xc90.
+
+; ebx := table index, [rbp-0x290] := negate mask, for group r14 of the
+; 129-bit scalar at %1. The bit offset depends on the group counter only.
+%macro GLVJ_DIGIT 1
+    imul ecx, r14d, 5
+    mov  eax, ecx
+    shr  eax, 6                    ; limb (0 or 1: the top group starts at 125)
+    and  ecx, 63
+    mov  rdx, [%1 + rax*8 + 8]
+    mov  rax, [%1 + rax*8]
+    shrd rax, rdx, cl
+    and  eax, 31                   ; the group's 5 bits
+    mov  edx, eax
+    shr  edx, 4
+    xor  edx, 1                    ; negative = top bit clear
+    mov  ecx, edx
+    neg  ecx
+    xor  ecx, eax
+    and  ecx, 15
+    mov  ebx, ecx                  ; index
+    neg  rdx                       ; 0 or all-ones
+    mov  [rbp-0x290], rdx
+%endmacro
+
+; T := entry ebx of the 16 x 64-byte table at rbp-%1 (every entry read)
+%macro GLVJ_SCAN_CMOV 1
+    lea  r15, [rbp-%1]
+    xor  ecx, ecx
+%%scan:
+    cmp  ecx, ebx
+%assign off 0
+%rep 8
+    mov  r8, [r15 + off]
+    mov  r9, [rbp-0xd0 + off]
+    cmovz r9, r8
+    mov  [rbp-0xd0 + off], r9
+%assign off off+8
+%endrep
+    add  r15, 64
+    inc  ecx
+    cmp  ecx, 16
+    jb   %%scan                    ; counter only
+%endmacro
+%macro GLVJ_SCAN_AVX2 1
+    vmovd   xmm15, ebx
+    vpbroadcastd ymm15, xmm15
+    vpxor   ymm14, ymm14, ymm14
+    vmovdqu ymm13, [rel CT_ONE_DD]
+    vpxor   ymm0, ymm0, ymm0
+    vpxor   ymm1, ymm1, ymm1
+    lea  r15, [rbp-%1]
+    mov  ecx, 16
+%%scan:
+    vpcmpeqd ymm3, ymm14, ymm15
+    vpblendvb ymm0, ymm0, [r15+0],  ymm3
+    vpblendvb ymm1, ymm1, [r15+32], ymm3
+    vpaddd  ymm14, ymm14, ymm13
+    add  r15, 64
+    dec  ecx
+    jnz  %%scan                    ; counter only
+    vmovdqu [rbp-0xd0+0],  ymm0
+    vmovdqu [rbp-0xd0+32], ymm1
+    vzeroupper
+%endmacro
+; T := +-entry: the scan by the per-call selection, then y := p - y under
+; the mask. rbx holds the index here, not C, so the negation is spelled out.
+%macro GLVJ_LOOKUP 1
+    cmp  byte [rbp-0x280], 1
+    jne  %%cmov                    ; the CPU's choice, never the scalar's
+    GLVJ_SCAN_AVX2 %1
+    jmp  %%neg
+%%cmov:
+    GLVJ_SCAN_CMOV %1
+%%neg:
+    V_ZERO
+    sub  r8,  [rbp-0xd0+32]
+    sbb  r9,  [rbp-0xd0+40]
+    sbb  r10, [rbp-0xd0+48]
+    sbb  r11, [rbp-0xd0+56]
+    sbb  rax, rax
+    mov  rcx, FE_C_VAL
+    and  rax, rcx
+    sub  r8,  rax
+    sbb  r9,  0
+    sbb  r10, 0
+    sbb  r11, 0                    ; p - y (y != 0 on the curve)
+    mov  rcx, [rbp-0x290]
+    test rcx, rcx
+    mov  rax, [rbp-0xd0+32]
+    cmovnz rax, r8
+    mov  [rbp-0xd0+32], rax
+    mov  rax, [rbp-0xd0+40]
+    cmovnz rax, r9
+    mov  [rbp-0xd0+40], rax
+    mov  rax, [rbp-0xd0+48]
+    cmovnz rax, r10
+    mov  [rbp-0xd0+48], rax
+    mov  rax, [rbp-0xd0+56]
+    cmovnz rax, r11
+    mov  [rbp-0xd0+56], rax
+%endmacro
+
+; ============================================================================
+; point_scalar_mul_glvj_ct(out[12], xy[8], k[4]) : out = k*P, CONSTANT TIME
+;   in k, Jacobian out; k < n (as point_scalar_mul_glv_ct). k == 0 yields the
+;   canonical infinity (1, 1, 0). Falls back to point_scalar_mul_win_ct if
+;   the split's identity check fails (a defect, never a value).
+; ============================================================================
+global point_scalar_mul_glvj_ct
+point_scalar_mul_glvj_ct:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub  rsp, 0xc68
+    mov  r12, rdi
+    mov  r13, rsi
+    mov  [rbp-0x278], rdx
+    movzx eax, byte [rel ct_scan_path]
+    test eax, eax
+    jnz  .have_sel
+    call ct_scan_probe
+    mov  ecx, 2
+    test eax, eax
+    mov  eax, 1
+    cmovz eax, ecx
+    mov  byte [rel ct_scan_path], al
+.have_sel:
+    mov  byte [rbp-0x280], al
+
+    ; ---- s = (k + K)/2 ; s = s1 + lambda*s2 ; v = s + 2^128 ----
+    lea  rdi, [rbp-0x110]
+    mov  rsi, [rbp-0x278]
+    lea  rdx, [rel CTJ_K]
+    call sc_add
+    lea  rdi, [rbp-0x110]
+    lea  rsi, [rbp-0x110]
+    call sc_half_ct
+    lea  rdi, [rbp-0x130]
+    lea  rsi, [rbp-0x150]
+    lea  rdx, [rbp-0x110]
+    call sc_split_lambda
+    test eax, eax
+    jz   .fallback
+    lea  rdi, [rbp-0x130]
+    mov  rsi, rdi
+    lea  rdx, [rel CTJ_2P128]
+    call sc_add
+    lea  rdi, [rbp-0x150]
+    mov  rsi, rdi
+    lea  rdx, [rel CTJ_2P128]
+    call sc_add
+
+    ; ---- odd multiples (2i+1)P, i < 16, on the isomorphic curve ----
+    ; AI := (x, y, 1) ; D := 2*AI ; C := D.z
+    lea  rdi, [rbp-0x210]
+    mov  rsi, r13
+    mov  rcx, 8
+    rep  movsq
+    mov  qword [rbp-0x210+64], 1
+    mov  qword [rbp-0x210+72], 0
+    mov  qword [rbp-0x210+80], 0
+    mov  qword [rbp-0x210+88], 0
+    lea  rdi, [rbp-0x1b0]
+    lea  rsi, [rbp-0x210]
+    call point_double
+    ; TA[0] = (x*C^2, y*C^3)
+    lea  rdi, [rbp-0x250]
+    lea  rsi, [rbp-0x1b0+64]
+    call fe_sqr
+    lea  rdi, [rbp-0x890]
+    mov  rsi, r13
+    lea  rdx, [rbp-0x250]
+    call fe_mul
+    lea  rdi, [rbp-0x250]
+    mov  rsi, rdi
+    lea  rdx, [rbp-0x1b0+64]
+    call fe_mul
+    lea  rdi, [rbp-0x890+32]
+    lea  rsi, [r13+32]
+    lea  rdx, [rbp-0x250]
+    call fe_mul
+    lea  rdi, [rbp-0x210]          ; AI := (TA[0], 1)
+    lea  rsi, [rbp-0x890]
+    mov  rcx, 8
+    rep  movsq
+    lea  rdi, [rbp-0x490]          ; ZR[0] := C
+    lea  rsi, [rbp-0x1b0+64]
+    mov  rcx, 4
+    rep  movsq
+    mov  r14, 1
+.tab:
+    lea  rdi, [rbp-0x210]
+    mov  rsi, rdi
+    lea  rdx, [rbp-0x1b0]          ; d_ge = (D.x, D.y)
+    mov  rcx, r14
+    shl  rcx, 5
+    lea  rcx, [rbp-0x490 + rcx]
+    call point_add_mixed_zr
+    mov  rax, r14
+    shl  rax, 6
+    lea  rdi, [rbp-0x890 + rax]
+    lea  rsi, [rbp-0x210]
+    mov  rcx, 8
+    rep  movsq
+    inc  r14
+    cmp  r14, 16
+    jb   .tab                      ; counter only
+    lea  rdi, [rbp-0x230]          ; ZG := AI.z * C
+    lea  rsi, [rbp-0x210+64]
+    lea  rdx, [rbp-0x1b0+64]
+    call fe_mul
+    ; globalz: TA[j] (j = 14..0) scaled by ZR[j+1]*...*ZR[15]
+    lea  rdi, [rbp-0x250]
+    lea  rsi, [rbp-0x490 + 15*32]
+    mov  rcx, 4
+    rep  movsq
+    mov  r14, 14
+.gz:
+    cmp  r14, 14
+    je   .gz_scale
+    lea  rax, [r14+1]
+    shl  rax, 5
+    lea  rdi, [rbp-0x250]
+    mov  rsi, rdi
+    lea  rdx, [rbp-0x490 + rax]
+    call fe_mul
+.gz_scale:
+    lea  rdi, [rbp-0x270]
+    lea  rsi, [rbp-0x250]
+    call fe_sqr
+    mov  rax, r14
+    shl  rax, 6
+    lea  rdi, [rbp-0x890 + rax]
+    mov  rsi, rdi
+    lea  rdx, [rbp-0x270]
+    call fe_mul
+    lea  rdi, [rbp-0x270]
+    mov  rsi, rdi
+    lea  rdx, [rbp-0x250]
+    call fe_mul
+    mov  rax, r14
+    shl  rax, 6
+    lea  rdi, [rbp-0x890+32 + rax]
+    mov  rsi, rdi
+    lea  rdx, [rbp-0x270]
+    call fe_mul
+    dec  r14
+    jns  .gz
+    ; TL[i] = (beta*TA[i].x, TA[i].y)
+    xor  r14d, r14d
+.lam:
+    mov  rax, r14
+    shl  rax, 6
+    lea  rdi, [rbp-0xc90 + rax]
+    lea  rsi, [rbp-0x890 + rax]
+    lea  rdx, [rel CT_BETA]
+    call fe_mul
+    mov  rax, r14
+    shl  rax, 6
+    lea  rdi, [rbp-0xc90+32 + rax]
+    lea  rsi, [rbp-0x890+32 + rax]
+    mov  rcx, 4
+    rep  movsq
+    inc  r14
+    cmp  r14, 16
+    jb   .lam
+
+    ; ---- top group seeds R; then 25 x (5 doubles, two adds) ----
+    mov  r14, 25
+    GLVJ_DIGIT rbp-0x130
+    GLVJ_LOOKUP 0x890
+    lea  rdi, [rbp-0x90]
+    lea  rsi, [rbp-0xd0]
+    mov  rcx, 8
+    rep  movsq
+    mov  qword [rbp-0x90+64], 1
+    mov  qword [rbp-0x90+72], 0
+    mov  qword [rbp-0x90+80], 0
+    mov  qword [rbp-0x90+88], 0
+    jmp  .lam_half
+.group:
+%rep 5
+    lea  rdi, [rbp-0x90]
+    lea  rsi, [rbp-0x90]
+    call point_double
+%endrep
+    GLVJ_DIGIT rbp-0x130
+    GLVJ_LOOKUP 0x890
+    lea  rdi, [rbp-0x90]
+    lea  rsi, [rbp-0x90]
+    lea  rdx, [rbp-0xd0]
+    call pointj_add_ge_ct
+.lam_half:
+    GLVJ_DIGIT rbp-0x150
+    GLVJ_LOOKUP 0xc90
+    lea  rdi, [rbp-0x90]
+    lea  rsi, [rbp-0x90]
+    lea  rdx, [rbp-0xd0]
+    call pointj_add_ge_ct
+    dec  r14
+    jns  .group                    ; counter only
+
+    ; ---- leave the isomorphic curve: Z *= ZG; Z == 0 -> (1, 1, 0) ----
+    lea  rdi, [r12+64]
+    lea  rsi, [rbp-0x90+64]
+    lea  rdx, [rbp-0x230]
+    call fe_mul
+    mov  rax, [r12+64]
+    or   rax, [r12+72]
+    or   rax, [r12+80]
+    or   rax, [r12+88]             ; ZF = (Z == 0)
+    mov  r10d, 1
+    mov  r11d, 0
+%assign off 0
+%rep 8
+    mov  r8, [rbp-0x90+off]
+%if off == 0 || off == 32
+    cmovz r8, r10
+%else
+    cmovz r8, r11
+%endif
+    mov  [r12+off], r8
+%assign off off+8
+%endrep
+    jmp  .done
+.fallback:
+    mov  rdi, r12
+    mov  rsi, r13
+    mov  rdx, [rbp-0x278]
+    call point_scalar_mul_win_ct
+.done:
+    ; the scalars and the selected digits' points held secrets
+    xor  eax, eax
+%assign off 0
+%rep 12
+    mov  [rbp-0x150+off], rax
+%assign off off+8
+%endrep
+%assign off 0
+%rep 8
+    mov  [rbp-0xd0+off], rax
+%assign off off+8
+%endrep
+    add  rsp, 0xc68
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
 section .note.GNU-stack noalloc noexec nowrite progbits
