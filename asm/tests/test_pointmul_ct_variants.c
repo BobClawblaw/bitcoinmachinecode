@@ -28,6 +28,7 @@ extern void point_scalar_mul_ct(u64 r[12], const u64 xy[8], const u64 k[4]);
 extern void point_scalar_mul_gen_ct(u64 r[12], const u64 k[4]);
 extern void point_scalar_mul_win_ct(u64 r[12], const u64 xy[8], const u64 k[4]);
 extern void point_scalar_mul_glv_ct(u64 r[12], const u64 xy[8], const u64 k[4]);   /* k < n */
+extern void point_scalar_mul_glvj_ct(u64 r[12], const u64 xy[8], const u64 k[4]);  /* k < n, Jacobian (2026-10-02) */
 extern void point_ct_force_scan(int p);   /* 0 probe, 1 AVX2 blend scan, 2 cmov scan */
 extern void point_scalar_mul(u64 r[12], const u64 xy[8], const u64 k[4]);
 extern void fe_inv(u64 r[4], const u64 a[4]);
@@ -85,6 +86,11 @@ static void check_win(const u64 P[8], const u64 k[4], const char* what){
     if (lt_n(k)){                                  /* the GLV routine requires k < n */
         u64 G[12]; point_scalar_mul_glv_ct(G, P, k);
         CK(same_point(A, G), "%s: glv_ct != ladder (k0=%016llx)", what, k[0]);
+        u64 H[12]; point_scalar_mul_glvj_ct(H, P, k);
+        CK(same_point(A, H), "%s: glvj_ct != ladder (k0=%016llx)", what, k[0]);
+        /* infinity is returned canonically, as the other routines do */
+        if ((H[8] | H[9] | H[10] | H[11]) == 0)
+            CK(H[0] == 1 && H[4] == 1 && !(H[1]|H[2]|H[3]|H[5]|H[6]|H[7]), "%s: glvj_ct infinity not (1,1,0)", what);
     }
     if (lt_n(k) && (k[0] | k[1] | k[2] | k[3])){
         u64 C[12]; point_scalar_mul(C, P, k);
@@ -101,6 +107,9 @@ int main(int argc, char** argv){
     { u64 k[4] = { 7, 0, 0, 0 }, A[12], B[12]; point_ct_force_scan(0);
       point_scalar_mul_glv_ct(A, G_AFF, k); point_scalar_mul_ct(B, G_AFF, k);
       CK(same_point(A, B), "glv_ct through the CPU probe"); }
+    { u64 k[4] = { 7, 0, 0, 0 }, A[12], B[12]; point_ct_force_scan(0);
+      point_scalar_mul_glvj_ct(A, G_AFF, k); point_scalar_mul_ct(B, G_AFF, k);
+      CK(same_point(A, B), "glvj_ct through the CPU probe"); }
     /* the GLV routine's table scan has an AVX2 body and a cmov body: both run */
     for (int scan = 2; scan >= 1; scan--){
         point_ct_force_scan(scan); rs = 0x9E3779B97F4A7C15ULL;

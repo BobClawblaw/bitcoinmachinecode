@@ -1659,3 +1659,52 @@ are within noise of the morning.
   two-lane SHA-NI body was exact and no faster than two calls.
 - **`EllSwiftCreate`, 1.16×** — the comb (9 µs) against `ecmult_gen` (~8),
   and two real square roots per successful encode.
+
+## Addendum 2026-10-02 — the ECDH multiply, A/B: complete formulas vs Jacobian
+
+The 09-28 note above named the next step for `BIP324_ECDH`: libsecp256k1's
+Jacobian `gej_add_ge` in place of the complete formulas. It is now a second
+routine beside the first, `point_scalar_mul_glvj_ct`
+(`asm/secp256k1_point_ct.asm`), a port of v31.1's `secp256k1_ecmult_const`:
+the scalar recoded as s = (k + K)/2 so that every 5-bit group selects a
+signed odd multiple (never the identity), a 16-entry odd-multiples table of
+the public point on the isomorphic curve, 125 Jacobian doubles and 51
+constant-time `gej_add_ge` adds (7M + 5S) against routine A's 132 complete
+doubles and 66 + 28 complete adds.
+
+Measured by `validation/ecdh_core_diff.sh` (one process, pinned to cpu 2,
+best of 7 x 4,000; Core's side is v31.1's libsecp256k1 linked into the same
+binary, `secp256k1_ellswift_xdh` with the BIP324 hash, which is what Core's
+`BIP324_ECDH` bench times):
+
+| | ns/op | |
+|---|---:|---|
+| A `point_scalar_mul_glv_ct` (complete formulas) | 24,907 | |
+| B `point_scalar_mul_glvj_ct` (Jacobian) | 15,900 | B/A 0.638 |
+| our `ellswift_ecdh` on A | 31,651 | 1.49x Core |
+| our `ellswift_ecdh` on B | 22,586 | **1.06x Core** |
+| Core `secp256k1_ellswift_xdh` | 21,384 | |
+
+The ECDH now calls B. Agreement and the constant-time property, all on B:
+
+- **Against Core**: 40,152 k*P checks (A and B against
+  `secp256k1_ec_pubkey_tweak_mul`: 19 edge scalars, including lambda and its
+  neighbours and the k that recode to s = 0, 1, n-1, times G, -G, lambda*G
+  and a random point, then 20,000 random pairs) and 80,000 ECDH checks
+  against `secp256k1_ellswift_xdh`, both roles: no difference.
+- **Each case of the add** (`tests/test_pointj_add_ge_ct`, gated): distinct
+  points, a == b, a == -b, y1 == -y2 with x1 = beta*x2 and beta^2*x2 (the
+  alternative-lambda case), a = infinity, r aliasing a, at random Z.
+- **The tests catch it**: six mutations (no alternative lambda, no odd
+  correction in the halving, no a-infinity cmov, the y negation inverted, a
+  wrong K limb, no M^3*Malt zeroing) each fail at least one gated test; the
+  alternative-lambda mutation is also caught by the multiply test through the
+  edge scalar k = lambda.
+- **valgrind memcheck** with the scalar marked undefined: the only reports
+  are the four limb compares of `sc_split_lambda`'s permanent identity check
+  (A has the same four; the check fails only on a defect, so its branch
+  pattern never varies with the key). Nothing in B's own code.
+- **Fixed-vs-random timing** (Welch t over rdtscp, one pinned core, fixed
+  keys 1, lambda, 2^128 and a sparse key): |t| <= 3.06 at 20,000, 100,000 and
+  400,000 samples per class, none growing with the sample count; A measures
+  |t| <= 0.59. The usual threshold for a leak is 4.5.
