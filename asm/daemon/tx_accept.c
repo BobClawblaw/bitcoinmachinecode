@@ -677,6 +677,8 @@ const char* txacc_witness_standard(void* mp_area, const u8* tx, unsigned long tx
     }
     return 0;
 }
+#include "../script_error_text.h"   /* Core's ScriptErrorString, generated from v31.1 */
+extern void sha256d(unsigned char out[32], const void* data, unsigned long len);
 /* Core's debug message for the last refusal on this thread (2026-10-03):
  * the reason buffers stay the bare token every classifier compares; this rides
  * beside them and the RPC layer prints "reason, detail" as Core's
@@ -725,6 +727,35 @@ static int txacc_script_verify(void* mp_area, const u8* tx, unsigned long txlen,
                           mp_area, &r) == 1)
         return 1;
     *rout = r ? r : "script verification failed";
+    /* Core's script-failure reason (2026-10-03): "mempool-script-verify-flag-
+     * failed (<ScriptErrorString>)" -- "block-..." when standard flags were
+     * not in force (-acceptnonstdtxn, as Core's GetBlockScriptFlags branch) --
+     * with the debug message "input N of <txid> (wtxid <wtxid>), spending
+     * <prevtxid>:<n>" (CScriptCheck). The verifier's descriptive text stays in
+     * the block-connection log. */
+    { extern int tx_verify_last_script_error(long*);
+      extern int tx_verify_input_prevout(long, u8*, unsigned int*);
+      extern int txv_get_mempool_standard(void);
+      extern int tx_txid(u8* out, const u8* tx, unsigned long txlen, u8* scratch, unsigned long scratchcap);
+      long fin = -1; int se = tx_verify_last_script_error(&fin);
+      if (se > 0 && fin >= 0){
+          static __thread char rb[128];
+          snprintf(rb, sizeof rb, "%s-script-verify-flag-failed (%s)",
+                   txv_get_mempool_standard() ? "mempool" : "block", script_error_string(se));
+          *rout = rb;
+          static u8 scratch[2000*81 + 8];
+          u8 tid[32], wid[32], pt[32]; unsigned int pv = 0;
+          if (tx_txid(tid, tx, txlen, scratch, sizeof scratch) == 1 && tx_verify_input_prevout(fin, pt, &pv)){
+              sha256d(wid, tx, (unsigned long)txlen);
+              char a[65], b[65], c[65];
+              static const char* H = "0123456789abcdef";
+              for (int k = 0; k < 32; k++){ a[2*k] = H[tid[31-k] >> 4]; a[2*k+1] = H[tid[31-k] & 15];
+                                            b[2*k] = H[wid[31-k] >> 4]; b[2*k+1] = H[wid[31-k] & 15];
+                                            c[2*k] = H[pt[31-k] >> 4];  c[2*k+1] = H[pt[31-k] & 15]; }
+              a[64] = b[64] = c[64] = 0;
+              snprintf(g_txacc_detail, sizeof g_txacc_detail, "input %ld of %s (wtxid %s), spending %s:%u", fin, a, b, c, pv);
+          }
+      } }
     /* Core's mempool names (2026-10-01): the verifier is shared with block
      * connection, whose log keeps the descriptive text; admission answers
      * with Core's reason strings (Consensus::CheckTxInputs). submitpackage's
