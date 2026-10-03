@@ -527,8 +527,33 @@ static long read_block(long h){
 }
 
 /* ---- chainwork ---- */
+long g_cw_header_reads;                 /* test seam: headers the fallbacks read */
 static int chainwork_at(long h, u8 out[16]){
     if (g_cw_fd >= 0 && pread(g_cw_fd, out, 16, (off_t)h * 16) == 16) return 1;
+    /* Past the end of chainwork.dat (2026-10-03): continue from its LAST
+     * record and walk only the missing tail. The fallback below starts at
+     * genesis, so a height the file did not cover yet -- the connected tip
+     * running ahead of it after a 23-hour outage -- cost a pread per block of
+     * the whole chain: getmininginfo's networkhashps held the exclusive exec
+     * lock for 149.5 s on 10-03 and every RPC waited behind it. */
+    if (g_cw_fd >= 0){
+        struct stat sb;
+        if (fstat(g_cw_fd, &sb) == 0){
+            long nf = (long)(sb.st_size / 16);
+            u8 acc[16];
+            if (nf > 0 && h >= nf && pread(g_cw_fd, acc, 16, (off_t)(nf - 1) * 16) == 16){
+                for (long i = nf; i <= h; i++){
+                    u8 hdr[80], w[16], t[16];
+                    g_cw_header_reads++;
+                    if (read_block_prefix(i, hdr, 80) != 1) return 0;
+                    block_work(w, rd32(hdr + 72));
+                    chainwork_add(t, acc, w); memcpy(acc, t, 16);
+                }
+                memcpy(out, acc, 16);
+                return 1;
+            }
+        }
+    }
     /* fallback: accumulate from headers, cached -- shared by every lane */
     pthread_mutex_lock(&g_cw_mu);
     if (h >= g_cw_cache_n){
@@ -541,6 +566,7 @@ static int chainwork_at(long h, u8 out[16]){
         }
         for (long i = g_cw_cache_n; i <= h; i++){
             u8 hdr[80];
+            g_cw_header_reads++;
             if (read_block_prefix(i, hdr, 80) != 1){ pthread_mutex_unlock(&g_cw_mu); return 0; }
             u8 w[16]; block_work(w, rd32(hdr + 72));
             if (i == 0) memcpy(g_cw_cache[0], w, 16);
@@ -551,6 +577,15 @@ static int chainwork_at(long h, u8 out[16]){
     memcpy(out, g_cw_cache[h], 16);
     pthread_mutex_unlock(&g_cw_mu);
     return 1;
+}
+/* test seam: re-open chainwork.dat (a test writes it after the chain view
+ * opened) and drop the genesis-walk cache */
+void rpc_chain_test_cw_reset(void){
+    pthread_mutex_lock(&g_cw_mu);
+    if (g_cw_fd >= 0) close(g_cw_fd);
+    g_cw_fd = open("chainwork.dat", O_RDONLY);
+    g_cw_cache_n = 0;
+    pthread_mutex_unlock(&g_cw_mu);
 }
 static void chainwork_hex(const u8 w[16], char out[65]){
     memset(out, '0', 32);
@@ -1175,8 +1210,15 @@ static int cmd_getnetworkhashps(const rj_val* params, rj_val** res, long* ec, co
  * currentblocktx/currentblockweight are omitted until a template has actually
  * been built, exactly as Core omits them: reporting 0 would assert an empty
  * block rather than "nobody has asked for a template yet". */
+/* 2026-10-03: getmininginfo held the exclusive exec lock 149.5 s once after
+ * a restart (10-03 13:17:27-13:19:57, during catch-up and the mempool.dat
+ * reload) and nothing named the slow step: no pool-lock wait was logged and
+ * chainwork.dat was in step. Each step is timed; a call over 1 s says which. */
+static long long gmi_ms(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (long long)t.tv_sec * 1000 + t.tv_nsec / 1000000; }
 static int cmd_getmininginfo(rj_val** res, long* ec, const char** em){
+    long long t0 = gmi_ms(), t_ref, t_hps = 0, t_nb = 0, t_cnt = 0;
     long tip = refresh();
+    t_ref = gmi_ms();
     if (tip < 0){ *ec=-28; *em="Loading block index..."; return 0; }
     u8 hdr[80]; if (read_block_prefix(tip, hdr, 80) != 1){ *ec=-1; *em="Block not available"; return 0; }
     u32 bits = rd32(hdr+72);
@@ -1184,15 +1226,16 @@ static int cmd_getmininginfo(rj_val** res, long* ec, const char** em){
     rj_obj_set(o,"blocks", rj_numf("%ld", tip));
     { char b[9]; snprintf(b,sizeof b,"%08x",(unsigned)bits); rj_obj_set(o,"bits", rj_str(b)); }
     rj_obj_set(o,"difficulty", rj_double(difficulty_of(bits)));
-    { rj_val* nh=NULL; long e2; const char* m2;
+    { long long a = gmi_ms(); rj_val* nh=NULL; long e2; const char* m2;
       if (cmd_getnetworkhashps(NULL,&nh,&e2,&m2)) rj_obj_set(o,"networkhashps", nh);
-      else rj_obj_set(o,"networkhashps", rj_numf("%d",0)); }
+      else rj_obj_set(o,"networkhashps", rj_numf("%d",0));
+      t_hps = gmi_ms() - a; }
     { char hx[65]; target_hex(bits, hx); rj_obj_set(o,"target", rj_str(hx)); }
     /* -blockmintxfee is carried in sat/kvB; Core prints it as a BTC amount */
     { long long s = g_gbt_minfee_satkvb;
       rj_obj_set(o,"blockmintxfee", rj_numf("%lld.%08lld", s/100000000LL, s%100000000LL)); }
     /* the block that would be mined NEXT: its retargeted bits, and what they mean */
-    { u32 nb = gbt_next_bits(tip, (long)time(NULL));
+    { long long a = gmi_ms(); u32 nb = gbt_next_bits(tip, (long)time(NULL)); t_nb = gmi_ms() - a;
       rj_val* nx = rj_obj();
       rj_obj_set(nx,"height", rj_numf("%ld", tip+1));
       { char b[9]; snprintf(b,sizeof b,"%08x",(unsigned)nb); rj_obj_set(nx,"bits", rj_str(b)); }
@@ -1206,12 +1249,17 @@ static int cmd_getmininginfo(rj_val** res, long* ec, const char** em){
     /* pooledtx is the mempool's transaction count, not a constant. It was
      * hard-coded to 0, which the key-level differential could never catch --
      * a field present and always wrong is invisible to a shape diff. */
-    { long pooled = 0;
+    { long long a = gmi_ms(); long pooled = 0;
       if (g_gbt_mph.mp && g_gbt_mph.count) pooled = (long)g_gbt_mph.count(g_gbt_mph.mp);
+      t_cnt = gmi_ms() - a;
       rj_obj_set(o,"pooledtx", rj_numf("%ld", pooled)); }
     rj_obj_set(o,"chain", rj_str(g_chain_name));
     rj_obj_set(o,"warnings", rj_arr());     /* v31: empty array */
     *res = o;
+    { long long tot = gmi_ms() - t0;
+      if (tot > 1000)
+          fprintf(stderr, "[rpc] getmininginfo took %lld ms: refresh %lld, networkhashps %lld, next bits %lld, pool count %lld, other %lld\n",
+                  tot, t_ref - t0, t_hps, t_nb, t_cnt, tot - (t_ref - t0) - t_hps - t_nb - t_cnt); }
     return 1;
 }
 

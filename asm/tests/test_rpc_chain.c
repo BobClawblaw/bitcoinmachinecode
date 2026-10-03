@@ -1107,6 +1107,29 @@ int main(void){
       expect_err("gnh nblocks=0 rejected", "getnetworkhashps", "[0]", -8, "Invalid nblocks. Must be a positive number or -1.");
       expect_err("gnh height out of range", "getnetworkhashps", "[120, 999]", -8, "Block does not exist at specified height");
 
+      /* 2026-10-03: past the end of chainwork.dat the lookup continues from
+       * the file's last record instead of walking from genesis (production:
+       * getmininginfo held the exec lock 149.5 s walking 969,700 headers).
+       * The fixture's four blocks each carry work 0x100010001. */
+      { extern long g_cw_header_reads; extern void rpc_chain_test_cw_reset(void);
+        rj_val* bh = call("getblockhash", "[3]", &ec, &em);
+        char q[96]; snprintf(q, sizeof q, "[\"%s\"]", bh && bh->str ? bh->str : "");
+        unlink("chainwork.dat"); rpc_chain_test_cw_reset(); g_cw_header_reads = 0;
+        rj_val* h0 = call("getblockheader", q, &ec, &em);
+        ck_str("no chainwork.dat: tip chainwork from the genesis walk", S(h0,"chainwork"), "0000000000000000000000000000000000000000000000000000000400040004");
+        long walk = g_cw_header_reads; rj_free(h0);
+        unsigned char rec[32]; memset(rec, 0, sizeof rec);
+        rec[0] = 1; rec[2] = 1; rec[4] = 1;                 /* h0: 0x100010001, little-endian */
+        rec[16] = 2; rec[18] = 2; rec[20] = 2;              /* h1: 0x200020002 */
+        FILE* f = fopen("chainwork.dat", "wb"); if (f){ fwrite(rec, 1, 32, f); fclose(f); }
+        rpc_chain_test_cw_reset(); g_cw_header_reads = 0;
+        rj_val* h1 = call("getblockheader", q, &ec, &em);
+        ck_str("chainwork.dat through height 1: the tip's chainwork is unchanged", S(h1,"chainwork"), "0000000000000000000000000000000000000000000000000000000400040004");
+        printf("      header reads: genesis walk %ld, from the file's end %ld\n", walk, g_cw_header_reads);
+        ck("...and only the two missing headers were read (not the whole chain)", walk == 4 && g_cw_header_reads == 2);
+        rj_free(h1); rj_free(bh);
+        unlink("chainwork.dat"); rpc_chain_test_cw_reset(); }
+
       r = call("getmininginfo", "[]", &ec, &em);
       ck_str("mininginfo.blocks", S(r,"blocks"), "3");
       ck_str("mininginfo.chain", S(r,"chain"), "main");
