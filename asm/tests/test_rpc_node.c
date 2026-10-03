@@ -744,7 +744,10 @@ int main(void){
         rj_free(r);
         ck("getmempoolinfo / getrawmempool / getmempoolentry are in the mempool lane (2)",
            rpc_node_method_lane("getmempoolinfo") == 2 && rpc_node_method_lane("getrawmempool") == 2 && rpc_node_method_lane("getmempoolentry") == 2);
-        ck("getpeerinfo is not", rpc_node_method_lane("getpeerinfo") == 0); }
+        ck("getpeerinfo is not", rpc_node_method_lane("getpeerinfo") == 0);
+        /* 2026-10-03: it reads rpc_chain's txospender index and store handle,
+         * which only the execution lock guards */
+        ck("gettxspendingprevout is not (it reads the chain index under the execution lock)", rpc_node_method_lane("gettxspendingprevout") == 0); }
 
       /* ---- getmempoolentry: drive a REAL parent->child chain through the
        * REAL policy accept path (mpool_policy_add), then assert the graph

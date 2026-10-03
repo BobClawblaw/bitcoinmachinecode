@@ -412,8 +412,20 @@ static rj_val* mempool_txs_batch(const rpc_wallet* w, const rj_val* ids){
         if (ok == pn && rpc_node_mempool_many((const unsigned char (*)[32])pw, (long)pn, pit) >= 0){
             for (size_t q = 0; q < pn; q++){
                 if (pit[q].present){ pdec[q] = esplora_decode_raw(w, pit[q].raw, pit[q].len); free(pit[q].raw); pit[q].raw = 0; continue; }
+                /* Under the execution lock, as every rpc_chain read is: the
+                 * txid index's run set (g_txi_runs) is rescanned in place by
+                 * irs_refresh, which zeroes each kept run's map before
+                 * copying the table back, so an unlocked lookup racing a
+                 * getrawtransaction read a NULL map with the run's counts
+                 * set. Production crashed on it eleven times on 2026-10-02
+                 * (memcmp at 0x6a61e3bd8 = the 1.43e9-record run's first
+                 * sparse probe off NULL). */
                 char bh[65];
-                if (rpc_chain_tx_blockhash(pid[q], bh)){
+                if (rpc_exec_set_label) rpc_exec_set_label("txindex lookup");
+                if (g_lock) g_lock();
+                int have_bh = rpc_chain_tx_blockhash(pid[q], bh);
+                if (g_unlock) g_unlock();
+                if (have_bh){
                     rj_val* a = rj_arr(); rj_arr_push(a, rj_str(pid[q])); rj_arr_push(a, rj_numf("%d", 1)); rj_arr_push(a, rj_str(bh));
                     pdec[q] = call(w, "getrawtransaction", a, 0, 0);
                 }

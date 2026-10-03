@@ -3935,9 +3935,15 @@ static pthread_mutex_t g_mpx_mu;
 static pthread_once_t g_mpx_once = PTHREAD_ONCE_INIT;
 static void mpx_init(void){ pthread_mutexattr_t a; pthread_mutexattr_init(&a); pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE); pthread_mutex_init(&g_mpx_mu, &a); pthread_mutexattr_destroy(&a); }
 int rpc_node_method_lane(const char* m){
+    /* gettxspendingprevout is NOT here (2026-10-03): its confirmed-spend
+     * path calls rpc_chain_txospender_lookup, which runs refresh() on the
+     * shared store handle and reads the txospender run set that irs_refresh
+     * rewrites in place -- the state the execution lock protects. In this
+     * lane it raced every chain RPC; the same race in the facade's txid-index
+     * lookup segfaulted production on 2026-10-02. */
     if (!strcmp(m, "getmempoolinfo") || !strcmp(m, "getrawmempool") || !strcmp(m, "getmempoolentry")
      || !strcmp(m, "getmempoolancestors") || !strcmp(m, "getmempooldescendants")
-     || !strcmp(m, "gettxspendingprevout") || !strcmp(m, "getmempoolcluster")) return 2;
+     || !strcmp(m, "getmempoolcluster")) return 2;
     return 0;
 }
 static int rpc_node_dispatch_unlocked(const char* m, const rj_val* params, rj_val** res, long* ec, const char** em);
