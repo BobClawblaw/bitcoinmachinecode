@@ -2247,7 +2247,9 @@ int rpc_chain_txospender_lookup(const unsigned char txid_wire[32], unsigned vout
  * which takes the pool lock; a caller that already knows the transaction is
  * not in the mempool -- the facade's batch, which just looked -- passes this
  * hash so the lookup goes straight to the index. 1 with out_disp (64 hex + NUL),
- * 0 when the index does not hold it. */
+ * 0 when the index does not hold it. The CALLER HOLDS THE EXECUTION LOCK: the
+ * run set and CUR_ST are what that lock protects (irs_refresh rewrites
+ * g_txi_runs in place; 2026-10-03, production crashed without it). */
 int rpc_chain_tx_blockhash(const char* txid_disp, char out_disp[65]){
     u8 disp[32], wire[32];
     if (!txid_disp || strlen(txid_disp) != 64) return 0;

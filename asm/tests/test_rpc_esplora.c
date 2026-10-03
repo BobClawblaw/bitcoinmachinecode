@@ -50,8 +50,15 @@ long rpc_node_mempool_many(const unsigned char (*w)[32], long n, rpc_mp_item* ou
     }
     return found;
 }
+/* The index lookup must run under the facade's execution lock (2026-10-03):
+ * rpc_chain's txid-index run set is rewritten in place by irs_refresh, and an
+ * unlocked lookup racing getrawtransaction read a NULL map -- production
+ * segfaulted on it eleven times. Count the calls made without the lock. */
+static int g_idx_calls = 0, g_idx_unlocked = 0;
+static int g_locks, g_unlocks;
 int rpc_chain_tx_blockhash(const char* t, char out[65]){
     if (!g_batch_on) return 0;
+    g_idx_calls++; if (g_locks - g_unlocks != 1) g_idx_unlocked++;
     if (!strcmp(t, TX2) || !strcmp(t, TX3) || !strcmp(t, "5555555555555555555555555555555555555555555555555555555555555555")){
         snprintf(out, 65, "%s", BH); return 1; }
     return 0;
@@ -77,7 +84,7 @@ static void write_base(void){
     fseek(f, 0, SEEK_SET); fwrite(&hd, 1, sizeof hd, f); fclose(f);
 }
 static rj_val* J(const char* lit){ return rj_parse(lit, strlen(lit)); }
-static int g_locks = 0, g_unlocks = 0; static void tlock(void){ g_locks++; } static void tunlock(void){ g_unlocks++; }
+static void tlock(void){ g_locks++; } static void tunlock(void){ g_unlocks++; }
 int rpc_dispatch(const char* method, const rj_val* params, const rpc_wallet* w, rj_val** result, long* ec, const char** em){
     (void)w; const char* p0 = params && params->typ == RJ_ARR && params->nitems ? params->items[0]->str : 0;
     long p1 = params && params->nitems > 1 && params->items[1]->str ? strtol(params->items[1]->str, 0, 10) : -1;
@@ -326,13 +333,15 @@ int main(void){
       g_mp_on = 1;
       g_batch_on = 0; g_pool_takes = 0;
       rj_val* a = POST("/internal/mempool/txs", body); char* sa = g_out ? strndup(g_out, g_outlen) : 0; int takes_old = g_pool_takes;
-      g_batch_on = 1; g_pool_takes = 0;
+      g_batch_on = 1; g_pool_takes = 0; g_idx_calls = g_idx_unlocked = 0;
       rj_val* b = POST("/internal/mempool/txs", body); char* sb = g_out ? strndup(g_out, g_outlen) : 0; int takes_new = g_pool_takes;
       ok(a && b && a->nitems == 3 && b->nitems == 3, "POST /internal/mempool/txs: all three transactions, both paths");
       ok(sa && sb && !strcmp(sa, sb), "...the batched reply is byte-identical to the per-transaction one (fee, prevouts from pool and index)");
       if (sa && sb && strcmp(sa, sb)) printf("      per-tx: %.300s\n      batch : %.300s\n", sa, sb);
       ok(takes_old == 9 && takes_new == 2, "...pool-lock takes: 9 per-transaction (3 x 3) -> 2 batched (one slice of txs, one of parents)");
       if (!(takes_old == 9 && takes_new == 2)) printf("      takes per-tx %d, batched %d\n", takes_old, takes_new);
+      ok(g_idx_calls > 0 && g_idx_unlocked == 0, "...every txid-index lookup ran under the execution lock (irs_refresh rewrites the run set in place)");
+      if (!(g_idx_calls > 0 && g_idx_unlocked == 0)) printf("      index lookups %d, without the lock %d\n", g_idx_calls, g_idx_unlocked);
       rj_val* v7 = (b && b->nitems == 3) ? rj_obj_get(b->items[2], "vin") : 0;
       rj_val* p7 = (v7 && v7->nitems) ? v7->items[0] : 0;
       ok(p7 && rj_obj_get(p7, "prevout") && !strcmp(S(rj_obj_get(p7, "prevout"), "value"), "3000000"), "...0x77..'s prevout came from its unconfirmed parent in the pool (3,000,000 sat)");
