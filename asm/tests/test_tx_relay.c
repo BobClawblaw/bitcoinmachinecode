@@ -78,6 +78,11 @@ static int  book_has(const char* hp, unsigned char* port_bytes){
     if (b && bmc_addr_from_string_port(&a, hp, 0)){ long i = ab2_find(b, &a); ok = i >= 0 && ab2_get(b, i, &r); if (ok && port_bytes){ port_bytes[0] = (unsigned char)(r.a.port >> 8); port_bytes[1] = (unsigned char)r.a.port; } }
     ab2_close(b); return ok; }
 extern long txrelay_announce(const int* fds, int nfds);
+/* BIP339 announce/serve (2026-10-03) */
+extern void txrelay_fd_set_wtxid(int fd, int on);
+extern void txrelay_announce_own(const u8 txid[32]);
+extern void txann_test_set_pool(void* mp);
+extern void sha256d(unsigned char out[32], const void* msg, long len);
 extern void txrelay_test_set_announce_mean_ms(long ms);
 extern long long txrelay_test_exp_draw(long mean_ms);
 extern void txrelay_announce_own(const unsigned char txid[32]);
@@ -551,6 +556,47 @@ int main(void){
                                 && pl4[1] == 1 && memcmp(pl4+5, txid2v, 32) == 0);
         ck("leg A (the source) got nothing", no_bytes_pending(sp[1]));
         close(spB[0]); close(spB[1]);
+    }
+
+    printf("\n== 8c: BIP339 -- a leg that negotiated wtxidrelay is told by wtxid and served by it ==\n");
+    {
+        /* Core drops MSG_TX invs from a peer that negotiated wtxidrelay, so a
+         * txid inv to it is lost; and the getdata it answers with names the
+         * WTXID, which the pool does not index. */
+        int spW[2];
+        ck("wtxid leg pair", socketpair(AF_UNIX, SOCK_STREAM, 0, spW) == 0);
+        { struct timeval tv = { 3, 0 }; setsockopt(spW[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv); }   /* a missing reply FAILS, it does not hang */
+        txann_test_set_pool(mp_area);
+        txrelay_test_set_announce_mean_ms(0);
+        txrelay_announce(NULL, 0);
+        u8 txid1[32]; tx_txid(txid1, s->tx, (unsigned long)s->txlen, tb, sizeof tb);   /* case 1's, pooled */
+        u8 wtxid1[32]; sha256d(wtxid1, s->tx, (long)s->txlen);
+        u8 ghost[32]; memset(ghost, 0xE1, 32);                                          /* not in the pool */
+        txrelay_fd_set_wtxid(spW[0], 1);
+        txrelay_announce_own(txid1); txrelay_announce_own(ghost);
+        int fdsW[1] = { spW[0] };
+        txrelay_announce(fdsW, 1);
+        char cmd[13]; static u8 plw[8192];
+        int plen = read_msg(spW[1], cmd, plw, sizeof plw);
+        ck("8c: the wtxid leg got ONE MSG_WTX (type 5) carrying the wtxid",
+           plen == 37 && strcmp(cmd, "inv") == 0 && plw[0] == 1 && plw[1] == 5 && memcmp(plw + 5, wtxid1, 32) == 0);
+        ck("8c: ...the tx not in the pool was not announced", no_bytes_pending(spW[1]));
+        u8 gd[1 + 2*36]; gd[0] = 2;
+        gd[1]=5; gd[2]=0; gd[3]=0; gd[4]=0; memcpy(gd+5, wtxid1, 32);
+        u8 nope[32]; memset(nope, 0xD7, 32);
+        gd[37]=5; gd[38]=0; gd[39]=0; gd[40]=0; memcpy(gd+41, nope, 32);
+        p2p_write(spW[1], "getdata", 7, gd, sizeof gd);
+        txrelay_poll_leg(spW[0], mp_area, 200);
+        plen = read_msg(spW[1], cmd, plw, sizeof plw);
+        ck("8c: getdata(MSG_WTX) served the WITNESS bytes", plen == s->txlen && strcmp(cmd, "tx") == 0 && memcmp(plw, s->tx, (size_t)s->txlen) == 0);
+        plen = read_msg(spW[1], cmd, plw, sizeof plw);
+        ck("8c: an unknown wtxid is answered with notfound", plen == 37 && strcmp(cmd, "notfound") == 0 && plw[1] == 5 && memcmp(plw + 5, nope, 32) == 0);
+        txrelay_fd_set_wtxid(spW[0], 0);
+        txrelay_announce_own(txid1); txrelay_announce(fdsW, 1);
+        plen = read_msg(spW[1], cmd, plw, sizeof plw);
+        ck("8c: the same leg without wtxidrelay is told by txid (MSG_TX)", plen == 37 && plw[1] == 1 && memcmp(plw + 5, txid1, 32) == 0);
+        txann_test_set_pool(0);
+        close(spW[0]); close(spW[1]);
     }
 
     /* ---- 8b: the announcement timer -----------------------------------

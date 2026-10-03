@@ -1102,8 +1102,8 @@ tests/test_peer_timeout: tests/test_peer_timeout.c daemon/peer_timeout.c daemon/
 # from the shared announce ring, never back to the sender, honouring the
 # peer's feefilter, Poisson-timed; inbound-origin transactions reach the
 # outbound legs. Negative control = the switch off (the pre-CC-1 node).
-tests/test_txann: tests/test_txann.c daemon/txann.c daemon/txann.h rpc_node.h
-	$(CC) $(WARNFLAGS) -O2 -D_GNU_SOURCE -I. -I daemon -o $@ tests/test_txann.c daemon/txann.c
+tests/test_txann: tests/test_txann.c daemon/txann.c daemon/txann.h rpc_node.h bitcoin_hash.o sha256.o
+	$(CC) $(WARNFLAGS) -O2 -D_GNU_SOURCE -I. -I daemon -o $@ tests/test_txann.c daemon/txann.c bitcoin_hash.o sha256.o
 # test_tx_handoff -- 2026-09-19: inbound serve children hand received
 # transactions to the worker (daemon/tx_handoff.c), which validates them
 # against the live UTXO set instead of the boot-time snapshot.

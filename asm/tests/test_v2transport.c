@@ -18,6 +18,7 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <poll.h>
 #include "../daemon/v2transport.h"
 
 extern long p2p_write(int fd, const char* cmd, unsigned cmdlen, const void* pl, unsigned plen);
@@ -67,7 +68,41 @@ static int responder(int fd, int expect_v2){
     return 0;
 }
 
+/* 2026-10-03: two messages written back to back, then a wait for the parent */
+static int responder_two(int fd){
+    if (bmc_v2_handshake(fd, 0, 5000) != 1) return 10;
+    unsigned char a[8] = {1,1,1,1,1,1,1,1}, b[8] = {2,2,2,2,2,2,2,2};
+    if (p2p_write(fd, "ping", 4, a, 8) <= 0) return 20;
+    if (p2p_write(fd, "ping", 4, b, 8) <= 0) return 21;
+    char cmd[12]; unsigned char buf[64]; unsigned plen;
+    return p2p_read(fd, cmd, buf, sizeof buf, &plen) == 1 ? 0 : 30;   /* the parent's "done" */
+}
+
 int main(void){
+    printf("== two messages in one read: the second is buffered, poll cannot see it (2026-10-03) ==\n");
+    { int sv[2];
+      if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0){ printf("  FAIL socketpair\n"); return 1; }
+      pid_t pid = fork();
+      if (pid == 0){ close(sv[0]); _exit(responder_two(sv[1])); }
+      close(sv[1]);
+      int fd = sv[0];
+      ck("initiator handshake completes", bmc_v2_handshake(fd, 1, 5000) == 1);
+      usleep(300000);                                   /* both packets are in the socket buffer */
+      char cmd[12]; unsigned char buf[64]; unsigned plen;
+      int r = p2p_read(fd, cmd, buf, sizeof buf, &plen);
+      ck("the first ping is delivered", r == 1 && !strncmp(cmd, "ping", 4) && plen == 8 && buf[0] == 1);
+      struct pollfd pf = { fd, POLLIN, 0 };
+      ck("  the socket itself is now empty: poll reports nothing", poll(&pf, 1, 100) == 0);
+      ck("  but bmc_v2_has_message reports the second one", bmc_v2_has_message(fd) == 1);
+      r = p2p_read(fd, cmd, buf, sizeof buf, &plen);
+      ck("the second ping is delivered without another packet", r == 1 && !strncmp(cmd, "ping", 4) && buf[0] == 2);
+      ck("  and then nothing is buffered", bmc_v2_has_message(fd) == 0);
+      ck("a v1 / unknown fd reports nothing buffered", bmc_v2_has_message(fd + 100) == 0);
+      p2p_write(fd, "verack", 6, "", 0);
+      bmc_v2_close(fd); close(fd);
+      int st = 0; waitpid(pid, &st, 0);
+      ck("the responder side agreed", WIFEXITED(st) && WEXITSTATUS(st) == 0); }
+
     printf("== v1 is untouched when no fd is registered ==\n");
     { int sv[2];
       socketpair(AF_UNIX, SOCK_STREAM, 0, sv);

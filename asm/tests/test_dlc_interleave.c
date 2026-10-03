@@ -329,8 +329,15 @@ int main(void){
          * pass leaves behind -- bounded by a chunk here, never a download's
          * worth (the pre-step-1 loop left all NB) */
         printf("     connected tip at the gate: %ld (lag %ld)\n", gate_applied, (NB-1) - gate_applied);
-        ckm("the connected tip at the gate is within a chunk of the archive tip (lag bounded)", (NB-1) - gate_applied <= g_dlc_chunk);
-        ckm("...and far past where the pre-step-1 loop left it (-1)", gate_applied >= NB - 1 - g_dlc_chunk);
+        /* 2026-10-03: bounded RELATIVE to the control, not by one chunk. The
+         * lag is what the last budget-bounded pass (500 ms here) left, which
+         * is a CPU-time quantity: alone the pass covers all but < a chunk, but
+         * under the gate's -j8 it left 54 and failed a correct build. The
+         * property under test is "connected during the download, far ahead
+         * of the pre-step-1 loop" (lag NB-1 = 599 in the control below);
+         * a quarter of the download keeps a 4x margin over that. */
+        ckm("the connected tip at the gate is far ahead of the control (lag <= NB/4; the control leaves NB-1)", (NB-1) - gate_applied <= NB/4);
+        ckm("...and far past where the pre-step-1 loop left it (-1)", gate_applied >= NB - 1 - NB/4);
         /* the sample trace: did applied rise while blocks were still missing? */
         long ns = g_ns, first_rise = -1, best_gap = -1, ooo = 0;
         for(long i=0;i<ns;i++){

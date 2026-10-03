@@ -15,6 +15,22 @@ static void id(unsigned char* t, int n){ memset(t, 0, 32); t[0]=(unsigned char)n
 static int inv_count(void){ return cap_n > 0 ? cap[0] : 0; }
 static int inv_has(int n){ unsigned char t[32]; id(t,n); for (int i = 0; i < inv_count(); i++) if (cap[1+i*36]==1 && !memcmp(cap+1+i*36+4, t, 32)) return 1; return 0; }
 static int drained_ids[64], drained_n; static void wcb(const unsigned char t[32]){ if (drained_n < 64) drained_ids[drained_n++] = t[0] | (t[1]<<8); }
+/* BIP339 (2026-10-03): txann maps a txid to its wtxid through the pool. A
+ * stub pool holds one transaction (id 800); sha256d is the real one, so the
+ * wtxid on the wire is checked against an independent computation. */
+long g_peer_wtxidrelay;                                  /* bitcoind.asm's, per handshake */
+extern void sha256d(unsigned char out[32], const void* msg, long len);
+static const unsigned char RAW800[] = { 2,0,0,0, 0,1, 1, 9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9, 0,0,0,0, 0, 0xff,0xff,0xff,0xff,
+                                        1, 0x10,0x27,0,0,0,0,0,0, 1, 0x51, 1, 1, 0x42, 0,0,0,0 };
+const unsigned char* mpool_get(void* mp, const unsigned char* txid, unsigned long* len_out){
+    (void)mp; unsigned char t8[32]; memset(t8, 0, 32); t8[0] = 800 & 255; t8[1] = 800 >> 8;
+    if (!memcmp(txid, t8, 32)){ *len_out = sizeof RAW800; return RAW800; }
+    *len_out = 0; return 0;
+}
+/* v2transport's "a whole message is already buffered" (2026-10-03): a stub
+ * that says yes for one fd, so txann_wait must not sit in poll for it */
+static int g_v2_buffered_fd = -1;
+int bmc_v2_has_message(int fd){ return fd == g_v2_buffered_fd; }
 static long long ms(void){ struct timeval t; gettimeofday(&t,0); return t.tv_sec*1000LL + t.tv_usec/1000; }
 int main(void){
     node_status_t* st = calloc(1, sizeof *st); if (!st){ puts("calloc"); return 2; }
@@ -60,6 +76,13 @@ int main(void){
     txann_child_init(5, 1); id(t,400); txann_push(t, 1000, 200); cap_n = 0; cap_writes = 0;
     txann_set_idle_secs(1); r = txann_wait(sv[0], 0);
     ok(cap_writes >= 1 && inv_has(400), "an accept during the wait is announced from inside the wait");
+    printf("== a v2 message already buffered ends the wait at once (poll cannot see it) ==\n");
+    { int sq[2]; if (socketpair(AF_UNIX, SOCK_STREAM, 0, sq)){ perror("sp"); return 2; }
+      txann_set_idle_secs(2); txann_child_init(5, 1); g_v2_buffered_fd = sq[0];
+      long long tq = ms(); long rq = txann_wait(sq[0], 0); long long dq = ms() - tq;
+      ok(rq == 1 && dq < 200, "silent socket, message in the v2 session: wait returns 1 immediately (was: until the peer's next packet)");
+      if (!(rq == 1 && dq < 200)) printf("      returned %ld after %lld ms\n", rq, dq);
+      g_v2_buffered_fd = -1; close(sq[0]); close(sq[1]); }
     printf("== worker drain: inbound-origin txs reach the outbound announce queue ==\n");
     txann_set_my_slot(7); id(t,500); txann_push(t, 1000, 200);
     txann_set_my_slot(-1); id(t,501); txann_push(t, 1000, 200);   /* the worker's own: already queued by tx_relay */
@@ -76,6 +99,24 @@ int main(void){
     printf("== relay not negotiated ==\n");
     txann_child_init(5, 0); id(t,600); txann_push(t, 1000, 200); cap_n = 0; n = txann_tick(9, ms()+1, 0);
     ok(n == 0 && cap_n == 0, "a peer that sent fRelay=0 gets nothing");
+    printf("== BIP339: a peer that negotiated wtxidrelay is announced to by wtxid ==\n");
+    { static int pool_tag; txann_test_set_pool(&pool_tag);
+      unsigned char want[32]; sha256d(want, RAW800, sizeof RAW800);
+      g_peer_wtxidrelay = 1; txann_set_my_slot(-1); txann_child_init(5, 1);
+      id(t,800); txann_push(t, 1000, 200); id(t,801); txann_push(t, 1000, 200);   /* 801 is not in the pool */
+      cap_n = 0; n = txann_tick(9, ms()+1, 0);
+      ok(n == 1 && inv_count() == 1 && cap[1] == 5 && cap[2] == 0 && !memcmp(cap + 5, want, 32),
+         "negotiated: one MSG_WTX (type 5) carrying sha256d of the pool's bytes -- Core drops MSG_TX from such a peer");
+      ok(!inv_has(800) && !inv_has(801), "...no MSG_TX entry, and the tx no longer in the pool is not announced");
+      unsigned char back[32]; id(t,800);
+      ok(txann_txid_for_wtxid(want, back) == 1 && !memcmp(back, t, 32), "the wtxid resolves back to the txid (for the getdata(MSG_WTX) that follows)");
+      unsigned char other[32]; memset(other, 0x77, 32);
+      ok(txann_txid_for_wtxid(other, back) == 0, "a wtxid we never announced does not resolve");
+      g_peer_wtxidrelay = 0; txann_child_init(5, 1);
+      id(t,800); txann_push(t, 1000, 200);
+      cap_n = 0; n = txann_tick(9, ms()+1, 0);
+      ok(n == 1 && inv_has(800), "not negotiated: the same tx goes out as MSG_TX by txid");
+      txann_test_set_pool(0); }
     printf("== negative control: the pre-CC-1 behaviour ==\n");
     txann_set_enabled(0); txann_child_init(5, 1); id(t,700); txann_push(t, 1000, 200);
     cap_n = 0; n = txann_tick(9, ms()+1, 0);

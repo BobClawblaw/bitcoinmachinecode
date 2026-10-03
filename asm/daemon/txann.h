@@ -26,6 +26,12 @@ long txann_tick(int fd, long long now_ms, unsigned long long peer_feefilter);  /
 
 long txann_worker_drain(void (*announce)(const unsigned char txid[32]));
 
+/* BIP339 (2026-10-03): txid -> wtxid through the pool, remembered so a later
+ * getdata(MSG_WTX) resolves back; 1 found, 0 not in the pool / not announced */
+int  txann_wtxid_of(const unsigned char txid[32], unsigned char wtxid_out[32]);
+int  txann_txid_for_wtxid(const unsigned char wtxid[32], unsigned char txid_out[32]);
+void txann_test_set_pool(void* mp);
+
 /* test seams */
 typedef long (*txann_writer_t)(int fd, const char* cmd, unsigned cmdlen, const void* payload, unsigned plen);
 void txann_set_writer(txann_writer_t w);
