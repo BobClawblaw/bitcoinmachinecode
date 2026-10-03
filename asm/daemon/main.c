@@ -50,6 +50,7 @@
 #include "secure_zero.h"    /* WAL-3: a memset the optimiser may not delete */
 #include "hdrrules.h"          /* VAL-5: ContextualCheckBlockHeader rules */
 #include "peer_timeout.h"      /* CC-7: -peertimeout, the handshake deadline */
+#include "crash_trace.h"       /* 2026-10-03: a fatal signal leaves a stack in the log */
 #include "txann.h"             /* CC-1: tx announcement to and from inbound peers */
 #include "inbound_evict.h"     /* CC-3: Core AttemptToEvictConnection */
 #include "../mempool_slot.h"    /* the structural mempool's slot layout (80-byte slots) */
@@ -11903,6 +11904,11 @@ static int datadir_lock_acquire(const char* effdir){
 }
 
 int main(int argc, char** argv){
+    /* a fatal signal writes the crashing thread's stack to the log (text-
+     * segment addresses only -- no core file, LimitCORE=0 stays: the seed);
+     * forked workers inherit it (2026-10-03, after a crash loop left only
+     * the kernel's one line) */
+    crash_trace_install();
     signal(SIGPIPE, SIG_IGN);   /* broken peer connections must not kill the node */
     /* counting reaper instead of SIG_IGN: we must know how many inbound
      * children are live to enforce MAX_INBOUND (see the budget above). */
