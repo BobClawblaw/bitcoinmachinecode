@@ -677,6 +677,16 @@ const char* txacc_witness_standard(void* mp_area, const u8* tx, unsigned long tx
     }
     return 0;
 }
+/* Core's debug message for the last refusal on this thread (2026-10-03):
+ * the reason buffers stay the bare token every classifier compares; this rides
+ * beside them and the RPC layer prints "reason, detail" as Core's
+ * TxValidationState::ToString does. Empty when Core has none. */
+static __thread char g_txacc_detail[512];
+const char* tx_accept_last_detail(void){ return g_txacc_detail; }
+void tx_accept_clear_detail(void){ g_txacc_detail[0] = 0; }
+extern const char* mpool_policy_detail(void* pol);
+extern __thread long g_txv_immature_depth;          /* daemon/tx_verify.c */
+
 /* the pre-script policy gate; returns NULL ok / reason. Also parks the sigop
  * cost for the policy layer's bytespersigop-adjusted feerate. */
 static const char* txacc_prechecks(void* mp_area, const u8* tx, unsigned long txlen){
@@ -684,7 +694,8 @@ static const char* txacc_prechecks(void* mp_area, const u8* tx, unsigned long tx
     long lc = txacc_legacy_sigops(tx, txlen);
     if (lc > 2500) return "bad-txns-legacy-sigops";              /* MAX_TX_LEGACY_SIGOPS, Core v30 */
     long sc = txacc_sigop_cost(mp_area, tx, txlen);
-    if (sc > 16000) return "bad-txns-too-many-sigops";           /* MAX_STANDARD_TX_SIGOPS_COST */
+    if (sc > 16000){ snprintf(g_txacc_detail, sizeof g_txacc_detail, "%ld", sc);   /* Core: strprintf("%d", nSigOpsCost) */
+                     return "bad-txns-too-many-sigops"; }       /* MAX_STANDARD_TX_SIGOPS_COST */
     /* MEM-23: Core gates IsWitnessStandard on require_standard
      * (validation.cpp:909, `tx.HasWitness() && require_standard && ...`).
      * This ran it unconditionally, so -acceptnonstdtxn did not actually
@@ -719,7 +730,9 @@ static int txacc_script_verify(void* mp_area, const u8* tx, unsigned long txlen,
      * with Core's reason strings (Consensus::CheckTxInputs). submitpackage's
      * per-member errors are compared with Core's word for word. */
     if (r && !strcmp(r, "input references a missing/already-spent UTXO")) *rout = "bad-txns-inputs-missingorspent";
-    else if (r && !strcmp(r, "immature coinbase spend (100-block rule)")) *rout = "bad-txns-premature-spend-of-coinbase";
+    else if (r && !strcmp(r, "immature coinbase spend (100-block rule)")){
+        *rout = "bad-txns-premature-spend-of-coinbase";
+        snprintf(g_txacc_detail, sizeof g_txacc_detail, "tried to spend coinbase at depth %ld", g_txv_immature_depth); }
     return 0;
 }
 
@@ -933,6 +946,7 @@ long tx_accept_validate(void* mp_area, const u8 txid[32], const u8* tx, unsigned
     }
     mp_lock_at(__func__);
     long padd = mpool_policy_add(g_pol, g_pol_state, mp_area, tx, txlen, txid, placeholder_utxo);
+    if (padd != 1) snprintf(g_txacc_detail, sizeof g_txacc_detail, "%s", mpool_policy_detail(g_pol));   /* under the lock */
     if (padd == 1) txacc_fee_note(txid);           /* fee estimation, under the same lock */
     mp_unlock();
     if (padd != 1){
@@ -988,6 +1002,7 @@ int txacc_fee_reconsiderable(const char* reason){
     return reason && (!strcmp(reason, "min relay fee not met") ||
                       !strcmp(reason, "mempool min fee not met") ||
                       !strcmp(reason, "insufficient fee") ||
+                      !strcmp(reason, "insufficient fee (including sibling eviction)") ||   /* Core's sibling-eviction name, also reconsiderable */
                       !strcmp(reason, "replacement-failed"));
 }
 /* the aggregate fee floor and an entry's fee/vsize, under the pool lock (submitpackage) */
@@ -1071,6 +1086,7 @@ long tx_accept_validate_p2p(void* mp_area, const u8 txid[32], const u8* tx,
     }
     mp_lock_at(__func__);
     long padd = mpool_policy_add(g_pol, g_pol_state, mp_area, tx, txlen, txid, placeholder_utxo);
+    if (padd != 1) snprintf(g_txacc_detail, sizeof g_txacc_detail, "%s", mpool_policy_detail(g_pol));   /* under the lock */
     if (padd == 1) txacc_fee_note(txid);           /* fee estimation, under the same lock */
     mp_unlock();
     if (padd != 1){
@@ -1102,6 +1118,7 @@ long tx_accept_validate_p2p(void* mp_area, const u8 txid[32], const u8* tx,
 long tx_accept_validate_reason(void* mp_area, const u8 txid[32], const u8* tx,
                                unsigned long txlen, char* reason, unsigned long rcap){
     if (reason && rcap) reason[0] = 0;
+    g_txacc_detail[0] = 0;
     if (!g_ready || !g_pol_ready){ if (reason && rcap) snprintf(reason, rcap, "mempool not initialized"); return -4; }
     void* placeholder_utxo = (void*)1;
     { const char* pre = txacc_prechecks(mp_area, tx, txlen);
@@ -1128,6 +1145,7 @@ long tx_accept_validate_reason(void* mp_area, const u8 txid[32], const u8* tx,
     }
     mp_lock_at(__func__);
     long padd = mpool_policy_add(g_pol, g_pol_state, mp_area, tx, txlen, txid, placeholder_utxo);
+    if (padd != 1) snprintf(g_txacc_detail, sizeof g_txacc_detail, "%s", mpool_policy_detail(g_pol));   /* under the lock */
     if (padd == 1) txacc_fee_note(txid);           /* fee estimation, under the same lock */
     mp_unlock();
     if (padd != 1){
@@ -1166,6 +1184,7 @@ long tx_accept_test_reason(void* mp_area, const u8 txid[32], const u8* tx,
                                   const unsigned char*, void*, unsigned long long*,
                                   unsigned long long*);
     if (reason && rcap) reason[0] = 0;
+    g_txacc_detail[0] = 0;
     if (fee_out) *fee_out = 0;
     /* The SIGOP-ADJUSTED vsize, for callers aggregating a package feerate.
      * Zero unless the policy layer was reached; a member rejected before it
@@ -1186,6 +1205,7 @@ long tx_accept_test_reason(void* mp_area, const u8 txid[32], const u8* tx,
     mp_lock_at(__func__);
     long pt = mpool_policy_test(g_pol, g_pol_state, mp_area, tx, txlen, txid,
                                 placeholder_utxo, fee_out, vsize_out);
+    if (pt != 1) snprintf(g_txacc_detail, sizeof g_txacc_detail, "%s", mpool_policy_detail(g_pol));   /* under the lock */
     mp_unlock();
     if (pt != 1){
         const char* r = mpool_policy_reason(g_pol);

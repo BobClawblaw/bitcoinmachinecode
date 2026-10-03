@@ -458,3 +458,6 @@ asm/daemon/bmc_build_txospender_index
 asm/daemon/bmc_build_*.run-*
 asm/daemon/bmc_build_tx_index
 asm/daemon/bmc_utxo_probe_one
+
+# ---- gate log audits (scripts/gate_log_audit.py writes one per gate log) ----
+asm/gate-*.audit

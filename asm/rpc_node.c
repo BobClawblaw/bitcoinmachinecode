@@ -2869,13 +2869,28 @@ static int cmd_importmempool(const rj_val* params, rj_val** res, long* ec, const
     return 1;
 }
 
+/* Core's decode-failure messages (2026-10-03, rpc/mempool.cpp v31.1):
+ * sendrawtransaction "TX decode failed. Make sure the tx has at least one
+ * input."; testmempoolaccept and submitpackage name the offending hex,
+ * "TX decode failed: <hex> Make sure the tx has at least one input.", and
+ * refuse the whole call. Returned through *em, so per thread and sized to
+ * the hex. */
+#define CORE_DECODE_MSG "TX decode failed. Make sure the tx has at least one input."
+static const char* core_decode_msg_hex(const char* hex){
+    static __thread char* b; static __thread size_t cap;
+    size_t need = strlen(hex) + 80;
+    if (need > cap){ char* nb = (char*)realloc(b, need); if (!nb) return "TX decode failed"; b = nb; cap = need; }
+    snprintf(b, cap, "TX decode failed: %s Make sure the tx has at least one input.", hex);
+    return b;
+}
+
 static int cmd_sendrawtransaction(const rj_val* params, rj_val** res, long* ec, const char** em){
     if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
         params->items[0]->typ != RJ_STR){
         *ec = -8; *em = "Invalid parameter, hexstring required"; return 0; }
     const char* hex = params->items[0]->str;
     size_t hl = strlen(hex);
-    if ((hl & 1) || hl/2 == 0 || hl/2 > RPC_TXSUBMIT_MAX){ *ec = -22; *em = "TX decode failed"; return 0; }
+    if ((hl & 1) || hl/2 == 0 || hl/2 > RPC_TXSUBMIT_MAX){ *ec = -22; *em = CORE_DECODE_MSG; return 0; }
     unsigned long n = (unsigned long)(hl/2);
     static unsigned char stage[RPC_TXSUBMIT_MAX];   /* under g_submit_lock */
     char                 txidhex[65];               /* 2026-09-30: read after the wait, so not shared */
@@ -2886,11 +2901,11 @@ static int cmd_sendrawtransaction(const rj_val* params, rj_val** res, long* ec, 
     submit_lock();
     int okhex = 1;
     for (unsigned long i=0;i<n;i++){ int hi=srt_hex1(hex[i*2]),lo=srt_hex1(hex[i*2+1]); if(hi<0||lo<0){okhex=0;break;} stage[i]=(unsigned char)((hi<<4)|lo); }
-    if (!okhex){ submit_unlock(); *ec=-22; *em="TX decode failed"; return 0; }
+    if (!okhex){ submit_unlock(); *ec=-22; *em=CORE_DECODE_MSG; return 0; }
 
     /* txid for the success result (display order) */
     { unsigned char id[32]; static unsigned char scratch[RPC_TXID_SCRATCH];   /* RPC-20 */
-      if (!tx_txid(id, stage, n, scratch, sizeof scratch)){ submit_unlock(); *ec=-22; *em="TX decode failed"; return 0; }
+      if (!tx_txid(id, stage, n, scratch, sizeof scratch)){ submit_unlock(); *ec=-22; *em=CORE_DECODE_MSG; return 0; }
       static const char* HEXD = "0123456789abcdef";
       for (int i=0;i<32;i++){ unsigned char b=id[31-i]; txidhex[i*2]=HEXD[b>>4]; txidhex[i*2+1]=HEXD[b&15]; }
       txidhex[64]=0; }
@@ -2924,12 +2939,15 @@ static int cmd_sendrawtransaction(const rj_val* params, rj_val** res, long* ec, 
 
     /* wait for the worker to ack this exact seq */
     int waited = 0, done = 0, result = 0;
+    char detail[512]; detail[0] = 0;
     reason[0] = 0;
     while (waited < g_srt_wait_us){
         if (s->tx_submit_ack == myseq){
             result = s->tx_submit_result;
             memcpy(reason, (const void*)s->tx_submit_reason, sizeof reason);
             reason[sizeof reason-1]=0;
+            memcpy(detail, (const void*)s->tx_submit_detail, sizeof detail);
+            detail[sizeof detail-1] = 0;
             done = 1; break;
         }
         struct timespec ts = {0, SRT_POLL_US*1000L}; nanosleep(&ts, NULL);
@@ -2940,8 +2958,11 @@ static int cmd_sendrawtransaction(const rj_val* params, rj_val** res, long* ec, 
     if (!done){ *ec=-4; *em="Transaction submission timed out"; return 0; }
     if (result == 1){ *res = rj_str(txidhex); return 1; }
     /* worker put a negative Core error code in result and the reason text */
-    static __thread char embuf[160];                /* returned through *em: per thread since the wait released the lock (2026-09-30) */
-    snprintf(embuf, sizeof embuf, "%s", reason[0] ? reason : "transaction rejected");
+    static __thread char embuf[640];                /* returned through *em: per thread since the wait released the lock (2026-09-30) */
+    /* Core: the error is TxValidationState::ToString() -- "reason, debug"
+     * when there is a debug message (2026-10-03) */
+    if (reason[0] && detail[0]) snprintf(embuf, sizeof embuf, "%s, %s", reason, detail);
+    else snprintf(embuf, sizeof embuf, "%s", reason[0] ? reason : "transaction rejected");
     *ec = result < 0 ? result : -26; *em = embuf;
     return 0;
 }
@@ -2971,7 +2992,7 @@ static int cmd_sendrawtransaction(const rj_val* params, rj_val** res, long* ec, 
 #define TMA_MAX 25
 
 static int tma_stage(node_status_t* s, const unsigned char* tx, unsigned long n,
-                     int* result_out, char reason[128], unsigned long long* fee_out){
+                     int* result_out, char reason[128], unsigned long long* fee_out, char detail[512]){
     memcpy((void*)s->tx_submit_buf, tx, n);
     s->tx_submit_len = n;
     s->tx_submit_result = 0;
@@ -2988,6 +3009,7 @@ static int tma_stage(node_status_t* s, const unsigned char* tx, unsigned long n,
             *fee_out = s->tx_submit_fee;
             memcpy(reason, (const void*)s->tx_submit_reason, 128);
             reason[127] = 0;
+            if (detail){ memcpy(detail, (const void*)s->tx_submit_detail, 512); detail[511] = 0; }
             return 1;
         }
         struct timespec ts = {0, SRT_POLL_US*1000L}; nanosleep(&ts, NULL);
@@ -3063,10 +3085,10 @@ static int cmd_submitpackage(const rj_val* params, rj_val** res, long* ec, const
             submit_unlock(); *ec = -22; *em = "TX decode failed"; return 0; }
         size_t hl = strlen(e->str);
         if (hl % 2 || hl/2 == 0 || total + hl/2 > sizeof raw){
-            submit_unlock(); *ec = -22; *em = "TX decode failed"; return 0; }
+            submit_unlock(); *ec = -22; *em = core_decode_msg_hex(e->str); return 0; }
         for (size_t k = 0; k < hl/2; k++){
             int a = srt_hex1(e->str[k*2]), b = srt_hex1(e->str[k*2+1]);
-            if (a < 0 || b < 0){ submit_unlock(); *ec = -22; *em = "TX decode failed"; return 0; }
+            if (a < 0 || b < 0){ submit_unlock(); *ec = -22; *em = core_decode_msg_hex(e->str); return 0; }
             raw[total + k] = (unsigned char)((a<<4)|b);
         }
         off[i] = total; tlen[i] = hl/2; total += hl/2;
@@ -3091,6 +3113,7 @@ static int cmd_submitpackage(const rj_val* params, rj_val** res, long* ec, const
     static int  r_result[RPC_PKG_MAX];
     static unsigned long long r_fee[RPC_PKG_MAX], r_vsize[RPC_PKG_MAX];
     static char r_reason[RPC_PKG_MAX][64];
+    static char r_detail[RPC_PKG_MAX][512];          /* Core's debug message per member (2026-10-03) */
     char pmsg[320]; pmsg[0] = 0;
     unsigned long long eff_fee = 0, eff_vsize = 0;
     static unsigned char replaced[RPC_PKG_REPLACED_MAX][32];
@@ -3101,6 +3124,7 @@ static int cmd_submitpackage(const rj_val* params, rj_val** res, long* ec, const
             r_fee[i]    = st->pkg_fee[i];
             r_vsize[i]  = st->pkg_vsize[i];
             snprintf(r_reason[i], sizeof r_reason[i], "%s", (const char*)st->pkg_reason[i]);
+            snprintf(r_detail[i], sizeof r_detail[i], "%s", (const char*)st->pkg_detail[i]);
         }
         snprintf(pmsg, sizeof pmsg, "%s", st->pkg_msg_full[0] ? (const char*)st->pkg_msg_full   /* the full package_msg (2026-10-01) */
                                                          : (const char*)st->tx_submit_reason);
@@ -3156,7 +3180,10 @@ static int cmd_submitpackage(const rj_val* params, rj_val** res, long* ec, const
             }
             rj_obj_set(e, "fees", f);
         } else if (r_reason[i][0]){
-            rj_obj_set(e, "error", rj_str(r_reason[i]));
+            /* Core: it->second.m_state.ToString() -- "reason, debug" */
+            if (r_detail[i][0]){ char full[600]; snprintf(full, sizeof full, "%.63s, %.511s", r_reason[i], r_detail[i]);
+                                 rj_obj_set(e, "error", rj_str(full)); }
+            else rj_obj_set(e, "error", rj_str(r_reason[i]));
         }
         rj_obj_set(results, whex, e);
     }
@@ -3181,13 +3208,17 @@ static int cmd_submitpackage(const rj_val* params, rj_val** res, long* ec, const
  * (rpc/mempool.cpp): the value is TxValidationState::ToString(), which is the
  * reject reason on its own when there is no debug message, and "reason, debug"
  * when there is. It is OMITTED for missing-inputs, where Core takes the other
- * branch and pushes only the reason. This node carries no separate debug
- * message, so details equals the reason -- which is precisely Core's output in
- * the no-debug-message case, not an approximation of it. */
-static void tma_set_reject(rj_val* e, const char* rsn){
+ * branch and pushes only the reason. 2026-10-03: the worker returns Core's
+ * debug message beside the reason (tx_submit_detail); empty means Core has
+ * none, and details is then the reason alone, as in Core. */
+static void tma_set_reject(rj_val* e, const char* rsn, const char* detail){
     rj_obj_set(e, "reject-reason", rj_str(rsn));
-    if (strcmp(rsn, "missing-inputs") != 0)
-        rj_obj_set(e, "reject-details", rj_str(rsn));
+    if (strcmp(rsn, "missing-inputs") != 0){
+        if (detail && detail[0]){
+            char full[640]; snprintf(full, sizeof full, "%s, %s", rsn, detail);
+            rj_obj_set(e, "reject-details", rj_str(full));
+        } else rj_obj_set(e, "reject-details", rj_str(rsn));
+    }
 }
 
 static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, const char** em){
@@ -3209,13 +3240,18 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
     for (size_t i = 0; i < list->nitems; i++){
         if (list->items[i]->typ != RJ_STR){ submit_unlock(); *ec = -22; *em = "TX decode failed"; return 0; }
         const char* hex = list->items[i]->str; size_t hl = strlen(hex);
-        if ((hl & 1) || hl/2 < 10 || hl/2 > RPC_TXSUBMIT_MAX){ submit_unlock(); *ec = -22; *em = "TX decode failed"; return 0; }
+        if ((hl & 1) || hl/2 < 10 || hl/2 > RPC_TXSUBMIT_MAX){ submit_unlock(); *ec = -22; *em = core_decode_msg_hex(hex); return 0; }
         lens[i] = (unsigned long)(hl/2);
         for (unsigned long k = 0; k < lens[i]; k++){
             int hi = srt_hex1(hex[k*2]), lo = srt_hex1(hex[k*2+1]);
-            if (hi < 0 || lo < 0){ submit_unlock(); *ec = -22; *em = "TX decode failed"; return 0; }
+            if (hi < 0 || lo < 0){ submit_unlock(); *ec = -22; *em = core_decode_msg_hex(hex); return 0; }
             stage[i][k] = (unsigned char)((hi<<4)|lo);
         }
+        /* Core decodes every entry before validating any, and an undecodable
+         * one refuses the whole call (2026-10-03: this reported it as one
+         * entry's reject-reason) */
+        { unsigned char id_[32]; static unsigned char sc_[RPC_TXID_SCRATCH];
+          if (tx_txid(id_, stage[i], lens[i], sc_, sizeof sc_) != 1){ submit_unlock(); *ec = -22; *em = core_decode_msg_hex(hex); return 0; } }
     }
 
     static const char* HEXD = "0123456789abcdef";
@@ -3253,6 +3289,7 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
         static int r_result[TMA_MAX];
         static unsigned long long r_fee[TMA_MAX], r_vsize[TMA_MAX];
         static char r_reason[TMA_MAX][64];
+        static char r_detail[TMA_MAX][512];
         char pmsg[128]; pmsg[0] = 0;
         unsigned long long eff_fee = 0, eff_vsize = 0;
         if (got){
@@ -3261,6 +3298,7 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
                 r_fee[i]    = s->pkg_fee[i];
                 r_vsize[i]  = s->pkg_vsize[i];
                 snprintf(r_reason[i], sizeof r_reason[i], "%s", (const char*)s->pkg_reason[i]);
+                snprintf(r_detail[i], sizeof r_detail[i], "%s", (const char*)s->pkg_detail[i]);
             }
             snprintf(pmsg, sizeof pmsg, "%s", (const char*)s->tx_submit_reason);
             eff_fee = s->pkg_eff_fee; eff_vsize = s->pkg_eff_vsize;
@@ -3339,7 +3377,7 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
                 rj_obj_set(e, "fees", f);
             } else {
                 rj_obj_set(e, "allowed", rj_bool(0));
-                tma_set_reject(e, r_reason[i][0] ? r_reason[i] : "transaction rejected");
+                tma_set_reject(e, r_reason[i][0] ? r_reason[i] : "transaction rejected", r_detail[i]);
             }
             rj_arr_push(arr, e);
         }
@@ -3365,11 +3403,11 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
             for (int k=0;k<32;k++){ unsigned char b=wid[31-k]; hx[k*2]=HEXD[b>>4]; hx[k*2+1]=HEXD[b&15]; }
             hx[64]=0; rj_obj_set(e, "wtxid", rj_str(hx));
         }
-        int result = 0; char reason[128] = {0}; unsigned long long fee = 0;
+        int result = 0; char reason[128] = {0}; char detail[512] = {0}; unsigned long long fee = 0;
         if (!have_id){
             rj_obj_set(e, "allowed", rj_bool(0));
             rj_obj_set(e, "reject-reason", rj_str("TX decode failed"));
-        } else if (!tma_stage(s, stage[i], lens[i], &result, reason, &fee)){
+        } else if (!tma_stage(s, stage[i], lens[i], &result, reason, &fee, detail)){
             /* no verdict: `allowed` is OMITTED, which is exactly how Core
              * marks a transaction it could not fully validate */
             rj_obj_set(e, "reject-reason", rj_str("mempool acceptance test timed out"));
@@ -3385,7 +3423,7 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
             rj_obj_set(e, "fees", fees);
         } else {
             rj_obj_set(e, "allowed", rj_bool(0));
-            tma_set_reject(e, reason[0] ? reason : "transaction rejected");
+            tma_set_reject(e, reason[0] ? reason : "transaction rejected", detail);
         }
         rj_arr_push(arr, e);
     }

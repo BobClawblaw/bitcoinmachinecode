@@ -860,6 +860,10 @@ static int txv_resolve_lsm(void* ctxv, const u8 outpoint[36], u32 index,
     return utxo_lsm_get(c->lst, c->u, outpoint, index, value, height, is_coinbase, spk, spklen) == 1;
 }
 
+/* the depth of the immature coinbase spend just refused (2026-10-03): Core's
+ * debug message is "tried to spend coinbase at depth N" -- the mempool
+ * admission path reads it back for that */
+__thread long g_txv_immature_depth;
 static int txv_connect_body(const u8* tx, u64 txlen, long height, unsigned long long flags,
                             txv_resolve_fn rf, void* rctx, const char** reason){
     u64 nin;
@@ -879,7 +883,7 @@ static int txv_connect_body(const u8* tx, u64 txlen, long height, unsigned long 
             { *reason = "input references a missing/already-spent UTXO"; return 0; }
         if (ucb) {
             long conf = height - (long)uheight;
-            if (conf < COINBASE_MATURITY) { *reason = "immature coinbase spend (100-block rule)"; return 0; }
+            if (conf < COINBASE_MATURITY) { g_txv_immature_depth = conf; *reason = "immature coinbase spend (100-block rule)"; return 0; }
         }
 
         g_txv_in[i].value = value;
@@ -1753,7 +1757,7 @@ int txvb_classify(txvb_in_t* in, long height, unsigned long long flags,
                   bytepool_t* spk_pool, int* has_taproot, const char** reason){
     if (ucb) {
         long conf = height - (long)uheight;
-        if (conf < COINBASE_MATURITY) { *reason = "immature coinbase spend (100-block rule)"; return 0; }
+        if (conf < COINBASE_MATURITY) { g_txv_immature_depth = conf; *reason = "immature coinbase spend (100-block rule)"; return 0; }
     }
     in->value = value;
     if (spklen > TXV_SPK_CAP) { *reason = "prevout script too large"; return 0; }

@@ -144,7 +144,15 @@ int main(void){
         lc = mk_tx(C, 3, ida, 1, 1, 900000, 3);
         long rv = add(C, lc, idc);
         ck("an equal-paying second child is refused", rv != 1);
-        ck("...on fee, not on topology", is_reject(rv, "insufficient fee"));
+        /* 2026-10-03: Core's name for this path, with its PaysForRBF detail */
+        ck("...on fee, not on topology (Core: \"insufficient fee (including sibling eviction)\")", is_reject(rv, "insufficient fee (including sibling eviction)"));
+        { extern const char* mpool_policy_detail(void*); const char* d = mpool_policy_detail(pol);
+          /* equal fee: rule 3 holds (100000 >= 100000), rule 4 fails -- zero
+           * additional fee against the incremental relay fee of C's vsize */
+          printf("      detail: %s\n", d ? d : "(null)");
+          ck("...with Core's PaysForRBF detail: \"rejecting replacement <txid>, not enough additional fees to relay; 0.00 < ...\"",
+             d && !strncmp(d, "rejecting replacement ", 22) && strlen(d) > 22 + 64
+               && !strncmp(d + 22 + 64, ", not enough additional fees to relay; 0.00 < 0.", 48)); }
         unsigned long ml;
         ck("...and is not in the pool", mpool_get(mp, idc, &ml) == NULL);
         ck("...and the sibling survives", mpool_get(mp, idb, &ml) != NULL);

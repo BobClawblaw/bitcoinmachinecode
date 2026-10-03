@@ -160,7 +160,8 @@ extern unsigned char g_peer_version_payload[512]; /* bitcoind.asm: raw capture, 
 extern long g_peer_version_len;
 extern long node_accept_handshake(int fd);
 extern long g_peer_wants_addrv2;   /* bitcoind.asm: peer sent sendaddrv2 before verack (per handshake) */
-extern long g_peer_wtxidrelay;     /* bitcoind.asm: peer sent wtxidrelay before verack -- BIP339 negotiated (2026-10-03) */
+extern long g_peer_wtxidrelay;
+extern const char* tx_accept_last_detail(void);   /* daemon/tx_accept.c: Core's debug message for the last refusal (2026-10-03) */     /* bitcoind.asm: peer sent wtxidrelay before verack -- BIP339 negotiated (2026-10-03) */
 extern void txrelay_fd_set_wtxid(int fd, int on);   /* tx_relay.c: announce to / serve this leg by wtxid */
 
 /* NODE_WITNESS (service bit 0x8) gate, checked right after every OUTBOUND
@@ -8105,7 +8106,7 @@ static int txsub_package(char* msg, unsigned long mcap){
          * package was rejected as a whole. */
         for (int i = 0; i < n; i++){
             st->pkg_result[i] = 0;
-            snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "package-not-validated");
+            snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "package-not-validated"); st->pkg_detail[i][0] = 0;
         }
         return 0;
     }
@@ -8135,12 +8136,12 @@ static int txsub_package(char* msg, unsigned long mcap){
          * ran, and such a member never joins the total below. */
         st->pkg_vsize[i] = avs ? avs : vsz[i];
         if (rc == 1){
-            st->pkg_result[i] = 1; st->pkg_reason[i][0] = 0;
+            st->pkg_result[i] = 1; st->pkg_reason[i][0] = 0; st->pkg_detail[i][0] = 0;
             tot_fee += fee; tot_vsize += st->pkg_vsize[i];
         } else {
             int fee_only = txacc_fee_reconsiderable(r);
             st->pkg_result[i] = 0;
-            snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "%s", r);
+            snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "%s", r); snprintf((char*)st->pkg_detail[i], sizeof st->pkg_detail[i], "%s", tx_accept_last_detail());
             if (fee_only){ tot_fee += fee; tot_vsize += st->pkg_vsize[i]; }
             else {
                 all_ok = 0;      /* not something a package can rescue */
@@ -8170,7 +8171,7 @@ static int txsub_package(char* msg, unsigned long mcap){
         int first_fail = -1;
         for (int i = 0; i < n; i++) if (st->pkg_result[i] != 1){ first_fail = i; break; }
         if (first_fail < 0){ snprintf(msg, mcap, "success"); return 1; }
-        for (int k = first_fail + 1; k < n; k++){ st->pkg_result[k] = -1; st->pkg_reason[k][0] = 0; }   /* not evaluated */
+        for (int k = first_fail + 1; k < n; k++){ st->pkg_result[k] = -1; st->pkg_reason[k][0] = 0; st->pkg_detail[k][0] = 0; }   /* not evaluated */
         snprintf(msg, mcap, "transaction failed");
         return 0;
     }
@@ -8182,7 +8183,7 @@ static int txsub_package(char* msg, unsigned long mcap){
             snprintf(msg, mcap, "TRUC-violation");
             for (int i = 0; i < n; i++){
                 st->pkg_result[i] = 0;
-                snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "package-not-validated");
+                snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "package-not-validated"); st->pkg_detail[i][0] = 0;
             }
             return 0;
         }
@@ -8210,10 +8211,10 @@ static int txsub_package(char* msg, unsigned long mcap){
             long rc = tx_accept_test_reason(txsub_pool(), txids + i*32, txs[i], lens[i],
                                             r, sizeof r, &fee, NULL);
             if (rc == 1){
-                st->pkg_result[i] = 1; st->pkg_reason[i][0] = 0; st->pkg_fee[i] = fee;
+                st->pkg_result[i] = 1; st->pkg_reason[i][0] = 0; st->pkg_detail[i][0] = 0; st->pkg_fee[i] = fee;
             } else {
                 st->pkg_result[i] = 0;
-                snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "%s", r);
+                snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "%s", r); snprintf((char*)st->pkg_detail[i], sizeof st->pkg_detail[i], "%s", tx_accept_last_detail());
                 all_pass = 0;
             }
         }
@@ -8286,7 +8287,7 @@ static int txsub_package_accept(const unsigned char* const* txs, const unsigned 
     int eval[RPC_PKG_MAX]; int n_eval = 0, quit_early = 0;
     for (int i = 0; i < n; i++){
         unsigned long ml = 0; unsigned long long fee = 0, avs = 0;
-        st->pkg_fee[i] = 0; st->pkg_vsize[i] = vsz[i]; st->pkg_reason[i][0] = 0;
+        st->pkg_fee[i] = 0; st->pkg_vsize[i] = vsz[i]; st->pkg_reason[i][0] = 0; st->pkg_detail[i][0] = 0;
         if (mpool_get(txsub_pool(), txids + i*32, &ml)){
             txacc_entry_fee_vsize(txids + i*32, &fee, &avs);
             st->pkg_result[i] = 3; st->pkg_fee[i] = fee; if (avs) st->pkg_vsize[i] = avs;
@@ -8303,7 +8304,7 @@ static int txsub_package_accept(const unsigned char* const* txs, const unsigned 
             continue;
         }
         st->pkg_result[i] = 0;
-        snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "%s", r);
+        snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "%s", r); snprintf((char*)st->pkg_detail[i], sizeof st->pkg_detail[i], "%s", tx_accept_last_detail());
         if (n == 1 || !(txacc_fee_reconsiderable(r) || rc == -25)) quit_early = 1;   /* not something a package can change */
         else eval[n_eval++] = i;
     }
@@ -8319,7 +8320,7 @@ static int txsub_package_accept(const unsigned char* const* txs, const unsigned 
     /* prechecks with the package in view: the overlay lets a member resolve
      * an earlier member; a fee-only verdict is what the package may change */
     unsigned long long tot_fee = 0, tot_vsize = 0;
-    int bad = -1, truc = 0; char badr[128]; badr[0] = 0;
+    int bad = -1, truc = 0; char badr[128]; badr[0] = 0; char badd[512]; badd[0] = 0;
     mpol_package_context(etx, elen, eid, n_eval);
     txacc_package_overlay(etx, elen, eid, n_eval);
     for (int k = 0; k < n_eval; k++){
@@ -8328,18 +8329,25 @@ static int txsub_package_accept(const unsigned char* const* txs, const unsigned 
         efee[k] = fee; evs[k] = avs ? avs : vsz[eval[k]];
         if (rc == 1 || txacc_fee_reconsiderable(r)){ tot_fee += fee; tot_vsize += evs[k]; continue; }
         if (!strcmp(r, "TRUC-violation")) truc = 1;
-        bad = k; snprintf(badr, sizeof badr, "%s", r); break;
+        bad = k; snprintf(badr, sizeof badr, "%s", r); snprintf(badd, sizeof badd, "%s", tx_accept_last_detail()); break;
     }
     txacc_package_overlay(NULL, NULL, NULL, 0);
     mpol_package_context(NULL, NULL, NULL, 0);
     if (truc){ snprintf(msg, mcap, "TRUC-violation"); return 0; }      /* package-level; members keep their step-1 verdicts */
     if (bad >= 0){
         snprintf((char*)st->pkg_reason[eval[bad]], sizeof st->pkg_reason[0], "%s", badr);
+        snprintf((char*)st->pkg_detail[eval[bad]], sizeof st->pkg_detail[0], "%s", badd);
         snprintf(msg, mcap, "transaction failed"); return 0; }
     /* the aggregate fee floor (CheckFeeRate over the package) -- attributed
      * to the last member, as Core's FeeFailure result is */
     { char why[160];
       if (!txacc_package_floor_check(tot_fee, tot_vsize, why, sizeof why)){
+          /* why is Core's ToString ("min relay fee not met, 14 < 15"): the
+           * reason is the part before ", ", the debug message the rest */
+          char* sep = strstr(why, ", ");
+          if (sep){ *sep = 0;
+                    snprintf((char*)st->pkg_detail[eval[n_eval-1]], sizeof st->pkg_detail[0], "%s", sep + 2); }
+          else st->pkg_detail[eval[n_eval-1]][0] = 0;
           size_t l_ = strlen(why); if (l_ >= sizeof st->pkg_reason[0]) l_ = sizeof st->pkg_reason[0] - 1;
           memcpy((char*)st->pkg_reason[eval[n_eval-1]], why, l_); st->pkg_reason[eval[n_eval-1]][l_] = 0;
           snprintf(msg, mcap, "transaction failed"); return 0; } }
@@ -8359,12 +8367,12 @@ static int txsub_package_accept(const unsigned char* const* txs, const unsigned 
         int i = eval[k]; char r[128]; r[0] = 0; int relayed = 0;
         int rc = txsub_accept_and_relay(txsub_pool(), etx[k], elen[k], mux_out_fd, mux_n_out, r, sizeof r, &relayed);
         if (rc == 1){
-            st->pkg_result[i] = 2; st->pkg_reason[i][0] = 0; st->pkg_fee[i] = efee[k]; st->pkg_vsize[i] = evs[k];
+            st->pkg_result[i] = 2; st->pkg_reason[i][0] = 0; st->pkg_detail[i][0] = 0; st->pkg_fee[i] = efee[k]; st->pkg_vsize[i] = evs[k];
             walletnotify_tx(etx[k], (long)elen[k]);
             TXSUB_NOTE_REPLACED();
         } else {
             st->pkg_result[i] = 0;
-            snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "%s", r);
+            snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "%s", r); snprintf((char*)st->pkg_detail[i], sizeof st->pkg_detail[i], "%s", tx_accept_last_detail());
             committed = 0;
         }
     }
@@ -9545,6 +9553,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 if(--budget < 0 || txsub_now_ms() - t_enter > TXSUB_ROTATION_MS) break;   /* back to the main loop; next rotation continues */
                 txsub_last_seq = g_node_status->tx_submit_seq;
             int result; char reason[128]; reason[0]=0;
+            { extern void tx_accept_clear_detail(void); tx_accept_clear_detail(); }   /* no stale detail on a path that never validates */
             if(g_node_status->tx_submit_pkg_n > 0){
                 result = txsub_package(reason, sizeof reason);
             }
@@ -9631,6 +9640,11 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 }
             } else { result=-4; snprintf(reason,sizeof reason,"mempool init failed"); }
             snprintf((char*)g_node_status->tx_submit_reason, sizeof g_node_status->tx_submit_reason, "%s", reason);
+            /* Core's debug message beside the reason (2026-10-03): the RPC
+             * prints "reason, detail" where Core prints ToString() */
+            { extern const char* tx_accept_last_detail(void);
+              snprintf((char*)g_node_status->tx_submit_detail, sizeof g_node_status->tx_submit_detail, "%s",
+                       result == 1 ? "" : tx_accept_last_detail()); }
             g_node_status->tx_submit_result = result;
             __sync_synchronize();
             g_node_status->tx_submit_ack = txsub_last_seq;

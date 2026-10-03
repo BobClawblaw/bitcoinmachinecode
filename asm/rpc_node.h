@@ -519,6 +519,15 @@ typedef struct {
      * RPC prefers it (pkg_msg, above, is 128 bytes and unused by the
      * package path). Appended: every offset above is unchanged. */
     char                      pkg_msg_full[320];
+    /* Core's debug message for the refusal in tx_submit_reason (2026-10-03):
+     * TxValidationState::ToString() is "reason, debug", and that is what
+     * sendrawtransaction's error, testmempoolaccept's reject-details and
+     * submitpackage's per-tx error print. Empty when Core has none (or on
+     * success). The reason stays bare: classifiers compare it. Appended:
+     * every offset above is unchanged. */
+    char                      tx_submit_detail[512];
+    /* the same for each package member, beside pkg_reason (2026-10-03) */
+    char                      pkg_detail[RPC_PKG_MAX][512];
 } node_status_t;
 #define NODE_TIP_UNTRACKED (-2LL)
 
