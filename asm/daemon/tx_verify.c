@@ -1105,6 +1105,30 @@ int tx_verify_mempool(const u8* tx, u64 txlen, long next_height,
 }
 #undef TXV_SHAPE_FAIL
 
+/* The inputs stage alone (2026-10-03): resolve every prevout and check
+ * coinbase maturity, no scripts -- Core's CheckTxInputs position, which
+ * comes BEFORE the fee/RBF/TRUC policy, which comes before the scripts. The
+ * RPC admission paths run this, then the policy test, then the full verify,
+ * so a tx failing more than one stage is named by the stage Core names. Same
+ * reasons as txv_connect_body's pass 1. 1 ok / 0 refused. */
+int tx_verify_mempool_inputs(const u8* tx, u64 txlen, long next_height,
+                             txv_resolve_fn rf, void* rctx, const char** reason){
+    u64 nin;
+    t_txv_fail_serr = 0; t_txv_fail_input = -1;
+    if (!txv_parse(tx, txlen, &nin, reason)) return 0;
+    for (u64 i = 0; i < nin; i++){
+        u32 index; memcpy(&index, g_txv_in[i].outpoint+32, 4);
+        u64 value=0, uheight=0, ucb=0; const u8* spk=0; unsigned long spklen=0;
+        if (!rf(rctx, g_txv_in[i].outpoint, index, &value, &uheight, &ucb, &spk, &spklen))
+            { *reason = "input references a missing/already-spent UTXO"; return 0; }
+        if (ucb){
+            long conf = next_height - (long)uheight;
+            if (conf < COINBASE_MATURITY){ g_txv_immature_depth = conf; *reason = "immature coinbase spend (100-block rule)"; return 0; }
+        }
+    }
+    return 1;
+}
+
 /* The ScriptError of the first failing input of the last txv_connect_body
  * call on this thread, with that input's index and prevout (2026-10-03).
  * 0 when the refusal was not a script failure. */

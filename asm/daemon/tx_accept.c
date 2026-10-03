@@ -1146,6 +1146,31 @@ long tx_accept_validate_p2p(void* mp_area, const u8 txid[32], const u8* tx,
  * -25 missing inputs, -26 policy/consensus reject, -27 already known. The
  * reason string is copied into `reason` (best-effort; empty on accept). Shares
  * the same g_pol/g_pol_state/g_ready state as tx_accept_validate. */
+/* Core's stage order for the RPC admission paths (2026-10-03): PreChecks
+ * (inputs: missing, coinbase maturity -- then fees, belowout, RBF, TRUC) run
+ * BEFORE the script checks, so a transaction failing more than one stage is
+ * refused for the earlier one. These paths verified scripts first: a
+ * script-invalid zero-fee transaction answered with its script failure
+ * where Core says "min relay fee not met". The inputs stage here, the
+ * policy test after it; the caller verifies scripts last. Returns 0 to
+ * continue, or the RPC code with reason (and g_txacc_detail) set. The p2p
+ * paths keep scripts first: one policy pass per relayed transaction. */
+static long txacc_rpc_inputs(void* mp_area, const u8* tx, unsigned long txlen, char* reason, unsigned long rcap){
+    extern int tx_verify_mempool_inputs(const u8*, u64, long, txv_resolve_fn, void*, const char**);
+    long nh = g_next_height > 0 ? g_next_height : (1L << 30);
+    const char* r = 0;
+    if (tx_verify_mempool_inputs(tx, (u64)txlen, nh, (txv_resolve_fn)txacc_resolve_verify, mp_area, &r) == 1) return 0;
+    if (r && !strcmp(r, "input references a missing/already-spent UTXO")){
+        if (reason && rcap){ snprintf(reason, rcap, "bad-txns-inputs-missingorspent"); }
+        return -25; }
+    if (r && !strcmp(r, "immature coinbase spend (100-block rule)")){
+        snprintf(g_txacc_detail, sizeof g_txacc_detail, "tried to spend coinbase at depth %ld", g_txv_immature_depth);
+        if (reason && rcap){ snprintf(reason, rcap, "bad-txns-premature-spend-of-coinbase"); }
+        return -26; }
+    if (reason && rcap) snprintf(reason, rcap, "%s", r ? r : "TX decode failed");
+    return -26;
+}
+
 long tx_accept_validate_reason(void* mp_area, const u8 txid[32], const u8* tx,
                                unsigned long txlen, char* reason, unsigned long rcap){
     if (reason && rcap) reason[0] = 0;
@@ -1154,6 +1179,22 @@ long tx_accept_validate_reason(void* mp_area, const u8 txid[32], const u8* tx,
     void* placeholder_utxo = (void*)1;
     { const char* pre = txacc_prechecks(mp_area, tx, txlen);
       if (pre){ if (reason && rcap) snprintf(reason, rcap, "%s", pre); return -26; } }
+    /* Core's order (2026-10-03): inputs, then the policy (as a test, the
+     * commit stays after the scripts), then the scripts */
+    { long ri = txacc_rpc_inputs(mp_area, tx, txlen, reason, rcap); if (ri) return ri; }
+    { extern long mpool_policy_test(void*, void*, void*, const unsigned char*, unsigned long,
+                                    const unsigned char*, void*, unsigned long long*, unsigned long long*);
+      mp_lock_at(__func__);
+      long pt = mpool_policy_test(g_pol, g_pol_state, mp_area, tx, txlen, txid, placeholder_utxo, NULL, NULL);
+      if (pt != 1) snprintf(g_txacc_detail, sizeof g_txacc_detail, "%s", mpool_policy_detail(g_pol));
+      mp_unlock();
+      if (pt != 1){
+          const char* r = mpool_policy_reason(g_pol);
+          if (reason && rcap) snprintf(reason, rcap, "%s", r ? r : "policy rejected");
+          if (r && strstr(r, "already")) return -27;
+          if (r && (strstr(r, "missing") || strstr(r, "inputs-spent"))) return -25;
+          return -26;
+      } }
     {
         const char* r = 0;
         if (!txacc_script_verify(mp_area, tx, txlen, &r)){
@@ -1225,14 +1266,8 @@ long tx_accept_test_reason(void* mp_area, const u8 txid[32], const u8* tx,
     void* placeholder_utxo = (void*)1;
     { const char* pre = txacc_prechecks(mp_area, tx, txlen);
       if (pre){ if (reason && rcap) snprintf(reason, rcap, "%s", pre); return -26; } }
-    {
-        const char* r = 0;
-        if (!txacc_script_verify(mp_area, tx, txlen, &r)){
-            if (reason && rcap) snprintf(reason, rcap, "%s", r ? r : "mandatory-script-verify-flag-failed");
-            if (r && (strstr(r, "missing") || strstr(r, "inputs-spent"))) return -25;
-            return -26;
-        }
-    }
+    /* Core's order (2026-10-03): inputs, policy, then scripts */
+    { long ri = txacc_rpc_inputs(mp_area, tx, txlen, reason, rcap); if (ri) return ri; }
     mp_lock_at(__func__);
     long pt = mpool_policy_test(g_pol, g_pol_state, mp_area, tx, txlen, txid,
                                 placeholder_utxo, fee_out, vsize_out);
@@ -1244,6 +1279,14 @@ long tx_accept_test_reason(void* mp_area, const u8 txid[32], const u8* tx,
         if (r && strstr(r, "already")) return -27;
         if (r && (strstr(r, "missing") || strstr(r, "inputs-spent"))) return -25;
         return -26;
+    }
+    {
+        const char* r = 0;
+        if (!txacc_script_verify(mp_area, tx, txlen, &r)){
+            if (reason && rcap) snprintf(reason, rcap, "%s", r ? r : "mandatory-script-verify-flag-failed");
+            if (r && (strstr(r, "missing") || strstr(r, "inputs-spent"))) return -25;
+            return -26;
+        }
     }
     return 1;
 }
