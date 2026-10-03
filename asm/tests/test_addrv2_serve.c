@@ -45,6 +45,7 @@ extern int  idx_put(void* idx, const unsigned char hash[32], long height);
 extern long p2p_write(int, const char*, unsigned, const void*, unsigned);
 extern int  p2p_read(int, char[12], void*, unsigned, unsigned*);
 extern long g_peer_wants_addrv2;
+extern long g_peer_wtxidrelay;
 #include "../daemon/addrbook.h"
 
 static int failures=0;
@@ -152,7 +153,8 @@ static void fake_peer(int c, unsigned proto, int send_v2){
     if (p2p_read(c, cmd, rb, sizeof rb, &plen) <= 0) _exit(0x40);   /* our version */
     unsigned char v[160]; long n = node_make_version(v); memcpy(v, &proto, 4);
     p2p_write(c, "version", 7, v, (unsigned)n);
-    if (send_v2) p2p_write(c, "sendaddrv2", 10, "", 0);
+    if (send_v2 & 2) p2p_write(c, "wtxidrelay", 10, "", 0);   /* BIP339, before verack */
+    if (send_v2 & 1) p2p_write(c, "sendaddrv2", 10, "", 0);
     p2p_write(c, "verack", 6, "", 0);
     for (int i = 0; i < 8; i++){
         if (p2p_read(c, cmd, rb, sizeof rb, &plen) <= 0) break;
@@ -163,13 +165,14 @@ static void fake_peer(int c, unsigned proto, int send_v2){
     }
     _exit(seen);
 }
+static long g_wtx_seen;                 /* g_peer_wtxidrelay after the last outbound_case */
 static int outbound_case(unsigned proto, int peer_sends_v2, long* wants){
     pid_t pid = fork();
     if (pid == 0){ int c = accept(g_ls, 0, 0); fake_peer(c, proto, peer_sends_v2); }
     int fd = tcp_connect_ip(htonl(INADDR_LOOPBACK), g_srv.sin_port);
     struct timeval tv; tv.tv_sec = 8; tv.tv_usec = 0; setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     long hk = node_handshake(fd);
-    *wants = g_peer_wants_addrv2;
+    *wants = g_peer_wants_addrv2; g_wtx_seen = g_peer_wtxidrelay;
     close(fd);
     int st = 0; waitpid(pid, &st, 0);
     return hk == 1 ? (WIFEXITED(st) ? WEXITSTATUS(st) : 0x80) : 0x100;
@@ -189,10 +192,10 @@ int main(void){
     book3();
     pid_t s1 = spawn_server();
     int fdA = raw_client(70016, 0, &off, &wt);
-    /* 2026-10-01: NOT offered. With BIP339 negotiated, Core drops our MSG_TX
-     * announcements (we announce by txid), so none of our transactions
-     * reached a Core peer; see node_handshake's note */
-    ck("wtxidrelay NOT offered (our txid announcements must be honoured)", wt == 0);
+    /* 2026-10-03: offered again. From 10-01 it was withheld because we
+     * announced by txid and Core drops MSG_TX invs from a wtxid peer; the
+     * announcers now speak MSG_WTX to a peer that negotiated it */
+    ck("wtxidrelay offered before verack (BIP339)", wt == 1 && g_saw_verack == 1);
     ck("sendaddrv2 offered before verack (BIP155)", off == 1 && g_saw_verack == 1);
 
     printf("\n== 2. peer WITHOUT sendaddrv2: legacy addr, byte-equal to Core's msg_addr ==\n");
@@ -254,17 +257,21 @@ int main(void){
 
     printf("\n== 6. outbound role (node_handshake) ==\n");
     long wants = -1;
-    int seen = outbound_case(70016, 1, &wants);
+    int seen = outbound_case(70016, 1|2, &wants);
     ck("outbound handshake completed", seen < 0x100);
-    ck("we did NOT send wtxidrelay (2026-10-01: Core would drop our MSG_TX invs)", (seen & 1) == 0);
+    ck("we sent wtxidrelay before our verack (BIP339, 70016 peer)", (seen & 1) == 1);
     ck("we sent sendaddrv2 before our verack (70016 peer)", (seen & 2) == 2);
     cki("peer's sendaddrv2 recorded in g_peer_wants_addrv2", wants, 1);
+    cki("peer's wtxidrelay recorded in g_peer_wtxidrelay (negotiated)", g_wtx_seen, 1);
     seen = outbound_case(70015, 0, &wants);
     ck("outbound handshake completed (70015 peer)", seen < 0x100);
     ck("no sendaddrv2 sent to a 70015 peer", (seen & 2) == 0);
+    ck("no wtxidrelay sent to a 70015 peer (WTXID_RELAY_VERSION)", (seen & 1) == 0);
     cki("g_peer_wants_addrv2 reset to 0 for a peer that did not ask", wants, 0);
+    cki("g_peer_wtxidrelay reset to 0 for a peer that did not send it", g_wtx_seen, 0);
     seen = outbound_case(70016, 0, &wants);
     ck("70016 peer that stays silent: offered, not recorded", (seen & 2) == 2 && wants == 0);
+    ck("...and wtxidrelay offered but not negotiated", (seen & 1) == 1 && g_wtx_seen == 0);
 
     printf("\n== 7. sendaddrv2 / wtxidrelay AFTER verack: disconnect, as Core does ==\n");
     book3();

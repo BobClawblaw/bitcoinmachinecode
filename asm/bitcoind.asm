@@ -161,6 +161,7 @@ node_handshake:
                            ; RSP alignment at the calls (0x28+0x338 = 0x360).
     mov  r12, rdi           ; fd
     mov  qword [rel g_peer_wants_addrv2], 0   ; per-handshake: the peer has not asked yet
+    mov  qword [rel g_peer_wtxidrelay], 0     ; BIP339: nor sent wtxidrelay
     ; build version payload
     lea  rdi, [rbp-0x538]
     call node_make_version
@@ -174,13 +175,10 @@ node_handshake:
     call p2p_write
     cmp  rax, 24
     jl   .fail
-    ; BIP339 wtxidrelay is NOT sent (2026-10-01). Sending it negotiated
-    ; wtxid relay with every modern peer, and Core then drops MSG_TX
-    ; announcements from that peer (net_processing: "Ignore INVs that don't
-    ; match wtxidrelay setting") -- yet we announce our transactions by txid
-    ; (tx_relay.c, txann.c), so none of them reached a Core peer. Without it,
-    ; peers announce to us by txid too (MSG_TX), which the relay drain handles.
-    ; Announcing by wtxid is the parity follow-up (FEATURE_GAPS).
+    ; BIP339 wtxidrelay: sent with sendaddrv2 once the peer's version is in
+    ; (below). From 2026-10-01 to 10-03 it was withheld, because we announced
+    ; by txid and Core drops MSG_TX invs from a wtxid peer; the announcers
+    ; now speak MSG_WTX to a peer that negotiated it.
 .read:
     ; p2p_read(fd, cmd[12], payload, cap, &plen)
     mov  rdi, r12
@@ -219,6 +217,15 @@ node_handshake:
     mov  eax, dword [rbp-0x2e0]   ; peer protocol version = payload[0..3]
     cmp  eax, 70016
     jb   .read
+    ; BIP339 wtxidrelay first, as Core orders them (2026-10-03): with it
+    ; negotiated the relay announces to this peer by wtxid (MSG_WTX) --
+    ; tx_relay.c / txann.c. Same >= 70016 gate (WTXID_RELAY_VERSION).
+    mov  rdi, r12
+    lea  rsi, [rel _wtxidrelay]
+    mov  rdx, 10
+    xor  ecx, ecx
+    xor  r8d, r8d
+    call p2p_write
     mov  rdi, r12
     lea  rsi, [rel _sendaddrv2]
     mov  rdx, 10
@@ -244,6 +251,16 @@ node_handshake:
     mov  qword [rel g_peer_wants_addrv2], 1
     jmp  .read
 .nh_not_sendaddrv2:
+    ; --- is it "wtxidrelay"? BIP339 negotiated when the peer sends it
+    ; before verack (we sent ours above). Snapshotted per leg like addrv2. ---
+    lea  rdi, [rbp-0xe0]
+    lea  rsi, [rel _wtxidrelay]
+    mov  ecx, 11            ; with the NUL: names compare the terminator
+    repe cmpsb
+    jne  .nh_not_wtxidrelay
+    mov  qword [rel g_peer_wtxidrelay], 1
+    jmp  .read
+.nh_not_wtxidrelay:
     ; --- is it "ping"? ---
     lea  rdi, [rbp-0xe0]
     lea  rsi, [rel _ping]
@@ -335,6 +352,7 @@ node_accept_handshake:
                            ;   is what leaves room for this.)
     mov  r12, rdi          ; fd (callee-saved)
     mov  qword [rel g_peer_wants_addrv2], 0   ; per-handshake reset (see node_handshake)
+    mov  qword [rel g_peer_wtxidrelay], 0     ; likewise (BIP339)
 .read_peer_version:
     ; wait for the peer's `version`
 .loop:
@@ -402,14 +420,18 @@ node_accept_handshake:
     call p2p_write
     cmp  rax, 24
     jl   .fail
-    ; BIP339 wtxidrelay is NOT sent (2026-10-01): see node_handshake -- with
-    ; it negotiated, Core ignores our MSG_TX announcements to this peer.
-    ; BIP155 sendaddrv2 -- also before verack, gated on the peer's version
-    ; exactly as in node_handshake (the peer's version is already in hand
-    ; here, at [rbp-0x300])
+    ; BIP339 wtxidrelay then BIP155 sendaddrv2 -- both before verack, gated
+    ; on the peer's version exactly as in node_handshake (the peer's version
+    ; is already in hand here, at [rbp-0x300])
     mov  eax, dword [rbp-0x300]
     cmp  eax, 70016
     jb   .av2_skip
+    mov  rdi, r12
+    lea  rsi, [rel _wtxidrelay]
+    mov  rdx, 10
+    xor  ecx, ecx
+    xor  r8d, r8d
+    call p2p_write
     mov  rdi, r12
     lea  rsi, [rel _sendaddrv2]
     mov  rdx, 10
@@ -449,6 +471,15 @@ node_accept_handshake:
     mov  qword [rel g_peer_wants_addrv2], 1
     jmp  .read_peer_verack
 .ah_not_sendaddrv2:
+    ; "wtxidrelay"? BIP339 negotiated (ours went out before our verack)
+    lea  rdi, [rbp-0x48]
+    lea  rsi, [rel _wtxidrelay]
+    mov  ecx, 11            ; with the NUL: names compare the terminator
+    repe cmpsb
+    jne  .ah_not_wtxidrelay
+    mov  qword [rel g_peer_wtxidrelay], 1
+    jmp  .read_peer_verack
+.ah_not_wtxidrelay:
     ; ping? echo pong
     lea  rdi, [rbp-0x48]
     lea  rsi, [rel _ping]
@@ -2354,6 +2385,8 @@ g_peer_version_len:     dq 0
 ; as the version snapshot above.
 global g_peer_wants_addrv2
 g_peer_wants_addrv2:    dq 0
+global g_peer_wtxidrelay
+g_peer_wtxidrelay:      dq 0      ; BIP339: the peer sent wtxidrelay before verack (per handshake)
 global g_peer_sendcmpct
 g_peer_sendcmpct:       dq 0      ; CC-2: this leg's peer sent sendcmpct (main.c snapshots per leg)
 global g_sync_mp

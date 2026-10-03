@@ -160,6 +160,8 @@ extern unsigned char g_peer_version_payload[512]; /* bitcoind.asm: raw capture, 
 extern long g_peer_version_len;
 extern long node_accept_handshake(int fd);
 extern long g_peer_wants_addrv2;   /* bitcoind.asm: peer sent sendaddrv2 before verack (per handshake) */
+extern long g_peer_wtxidrelay;     /* bitcoind.asm: peer sent wtxidrelay before verack -- BIP339 negotiated (2026-10-03) */
+extern void txrelay_fd_set_wtxid(int fd, int on);   /* tx_relay.c: announce to / serve this leg by wtxid */
 
 /* NODE_WITNESS (service bit 0x8) gate, checked right after every OUTBOUND
  * handshake that can lead to fetching blocks or transactions. A peer without
@@ -3967,7 +3969,7 @@ static long long g_dh_timeout_ms = 120000;
 /* g_in_dial_helper is declared with the leg tables above */
 /* NET-13: vpayload MUST match g_peer_version_payload -- a smaller field here
  * silently truncates the capture across the dial-helper socketpair. */
-typedef struct { int ok; unsigned char wants_addrv2; long vlen; unsigned char vpayload[512]; char why[128];
+typedef struct { int ok; unsigned char wants_addrv2; unsigned char wtxidrelay; long vlen; unsigned char vpayload[512]; char why[128];
                  unsigned long v2_len;      /* 2026-09-10: bytes of exported v2 session that follow the struct on the socketpair (0: v1) */
                } dh_result_t;
 #define DH_V2_BLOB_CAP (8u << 20)    /* 2026-09-10 (ab): 64 KB refused a headers reply in flight and closed the leg; a block in flight fits now */
@@ -4085,7 +4087,7 @@ static int dh_start_slot(const char* host, int out_port, int want_slot){
         int fd = outbound_connect(host, 300, out_port);
         static unsigned char blob[DH_V2_BLOB_CAP];
         if(fd >= 0){
-            r.ok = 1; r.wants_addrv2 = (unsigned char)g_peer_wants_addrv2;
+            r.ok = 1; r.wants_addrv2 = (unsigned char)g_peer_wants_addrv2; r.wtxidrelay = (unsigned char)g_peer_wtxidrelay;
             r.vlen = g_peer_version_len > 0 && g_peer_version_len <= 256 ? g_peer_version_len : 0;
             if(r.vlen) memcpy(r.vpayload, g_peer_version_payload, (size_t)r.vlen);
             /* the v2 session, if any, follows the struct: the parent imports it
@@ -4338,6 +4340,8 @@ static int dh_install_leg(const char* host, int fd, const dh_result_t* r){
     }
     g_peer_version_len = r->vlen; if(r->vlen) memcpy(g_peer_version_payload, r->vpayload, (size_t)r->vlen);
     g_peer_wants_addrv2 = r->wants_addrv2;
+    g_peer_wtxidrelay = r->wtxidrelay;
+    txrelay_fd_set_wtxid(fd, r->wtxidrelay);   /* BIP339, negotiated in the helper's handshake */
     int s = g_dh_last_slot; g_dh_last_slot = -1;
     if(s >= 0 && s < mux_n_out && mux_out_fd[s] < 0){                       /* a re-dial: the leg it was for is still down */
         snprintf(mux_out_host[s], sizeof mux_out_host[s], "%s", host);
@@ -4345,7 +4349,7 @@ static int dh_install_leg(const char* host, int fd, const dh_result_t* r){
         mux_out_kind[s] = host_is_block_only(host) ? LEG_BLOCK_ONLY : LEG_FULL; mux_out_cmpct[s] = 0;
         mux_out_wants_v2[s] = r->wants_addrv2;
         anchor_locator(mux_out_loc[s]); mux_out_nextretry[s] = 0;
-        fprintf(stderr,"[mux:%d] leg replaced: connected next pool peer %s (fd %d) addrv2=%d [background dial]\n", s, host, fd, (int)r->wants_addrv2);
+        fprintf(stderr,"[mux:%d] leg replaced: connected next pool peer %s (fd %d) addrv2=%d wtxid=%d [background dial]\n", s, host, fd, (int)r->wants_addrv2, (int)r->wtxidrelay);
         rpc_fill_peer_slot(s, host);
         rpc_note_peer_socket(s, fd);
         return 1;
@@ -4359,7 +4363,7 @@ static int dh_install_leg(const char* host, int fd, const dh_result_t* r){
     anchor_locator(mux_out_loc[mux_n_out]);
     mux_out_nextretry[mux_n_out] = 0;
     { char pv[256]; format_peer_version_info(pv, sizeof pv);
-      fprintf(stderr, "[dl] filled outbound %d = %s (fd %d) %s addrv2=%d [background dial]\n", mux_n_out, host, fd, pv, (int)r->wants_addrv2); }
+      fprintf(stderr, "[dl] filled outbound %d = %s (fd %d) %s addrv2=%d wtxid=%d [background dial]\n", mux_n_out, host, fd, pv, (int)r->wants_addrv2, (int)r->wtxidrelay); }
     rpc_fill_peer_slot(mux_n_out, host);
     rpc_note_peer_socket(mux_n_out, fd);
     mux_n_out++;
@@ -9310,11 +9314,12 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             strncpy(mux_out_host[mux_n_out], srcpool[i], 127);
             mux_out_fd[mux_n_out]=cfd[i]; leg_note_installed(mux_n_out); mux_out_kind[mux_n_out] = host_is_block_only(srcpool[i]) ? LEG_BLOCK_ONLY : LEG_FULL;   /* CC-4 */ mux_out_cmpct[mux_n_out] = 0;
             mux_out_wants_v2[mux_n_out]=(unsigned char)g_peer_wants_addrv2;
+            txrelay_fd_set_wtxid(cfd[i], (int)g_peer_wtxidrelay);   /* BIP339 (2026-10-03) */
             mux_out_peer[mux_n_out]=i;
             anchor_locator(mux_out_loc[mux_n_out]);
             mux_out_nextretry[mux_n_out]=0;
             { char pv[256]; format_peer_version_info(pv, sizeof pv);
-              fprintf(stderr,"[dl] outbound %d = %s (fd %d) %s addrv2=%d\n", mux_n_out, srcpool[i], cfd[i], pv, (int)mux_out_wants_v2[mux_n_out]); }
+              fprintf(stderr,"[dl] outbound %d = %s (fd %d) %s addrv2=%d wtxid=%d\n", mux_n_out, srcpool[i], cfd[i], pv, (int)mux_out_wants_v2[mux_n_out], (int)g_peer_wtxidrelay); }
             rpc_fill_peer_slot(mux_n_out, srcpool[i]);   /* publish peer to getpeerinfo */
             rpc_note_peer_socket(mux_n_out, cfd[i]);
             mux_n_out++;
@@ -10561,11 +10566,12 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     strncpy(mux_out_host[mux_n_out], host, 127);
                     mux_out_fd[mux_n_out] = nfd; txrelay_leg_reset(nfd); leg_note_installed(mux_n_out); mux_out_kind[mux_n_out] = host_is_block_only(host) ? LEG_BLOCK_ONLY : LEG_FULL;
                     mux_out_wants_v2[mux_n_out] = (unsigned char)g_peer_wants_addrv2;
+                    txrelay_fd_set_wtxid(nfd, (int)g_peer_wtxidrelay);   /* BIP339 (2026-10-03) */
                     mux_out_peer[mux_n_out] = 0;
                     anchor_locator(mux_out_loc[mux_n_out]);
                     mux_out_nextretry[mux_n_out] = 0;
                     { char pv[256]; format_peer_version_info(pv, sizeof pv);
-                      fprintf(stderr,"[dl] filled outbound %d = %s (fd %d) %s addrv2=%d [manual: addnode]\n", mux_n_out, host, nfd, pv, (int)mux_out_wants_v2[mux_n_out]); }
+                      fprintf(stderr,"[dl] filled outbound %d = %s (fd %d) %s addrv2=%d wtxid=%d [manual: addnode]\n", mux_n_out, host, nfd, pv, (int)mux_out_wants_v2[mux_n_out], (int)g_peer_wtxidrelay); }
                     rpc_fill_peer_slot(mux_n_out, host);
                     rpc_note_peer_socket(mux_n_out, nfd);
                     mux_n_out++;
@@ -11323,9 +11329,10 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
          * sync-fail streak and ping clock were whatever the slot held before. */
         mux_out_fd[mux_n_out]=fd; txrelay_leg_reset(fd); leg_note_installed(mux_n_out); mux_out_kind[mux_n_out] = host_is_block_only(peers[i]) ? LEG_BLOCK_ONLY : LEG_FULL;   /* CC-4 */ mux_out_cmpct[mux_n_out] = 0;
         mux_out_wants_v2[mux_n_out]=(unsigned char)g_peer_wants_addrv2;
+        txrelay_fd_set_wtxid(fd, (int)g_peer_wtxidrelay);   /* BIP339 (2026-10-03) */
         mux_out_peer[mux_n_out]=i;
         anchor_locator(mux_out_loc[mux_n_out]);
-        fprintf(stderr,"[mux] outbound %d = %s (fd %d) addrv2=%d\n", mux_n_out, peers[i], fd, (int)mux_out_wants_v2[mux_n_out]);
+        fprintf(stderr,"[mux] outbound %d = %s (fd %d) addrv2=%d wtxid=%d\n", mux_n_out, peers[i], fd, (int)mux_out_wants_v2[mux_n_out], (int)g_peer_wtxidrelay);
         mux_n_out++;
     }
     fprintf(stderr, "serving on port %d (%d outbound peer(s))...\n", port, mux_n_out);

@@ -16,10 +16,12 @@
  * STRIPPED serialization -- the exact bug shape that silently stripped the
  * whole segwit-era block archive (incident #10) -- and a stripped segwit
  * transaction fails signature validation, so every segwit tx would be
- * fetched, rejected, and re-fetched forever. Peers announce with type 1
- * (we do not negotiate BIP339 wtxidrelay, so announcements are txid-based);
- * the REQUEST flags the witness bit, exactly as the block fetch asks for
- * MSG_WITNESS_BLOCK.
+ * fetched, rejected, and re-fetched forever. Peers that did not negotiate
+ * BIP339 announce with type 1, and the REQUEST flags the witness bit, exactly
+ * as the block fetch asks for MSG_WITNESS_BLOCK; a peer that negotiated
+ * wtxidrelay announces MSG_WTX and is asked with MSG_WTX (2026-10-03: we send
+ * wtxidrelay again, and announce to such a peer by wtxid -- txrelay_announce,
+ * txann.c's map -- because Core drops MSG_TX invs from it).
  *
  * WHAT THIS DOES NOT DO, deliberately, stated rather than implied:
  *   - block-type inv entries are ignored here exactly as the sync drains
@@ -517,6 +519,18 @@ static void txr_ann_add(const u8 txid[32], int src_fd){
     txr_ann_n++;
 }
 
+/* BIP339 (2026-10-03): did the peer on this fd negotiate wtxidrelay? Set by
+ * main.c at every leg install from the handshake's g_peer_wtxidrelay (and the
+ * dial helper's copy of it). A wtxid peer is announced to by MSG_WTX -- Core
+ * drops our MSG_TX invs from it -- and its getdata(MSG_WTX) is served through
+ * txann's wtxid map (txann.c, the same map the inbound children use). */
+#define TXR_WTX_FDS 65536
+static unsigned char txr_fd_wtxid[TXR_WTX_FDS];
+void txrelay_fd_set_wtxid(int fd, int on){ if (fd >= 0 && fd < TXR_WTX_FDS) txr_fd_wtxid[fd] = on ? 1 : 0; }
+int  txrelay_fd_wtxid(int fd){ return (fd >= 0 && fd < TXR_WTX_FDS) ? txr_fd_wtxid[fd] : 0; }
+extern int txann_wtxid_of(const u8 txid[32], u8 wtxid_out[32]) __attribute__((weak));
+extern int txann_txid_for_wtxid(const u8 wtxid[32], u8 txid_out[32]) __attribute__((weak));
+
 /* A transaction WE originated: no source leg to hold back from, so it is
  * announced on every one. Called by daemon/tx_submit.c, which reaches it
  * through a weak stub so the socketpair unit test links without this TU. */
@@ -611,10 +625,16 @@ long txrelay_announce(const int* fds, int nfds){
         if (sl < 0 || !txr_leg_pend_n[sl]) continue;
         if (now < txr_leg_next[sl]) continue;             /* this leg's turn has not come */
         unsigned n = 0;
+        int wtx = txrelay_fd_wtxid(fds[f]);
         for (int i = 0; i < txr_leg_pend_n[sl]; i++){
             u8* e = inv + 1 + n*36;
-            e[0] = 1; e[1] = 0; e[2] = 0; e[3] = 0;       /* MSG_TX */
-            memcpy(e + 4, txr_leg_pend[sl][i], 32);
+            if (wtx){                                     /* BIP339: MSG_WTX by wtxid */
+                if (!txann_wtxid_of || !txann_wtxid_of(txr_leg_pend[sl][i], e + 4)) continue;   /* left the pool */
+                e[0] = 5; e[1] = 0; e[2] = 0; e[3] = 0;
+            } else {
+                e[0] = 1; e[1] = 0; e[2] = 0; e[3] = 0;   /* MSG_TX */
+                memcpy(e + 4, txr_leg_pend[sl][i], 32);
+            }
             n++;
         }
         if (n){ inv[0] = (u8)n; p2p_write(fds[f], "inv", 3, inv, 1 + n*36); }
@@ -1595,9 +1615,13 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
                 if (e + 36 > pl + plen) break;
                 unsigned type = (unsigned)e[0] | (unsigned)e[1]<<8 |
                                 (unsigned)e[2]<<16 | (unsigned)e[3]<<24;
-                if (type != TXR_MSG_TX && type != TXR_MSG_WITNESS_TX) continue;
+                if (type != TXR_MSG_TX && type != TXR_MSG_WITNESS_TX && type != TXR_MSG_WTX) continue;
                 unsigned long got_len = 0;
-                const u8* bytes = mpool_get(mp, e + 4, &got_len);
+                const u8* bytes = 0;
+                if (type == TXR_MSG_WTX){                 /* BIP339: the wtxid we announced -> txid -> pool */
+                    u8 tid[32];
+                    if (txann_txid_for_wtxid && txann_txid_for_wtxid(e + 4, tid)) bytes = mpool_get(mp, tid, &got_len);
+                } else bytes = mpool_get(mp, e + 4, &got_len);
                 if (bytes && got_len){
                     /* MEM-24 (audit 2026-09-03): a bare MSG_TX (witness bit
                      * CLEAR) asks for the NON-WITNESS serialization. Core
