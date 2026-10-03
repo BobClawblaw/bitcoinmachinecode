@@ -134,13 +134,13 @@ H=$(sign "$(cw createrawtransaction "[{\"txid\":\"$UT\",\"vout\":$UV}]" "[{\"$DE
 compare "ephemeral dust with a fee" "$H"
 
 # a signature byte flipped: still well-formed, now wrong. $1 = address type
-badsig(){ local at=$1 a txid vout amt raw hex sig bad
+badsig(){ local at=$1 outamt=${2:-1.4999} a txid vout amt raw hex sig bad
   a=$(cw getnewaddress "" "$at"); txid=$(cw sendtoaddress "$a" 1.5); cw generatetoaddress 1 "$ADDR" >/dev/null
   for i in $(seq 60); do [ "$(bmc getblockcount | js 'print(d["result"])')" = "$(core getblockcount)" ] && break; sleep 1; done
   vout=$(core getrawtransaction "$txid" true "$(cw gettransaction "$txid" | js 'print(d["blockhash"])')" | js "
 for o in d['vout']:
     if o['scriptPubKey'].get('address')=='$a': print(o['n'])")
-  raw=$(cw createrawtransaction "[{\"txid\":\"$txid\",\"vout\":$vout}]" "{\"$(cw getnewaddress)\":1.4999}")
+  raw=$(cw createrawtransaction "[{\"txid\":\"$txid\",\"vout\":$vout}]" "{\"$(cw getnewaddress)\":$outamt}")
   hex=$(sign "$raw")
   echo "$hex" | python3 -c "
 import sys,json,subprocess
@@ -158,6 +158,14 @@ echo "== 9. script failures: a wrong signature, three ways"
 H=$(badsig bech32);  compare "P2WPKH wrong signature" "$H"
 H=$(badsig legacy);  compare "P2PKH wrong signature" "$H"
 H=$(badsig bech32m); compare "P2TR keypath wrong signature" "$H"
+
+echo "== 10. two failures at once: Core names the EARLIER stage"
+H=$(badsig bech32 1.5); compare "wrong signature AND zero fee (the fee floor comes before scripts)" "$H"
+CB2=$(cw generatetoaddress 1 "$ADDR" | js 'print(d[0])')
+for i in $(seq 60); do [ "$(bmc getblockcount | js 'print(d["result"])')" = "$(core getblockcount)" ] && break; sleep 1; done
+CBT2=$(core getblock "$CB2" 2 | js 'print(d["tx"][0]["txid"])'); CBA2=$(core getblock "$CB2" 2 | js 'print("%.8f" % d["tx"][0]["vout"][0]["value"])')
+H=$(sign "$(cw createrawtransaction "[{\"txid\":\"$CBT2\",\"vout\":0}]" "{\"$(cw getnewaddress)\":$CBA2}")")
+compare "premature coinbase spend AND zero fee (inputs come before fees)" "$H"
 
 echo "== 8. an undecodable transaction"
 c=$(core sendrawtransaction "00" 2>&1 | tail -1); b=$(bmc sendrawtransaction '["00"]' | js 'print(d["error"]["message"])')
