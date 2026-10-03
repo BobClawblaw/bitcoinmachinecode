@@ -121,6 +121,11 @@ static void mine_range(long from, long to){
     }
 }
 
+/* daemon/main.c's serve_reorg_check (2026-10-04) is not linked here: this
+ * stub reports a reorg when the test sets the flag, once */
+static int g_fake_reorg;
+long serve_reorg_check(void){ if (g_fake_reorg){ g_fake_reorg = 0; return 1; } return 0; }
+
 int main(void){
     tt_isolate();
     memset(store_buf,0,sizeof store_buf);
@@ -192,7 +197,15 @@ int main(void){
        * (the accept path refreshes it), the tip still old */
       mine_range(14, 15);
       memcpy(stale, store_buf, sizeof store_buf); *(int*)(stale+24) = 13;
-      ck("idx_len current, tip stale at 13: serve_public_tip reports 15", serve_public_tip(stale), 15); }
+      ck("idx_len current, tip stale at 13: serve_public_tip reports 15", serve_public_tip(stale), 15);
+      /* 2026-10-04: after a reorg the worker bumps a generation and the serve
+       * side may move its tip BACK, once (the stub below reports one reorg).
+       * Without the reorg, a handle above the archive's tip stays put. */
+      *(int*)(stale+24) = 20; g_fake_reorg = 0;
+      ck("no reorg: a handle above the archive's tip is never moved back (20)", serve_public_tip(stale), 20);
+      mine_range(16, 16); *(int*)(stale+24) = 20; g_fake_reorg = 1;
+      ck("a reorg reported: the tip moves back to the archive's (16)", serve_public_tip(stale), 16);
+      ck("...and only once (the generation is consumed)", g_fake_reorg, 0); }
 
     utxo_live_close();
     printf("\n%s (%d failures)\n", failures==0 ? "ALL TESTS PASSED" : "TESTS FAILED", failures);

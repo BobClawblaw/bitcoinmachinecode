@@ -528,6 +528,13 @@ typedef struct {
     char                      tx_submit_detail[512];
     /* the same for each package member, beside pkg_reason (2026-10-03) */
     char                      pkg_detail[RPC_PKG_MAX][512];
+    /* bumped by the download worker after a reorg rebuilt its hash index
+     * (2026-10-04): the serve process and its inbound children rebuild THEIR
+     * copies when it moves -- they only ever topped up forward, so after a
+     * reorg the losing branch's hashes kept their heights and the winning
+     * branch's blocks there were never servable until a restart. Appended:
+     * every offset above is unchanged. */
+    volatile unsigned long long reorg_gen;
 } node_status_t;
 #define NODE_TIP_UNTRACKED (-2LL)
 

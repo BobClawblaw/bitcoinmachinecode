@@ -571,6 +571,27 @@ long serve_idx_topup(void){
  * guess at this, it calls back through reorg_set_index_rebuild. Reuses the
  * already-allocated buffer instead of mallocing a new one each time (a reorg
  * can happen repeatedly over a process's lifetime). */
+/* the reorg generation this process's hash index reflects (node_status_t.reorg_gen) */
+static unsigned long long g_htidx_gen;
+/* The serve side's half of a reorg (2026-10-04): when the worker has rebuilt
+ * after one, rebuild this process's hash index from index.dat. Called by the
+ * serve parent at each accept (so children fork with a fresh copy) and by
+ * serve_store_follow in the children. 1 = rebuilt (the caller then lets the
+ * store tip move BACK, once), 0 = nothing to do. */
+long serve_reorg_check(void){
+    if (!g_node_status || !ht_idx) return 0;
+    unsigned long long g = g_node_status->reorg_gen;
+    if (g == g_htidx_gen) return 0;
+    g_htidx_gen = g;
+    idx_init(ht_idx, HT_SLOTS);
+    if (idx_build_from_file(ht_idx, "index.dat") < 0){
+        fprintf(stderr, "[hashidx] serve side: rebuild after a reorg FAILED; block-by-hash serving is degraded until restart\n");
+        return 1;
+    }
+    g_htidx_next = htidx_file_heights();
+    fprintf(stderr, "[hashidx] serve side: rebuilt after a reorg (generation %llu, %ld heights)\n", g, (long)idx_count(ht_idx));
+    return 1;
+}
 static void rebuild_hash_index_after_reorg(void){
     if(!ht_idx) return;
     idx_init(ht_idx, HT_SLOTS);
@@ -581,6 +602,8 @@ static void rebuild_hash_index_after_reorg(void){
         g_htidx_next = htidx_file_heights();
         fprintf(stderr,"[reorg] hash index rebuilt: %ld heights\n", (long)idx_count(ht_idx));
     }
+    /* tell the serve side (its own copies rebuild on the next check) */
+    if (g_node_status) g_htidx_gen = __sync_add_and_fetch(&g_node_status->reorg_gen, 1ULL);
     /* ---- STO-9 (audit 2026-09-03): rewind headers.dat too ----
      * Nothing here touched the header mirror, so after a reorg it kept the
      * LOSING branch's headers at fork+1..old_tip, and dl_header_mirror_topup
@@ -4341,6 +4364,23 @@ static int dh_install_leg(const char* host, int fd, const dh_result_t* r){
         g_dh_v2_len = 0;
     }
     g_peer_version_len = r->vlen; if(r->vlen) memcpy(g_peer_version_payload, r->vpayload, (size_t)r->vlen);
+    /* The two things outbound_connect_raw does with the peer's version that a
+     * helper child cannot keep (2026-10-04): the helper never writes the
+     * address book (a fork's copy would vanish), and its self-address vote
+     * died with it -- so every helper-dialed peer (every re-dial and top-up
+     * since 2026-09-10) kept services=1, which reads as "no v2" at the next
+     * dial, and only the boot fill could ever teach us our own address. */
+    { unsigned long long svc = 0;
+      if (r->vlen >= 12) memcpy(&svc, r->vpayload + 4, 8);
+      if (svc){
+          bmc_addr_t pa;
+          if (bmc_addr_from_string_port(&pa, host, (unsigned short)g_chainp->default_port)){
+              ab2_t* b = addr_book();
+              if (b) ab2_add(b, &pa, svc, (unsigned)time(NULL));
+          }
+      }
+      extern void addrself_note_peer_view(const unsigned char*, long);
+      addrself_note_peer_view(r->vpayload, r->vlen); }
     g_peer_wants_addrv2 = r->wants_addrv2;
     g_peer_wtxidrelay = r->wtxidrelay;
     txrelay_fd_set_wtxid(fd, r->wtxidrelay);   /* BIP339, negotiated in the helper's handshake */
@@ -11574,7 +11614,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                 }
                 close(c); c = -1;
             }
-            if(c>=0) serve_idx_topup();
+            if(c>=0){ serve_reorg_check(); serve_idx_topup(); }   /* a reorg first: children fork with a fresh index */
             if(c>=0 && upload_note_and_check(0)){
                 /* over -maxuploadtarget for this 24h window -- unless the
                  * peer has the `download` permission (Core: served regardless) */
@@ -11676,6 +11716,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                       if(n >= sizeof g_cur_peer_ip) n = sizeof g_cur_peer_ip - 1;
                       memcpy(g_cur_peer_ip, peerdesc, n); g_cur_peer_ip[n] = 0; }
                     g_serve_violation_hook = serve_violation_report;
+                    { extern long serve_public_tip(const void*); (void)serve_public_tip(store_buf); }   /* follow the archive first: our version must not say the boot height (2026-10-04) */
                     version_tell_the_truth();
                     int hok = node_accept_handshake(c);
                     if(hok==1) peer_inbound_deadline(c);      /* NET-3: handshake done -> the 20-minute idle bound */
@@ -11754,6 +11795,9 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
             }
             bool due=(rot % mux_n_out)==(long long)i;     /* periodic */
             if(ev & POLLIN) due=true;                     /* data */
+            /* data poll cannot see: a v2 message already decrypted (2026-10-04) */
+            { extern int bmc_v2_has_message(int) __attribute__((weak));
+              if(bmc_v2_has_message && bmc_v2_has_message(mux_out_fd[i])) due=true; }
             /* Bounded: each leg's node_sync must not starve inbound accepts.
              * do_outbound_sync_bounded caps the wall-clock and re-dials the
              * leg if it exceeds the budget, so the loop always returns to

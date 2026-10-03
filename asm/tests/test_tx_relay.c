@@ -83,6 +83,25 @@ extern void txrelay_fd_set_wtxid(int fd, int on);
 extern void txrelay_announce_own(const u8 txid[32]);
 extern void txann_test_set_pool(void* mp);
 extern void sha256d(unsigned char out[32], const void* msg, long len);
+/* 2026-10-04: a fake v2 session -- a message held "decrypted" by a stand-in
+ * read hook while the socket itself is empty, which is what poll() cannot
+ * see. bitcoin_net.asm's p2p_read/p2p_write dispatch to these hooks for an fd
+ * flagged in g_v2_active; v2transport.c is not linked here, so this file
+ * supplies bmc_v2_has_message. */
+extern unsigned char g_v2_active[];
+extern int  (*g_v2_hook_read)(int, char*, void*, unsigned, unsigned*);
+extern long (*g_v2_hook_write)(int, const char*, unsigned, const void*, unsigned);
+static int g_fq_fd = -1, g_fq_n = 0, g_fq_pong = 0;
+static const unsigned char FQ_NONCE[8] = { 7,1,4,1,5,9,2,6 };
+int bmc_v2_has_message(int fd){ return fd == g_fq_fd && g_fq_n > 0; }
+static int fq_read(int fd, char* cmd, void* pl, unsigned cap, unsigned* plen){
+    if (fd != g_fq_fd || g_fq_n <= 0 || cap < 8) return -1;
+    memset(cmd, 0, 12); memcpy(cmd, "ping", 4); memcpy(pl, FQ_NONCE, 8); *plen = 8; g_fq_n--; return 1;
+}
+static long fq_write(int fd, const char* cmd, unsigned cl, const void* p, unsigned pl){
+    if (fd == g_fq_fd && cl == 4 && !memcmp(cmd, "pong", 4) && pl == 8 && !memcmp(p, FQ_NONCE, 8)) g_fq_pong++;
+    return 24 + (long)pl;
+}
 extern void txrelay_test_set_announce_mean_ms(long ms);
 extern long long txrelay_test_exp_draw(long mean_ms);
 extern void txrelay_announce_own(const unsigned char txid[32]);
@@ -597,6 +616,25 @@ int main(void){
         ck("8c: the same leg without wtxidrelay is told by txid (MSG_TX)", plen == 37 && plw[1] == 1 && memcmp(plw + 5, txid1, 32) == 0);
         txann_test_set_pool(0);
         close(spW[0]); close(spW[1]);
+    }
+
+    printf("\n== 8d: a v2 message already decrypted is read without waiting for the next packet ==\n");
+    {
+        /* One recv can carry several v2 messages; after the first, the rest
+         * sit in the session and poll() reports the socket empty. The relay
+         * loop polled first and broke on "nothing to read" -- on an outbound
+         * leg a ping (or a getdata reply) waited for the peer's next packet. */
+        int spV[2];
+        ck("fake-v2 leg pair", socketpair(AF_UNIX, SOCK_STREAM, 0, spV) == 0);
+        int (*oldr)(int, char*, void*, unsigned, unsigned*) = g_v2_hook_read;
+        long (*oldw)(int, const char*, unsigned, const void*, unsigned) = g_v2_hook_write;
+        g_v2_hook_read = fq_read; g_v2_hook_write = fq_write;
+        g_fq_fd = spV[0]; g_fq_n = 1; g_fq_pong = 0; g_v2_active[spV[0]] = 1;
+        txrelay_poll_leg(spV[0], mp_area, 0);
+        ck("8d: the buffered ping was read (socket empty) and answered with its pong", g_fq_pong == 1 && g_fq_n == 0);
+        g_v2_active[spV[0]] = 0; g_fq_fd = -1; g_fq_n = 0;
+        g_v2_hook_read = oldr; g_v2_hook_write = oldw;
+        close(spV[0]); close(spV[1]);
     }
 
     /* ---- 8b: the announcement timer -----------------------------------

@@ -173,6 +173,7 @@ void serve_set_connected_tip_ptr(const volatile long long* p){ g_connected_tip =
  * call, and only when the file grew more. */
 extern long idxscan_tip(void) __attribute__((weak));
 extern long serve_idx_topup(void) __attribute__((weak));
+extern long serve_reorg_check(void) __attribute__((weak));   /* daemon/main.c, 2026-10-04 */
 static long g_followed_len = -1;            /* index.dat size this process last followed */
 static void serve_store_follow(const void* stc){
     char* st = (char*)stc;
@@ -180,6 +181,14 @@ static void serve_store_follow(const void* stc){
     struct stat sb;
     if (fd < 0 || fstat(fd, &sb) != 0) return;
     long len = (long)sb.st_size - (long)(sb.st_size % 48);
+    /* A reorg (2026-10-04): the worker rebuilt and bumped the generation;
+     * rebuild our index and let the tip move BACK to the new branch's, once
+     * -- forward-only following kept the old branch's height */
+    if (serve_reorg_check && serve_reorg_check()){
+        long tip = idxscan_tip ? idxscan_tip() : len / 48 - 1;
+        *(long*)(st + 16) = len; *(int*)(st + 24) = (int)tip; g_followed_len = len;
+        return;
+    }
     /* keyed on the FILE, not on idx_len: the accept path refreshes idx_len
      * (st+16) before forking a child but never the tip, so a child starts
      * with idx_len current and st+24 at the boot height (seen in a live

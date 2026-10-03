@@ -1354,7 +1354,10 @@ static int cmd_getblocktemplate(const rj_val* params, rj_val** res, long* ec, co
                 *ec = -8; *em = "Missing data String key for proposal"; return 0; }
             if (!g_gbt_proposal){
                 *ec = -1; *em = "Block proposal evaluation unavailable (no download worker)"; return 0; }
-            static char reason[64];
+            /* on the stack (2026-10-04): the proposal stages through
+             * submit_lock, which YIELDS the exec lock, so a static buffer here
+             * could be filled by a second proposal before this one reads it */
+            char reason[64]; reason[0] = 0;
             long pr = g_gbt_proposal(data->str, reason, sizeof reason);
             if (pr == 1){ *res = rj_null(); return 1; }
             if (pr == -2){ *ec = -22; *em = "Block decode failed"; return 0; }
