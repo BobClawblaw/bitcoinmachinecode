@@ -53,6 +53,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <pthread.h>
 #include "addr_index_fmt.h"
 /* the address history base (daemon/addr_hist.c), WEAK: the tail's own tests
  * and the binaries that link the tail without the facade still build; the
@@ -543,6 +544,13 @@ long axt_read_address(int type, const u8 hash[32],
  * to_height; the journal above it is this. cb receives each record of the
  * key above `min_height` in journal order: op (ADD/DEL/TOUCH), txid, vout,
  * value, height. Returns the number delivered, -1 without a journal. */
+static long axt_read_events_locked(int type, const u8 hash[32], long min_height,
+                                   int (*cb)(void* ctx, int op, const u8 txid[32], u32 vout, u64 value, u32 height), void* ctx,
+                                   int* map_fd_p, u8** map_p_p, size_t* map_sz_p);
+static long axt_read_events_scan(int type, const u8 hash[32], long min_height,
+                                 int (*cb)(void* ctx, int op, const u8 txid[32], u32 vout, u64 value, u32 height), void* ctx,
+                                 int* map_fd_p, u8** map_p_p, size_t* map_sz_p);
+long g_axt_inside, g_axt_inside_max;         /* test seam (2026-10-04): concurrent callers, and the most seen */
 long axt_read_events(int type, const u8 hash[32], long min_height,
                      int (*cb)(void* ctx, int op, const u8 txid[32], u32 vout, u64 value, u32 height), void* ctx){
     /* This used to malloc() the WHOLE journal and pread() it in, on every
@@ -561,6 +569,41 @@ long axt_read_events(int type, const u8 hash[32], long min_height,
     static int      map_fd = -1;
     static u8*      map_p;
     static size_t   map_sz;
+    /* ONE caller at a time (2026-10-04). The mapping is shared by every
+     * caller and replaced whenever the journal grows -- every block -- and the
+     * Esplora facade calls this from its per-connection threads WITHOUT the
+     * RPC execution lock (address history and utxo routes), while
+     * getaddressbalance/getaddresstxids call it under that lock. A second
+     * caller's munmap under a first caller's scan is a read of unmapped
+     * memory: a segfault, the shape of 10-02's outage. The callbacks only
+     * accumulate into their caller's context. */
+    static pthread_mutex_t axt_mu = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&axt_mu);
+    long rv = axt_read_events_locked(type, hash, min_height, cb, ctx, &map_fd, &map_p, &map_sz);
+    pthread_mutex_unlock(&axt_mu);
+    return rv;
+}
+static long axt_read_events_locked(int type, const u8 hash[32], long min_height,
+                                   int (*cb)(void* ctx, int op, const u8 txid[32], u32 vout, u64 value, u32 height), void* ctx,
+                                   int* map_fd_p, u8** map_p_p, size_t* map_sz_p){
+    #define map_fd (*map_fd_p)
+    #define map_p  (*map_p_p)
+    #define map_sz (*map_sz_p)
+    long inside = __sync_add_and_fetch(&g_axt_inside, 1);       /* test seam: callers in here at once */
+    if (inside > g_axt_inside_max) g_axt_inside_max = inside;
+    long rv = axt_read_events_scan(type, hash, min_height, cb, ctx, map_fd_p, map_p_p, map_sz_p);
+    __sync_sub_and_fetch(&g_axt_inside, 1);
+    return rv;
+    #undef map_fd
+    #undef map_p
+    #undef map_sz
+}
+static long axt_read_events_scan(int type, const u8 hash[32], long min_height,
+                                 int (*cb)(void* ctx, int op, const u8 txid[32], u32 vout, u64 value, u32 height), void* ctx,
+                                 int* map_fd_p, u8** map_p_p, size_t* map_sz_p){
+    #define map_fd (*map_fd_p)
+    #define map_p  (*map_p_p)
+    #define map_sz (*map_sz_p)
     int fd = open(AXF_TAIL_FILE, O_RDONLY); if (fd < 0) return -1;
     struct stat sb; if (fstat(fd, &sb) != 0){ close(fd); return -1; }
     size_t sz = (size_t)(sb.st_size / AXF_TAIL_REC) * AXF_TAIL_REC;
@@ -585,4 +628,7 @@ long axt_read_events(int type, const u8 hash[32], long min_height,
     }
     return n;
 }
+    #undef map_fd
+    #undef map_p
+    #undef map_sz
 

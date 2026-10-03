@@ -139,6 +139,14 @@ int main(void){
     int before = mux_n_out;
     ok(dh_install_leg(h, fd, &r) == 1 && mux_n_out == before + 1, "installed as an outbound leg");
     ok(!strcmp(mux_out_host[mux_n_out - 1], host) && mux_out_fd[mux_n_out - 1] == fd, "...with its host and fd recorded");
+    /* 2026-10-04: the helper child never writes the address book, so the
+     * worker records what the peer's version said -- before, a helper-dialed
+     * peer kept services=1 and read as "no v2" at the next dial */
+    { bmc_addr_t pa; ab2_rec_t rec; memset(&rec, 0, sizeof rec);
+      ab2_t* b = addr_book(); long ix = -1;
+      if (b && bmc_addr_from_string_port(&pa, host, 8333)) ix = ab2_find(b, &pa);
+      ok(ix >= 0 && ab2_get(b, ix, &rec) == 1 && rec.services == 0x409ULL,
+         "the helper-dialed peer's real services (0x409, from its version) are in the address book"); }
     { char pv[256]; format_peer_version_info(pv, sizeof pv); ok(strstr(pv, "fakepeer") != 0, "getpeerinfo-style version text reflects the peer"); }
     ok(dh_install_leg(h, fd, &r) == 0, "a second install of the same host is refused (dedupe)");
     close(mux_out_fd[mux_n_out - 1]); mux_out_fd[mux_n_out - 1] = -1;

@@ -529,6 +529,12 @@ static unsigned char txr_fd_wtxid[TXR_WTX_FDS];
 void txrelay_fd_set_wtxid(int fd, int on){ if (fd >= 0 && fd < TXR_WTX_FDS) txr_fd_wtxid[fd] = on ? 1 : 0; }
 int  txrelay_fd_wtxid(int fd){ return (fd >= 0 && fd < TXR_WTX_FDS) ? txr_fd_wtxid[fd] : 0; }
 extern int txann_wtxid_of(const u8 txid[32], u8 wtxid_out[32]) __attribute__((weak));
+/* a whole v2 message already decrypted from an earlier recv: poll() cannot
+ * see it, so a poll-gated read loop must ask first (daemon/v2transport.c;
+ * the inbound serve loop's txann_wait got this 2026-10-03, these outbound
+ * loops 2026-10-04) */
+extern int bmc_v2_has_message(int fd) __attribute__((weak));
+static int txr_v2_buffered(int fd){ return bmc_v2_has_message && bmc_v2_has_message(fd); }
 extern int txann_txid_for_wtxid(const u8 wtxid[32], u8 txid_out[32]) __attribute__((weak));
 
 /* A transaction WE originated: no source leg to hold back from, so it is
@@ -1353,8 +1359,10 @@ int txrelay_classify_missing(const unsigned char* tx, unsigned long len){
 long txrelay_poll_block_only_leg(int fd){
     char cmd[12]; unsigned plen; long seen = 0;
     for (int msgs = 0; msgs < TXR_MAX_MSGS; msgs++){
-        struct pollfd pf = { fd, POLLIN, 0 };
-        if (poll(&pf, 1, 0) <= 0 || !(pf.revents & POLLIN)) break;
+        if (!txr_v2_buffered(fd)){
+            struct pollfd pf = { fd, POLLIN, 0 };
+            if (poll(&pf, 1, 0) <= 0 || !(pf.revents & POLLIN)) break;
+        }
         if (p2p_read(fd, cmd, txr_pl, sizeof txr_pl, &plen) != 1) break;
         seen++;
         /* getpeerinfo bytesrecv_per_msg: the command is in hand here, and the
@@ -1498,9 +1506,11 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
             if (left <= 0) break;
             wait = (int)left;
         }
-        struct pollfd pf = { fd, POLLIN, 0 };
-        int pr = poll(&pf, 1, wait);
-        if (pr <= 0 || !(pf.revents & POLLIN)) break;
+        if (!txr_v2_buffered(fd)){
+            struct pollfd pf = { fd, POLLIN, 0 };
+            int pr = poll(&pf, 1, wait);
+            if (pr <= 0 || !(pf.revents & POLLIN)) break;
+        }
         if (p2p_read(fd, cmd, pl, TXR_PAYLOAD_CAP, &plen) != 1) break;
         /* getpeerinfo bytesrecv_per_msg: the command is in hand here, and the
          * asm read path has two exits whose frames are not worth disturbing. */
