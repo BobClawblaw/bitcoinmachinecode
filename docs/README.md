@@ -166,6 +166,7 @@ also annotated tags.
 | [`releases/2026-09-27-crypto-parity-and-the-full-verification-sync.md`](releases/2026-09-27-crypto-parity-and-the-full-verification-sync.md) | Signature verification at libsecp256k1's speed, the full-verification sync, and a byte order (2026-09-27) |
 | [`releases/2026-09-28-the-module-benchmarks-gaps-closed.md`](releases/2026-09-28-the-module-benchmarks-gaps-closed.md) | The module benchmark's gaps closed: MuHash, ElligatorSwift, ChaCha20, SHA-1, SHA-512, Base58 (2026-09-28) |
 | [`releases/2026-09-29-core-download-shape-matched.md`](releases/2026-09-29-core-download-shape-matched.md) | The IBD download takes Core's shape: 10 download peers (the two outbound classes), a 1,024-block window, no idle legs beside the workers (2026-09-29) |
+| [`releases/2026-10-03-the-outage-and-cores-words.md`](releases/2026-10-03-the-outage-and-cores-words.md) | The 23-hour outage and its fix; inbound serving past the boot height; buffered v2 messages; wtxid relay; Core's exact rejection text (26/26) and stage order; crash backtraces without core files (2026-10-03) |
 
 ## Development history
 
