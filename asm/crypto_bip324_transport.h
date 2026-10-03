@@ -82,6 +82,9 @@ int  bip324_t_feed(bip324_transport_t* t, const unsigned char* data, unsigned lo
  * Decoy (ignore-bit) packets never surface here. */
 int  bip324_t_next_message(bip324_transport_t* t, const char** type,
                            const unsigned char** payload, unsigned long* plen);
+/* 1 when a complete message is ready without another socket read (or a
+ * protocol violation the next read reports); 0 when more bytes are needed */
+int  bip324_t_has_message(bip324_transport_t* t);
 
 /* Bytes the caller should write to the socket, and how many were taken. */
 const unsigned char* bip324_t_send_pending(bip324_transport_t* t, unsigned long* len);

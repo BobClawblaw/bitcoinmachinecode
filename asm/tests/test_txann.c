@@ -27,6 +27,10 @@ const unsigned char* mpool_get(void* mp, const unsigned char* txid, unsigned lon
     if (!memcmp(txid, t8, 32)){ *len_out = sizeof RAW800; return RAW800; }
     *len_out = 0; return 0;
 }
+/* v2transport's "a whole message is already buffered" (2026-10-03): a stub
+ * that says yes for one fd, so txann_wait must not sit in poll for it */
+static int g_v2_buffered_fd = -1;
+int bmc_v2_has_message(int fd){ return fd == g_v2_buffered_fd; }
 static long long ms(void){ struct timeval t; gettimeofday(&t,0); return t.tv_sec*1000LL + t.tv_usec/1000; }
 int main(void){
     node_status_t* st = calloc(1, sizeof *st); if (!st){ puts("calloc"); return 2; }
@@ -72,6 +76,13 @@ int main(void){
     txann_child_init(5, 1); id(t,400); txann_push(t, 1000, 200); cap_n = 0; cap_writes = 0;
     txann_set_idle_secs(1); r = txann_wait(sv[0], 0);
     ok(cap_writes >= 1 && inv_has(400), "an accept during the wait is announced from inside the wait");
+    printf("== a v2 message already buffered ends the wait at once (poll cannot see it) ==\n");
+    { int sq[2]; if (socketpair(AF_UNIX, SOCK_STREAM, 0, sq)){ perror("sp"); return 2; }
+      txann_set_idle_secs(2); txann_child_init(5, 1); g_v2_buffered_fd = sq[0];
+      long long tq = ms(); long rq = txann_wait(sq[0], 0); long long dq = ms() - tq;
+      ok(rq == 1 && dq < 200, "silent socket, message in the v2 session: wait returns 1 immediately (was: until the peer's next packet)");
+      if (!(rq == 1 && dq < 200)) printf("      returned %ld after %lld ms\n", rq, dq);
+      g_v2_buffered_fd = -1; close(sq[0]); close(sq[1]); }
     printf("== worker drain: inbound-origin txs reach the outbound announce queue ==\n");
     txann_set_my_slot(7); id(t,500); txann_push(t, 1000, 200);
     txann_set_my_slot(-1); id(t,501); txann_push(t, 1000, 200);   /* the worker's own: already queued by tx_relay */

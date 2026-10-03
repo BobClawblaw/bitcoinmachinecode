@@ -74,6 +74,7 @@ int txann_txid_for_wtxid(const unsigned char wtxid[32], unsigned char txid_out[3
 extern long g_peer_wtxidrelay __attribute__((weak));
 static int c_wtxid;
 
+extern int bmc_v2_has_message(int fd) __attribute__((weak));   /* daemon/v2transport.c */
 static long long now_ms(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (long long)t.tv_sec*1000 + t.tv_nsec/1000000; }
 static long long draw_ms(void){ long long d = txrelay_test_exp_draw ? txrelay_test_exp_draw(g_mean_ms) : g_mean_ms; return d < 0 ? 0 : d; }
 
@@ -180,6 +181,9 @@ long txann_wait(int fd, unsigned long long peer_feefilter){
          * newcomer (Core AttemptToEvictConnection). Leave cleanly. */
         if (c_slot >= 0 && c_slot < RPC_MAX_PEERS && g_st->peers[c_slot].evict_requested) return 0;
         txann_tick(fd, now, peer_feefilter);
+        /* a v2 message already decrypted from an earlier recv: poll cannot
+         * see it (2026-10-03) -- let the read deliver it now */
+        if (bmc_v2_has_message && bmc_v2_has_message(fd)){ c_last_msg = now_ms(); return 1; }
         long long until = c_next_send > now ? c_next_send - now : 0;
         long long t = idle_deadline - now; if (until > 0 && until < t) t = until; if (t > 1000) t = 1000; if (t < 1) t = 1;
         struct pollfd p; p.fd = fd; p.events = POLLIN; p.revents = 0;

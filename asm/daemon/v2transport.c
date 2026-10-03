@@ -381,6 +381,14 @@ static long v2_write_hook(int fd, const char* cmd, unsigned cmdlen,
 
 /* Hand one message to the caller in v1's shape: cmd_out is 12 bytes,
  * NUL-padded and NOT NUL-terminated, exactly as p2p_read fills it. */
+/* A complete message already buffered in this fd's session? A poll-driven
+ * caller must ask this before polling the socket (2026-10-03): one recv can
+ * carry several messages, and the ones after the first are invisible to
+ * poll. 0 for a v1 or unknown fd. */
+int bmc_v2_has_message(int fd){
+    v2_conn* c = (fd >= 0 && fd < V2_FD_MAX) ? g_conn[fd] : 0;
+    return c ? bip324_t_has_message(&c->t) : 0;
+}
 static int deliver(v2_conn* c, const char* type, const unsigned char* body,
                    unsigned long blen, char* cmd_out, void* payload,
                    unsigned cap, unsigned* plen_out){
