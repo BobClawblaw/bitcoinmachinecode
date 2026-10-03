@@ -14,7 +14,9 @@
 # Cases: min relay fee (zero fee), bad-txns-in-belowout, RBF less fees, RBF not
 # enough additional fees, premature coinbase spend, TRUC inheritance (a
 # non-v3 child of a v3 parent), ephemeral dust with a fee, and an undecodable
-# transaction (Core's decode-failure messages).
+# transaction (Core's decode-failure messages), and script failures -- a
+# wrong signature on P2WPKH, P2PKH and a P2TR key path ("mempool-script-
+# verify-flag-failed (<ScriptErrorString>)" with the input/prevout detail).
 set -u
 CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-v31.1/bin}
 ROOT=${ROOT:-$(cd "$(dirname "$0")/.." && pwd)}
@@ -130,6 +132,32 @@ take; DEST=$(cw getnewaddress)
 # the dust: a 0-value P2WPKH output (a zero-value OP_RETURN is not dust)
 H=$(sign "$(cw createrawtransaction "[{\"txid\":\"$UT\",\"vout\":$UV}]" "[{\"$DEST\":$(amt "$UA - 0.0001")},{\"$(cw getnewaddress)\":0}]")")
 compare "ephemeral dust with a fee" "$H"
+
+# a signature byte flipped: still well-formed, now wrong. $1 = address type
+badsig(){ local at=$1 a txid vout amt raw hex sig bad
+  a=$(cw getnewaddress "" "$at"); txid=$(cw sendtoaddress "$a" 1.5); cw generatetoaddress 1 "$ADDR" >/dev/null
+  for i in $(seq 60); do [ "$(bmc getblockcount | js 'print(d["result"])')" = "$(core getblockcount)" ] && break; sleep 1; done
+  vout=$(core getrawtransaction "$txid" true "$(cw gettransaction "$txid" | js 'print(d["blockhash"])')" | js "
+for o in d['vout']:
+    if o['scriptPubKey'].get('address')=='$a': print(o['n'])")
+  raw=$(cw createrawtransaction "[{\"txid\":\"$txid\",\"vout\":$vout}]" "{\"$(cw getnewaddress)\":1.4999}")
+  hex=$(sign "$raw")
+  echo "$hex" | python3 -c "
+import sys,json,subprocess
+h=sys.stdin.read().strip()
+d=json.loads(subprocess.check_output(sys.argv[1:]+['decoderawtransaction',h]))
+vin=d['vin'][0]
+sig=(vin.get('txinwitness') or [None])[0] if vin.get('txinwitness') else vin['scriptSig']['asm'].split()[0].split('[')[0]
+# flip one nibble in the middle of the signature (inside R for DER, inside r for Schnorr)
+k=len(sig)//3
+bad=sig[:k]+('0' if sig[k]!='0' else '1')+sig[k+1:]
+assert h.count(sig)==1, 'signature not unique in the hex'
+print(h.replace(sig,bad))" "$CORE_BIN/bitcoin-cli" -datadir="$CORE_DIR" -rpcport=$CORE_RPC -rpcuser=e2e -rpcpassword=e2epw; }
+
+echo "== 9. script failures: a wrong signature, three ways"
+H=$(badsig bech32);  compare "P2WPKH wrong signature" "$H"
+H=$(badsig legacy);  compare "P2PKH wrong signature" "$H"
+H=$(badsig bech32m); compare "P2TR keypath wrong signature" "$H"
 
 echo "== 8. an undecodable transaction"
 c=$(core sendrawtransaction "00" 2>&1 | tail -1); b=$(bmc sendrawtransaction '["00"]' | js 'print(d["error"]["message"])')

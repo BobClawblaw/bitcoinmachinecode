@@ -246,7 +246,17 @@ typedef struct {
     u8  shape;
 } txv_rawin_t;
 static txv_rawin_t* g_txv_in; static u64 g_txv_in_cap;   /* grown per transaction in txv_parse */
-typedef struct { u8 ok; char reason[64]; } txv_result_t;
+typedef struct { u8 ok; char reason[64]; int serr; } txv_result_t;
+/* Core's ScriptError for a failed input (2026-10-03). Each verify arm sets
+ * t_txv_serr on failure (the interpreter returns Core's own values; taproot
+ * leaves its code in g_tap_serr); workers carry it in g_txv_results[i].serr.
+ * The caller's thread keeps the FIRST failing input -- Core's mempool checks
+ * inputs in order and reports the first -- for tx_verify_last_script_error. */
+#include "../script_error_codes.h"
+extern __thread int g_tap_serr;               /* bitcoin_taproot_sighash.c */
+static __thread int  t_txv_serr;
+static __thread int  t_txv_fail_serr;
+static __thread long t_txv_fail_input = -1;
 static txv_result_t* g_txv_results; static u64 g_txv_results_cap;   /* grown with g_txv_in */
 
 /* ---- VAL-10 / SER-3 (audit 2026-09-03): CANONICAL CompactSize ----
@@ -635,20 +645,23 @@ static int txv_verify_one(const u8* tx, u64 txlen, u64 i, unsigned long long fla
          * strictly before any worker thread was created, and are read-only
          * from here on -- so this case is safe to run concurrently. */
         if (!g_t1_tap_built) { *reason = "internal: taproot aggregate not built"; return 0; }
-        return tapagg_verify(&g_t1_tap_pool, &g_t1_tap, in->spk,
-                             in->wit, in->witlen, in->nwit, i, flags, reason);
+        g_tap_serr = 0;
+        if (!tapagg_verify(&g_t1_tap_pool, &g_t1_tap, in->spk,
+                           in->wit, in->witlen, in->nwit, i, flags, reason)){
+            t_txv_serr = g_tap_serr ? g_tap_serr : SCRIPT_ERR_UNKNOWN_ERROR; return 0; }
+        return 1;
     }
     case TXV_SHAPE_WV0: {
         int err = sv_verify_witness_v0(in->wprog, in->wproglen, in->wit, in->witlen, in->nwit,
                                        in->value, flags, (unsigned long)i, tx, txlen, sv_work, sv_workcap);
-        if (err != 0) { *reason = in->wproglen == 20 ? "p2wpkh signature invalid" : "p2wsh script verification failed"; return 0; }
+        if (err != 0) { t_txv_serr = err; *reason = in->wproglen == 20 ? "p2wpkh signature invalid" : "p2wsh script verification failed"; return 0; }
         return 1;
     }
     case TXV_SHAPE_LEGACY: {
         u64 ltxlen; const u8* ltx = legacy_tx_view(tx, txlen, &ltxlen);
         int err = sv_verify_script(in->scriptSig, in->scriptSiglen, in->spk, in->spklen,
                                    flags, (unsigned long)i, ltx, ltxlen, sv_work, sv_workcap);
-        if (err != 0) { *reason = "legacy script verification failed"; return 0; }
+        if (err != 0) { t_txv_serr = err; *reason = "legacy script verification failed"; return 0; }
         return 1;
     }
     default: /* TXV_SHAPE_WPASS: unknown witness version, anyone-can-spend */
@@ -748,8 +761,10 @@ static void* txv_worker_thread(void* argp){
     txv_session_begin(a->key);                                   /* IR-5 */
     for (u64 i=a->lo;i<a->hi;i++){
         const char* r = 0;
+        t_txv_serr = 0;
         int ok = txv_verify_one(a->tx, a->txlen, i, a->flags, sv_work, 1<<20, &r);
         g_txv_results[i].ok = ok ? 1 : 0;
+        g_txv_results[i].serr = ok ? 0 : t_txv_serr;
         if (!ok) { size_t n=strlen(r); if(n>63)n=63; memcpy(g_txv_results[i].reason, r, n); g_txv_results[i].reason[n]=0; }
     }
     txv_session_end();
@@ -775,7 +790,9 @@ static int txv_verify_all(const u8* tx, u64 txlen, u64 nin, unsigned long long f
         txv_session_begin(key);
         for (u64 i=0;i<nin;i++){
             const char* r = 0;
+            t_txv_serr = 0;
             if (!txv_verify_one(tx, txlen, i, flags, sv_work, 1<<20, &r)) {
+                t_txv_fail_serr = t_txv_serr; t_txv_fail_input = (long)i;
                 *reason = r; txv_session_end(); return 0;
             }
         }
@@ -819,16 +836,19 @@ static int txv_verify_all(const u8* tx, u64 txlen, u64 nin, unsigned long long f
     for (u64 i=0;i<nin;i++){
         if (g_txv_results[i].ok) continue;
         if (g_txv_results[i].reason[0] != 0){
-            /* a real, reported failure */
+            /* a real, reported failure -- the lowest index, as Core reports */
             memcpy(rbuf, g_txv_results[i].reason, sizeof rbuf);
+            t_txv_fail_serr = g_txv_results[i].serr; t_txv_fail_input = (long)i;
             all_ok = 0; break;
         }
         /* blank: pthread_create failure above left this index untouched --
          * verify it inline now, in this thread, so a transient resource
          * failure never silently skips a check. */
         const char* r = 0;
+        t_txv_serr = 0;
         if (!txv_verify_one(tx, txlen, i, flags, sv_work_main, sizeof sv_work_main, &r)) {
             memcpy(rbuf, r, strlen(r)+1 > sizeof rbuf ? sizeof rbuf : strlen(r)+1);
+            t_txv_fail_serr = t_txv_serr; t_txv_fail_input = (long)i;
             all_ok = 0; break;
         }
     }
@@ -867,9 +887,12 @@ __thread long g_txv_immature_depth;
 static int txv_connect_body(const u8* tx, u64 txlen, long height, unsigned long long flags,
                             txv_resolve_fn rf, void* rctx, const char** reason){
     u64 nin;
+    t_txv_fail_serr = 0; t_txv_fail_input = -1;
     if (!txv_parse(tx, txlen, &nin, reason)) return 0;
 
     int has_taproot = 0;
+    /* a script-shape refusal below is a script failure in Core, with a code */
+    #define TXV_SHAPE_FAIL(code, msg) do { t_txv_fail_serr = (code); t_txv_fail_input = (long)i; *reason = (msg); return 0; } while (0)
 
     /* ---- pass 1 (sequential, unchanged in spirit from before): maturity
      * check + resolve every input's prevout from the confirmed UTXO set,
@@ -894,8 +917,8 @@ static int txv_connect_body(const u8* tx, u64 txlen, long height, unsigned long 
         if (is_p2tr(spk, (u32)spklen) && (flags & TXV_FLAG_TAPROOT)) {
             has_taproot = 1;
             g_txv_in[i].shape = TXV_SHAPE_P2TR;
-            if (g_txv_in[i].scriptSiglen != 0) { *reason = "p2tr scriptSig must be empty"; return 0; }
-            if (g_txv_in[i].nwit == 0) { *reason = "p2tr empty witness"; return 0; }
+            if (g_txv_in[i].scriptSiglen != 0) TXV_SHAPE_FAIL(SCRIPT_ERR_WITNESS_MALLEATED, "p2tr scriptSig must be empty");
+            if (g_txv_in[i].nwit == 0) TXV_SHAPE_FAIL(SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY, "p2tr empty witness");
             continue;
         }
         if (flags & TXV_FLAG_WITNESS) {
@@ -907,13 +930,13 @@ static int txv_connect_body(const u8* tx, u64 txlen, long height, unsigned long 
              * the block path's wprog_off (incident 482566 tx 1499). */
             int cls = sv_classify_segwit(g_txv_in[i].spk, (u32)spklen, g_txv_in[i].scriptSig, g_txv_in[i].scriptSiglen,
                                          &wver, &wprog, &wplen, &wrapped);
-            if (cls < 0) { *reason = "p2sh-wrapped witness program: scriptSig must be exactly one push of the redeemScript"; return 0; }
+            if (cls < 0) TXV_SHAPE_FAIL(SCRIPT_ERR_WITNESS_MALLEATED_P2SH, "p2sh-wrapped witness program: scriptSig must be exactly one push of the redeemScript");
             if (cls > 0) {
-                if (!wrapped && g_txv_in[i].scriptSiglen != 0) { *reason = "witness program scriptSig must be empty"; return 0; }
+                if (!wrapped && g_txv_in[i].scriptSiglen != 0) TXV_SHAPE_FAIL(SCRIPT_ERR_WITNESS_MALLEATED, "witness program scriptSig must be empty");
                 if (wver == 0) {
                     g_txv_in[i].shape = TXV_SHAPE_WV0; g_txv_in[i].wprog = wprog; g_txv_in[i].wproglen = wplen; g_txv_in[i].wrapped = (u8)wrapped;
-                    if (wplen == 20 && g_txv_in[i].nwit != 2) { *reason = "p2wpkh needs exactly 2 witness items"; return 0; }
-                    if (wplen == 32 && g_txv_in[i].nwit < 1) { *reason = "p2wsh needs a witnessScript"; return 0; }
+                    if (wplen == 20 && g_txv_in[i].nwit != 2) TXV_SHAPE_FAIL(SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH, "p2wpkh needs exactly 2 witness items");
+                    if (wplen == 32 && g_txv_in[i].nwit < 1) TXV_SHAPE_FAIL(SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY, "p2wsh needs a witnessScript");
                 } else {
                     g_txv_in[i].shape = TXV_SHAPE_WPASS;   /* unknown version: valid under consensus flags (no DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM) */
                 }
@@ -921,7 +944,7 @@ static int txv_connect_body(const u8* tx, u64 txlen, long height, unsigned long 
             }
             /* Core VerifyScript: a witness on an input whose script is not a
              * witness program is SCRIPT_ERR_WITNESS_UNEXPECTED. */
-            if (g_txv_in[i].nwit != 0) { *reason = "unexpected witness on a non-witness script"; return 0; }
+            if (g_txv_in[i].nwit != 0) TXV_SHAPE_FAIL(SCRIPT_ERR_WITNESS_UNEXPECTED, "unexpected witness on a non-witness script");
         }
         g_txv_in[i].shape = TXV_SHAPE_LEGACY;
     }
@@ -1079,6 +1102,21 @@ int tx_verify_mempool(const u8* tx, u64 txlen, long next_height,
     unsigned long long flags = script_flags_for_block((unsigned long long)next_height, zero32);
     if (g_txv_mempool_standard) flags |= TXV_MEMPOOL_POLICY_FLAGS;
     return txv_connect_body(tx, txlen, next_height, flags, rf, rctx, reason);
+}
+#undef TXV_SHAPE_FAIL
+
+/* The ScriptError of the first failing input of the last txv_connect_body
+ * call on this thread, with that input's index and prevout (2026-10-03).
+ * 0 when the refusal was not a script failure. */
+int tx_verify_last_script_error(long* input_out){
+    if (input_out) *input_out = t_txv_fail_input;
+    return t_txv_fail_serr;
+}
+int tx_verify_input_prevout(long i, u8 txid_out[32], u32* vout_out){
+    if (i < 0 || !g_txv_in || (u64)i >= g_txv_in_cap) return 0;
+    memcpy(txid_out, g_txv_in[i].outpoint, 32);
+    memcpy(vout_out, g_txv_in[i].outpoint + 32, 4);
+    return 1;
 }
 
 /* ============================================================================

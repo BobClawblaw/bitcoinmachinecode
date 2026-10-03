@@ -25,6 +25,13 @@ extern void tagged_hash256(uint8_t* out, const char* tag, uint64_t taglen,
                            const uint8_t* msg, uint64_t msglen);
 extern int  schnorr_verify(const uint8_t* sig, const uint8_t* pk,
                            const uint8_t* msg, int msglen);
+
+/* Core's ScriptError for the last taproot failure on this thread (2026-10-03):
+ * the mempool reject reason names it ("mempool-script-verify-flag-failed
+ * (Invalid Schnorr signature)"), and the reason strings here only describe.
+ * Set at every failure site; tx_verify.c reads it. */
+#include "script_error_codes.h"
+__thread int g_tap_serr;
 /* RETURNS 0 fail, 1 success with EVEN tweaked Y, 2 success with ODD tweaked Y.
  * The parity is consensus-critical: BIP341 carries it in control[0]&1 and Core
  * verifies it (CheckTapTweak -> secp256k1_xonly_pubkey_tweak_add_check). Test
@@ -1025,7 +1032,7 @@ int taproot_verify_input_flags(const uint8_t* spk,
                          const uint8_t* spks, int64_t num_inputs,
                          const char** reason, uint64_t flags)
 {
-    if (nwit == 0) { *reason = "p2tr empty witness"; return 0; }
+    if (nwit == 0) { g_tap_serr = SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY; *reason = "p2tr empty witness"; return 0; }
 
     /* ---- BIP341 annex: present iff >=2 items and the LAST item's first
      * byte is the annex tag (0x50). Stripped before path classification;
@@ -1037,7 +1044,7 @@ int taproot_verify_input_flags(const uint8_t* spk,
         annex_present = 1; annex = wit[nwit-1]; annexlen = witlen[nwit-1];
     }
     uint32_t eff = nwit - (annex_present ? 1u : 0u);
-    if (eff == 0) { *reason = "p2tr empty witness after annex"; return 0; }
+    if (eff == 0) { g_tap_serr = SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY; *reason = "p2tr empty witness after annex"; return 0; }
 
     /* ---- key-path: effective stack size 1 (just the signature) ---- */
     if (eff == 1) {
@@ -1045,13 +1052,13 @@ int taproot_verify_input_flags(const uint8_t* spk,
             if (!taproot_keypath_verify_annex(spk, wit[0], (int)witlen[0], tx, txlen, n_in,
                                               prevouts, amounts, spks, num_inputs,
                                               annex, annexlen, NULL)) {
-                *reason = "p2tr keypath (annex) signature invalid"; return 0;
+                g_tap_serr = SCRIPT_ERR_SCHNORR_SIG; *reason = "p2tr keypath (annex) signature invalid"; return 0;
             }
             return 1;
         }
         if (!taproot_keypath_verify(spk, wit[0], (int)witlen[0], tx, txlen, n_in,
                                     prevouts, amounts, spks, num_inputs)) {
-            *reason = "p2tr keypath signature invalid"; return 0;
+            g_tap_serr = SCRIPT_ERR_SCHNORR_SIG; *reason = "p2tr keypath signature invalid"; return 0;
         }
         return 1;
     }
@@ -1064,7 +1071,7 @@ int taproot_verify_input_flags(const uint8_t* spk,
 
     if (clen < TAPROOT_CONTROL_BASE_SIZE || clen > TAPROOT_CONTROL_MAX_SIZE ||
         ((clen - TAPROOT_CONTROL_BASE_SIZE) % TAPROOT_CONTROL_NODE_SIZE) != 0) {
-        *reason = "p2tr control block wrong size"; return 0;
+        g_tap_serr = SCRIPT_ERR_TAPROOT_WRONG_CONTROL_SIZE; *reason = "p2tr control block wrong size"; return 0;
     }
 
     uint8_t leaf_version = control[0] & TAPROOT_LEAF_MASK;
@@ -1076,16 +1083,16 @@ int taproot_verify_input_flags(const uint8_t* spk,
      * SCRIPT gets executed afterward depends on the leaf version. */
     uint8_t leaf_hash[32];
     if (tap_leaf_hash(leaf_hash, leaf_version, script, slen) != 1) {
-        *reason = "p2tr tapscript too large"; return 0;
+        g_tap_serr = SCRIPT_ERR_UNKNOWN_ERROR; *reason = "p2tr tapscript too large"; return 0;
     }
     uint8_t merkle_root[32];
     if (tap_merkle_root(merkle_root, leaf_hash, 1, control, clen) != 1) {
-        *reason = "p2tr merkle root reconstruction failed"; return 0;
+        g_tap_serr = SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH; *reason = "p2tr merkle root reconstruction failed"; return 0;
     }
     uint8_t computed_q[32];
     long tw = taproot_tweak_pubkey(computed_q, internal_pk, merkle_root);
     if (tw < 1) {
-        *reason = "p2tr script-path internal pubkey invalid"; return 0;
+        g_tap_serr = SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH; *reason = "p2tr script-path internal pubkey invalid"; return 0;
     }
     /* BIP341: the control block's low bit is the tweaked output key's Y
      * PARITY, and it is part of the commitment -- Core checks it inside
@@ -1099,7 +1106,7 @@ int taproot_verify_input_flags(const uint8_t* spk,
         int want_odd = (tw == 2);
         int got_odd  = (control[0] & 1);
         if (want_odd != got_odd) {
-            *reason = "p2tr control block parity mismatch"; return 0;
+            g_tap_serr = SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH; *reason = "p2tr control block parity mismatch"; return 0;
         }
     }
     /* x AFTER parity: Core folds both into one tweak_add_check and so has no
@@ -1107,7 +1114,7 @@ int taproot_verify_input_flags(const uint8_t* spk,
      * differential compares reason strings -- so they must agree on which
      * check fires first. */
     if (memcmp(computed_q, spk + 2, 32) != 0) {
-        *reason = "p2tr script-path commitment mismatch"; return 0;
+        g_tap_serr = SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH; *reason = "p2tr script-path commitment mismatch"; return 0;
     }
 
     /* Unknown leaf version: per BIP341, the commitment check just above is
@@ -1150,17 +1157,17 @@ int taproot_verify_input_flags(const uint8_t* spk,
          * under STANDARD flags it is DISCOURAGE_OP_SUCCESS. The interpreter
          * has the same arm (bitcoin_interp.asm:457) but this prescan returned
          * before it could run -- and until IR-9 no flags reached it anyway. */
-        if (flags & TS_FLAG_DISCOURAGE_OP_SUCCESS) { *reason = "p2tr tapscript OP_SUCCESSx discouraged"; return 0; }
+        if (flags & TS_FLAG_DISCOURAGE_OP_SUCCESS) { g_tap_serr = SCRIPT_ERR_DISCOURAGE_OP_SUCCESS; *reason = "p2tr tapscript OP_SUCCESSx discouraged"; return 0; }
         return 1;   /* overrides everything below */
     }
     {
         uint32_t ninit = eff - 2;                     /* eff >= 2 checked above */
         if (ninit > TS_MAX_STACK) {
-            *reason = "p2tr tapscript initial stack too large"; return 0;
+            g_tap_serr = SCRIPT_ERR_STACK_SIZE; *reason = "p2tr tapscript initial stack too large"; return 0;
         }
         for (uint32_t i = 0; i < ninit; i++) {
             if (witlen[i] > TS_MAX_ELEM) {
-                *reason = "p2tr tapscript witness item exceeds 520 bytes"; return 0;
+                g_tap_serr = SCRIPT_ERR_PUSH_SIZE; *reason = "p2tr tapscript witness item exceeds 520 bytes"; return 0;
             }
         }
     }
@@ -1192,7 +1199,7 @@ int taproot_verify_input_flags(const uint8_t* spk,
     uint64_t sp = 0;
     for (uint32_t i = 0; i + 2 < eff; i++) {
         if (!stack_push(&sp, ts_main_e, wit[i], witlen[i])) {
-            *reason = "p2tr tapscript initial stack overflow"; return 0;
+            g_tap_serr = SCRIPT_ERR_STACK_SIZE; *reason = "p2tr tapscript initial stack overflow"; return 0;
         }
     }
 
@@ -1233,10 +1240,10 @@ int taproot_verify_input_flags(const uint8_t* spk,
     st.checksig_ctx = &ctx;
     st.checksig_fn  = taproot_checksig_fn;
 
-    if (!script_eval(&st)) { *reason = "p2tr tapscript execution failed"; return 0; }
+    if (!script_eval(&st)) { g_tap_serr = err ? (int)err : SCRIPT_ERR_UNKNOWN_ERROR; *reason = "p2tr tapscript execution failed"; return 0; }
     /* A checksig that set hard_fail invalidates the script even if the stack
      * happens to end truthy -- see taproot_checksig_ctx.hard_fail. */
-    if (ctx.hard_fail) { *reason = "p2tr tapscript checksig invalid"; return 0; }
+    if (ctx.hard_fail) { g_tap_serr = SCRIPT_ERR_SCHNORR_SIG; *reason = "p2tr tapscript checksig invalid"; return 0; }
     /* script_eval returning 1 already means the interpreter's own
      * SIGVERSION_TAPSCRIPT-specific cleanstack/empty-result rule (exactly
      * one truthy element left) passed -- nothing further to check here. */
