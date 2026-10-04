@@ -42,6 +42,7 @@ node_config_t g_cfg = {
     .min_usable_peers      = 8,
     .maxpool               = 2048,
     .dlc_chunk_blocks      = 16,
+    .dl_shape_core         = 0,
     .addr_max_per_response = 256,
     .addr_max_per_netgroup = 16,
     .utxo_bulk_slots_log2  = 22,
@@ -280,6 +281,7 @@ static void set_defaults(void){
     g_cfg.min_usable_peers      = 8;
     g_cfg.maxpool               = 2048;
     g_cfg.dlc_chunk_blocks      = 16;
+    g_cfg.dl_shape_core         = 0;
     g_cfg.addr_max_per_response = 256;
     g_cfg.addr_max_per_netgroup = 16;
     g_cfg.proxyrandomize        = 1;     /* Core DEFAULT_PROXYRANDOMIZE */
@@ -1109,6 +1111,19 @@ long node_config_load(const char* path){
          * keeps 16 in flight per peer, refilled as each lands; ours is one
          * getdata per chunk. 4..64: the staging buffer is sized for 64. */
         else if(!strcmp(key,"bmc.dlcchunk"))          { t=clamp_int(IV,4,64,key,&bad);     if(t>=0){g_cfg.dlc_chunk_blocks=t;applied++;} }
+        /* 2026-10-04: the download's SHAPE. "bmc" (the default) is this
+         * node's own: whole-chunk requests, peers ranked by a header sample
+         * and picked by speed, slow peers rotated, dead weight and stallers
+         * banned for the run, a 120 s no-block budget. "core" copies Bitcoin
+         * Core v31.1's rules (net_processing.cpp): 16 blocks in flight per
+         * peer topped up as each lands, peers in random order with no speed
+         * ranking, no rotation or rate floor, a staller disconnected but
+         * never banned, and Core's block download timeout -- so a benchmark
+         * against Core compares validation, not download policy. */
+        else if(!strcmp(key,"bmc.dlshape")){
+            if(!strcmp(val,"core")) { g_cfg.dl_shape_core = 1; applied++; }
+            else if(!strcmp(val,"bmc")) { g_cfg.dl_shape_core = 0; applied++; }
+            else { fprintf(stderr,"[config] bmc.dlshape=%s: expected core or bmc -- ignoring\n", val); bad++; } }
         else if(!strcmp(key,"bmc.addrmaxperresponse")){ t=clamp_int(IV,1,1000,key,&bad);   if(t>=0){g_cfg.addr_max_per_response=t;applied++;} }
         else if(!strcmp(key,"bmc.addrmaxpernetgroup")){ t=clamp_int(IV,1,256,key,&bad);    if(t>=0){g_cfg.addr_max_per_netgroup=t;applied++;} }
         else if(!strcmp(key,"bmc.utxobulkgapblocks")) { t=clamp_int(IV,0,1000000,key,&bad);if(t>=0){g_cfg.utxo_bulk_gap_blocks=t;applied++;} }
@@ -1345,9 +1360,9 @@ void node_config_log(void){
             g_cfg.max_connections, outbound, g_cfg.max_outbound,
             g_cfg.max_block_relay_only, g_cfg.max_feeler,
             g_cfg.max_connections-outbound, g_cfg.feeler_interval_ms/1000);
-    fprintf(stderr,"[config] peers: min_bps=%.0f ticks=%d min_usable=%d pool=%d dlc_chunk=%d\n",
+    fprintf(stderr,"[config] peers: min_bps=%.0f ticks=%d min_usable=%d pool=%d dlc_chunk=%d dlshape=%s\n",
             g_cfg.dead_weight_bps, g_cfg.dead_weight_ticks,
-            g_cfg.min_usable_peers, g_cfg.maxpool, g_cfg.dlc_chunk_blocks);
+            g_cfg.min_usable_peers, g_cfg.maxpool, g_cfg.dlc_chunk_blocks, g_cfg.dl_shape_core ? "core" : "bmc");
     fprintf(stderr,"[config] addr : max_per_response=%d max_per_netgroup=%d\n",
             g_cfg.addr_max_per_response, g_cfg.addr_max_per_netgroup);
     fprintf(stderr,"[config] utxo : dbcache=%dMB -> bulk_slots=2^%d bulk_blob=%dMB bulk_gap=%ld compact_at=%d\n",
