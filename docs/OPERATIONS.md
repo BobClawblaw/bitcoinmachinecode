@@ -297,7 +297,10 @@ I2P destination.
   when it is absent, spawns the builder beside its own executable, niced,
   never during initial block download, at most three attempts per boot
   with six hours between them; `bmc.coinstatshistrepair=0` turns that
-  off. A base that fails the check is renamed `*.broken-<epoch>` (delete
+  off. **A node synced from block 0 skips it** (2026-10-04): its tail
+  starts at genesis, so after the download the fold worker checks every
+  tail row once (hash and one generation, no re-seed in between) and
+  answers from the tail; a torn row or a re-seed falls back to the build. A base that fails the check is renamed `*.broken-<epoch>` (delete
   those when you have looked) and rebuilt. The builder resumes at the
   pass after its last `csh_tmp/passN.done` marker, discards scratch
   without a marker (and the old layout's `csh_*.tmp`), sizes pass 3 from
