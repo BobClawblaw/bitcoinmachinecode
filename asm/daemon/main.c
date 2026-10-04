@@ -86,6 +86,8 @@ static void mempool_refresh_seqlocks(void* store_buf, long now_tip);
 #include "v2transport.h"  /* BIP324 v2 encrypted transport */
 #include "wallet_pass.h"   /* wallet passphrase source (audit finding 2) */
 #include "chainparams.h" /* runtime chain selection (main / regtest)   */
+#include "benchlog.h"    /* 2026-10-04: the [bench] index line and the [ready] finish line */
+#include "dlc_benchlog.h" /* 2026-10-04: the [bench] per-chunk download line (bmc.benchlog) */
 
 /* The node log path, chain-tagged so an aggregated view can never confuse
  * chains: logs/bitcoind.log on mainnet, logs/bitcoind.<chain>.log otherwise
@@ -426,6 +428,7 @@ extern int  tsp_active(void);
 extern void tsp_on_block(void* store_buf, long h, const unsigned char* blk, long blen);
 extern void txit_on_block(void* store_buf, long h, const unsigned char* blk, long blen);
 extern void bfi_on_block(void* store_buf, long h, const unsigned char* blk, unsigned long blen);  /* daemon/bfilter_index.c */
+extern long txit_covered(void);                                               /* daemon/tx_index_tail.c: runs + tail, -1 off */
 typedef int (*bfi_undo_cb_t)(void*, const unsigned char*, unsigned int, unsigned long long,
                              unsigned int, unsigned char, const unsigned char*, unsigned short);
 extern void bfi_set_undo_replay(long (*fn)(long, bfi_undo_cb_t, void*));
@@ -8697,6 +8700,55 @@ static int dl_tip_is_ibd(void){
     unsigned long tip_time = (unsigned long)hb[68] | ((unsigned long)hb[69]<<8) | ((unsigned long)hb[70]<<16) | ((unsigned long)hb[71]<<24);
     return !dl_announce_allowed(tip_time, (long long)time(NULL), g_cfg.maxtipage > 0 ? g_cfg.maxtipage : 86400);
 }
+/* bmc.benchlog's clock (2026-10-04): CLOCK_MONOTONIC in ns with the key on,
+ * 0 with it off -- so the index timing in the choke point below reads no
+ * clock on a node that does not print it. */
+static unsigned long long bl_ns(void){
+    if (!g_cfg.benchlog) return 0;
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (unsigned long long)t.tv_sec * 1000000000ULL + (unsigned long long)t.tv_nsec;
+}
+/* ---- the finish line (2026-10-04, worklog/2026-10-04-logged-ibd-runs-plan.md
+ * part 3) ------------------------------------------------------------------
+ * ONE line, once per process, the first time the node is ready to serve RPC
+ * with every enabled index at the tip: IBD over (the latch), the UTXO set at
+ * the archive tip, the txid index covering it (runs + tail), the filter index
+ * holding its filter, and the coinstats history complete -- which on a fresh
+ * sync means the post-IBD history-base rebuild (38 m 47 s in run 31) has
+ * finished and verified, so the line marks the END of that, not the end of
+ * the download. Disabled indexes are named as skipped. Not gated by
+ * bmc.benchlog: a benchmark's finish must not depend on a debug switch, and
+ * it is one line per run. Evaluated every rotation of the worker loop (a few
+ * loads and compares) until it prints; the coinstats repair is only
+ * re-examined once a heartbeat (csi_hist_repair_tick), so that one condition
+ * is seen up to DL_HEARTBEAT_MS late -- the same latency its own
+ * "[coinstats] repair: history base rebuilt" line has. */
+static long long g_proc_start_ms = 0;   /* main()'s first statement; forks inherit it */
+static void dl_ready_check(int utxo_ok){
+    static int said = 0;
+    if (said) return;
+    extern int csi_hist_repair_state(void); extern long csi_height(void); extern int csi_worker_pid(void);
+    extern long bfi_count(void);
+    benchlog_ready_t r; memset(&r, 0, sizeof r);
+    r.ibd_over = g_dl_ibd_left;
+    r.tip = (long)*(int*)(store_buf+24);
+    r.utxo_on = utxo_ok;              r.utxo_applied = utxo_ok ? utxo_live_applied_height() : -1;
+    r.txindex_on = g_cfg.txindex;     r.txindex_covered = g_cfg.txindex ? txit_covered() : -1;
+    r.bfilter_on = g_cfg.blockfilterindex; r.bfilter_count = g_cfg.blockfilterindex ? bfi_count() : -1;
+    r.coinstats_on = g_cfg.coinstatsindex;
+    if (g_cfg.coinstatsindex){
+        r.coinstats_hist_ok = csi_hist_repair_state() == 1;   /* CSI_REPAIR_OK (coinstats_index.c) */
+        /* the fold's watermark: the worker's published height when it folds
+         * (this process's own copy is stale after the fork), else in-process */
+        r.coinstats_height = (csi_worker_pid() > 0 && g_node_status) ? (long)g_node_status->csi_folded_height : csi_height();
+    }
+    { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+      r.secs = (double)(t.tv_sec * 1000LL + t.tv_nsec / 1000000 - g_proc_start_ms) / 1000.0; }
+    char line[320];
+    if (!benchlog_ready_eval(&r, line, sizeof line)) return;
+    said = 1;
+    fprintf(stderr, "%s\n", line);
+}
 static void dl_new_block_choke(void){
     int now_tip = (int)node_public_tip(store_buf);
     if(g_dl_last_seen_tip >= 0 && now_tip > g_dl_last_seen_tip){
@@ -8761,16 +8813,25 @@ static void dl_new_block_choke(void){
                  * getrawtransaction-by-txid keeps up with the tip
                  * (idempotent by height -- a replayed height is a
                  * no-op) */
+                /* bmc.benchlog (2026-10-04, plan part 2): each index's share
+                 * of this block, outside the UTXO apply timer. bl_ns() reads
+                 * no clock with the key off, so the default costs a branch. */
+                unsigned long long bix[BL_IX_N] = {0}, bt0 = bl_ns(), bt1;
                 txit_on_block(store_buf, zh, zb, bl);
+                bt1 = bl_ns(); bix[BL_IX_TXINDEX] = bt1 - bt0;
                 dl_index_trail_tick(g_utxo_live_on ? utxo_live_applied_height() : -1);
+                bt0 = bl_ns();                          /* the trailing builders' tick is in no column */
                 tsp_on_block(store_buf, zh, zb, bl);
+                bt1 = bl_ns(); bix[BL_IX_TXOSPENDER] = bt1 - bt0; bt0 = bt1;
                 /* filter index tail: adopt/append (cheap probe when
                  * the backfill has not closed in yet) */
                 if (g_cfg.blockfilterindex)
                     bfi_on_block(store_buf, zh, zb, (unsigned long)bl);
+                bt1 = bl_ns(); bix[BL_IX_BFILTER] = bt1 - bt0; bt0 = bt1;
                 /* address index (extension): ADDs from the block,
                  * DELs/TOUCHes from its undo records */
                 axt_on_block(store_buf, zh, zb, bl);
+                bt1 = bl_ns(); bix[BL_IX_ADDR] = bt1 - bt0;
                 /* -blocknotify: after the indexes have taken the
                  * block, so a hook that queries us sees it. */
                 if (g_cfg.blocknotify[0]){
@@ -8812,22 +8873,29 @@ static void dl_new_block_choke(void){
                       unsigned char cbh[32]; sha256d(cbh, zb, 80);
                       mempool_seq_block(cbh, 'C');
                   } }
-                if (!zmqpub_active()) continue;
-                /* Publish what this block staged (the sequence topic's 'R's
-                 * and 'C') now, not at the end of a catch-up burst: a burst
-                 * of thousands of blocks would otherwise lap the ring. */
-                zmqn_drain();
-                /* The block HASH is sha256d over the 80-byte
-                 * header, REVERSED: Core's notifier flips the bytes
-                 * (data[31-i] = hash.begin()[i]) so the hashblock
-                 * topic carries the DISPLAY-order hash getblockhash
-                 * prints. Verified against real archived blocks by
-                 * tests/zmq_realblock_check. */
-                unsigned char bh[32], bhr[32];
-                sha256d(bh, zb, 80);
-                for (int zi = 0; zi < 32; zi++) bhr[zi] = bh[31 - zi];
-                zmqpub_notify("hashblock", bhr, 32);
-                zmqpub_notify("rawblock", zb, (unsigned long)bl);
+                if (zmqpub_active()){   /* was `continue` when inactive; a block so the [bench] line below still prints (2026-10-04) */
+                    bt0 = bl_ns();
+                    /* Publish what this block staged (the sequence topic's 'R's
+                     * and 'C') now, not at the end of a catch-up burst: a burst
+                     * of thousands of blocks would otherwise lap the ring. */
+                    zmqn_drain();
+                    /* The block HASH is sha256d over the 80-byte
+                     * header, REVERSED: Core's notifier flips the bytes
+                     * (data[31-i] = hash.begin()[i]) so the hashblock
+                     * topic carries the DISPLAY-order hash getblockhash
+                     * prints. Verified against real archived blocks by
+                     * tests/zmq_realblock_check. */
+                    unsigned char bh[32], bhr[32];
+                    sha256d(bh, zb, 80);
+                    for (int zi = 0; zi < 32; zi++) bhr[zi] = bh[31 - zi];
+                    zmqpub_notify("hashblock", bhr, 32);
+                    zmqpub_notify("rawblock", zb, (unsigned long)bl);
+                    bix[BL_IX_ZMQ] = bl_ns() - bt0;
+                }
+                if (g_cfg.benchlog){
+                    char bline[256]; benchlog_fmt_index(bline, sizeof bline, zh, bix);
+                    fprintf(stderr, "%s\n", bline);
+                }
             }
         }
     }
@@ -10510,6 +10578,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
          * This is the shape Core has for free: libzmq services subscribers on
          * its own I/O thread and Core's hot paths never touch them. */
         if (zmqpub_active()) zmqn_drain();
+        dl_ready_check(utxo_live_ok);   /* the [ready] finish line, once (2026-10-04) */
         if(now_ms >= next_heartbeat_ms){
             int live_peers=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) live_peers++;
             char upbuf[UPTIME_BUF];
@@ -12023,6 +12092,7 @@ static int datadir_lock_acquire(const char* effdir){
 }
 
 int main(int argc, char** argv){
+    { struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0); g_proc_start_ms = t0.tv_sec * 1000LL + t0.tv_nsec / 1000000; }   /* the [ready] line's clock */
     /* a fatal signal writes the crashing thread's stack to the log (text-
      * segment addresses only -- no core file, LimitCORE=0 stays: the seed);
      * forked workers inherit it (2026-10-03, after a crash loop left only
