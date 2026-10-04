@@ -351,6 +351,10 @@ RE_READY = re.compile(r"\[ready\] all indexes at height (\d+)")
 RE_KV = re.compile(r"([A-Za-z_][\w]*)=([^\s,|]+)")
 RE_DLC_SUMMARY = re.compile(r"\[dlc\] -- recv ([\d.]+[KMG]?B/s) \(avg ([\d.]+[KMG]?B/s)\) \| pool idle (\d+)%")
 RE_DLC_PEER = re.compile(r"\[dlc\]\s+w(\d+) (\S+)\s+chunks=(\d+)\s+blocks=(\d+)")
+# 2026-10-04: the format daemon/dlc_benchlog.c actually prints (bmc.benchlog):
+# "[bench] chunk w3 peer 1.2.3.4:8333: blocks 800000..800015 (16) | wall 1234 ms
+#  | wait 56 ms | 12.34 MB (10.00 MB/s) | inflight max 16"
+RE_BENCH_CHUNK = re.compile(r"\[bench\] chunk w(\d+) peer (\S+): blocks (\d+)\.\.(\d+) \((\d+)\) \| wall (\d+) ms \| wait (\d+) ms \| ([\d.]+) MB \([\d.]+ MB/s\) \| inflight max (\d+)")
 
 
 def to_ms(v, unit):
@@ -440,6 +444,13 @@ def parse_bmc(path, size, side=None):
                     for k, v in parse_parts(m.group(2)).items():
                         s.add("ix:" + k, v)
                     s.inc("index_lines")
+                    continue
+                m = RE_BENCH_CHUNK.search(line)
+                if m:
+                    side.chunks.append({"_ts": bmc_ts(line), "w": m.group(1), "peer": m.group(2).rstrip(":"),
+                                        "h": "[%s,%s]" % (m.group(3), m.group(4)), "n": m.group(5),
+                                        "wall": m.group(6) + "ms", "wait": m.group(7) + "ms",
+                                        "bytes": m.group(8) + "MB", "inflight": m.group(9)})
                     continue
                 m = RE_BMC_OTHER.search(line)
                 if m:
@@ -933,6 +944,7 @@ SAMPLE_BMC = """\
 2026-10-05 01:00:00.000 [boot] logging to /x/run34/data/main/debug.log (debuglogfile)
 2026-10-05 01:00:05.000 [dlc] chunk w0 peer=1.2.3.4:8333 h=[0,15] wall=1500ms wait=200ms bytes=2.5MB inflight=16
 2026-10-05 01:00:06.000 [dlc] chunk w1 peer=5.6.7.8:8333 h=[16,31] wall=2.5s wait=0.5s bytes=1.5MB inflight=16
+2026-10-05 01:00:07.000 [bench] chunk w2 peer 9.9.9.9:8333: blocks 32..47 (16) | wall 1000 ms | wait 10 ms | 1.00 MB (1.00 MB/s) | inflight max 16
 2026-10-05 01:00:10.000 [bench] block 1: 1 tx, 0 txin | read 0.5 | idx 0.1 | verify 0.0 | get 0.0 | put 0.2 | ckpt 0.0 | flush 0.0 | csi 0.1 | total 1.0 ms
 2026-10-05 01:00:10.001 [bench] index 1: txindex 0.2 | txospender 0.1 | bfilter 0.3 | addr 0.0 | zmq 0.4 ms
 some line with a NUL \x00 in it
@@ -1033,9 +1045,10 @@ def selftest():
         ck("bmc index line zmq seg 0", g0.st.get("ix:zmq"), 0.4)
         ck("bmc tx/txin seg 1", (g1.tx, g1.txin), (11, 10))
         ck("other [bench] kinds counted with their ms", b.other_bench.get("memflush"), [1, 480.0])
-        ck("chunk lines parsed", len(b.chunks), 2)
-        ck("chunk wall in seconds (ms and s units)", sorted(kv_value(d["wall"])[1] for d in b.chunks), [1.5, 2.5])
-        ck("chunk bytes", sum(kv_value(d["bytes"])[1] for d in b.chunks), 4.0e6)
+        ck("chunk lines parsed (both formats)", len(b.chunks), 3)
+        ck("chunk wall in seconds (ms and s units)", sorted(kv_value(d["wall"])[1] for d in b.chunks), [1.0, 1.5, 2.5])
+        ck("chunk bytes", sum(kv_value(d["bytes"])[1] for d in b.chunks), 5.0e6)
+        ck("the [bench] chunk line's peer", [d["peer"] for d in b.chunks][2], "9.9.9.9:8333")
         ck("IBD end from catch-up done", b.ibd_end, parse_ts("2026-10-05 01:00:31"))
         ck("READY from the [ready] line (log's own ms kept)", b.ready.get("READY"), parse_ts("2026-10-05 01:00:45.678"))
         ck("ready height", b.ready_h, 3)

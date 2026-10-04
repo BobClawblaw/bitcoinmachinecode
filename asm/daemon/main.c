@@ -6600,6 +6600,13 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                 long chunk_r1 = dlc_proc_rchar(getpid());
 #endif
                 double chunk_bps = (secs >= 2.0 && chunk_r0 >= 0 && chunk_r1 >= chunk_r0) ? (double)(chunk_r1 - chunk_r0) / secs : -1.0;
+                /* bmc.benchlog (2026-10-04): one line per completed chunk --
+                 * wall, the wait before first bytes, bytes, and the most
+                 * blocks in flight (16 under bmc.dlshape=core; the whole
+                 * chunk under bmc's own shape) */
+                dlc_benchlog_chunk(w, (const char*)mystat->peer, lo, n, ibd_pipeline_last_wall_ms(), ibd_pipeline_last_wait_ms(),
+                                   (chunk_r0 >= 0 && chunk_r1 >= chunk_r0) ? chunk_r1 - chunk_r0 : 0,
+                                   g_dlc_core ? (int)ibd_pipeline_max_inflight() : (int)n);
                 double med = mystat->pool_median_bps;
                 if(!g_dlc_core && dlc_rotate_after_chunk(chunk_bps, med) && dlc_replace_allowed((int)next_claim[DLC_CTL_FREE_PEERS])){   /* Core rotates nobody for speed */   /* 2026-09-10: no free peer, no rotation -- the window's tail judges */
                     __sync_fetch_and_add(&next_claim[DLC_CTL_N_ROTATE], 1L);   /* counted on the tick line; nothing is discarded, so no line per event */
