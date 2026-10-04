@@ -312,6 +312,65 @@ ck "the monitor loop also counts short-lived RPC connections" "$(awk '/^while :;
 # live: a port nothing listens on has no TIME-WAIT sockets, and the reader counts
 ck "a quiet port has no recent closes" "$(ibd_rpc_recent_closes 1)" "0"
 
+echo "== logged runs: BENCHLOG / DLSHAPE / READY (2026-10-04) =="
+ck "BENCHLOG=1 DLSHAPE=core gives both conf lines" \
+   "$(ibd_bench_conf_lines 1 core | tr '\n' ' ')" "bmc.benchlog=1 bmc.dlshape=core "
+ck "the defaults add nothing" "$(ibd_bench_conf_lines 0 '')" ""
+ck "...nor do empty values" "$(ibd_bench_conf_lines '' '')" ""
+ibd_bench_conf_lines yes '' >/dev/null; ckc "BENCHLOG=yes is refused, not read as off" "$?" "1"
+ibd_bench_conf_lines 1 Core >/dev/null; ckc "DLSHAPE=Core (a typo) is refused" "$?" "1"
+ck "...and a refusal prints no conf line" "$(ibd_bench_conf_lines 1 fast | grep -c '^bmc\.')" "0"
+printf 'xx\000bmc.catchupworkers\000bmc.benchlog\000yy' > "$T/fakebin"
+ibd_binary_knows "$T/fakebin" bmc.benchlog; ckc "a key in the binary is known" "$?" "0"
+ibd_binary_knows "$T/fakebin" bmc.dlshape;  ckc "a key missing from the binary is not" "$?" "1"
+LR="$T/ready.log"
+printf '2026-10-05 01:00:00.100 [dlc] catch-up done: 969000 new blocks written\n' > "$LR"
+ibd_ready_line "$LR" >/dev/null; ckc "no [ready] line yet: rc 1" "$?" "1"
+printf 'INFO [ready] all indexes at height 5 (no timestamp)\n' > "$T/ready_nots.log"
+ibd_ready_line "$T/ready_nots.log" >/dev/null; ckc "a [ready] line with no timestamp is not a reading: rc 1" "$?" "1"
+printf 'a NUL \000 before the line\n' >> "$LR"
+printf '2026-10-05 01:39:12.345 [ready] all indexes at height 969812 (utxo 969812, txindex 969812, bfilter 969812, coinstats 969812) -- 2347s\n' >> "$LR"
+printf '2026-10-05 02:00:00.000 [ready] all indexes at height 969900 (later) -- 1s\n' >> "$LR"
+ck "the FIRST [ready] line, after a NUL, gives date, time and height" "$(ibd_ready_line "$LR")" "2026-10-05 01:39:12 969812"
+# The READY wait is log-only: no RPC between the TIP line and the capstone.
+ck "the READY wait makes no RPC call" \
+   "$(awk '/ph "TIP reached/,/CAPSTONE network disabled/' fresh_ibd_run.sh | grep -v 'setnetworkactive' | grep -c '\$CLI ')" "0"
+ck "the READY wait reads the [ready] line" \
+   "$(awk '/ph "TIP reached/,/CAPSTONE network disabled/' fresh_ibd_run.sh | grep -c 'ibd_ready_line')" "1"
+ck "BENCHLOG and DLSHAPE are checked against the built binary" \
+   "$(grep -cE 'ibd_binary_knows src/asm/daemon/bmcbitcoind bmc\.(benchlog|dlshape)' fresh_ibd_run.sh)" "2"
+
+echo "== Core watcher: the READY step =="
+CL="$T/core.log"
+printf '2026-10-04T13:48:36.000001Z UpdateTip: new best=00ab height=969800 version=0x20000000 log2_work=95.1 tx=1 date=x progress=1.000000 cache=1.0MiB(1txo)\n' > "$CL"
+printf '2026-10-04T13:48:37.500000Z [bench] - Connect block: 12.34ms [1.00s (1.00ms/blk)]\n' >> "$CL"
+printf '2026-10-04T13:48:38.250000Z UpdateTip: new best=00cd height=969801 version=0x20000000 log2_work=95.1 tx=2 date=y progress=1.000000 cache=1.0MiB(2txo)\n' >> "$CL"
+printf '2026-10-04T13:48:39Z [background validation] UpdateTip: new best=00ef height=2000 version=1\n' >> "$CL"
+ck "Core's log tip is the last active-chain UpdateTip" "$(core_log_tip_height "$CL")" "969801"
+ck "...read from a tail as small as the last line" "$(core_log_tip_height "$CL" 400)" "969801"
+ck "the UpdateTip time at a height, microseconds kept" "$(core_log_tip_time "$CL" 969801)" "2026-10-04T13:48:38.250000Z"
+ck "a height not reached has no time" "$(core_log_tip_time "$CL" 969802)" ""
+GI='{"txindex":{"synced":true,"best_block_height":969801},"coinstatsindex":{"synced":true,"best_block_height":969801},"basic block filter index":{"synced":true,"best_block_height":969801}}'
+core_index_unready "$GI" 969801 >/dev/null; ckc "every index at the finish height: ready" "$?" "0"
+GL='{"txindex":{"synced":true,"best_block_height":969801},"coinstatsindex":{"synced":true,"best_block_height":969770},"basic block filter index":{"synced":true,"best_block_height":969801}}'
+ck "synced=true but 31 blocks behind is NOT ready, and is named" "$(core_index_unready "$GL" 969801)" "coinstatsindex@969770"
+core_index_unready "$GL" 969801 >/dev/null; ckc "...rc 1" "$?" "1"
+core_index_unready '' 969801 >/dev/null; ckc "an empty answer is unreadable (rc 2), never ready" "$?" "2"
+core_index_unready '{}' 969801 >/dev/null; ckc "no index at all is unreadable (rc 2), never ready" "$?" "2"
+core_index_unready 'error code: -28' 969801 >/dev/null; ckc "an RPC error is unreadable (rc 2)" "$?" "2"
+# The timed span is RPC-free: the only call to the timed node (getindexinfo)
+# comes after the IBD_END loop and after READY_TIP.
+ck "the watcher's IBD loop makes no call to the node" \
+   "$(awk '/^while :; do/ && !s {s=1} s && !e {print} s && /^done/ {e=1}' core_bench_watch.sh | grep -c 'TCLI\|getindexinfo\|CORE_CLI\|ORACLE')" "0"
+ck "...and that loop is the one that records IBD_END" \
+   "$(awk '/^while :; do/ && !s {s=1} s && !e {print} s && /^done/ {e=1}' core_bench_watch.sh | grep -c 'w "IBD_END')" "1"
+ck "getindexinfo is issued only after READY_TIP is recorded" \
+   "$(awk '/w "READY_TIP/{r=1} r && /getindexinfo 2>&1/{print "after"}' core_bench_watch.sh)" "after"
+
+echo "== the stage report's self-test =="
+st=$(python3 ibd_stage_report.py --selftest 2>&1 | tail -1)
+ck "ibd_stage_report.py --selftest passes" "$st" "SELFTEST PASSED"
+
 echo
 echo "passed $pass, failed $fail"
 [ "$fail" -eq 0 ] || exit 1
