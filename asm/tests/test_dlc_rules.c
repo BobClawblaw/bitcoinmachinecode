@@ -73,6 +73,8 @@ int main(void){
        !dlc_tail_stalled(1, 7000 - dlc_stall_clock(0, 5100), 2));
     ck("a peer silent for the timeout after its last block is one", dlc_tail_stalled(1, 7200 - dlc_stall_clock(0, 5100), 2));
     ck("a peer is replaced only when a free peer exists", dlc_replace_allowed(1) && !dlc_replace_allowed(0));
+    ck("Core mode: the block download timeout with Core's 10 download peers is 3,300 s", dlc_core_block_timeout_s(10) == 3300);
+    ck("...600 s with one peer, never less", dlc_core_block_timeout_s(1) == 600 && dlc_core_block_timeout_s(0) == 600);
     printf("%s (%d failure(s))\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);
     return fails ? 1 : 0;
 }

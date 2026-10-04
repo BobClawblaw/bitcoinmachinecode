@@ -75,4 +75,17 @@ void ibd_pipeline_set_sink(ibd_sink_fn sink);
  * never land below the archive frontier and break the layout. Pass
  * archive_store_frontier. NULL = no guard (tests). */
 void ibd_pipeline_set_frontier(void (*f)(void*));
+/* Core's download shape (2026-10-04, bmc.dlshape=core; see ibd_pipeline.c):
+ * complete chunk A (hst, lo_real, nloc) with at most `cap` hashes in flight,
+ * topping the peer up as each block lands, and spill the spare slots into
+ * the lookahead chunk B (hst_next, lo_next, n_next; n_next 0 = none). Returns
+ * like ibd_fetch_chunk_pipelined once A is stored; B's arrivals are carried
+ * to the next call for B on the same fd. Any failure drops the carry. */
+long ibd_fetch_chunk_rolling(int fd, void* st, void* hst, long lo_real, long nloc,
+                             void* hst_next, long lo_next, long n_next, long cap,
+                             unsigned char* buf, unsigned buflen,
+                             void* scratch, unsigned scratch_cap);
+void ibd_pipeline_drop_carry(void);       /* the worker closed the socket or gave B away */
+long ibd_pipeline_carried(void);          /* lookahead blocks carried by the last successful call */
+long ibd_pipeline_max_inflight(void);     /* test seam: most hashes outstanding during the last call */
 #endif

@@ -17,6 +17,15 @@
  * goes through tx_verify_block_connect_all's Phase 1 resolve and Phase 2
  * verify. The coinstats "fold" here is a stand-in callback that burns about
  * a microsecond, the real csi_on_add/csi_on_remove cost the scope measured.
+ *
+ * C (2026-10-04, bmc.benchlog; worklog/2026-10-04-logged-ibd-runs-plan.md
+ * part 2): with the key on, the same catch-up writes ONE "[bench] block H:"
+ * line per connected block -- every height exactly once, its tx and txin
+ * counts, the eight phases in ms whose sum stays within the block's total --
+ * and one "[bench] flush at block H:" line per memtable flush (the memtable
+ * is shrunk to force several), with the flushed ops, the run's size and the
+ * run count. Section A is the negative control: the default (key off)
+ * writes no [bench] line at all.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,6 +35,8 @@
 #include <fcntl.h>
 #include <time.h>
 #include "test_tmpdir.h"
+#include "../daemon/node_config.h"   /* g_cfg.benchlog (section C) */
+#include "../daemon/lsm_state.h"     /* g_utxo_lst: section C shrinks the memtable to force flushes */
 
 typedef unsigned char u8;
 typedef unsigned int u32;
@@ -268,6 +279,7 @@ int main(void){
         ckm("A ckpt phase is non-zero (at least one checkpoint fsync landed)", utxo_live_timing_us(TM_CKPT) > 0);
         ckm("A the progress line carries the breakdown", log && strstr(log, "catchup progress:") && strstr(log, "| read ") && strstr(log, " csi "));
         ckm("A the call ends with a 'catchup timing' summary line", log && strstr(log, "[utxo_live] catchup timing: "));
+        ckm("A bmc.benchlog off (the default): no [bench] line at all", log && !strstr(log, "[bench]"));
         if (log){ echo_lines_with(log, "catchup progress:"); echo_lines_with(log, "catchup timing:"); free(log); }
         utxo_live_close();
     }
@@ -320,6 +332,80 @@ int main(void){
         dump_phases("B-on phases (us)");
         ck("B timing back on: blocks counted again", (long)utxo_live_timing_us(TM_N), 3);
         ckm("B timing back on: wall is non-zero again", utxo_live_timing_us(TM_WALL) > 0);
+        utxo_live_close();
+    }
+
+    /* ---------------- C: bmc.benchlog=1, the per-block and flush lines ---------------- */
+    {
+        extern struct lsm_state g_utxo_lst;
+        tt_subdir("bench");
+        memset(store_buf,0,sizeof store_buf);
+        g_fold_adds = g_fold_rms = 0;
+        utxo_live_set_timing(1);
+        g_cfg.benchlog = 1;
+        ck("C store_init", store_init(store_buf), 1);
+        ck("C utxo_live_init", utxo_live_init("."), 1);
+        utxo_live_set_coinstats(fold_add, fold_rm, fold_inval, fold_commit);
+        undo_set_coin_observer(fold_rm);
+        build_chain(0x73000000u);
+        /* ~260 puts+dels over the chain: a flush every 40 ops forces several */
+        g_utxo_lst.op_threshold = 40;
+
+        capture_begin("catchup_bench.log");
+        u64 t0 = now_us();
+        long ar = utxo_live_catchup(store_buf);
+        u64 wall_call = now_us() - t0;
+        char* log = capture_end("catchup_bench.log");
+        g_cfg.benchlog = 0;
+        ck("C catch-up applied the whole chain", ar, NBLOCKS);
+
+        int seen[NBLOCKS]; memset(seen, 0, sizeof seen);
+        int bad_fmt = 0, bad_counts = 0, bad_sum = 0, extra = 0, nflush = 0, bad_flush = 0;
+        double verify_spend = 0.0, total_sum = 0.0;
+        const char* p = log ? log : "";
+        while (*p){
+            const char* e = strchr(p, '\n'); size_t n = e ? (size_t)(e - p) : strlen(p);
+            char line[512]; size_t m = n < sizeof line - 1 ? n : sizeof line - 1;
+            memcpy(line, p, m); line[m] = 0;
+            const char* b = strstr(line, "[bench] block ");
+            const char* f = strstr(line, "[bench] flush at block ");
+            if (b){
+                long h; unsigned long long ntx, nin; double v[8], tot; int used = 0;
+                int k = sscanf(b, "[bench] block %ld: %llu tx, %llu txin | read %lf | idx %lf | verify %lf | get %lf | put %lf | ckpt %lf | flush %lf | csi %lf | total %lf ms%n",
+                               &h, &ntx, &nin, &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &tot, &used);
+                if (k != 12 || b[used] != 0){ bad_fmt++; printf("     bad block line: %s\n", b); }
+                else if (h < 0 || h >= NBLOCKS) extra++;
+                else {
+                    seen[h]++;
+                    unsigned long long want = h < NCB ? 1 : 1 + PERBLK;   /* coinbase (1 input) + PERBLK one-input spends */
+                    if (ntx != want || nin != want) bad_counts++;
+                    double sum = 0; for (int q = 0; q < 8; q++){ if (v[q] < 0) bad_sum++; sum += v[q]; }
+                    if (sum > tot + 0.08) bad_sum++;               /* eight values rounded to 0.01 */
+                    if (h >= NCB) verify_spend += v[2];
+                    total_sum += tot;
+                }
+            }
+            if (f){
+                long h; double ms, mb; unsigned long long ops, runs, live; unsigned run; int used = 0;
+                int k = sscanf(f, "[bench] flush at block %ld: %lf ms, %llu ops, run %u %lf MB, runs %llu, live %llu%n",
+                               &h, &ms, &ops, &run, &mb, &runs, &live, &used);
+                if (k != 7 || f[used] != 0 || h < 0 || h >= NBLOCKS || ops == 0 || mb <= 0.0 || runs == 0){ bad_flush++; printf("     bad flush line: %s\n", f); }
+                nflush++;
+            }
+            if (!e) break;
+            p = e + 1;
+        }
+        int all_once = 1; for (long h = 0; h < NBLOCKS; h++) if (seen[h] != 1){ all_once = 0; printf("     height %ld: %d block line(s)\n", h, seen[h]); }
+        ckm("C every connected block has exactly one [bench] block line", all_once);
+        ckm("C every block line parses in the documented format", bad_fmt == 0 && extra == 0);
+        ckm("C tx and txin counts match the block (coinbase-only 1/1, spend blocks 6/6)", bad_counts == 0);
+        ckm("C phases are non-negative and sum within the block's total", bad_sum == 0);
+        ckm("C the spend blocks' verify column is non-zero (the script pass ran)", verify_spend > 0.0);
+        ckm("C the block totals sum to no more than the call's wall", total_sum <= (double)wall_call / 1000.0 + 0.01 * NBLOCKS);
+        ckm("C a forced memtable flush writes [bench] flush lines", nflush >= 2);
+        ckm("C every flush line parses, with ops, the run's size and the run count", bad_flush == 0);
+        printf("     C: %d flush line(s), block totals %.2f ms, call wall %.2f ms\n", nflush, total_sum, (double)wall_call / 1000.0);
+        if (log){ echo_lines_with(log, "[bench] flush"); echo_lines_with(log, "[bench] block 159:"); free(log); }
         utxo_live_close();
     }
 

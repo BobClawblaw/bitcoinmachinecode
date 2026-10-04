@@ -86,6 +86,8 @@ static void mempool_refresh_seqlocks(void* store_buf, long now_tip);
 #include "v2transport.h"  /* BIP324 v2 encrypted transport */
 #include "wallet_pass.h"   /* wallet passphrase source (audit finding 2) */
 #include "chainparams.h" /* runtime chain selection (main / regtest)   */
+#include "benchlog.h"    /* 2026-10-04: the [bench] index line and the [ready] finish line */
+#include "dlc_benchlog.h" /* 2026-10-04: the [bench] per-chunk download line (bmc.benchlog) */
 
 /* The node log path, chain-tagged so an aggregated view can never confuse
  * chains: logs/bitcoind.log on mainnet, logs/bitcoind.<chain>.log otherwise
@@ -426,6 +428,7 @@ extern int  tsp_active(void);
 extern void tsp_on_block(void* store_buf, long h, const unsigned char* blk, long blen);
 extern void txit_on_block(void* store_buf, long h, const unsigned char* blk, long blen);
 extern void bfi_on_block(void* store_buf, long h, const unsigned char* blk, unsigned long blen);  /* daemon/bfilter_index.c */
+extern long txit_covered(void);                                               /* daemon/tx_index_tail.c: runs + tail, -1 off */
 typedef int (*bfi_undo_cb_t)(void*, const unsigned char*, unsigned int, unsigned long long,
                              unsigned int, unsigned char, const unsigned char*, unsigned short);
 extern void bfi_set_undo_replay(long (*fn)(long, bfi_undo_cb_t, void*));
@@ -4986,6 +4989,11 @@ static int dl_pool_from_book(void* ab, char out[][DL_POOL_SLOT], int nitems){
  * one in each order, reached it 19.5% and 14.1% sooner than at 40, the gain
  * concentrated at 200k-300k (-23%, -25%) */
 static long g_dlc_chunk = 16;
+/* bmc.dlshape=core (2026-10-04): download exactly as Core v31.1 does -- see
+ * node_config.c and ibd_fetch_chunk_rolling. Set once per pass before any
+ * worker forks, like g_dlc_chunk. */
+static int  g_dlc_core = 0;
+#define DLC_CORE_INFLIGHT 16      /* Core: MAX_BLOCKS_IN_TRANSIT_PER_PEER (net_processing.cpp:130) */
 static long g_dlc_pool_idle_pct = -1;   /* pool-wide share of worker wall-clock blocked in the socket read (2026-09-11); -1 until a chunk completes */
 /* Draw from the WHOLE address book, not a 512 slice of it. Measured
  * 2026-08-18: the book held 1,974 peers, the pool was capped at 512, the
@@ -5017,8 +5025,10 @@ static long g_live_announced[DLC_MAXPOOL];   /* each ranked live peer's start_he
  * timeout is 10 minutes (BLOCK_DOWNLOAD_TIMEOUT_BASE); this is stricter,
  * as before. */
 #define DLC_CHUNK_BUDGET_SECS 120
-#define DLC_STR_(x) #x
-#define DLC_STR(x) DLC_STR_(x)     /* the stall line prints the constant, not a copy of it */
+/* the no-block budget in force: DLC_CHUNK_BUDGET_SECS, or under
+ * bmc.dlshape=core Core's block download timeout, 600 s x (1 + 0.5 x (the
+ * other peers downloading)) (net_processing.cpp:148-150, 6113-6122) */
+static long g_dlc_budget_s = DLC_CHUNK_BUDGET_SECS;
 /* early-kill thresholds: the parent's status loop already samples each
  * worker's real /proc/<pid>/io bandwidth every 10s for the live display --
  * a connection sustaining under DLC_DEAD_WEIGHT_BPS for
@@ -6217,7 +6227,7 @@ typedef struct { char peer[64]; long chunks; long blocks; long guard; double las
 static int g_dl_wire_scope = 0;                    /* 1 inside dl_catchup; forked helpers inherit it */
 static volatile dlc_stat_t* g_dlc_me = NULL;       /* a helper's own stats slot; NULL in the parent */
 static long long dlc_now_ms(void);
-static void dlc_chunk_progress(void* arg){ (void)arg; alarm(DLC_CHUNK_BUDGET_SECS); if(g_dlc_me) g_dlc_me->last_block_ms = dlc_now_ms(); }
+static void dlc_chunk_progress(void* arg){ (void)arg; alarm((unsigned)g_dlc_budget_s); if(g_dlc_me) g_dlc_me->last_block_ms = dlc_now_ms(); }
 static int g_dlc_conn_fd = -1;                     /* the connection g_dlc_me publishes */
 static long long g_dlc_pend_sent, g_dlc_pend_recv, g_dlc_pend_spm[RPC_MSG_N], g_dlc_pend_rpm[RPC_MSG_N];
 /* The BOOT catch-up (bmc.bootcatchup=1, the default) runs before main()
@@ -6315,6 +6325,13 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
     static unsigned char hst[64]; static unsigned char rec[112];
     int slot=slot0; long total=0; long stalled=0;
     int fd=-1; int held=-1;   /* index into live[]/claimed[] currently held, or -1 */
+    /* bmc.dlshape=core (2026-10-04): the lookahead. While chunk A is being
+     * fetched this worker also holds its NEXT claim, B, so the rolling fetch
+     * can keep 16 blocks in flight across the boundary (Core tops a peer up
+     * as each block lands). B becomes the next iteration's A. */
+    long la_lo=-1;
+    char hp2_[64]; snprintf(hp2_,sizeof hp2_,"dlc_hdr2_%d.dat",getpid());
+    static unsigned char hst2[64];
 #define DLC_RELEASE() do{ if(held>=0){ claimed[held]=0; held=-1; } }while(0)
     for(;;){
         stalled=0;                          /* per CHUNK: run 10's cascade was this counter surviving into the next chunk */
@@ -6324,13 +6341,17 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
          * the ring, and after DLC_WINDOW_HELP_SECS fetch the blocking chunk
          * ourselves rather than wait on a worker that may be gone. */
         int helping=0;
-        long lo=dlc_retry_pop(next_claim);
+        long lo=-1;
+        if(la_lo>=0){ lo=la_lo; la_lo=-1; }      /* Core mode: the lookahead claimed last time */
+        else lo=dlc_retry_pop(next_claim);
         if(lo<0){
             /* the committer's stalled cursor chunk, before anything new: one
              * helper (the CAS on HELPING), and not a chunk that is already
              * staged (the owner finished in the meantime) */
             long want=next_claim[DLC_CTL_CURSOR_WANT];
-            if(want>=0 && !dlc_stage_exists(want)){
+            /* Core mode: no cursor help -- Core never asks a second peer for a
+             * block already in flight; its staller rule is what moves the tail */
+            if(want>=0 && !g_dlc_core && !dlc_stage_exists(want)){
                 long cur=next_claim[DLC_CTL_HELPING];
                 if(cur!=want && __sync_bool_compare_and_swap(&next_claim[DLC_CTL_HELPING], cur, want)){
                     lo=want; helping=1;
@@ -6378,6 +6399,36 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
         }
         if(mf) fclose(mf);
         if(n<=0){ close(hfd); if(fd>=0) close(fd); DLC_RELEASE(); break; }
+        /* Core mode: claim the lookahead B -- a NEW chunk, only if the window
+         * allows it now (never wait for it: Core requests nothing past its
+         * window either), and its headers into hst2. A retried chunk is never
+         * a lookahead, so B is always above A and the stall rule, which keys
+         * on the chunk a worker is completing, still sees the oldest one. */
+        long bl=-1, bn=0; int hfd2=-1;
+        if(g_dlc_core){
+            long peek=next_claim[DLC_CTL_CLAIM], fh=next_claim[DLC_CTL_FIRST_HOLE];
+            long anchor=dlc_window_anchor(next_claim[DLC_CTL_APPLIED], fh);
+            if(peek<=end_h && dlc_window_allows(peek, anchor, g_dlc_window)){
+                bl=__sync_fetch_and_add(next_claim,g_dlc_chunk);
+                if(bl>end_h) bl=-1;
+            }
+            if(bl>=0){
+                long bh=bl+g_dlc_chunk-1; if(bh>end_h) bh=end_h;
+                unlink(hp2_);
+                hfd2=open(hp2_,O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW,0600);
+                if(hfd2>=0){
+                    unlink(hp2_);
+                    *(int*)((char*)hst2+0)=hfd2; *(long*)((char*)hst2+8)=0;
+                    FILE* mf2=fopen("headers.dat","rb");
+                    for(long k=bl;k<=bh;k++){
+                        if(mf2 && fseek(mf2,k*112,SEEK_SET)==0 && fread(rec,1,112,mf2)==112){ if(hst_append(hst2,rec,rec+80)<0) break; bn++; }
+                        else break;
+                    }
+                    if(mf2) fclose(mf2);
+                }
+                if(bn<=0){ if(hfd2>=0) close(hfd2); hfd2=-1; dlc_retry_push(next_claim, bl); bl=-1; bn=0; }   /* cannot stage it: give it back */
+            }
+        }
 
         int guard=0, chunk_ok=0;
         for(;;){
@@ -6389,7 +6440,7 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                  * rotation. Losing a CAS race simply re-asks -- the peer the
                  * other worker won is now claimed and drops out of the scan. */
                 for(int q=0;q<nlive && !ok;q++){
-                    int idx=dlc_pick_peer(nlive, slot, ema, claimed, banned, mystat->pool_median_bps*DLC_ROTATE_FRACTION);
+                    int idx=dlc_pick_peer(nlive, slot, g_dlc_core ? NULL : ema, claimed, banned, mystat->pool_median_bps*DLC_ROTATE_FRACTION);   /* Core mode: no speed ranking, the (shuffled) rotation */
                     if(idx<0) break;
                     const char* cand=live[idx];
                     int cp2=0; unsigned ip=0; if(!dlc_parse_peer(cand, &ip, &cp2)) continue;
@@ -6407,7 +6458,9 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                     int fdc=tcp_connect_ip(ip,(unsigned short)htons((unsigned short)cp2));
                     if(fdc<0){ if(ema[idx]<=0.0) ema[idx]=1.0; claimed[idx]=0; continue; }   /* tried, unreachable: the picker must not offer it as untried again */
                     dlc_wire_dial();                  /* the handshake's bytes belong to this connection, published once it succeeds */
-                    struct timeval tv; tv.tv_sec=20; tv.tv_usec=0; setsockopt(fdc,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
+                    /* Core mode: Core has no per-read timeout on a download
+                     * peer; its inactivity bound is 20 minutes (TIMEOUT_INTERVAL) */
+                    struct timeval tv; tv.tv_sec=g_dlc_core ? 1200 : 20; tv.tv_usec=0; setsockopt(fdc,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
                     /* 2026-09-06: a getdata is small and is the ONLY thing
                      * standing between this worker and the peer's reply, so
                      * Nagle can only delay it -- and p2p_write sends a message
@@ -6418,6 +6471,7 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                     { int one=1; setsockopt(fdc,IPPROTO_TCP,TCP_NODELAY,&one,sizeof one); }
                     if(node_handshake(fdc)==1 && peer_has_witness(cand)){
                         fd=fdc; ok=1; held=idx; slot=(idx+1)%nlive;
+                        ibd_pipeline_drop_carry();   /* a new socket may reuse an old fd number: nothing carried applies to it */
                         dlc_wire_adopt(fdc);    /* getpeerinfo's bytes are this connection's, handshake included */
                         mystat->held_idx=idx;   /* so the parent can ban THIS peer on early-kill */
                         strncpy((char*)mystat->peer,cand,63);
@@ -6473,7 +6527,7 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
             mux_sync_budget_fired=0; mux_sync_budget_sig=0;
             ibd_pipeline_set_progress(dlc_chunk_progress, 0);   /* each arriving block re-arms this */
             ibd_pipeline_set_bytes(dlc_chunk_bytes);
-            alarm(DLC_CHUNK_BUDGET_SECS);
+            alarm((unsigned)g_dlc_budget_s);
             /* 2026-09-06: the whole chunk in ONE getdata, blocks placed by
              * hash as they arrive (daemon/ibd_pipeline.c). node_ibd_blocks_s
              * asked for one block and waited for it before asking for the
@@ -6494,7 +6548,11 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
             char stmp[96]; int sfd=dlc_stage_open_tmp(stmp,sizeof stmp,lo);
             if(sfd<0){ fprintf(stderr,"[dlc w%d] stage: cannot create %s (%s)\n", w, stmp, strerror(errno)); close(fd); fd=-1; DLC_RELEASE(); break; }
             g_stage_fd=sfd; ibd_pipeline_set_sink(dlc_stage_sink);
-            long r=ibd_fetch_chunk_pipelined(fd, st, hst, lo, n, buf, (unsigned)sizeof buf, scratch, cap);
+            long r = g_dlc_core
+                   ? ibd_fetch_chunk_rolling(fd, st, hst, lo, n, bl>=0 ? (void*)hst2 : NULL, bl, bn, DLC_CORE_INFLIGHT,
+                                             buf, (unsigned)sizeof buf, scratch, cap)
+                   : ibd_fetch_chunk_pipelined(fd, st, hst, lo, n, buf, (unsigned)sizeof buf, scratch, cap);
+            if(r<0 || mux_sync_budget_fired) ibd_pipeline_drop_carry();   /* the socket is about to close */
             mystat->wait_ms += ibd_pipeline_last_wait_ms();
             mystat->wall_ms += ibd_pipeline_last_wall_ms();
             alarm(0); sigaction(SIGALRM,&old,NULL);
@@ -6515,10 +6573,11 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                  * clock (SIGALRM: no block for DLC_CHUNK_BUDGET_SECS). Before
                  * 2026-09-07 both printed "dead weight", and 429 of 432 such
                  * lines in one run were the alarm, not the verdict. */
-                fprintf(stderr,"[dlc w%d] %s %s (last measured %s, completed %ld chunk(s)/%ld block(s) on this peer); dropping for a fresh peer\n",
+                fprintf(stderr,"[dlc w%d] %s %s%s (last measured %s, completed %ld chunk(s)/%ld block(s) on this peer); dropping for a fresh peer\n",
                         w, mystat->peer,
                         mux_sync_budget_sig==SIGUSR1 ? (mystat->kill_reason==1 ? "stalling the window (held its oldest missing chunk while it was full)" : "dead weight")
-                                                     : "stalled: no block for " DLC_STR(DLC_CHUNK_BUDGET_SECS) "s",
+                                                     : "stalled: no block for ",
+                        mux_sync_budget_sig==SIGUSR1 ? "" : (g_dlc_budget_s==DLC_CHUNK_BUDGET_SECS ? "120s" : "Core's block download timeout"),
                         lastbw, mystat->chunks, mystat->blocks);
                 mystat->kill_reason=0;
                 close(fd); fd=-1; DLC_RELEASE();
@@ -6541,8 +6600,15 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                 long chunk_r1 = dlc_proc_rchar(getpid());
 #endif
                 double chunk_bps = (secs >= 2.0 && chunk_r0 >= 0 && chunk_r1 >= chunk_r0) ? (double)(chunk_r1 - chunk_r0) / secs : -1.0;
+                /* bmc.benchlog (2026-10-04): one line per completed chunk --
+                 * wall, the wait before first bytes, bytes, and the most
+                 * blocks in flight (16 under bmc.dlshape=core; the whole
+                 * chunk under bmc's own shape) */
+                dlc_benchlog_chunk(w, (const char*)mystat->peer, lo, n, ibd_pipeline_last_wall_ms(), ibd_pipeline_last_wait_ms(),
+                                   (chunk_r0 >= 0 && chunk_r1 >= chunk_r0) ? chunk_r1 - chunk_r0 : 0,
+                                   g_dlc_core ? (int)ibd_pipeline_max_inflight() : (int)n);
                 double med = mystat->pool_median_bps;
-                if(dlc_rotate_after_chunk(chunk_bps, med) && dlc_replace_allowed((int)next_claim[DLC_CTL_FREE_PEERS])){   /* 2026-09-10: no free peer, no rotation -- the window's tail judges */
+                if(!g_dlc_core && dlc_rotate_after_chunk(chunk_bps, med) && dlc_replace_allowed((int)next_claim[DLC_CTL_FREE_PEERS])){   /* Core rotates nobody for speed */   /* 2026-09-10: no free peer, no rotation -- the window's tail judges */
                     __sync_fetch_and_add(&next_claim[DLC_CTL_N_ROTATE], 1L);   /* counted on the tick line; nothing is discarded, so no line per event */
                     /* hand the verdict's number to the picker: the parent's
                      * tick-EMA lags (alpha 0.5 over 10 s ticks), and a peer
@@ -6569,6 +6635,8 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
             usleep((useconds_t)(dlc_fail_backoff_ms(guard)*1000));   /* do not hammer the pool: 12 reconnects/s was run 14's stall */
         }
         close(hfd);
+        if(hfd2>=0) close(hfd2);
+        if(bl>=0) la_lo=bl;                     /* Core mode: B is ours; it is the next A, whatever happened to this one */
         if(helping) __sync_bool_compare_and_swap(&next_claim[DLC_CTL_HELPING], lo, -1L);   /* the help is over, whichever way */
         if(chunk_ok){
             total+=n; __sync_fetch_and_add(done_count,n);
@@ -7282,7 +7350,8 @@ static void dlc_stall_tick(volatile long* ctl, volatile dlc_stat_t* stats, pid_t
     const char* verdict = "kept (no pool)";
     long bidx = stats[w].held_idx;
     if(banned && live && bidx >= 0 && bidx < nlive){
-        if(node_config_is_manual(live[bidx]))      verdict = "manual, kept selectable";
+        if(g_dlc_core)                             verdict = "disconnected, not banned (Core)";   /* Core: fDisconnect only, no Misbehaving */
+        else if(node_config_is_manual(live[bidx])) verdict = "manual, kept selectable";
         else if(banned[bidx])                      verdict = "already banned";
         else {
             int usable = 0; for(int q = 0; q < nlive; q++) if(!banned[q]) usable++;
@@ -7454,7 +7523,18 @@ static long dl_catchup_run(const char* dir, int min_workers){
         }
     }
     if(nlive<=0){ fprintf(stderr,"[dlc] no live peers; skipping catch-up\n"); return 0; }
-    dlc_rank_by_throughput(live, nlive);      /* fastest first: the workers claim from the top */
+    if(g_cfg.dl_shape_core){
+        /* Core mode: no speed ranking. Core's replacement for a download
+         * peer is a random addrman pick (net.cpp:2797-2878); a shuffle of the
+         * live pool gives the workers' rotation the same no-preference order. */
+        unsigned seed = (unsigned)time(NULL) ^ (unsigned)getpid();
+        for(int i = nlive - 1; i > 0; i--){
+            int j = (int)(rand_r(&seed) % (unsigned)(i + 1));
+            char tmp[DL_POOL_SLOT]; memcpy(tmp, live[i], DL_POOL_SLOT); memcpy(live[i], live[j], DL_POOL_SLOT); memcpy(live[j], tmp, DL_POOL_SLOT);
+        }
+        fprintf(stderr, "[dlc] Core's download rules (bmc.dlshape=core): %d live peer(s) in random order, no speed ranking\n", nlive);
+    }
+    else dlc_rank_by_throughput(live, nlive);      /* fastest first: the workers claim from the top */
     /* Core's shape (2026-09-10): every live peer downloads, up to the cap
      * (bmc.catchupworkers, default 64) -- a fixed 16 against 124 live peers
      * carried 11 MB/s on a 2.5 Gbit link, the sum of 16 peers at 250-600
@@ -7476,6 +7556,11 @@ static long dl_catchup_run(const char* dir, int min_workers){
     int nw = dlc_workers_for(nlive, min_workers, end_h - start_h + 1, g_dlc_chunk);   /* a handoff's few dozen blocks do not need 64 helpers (row 3) */
     g_dlc_window = dlc_window_blocks(nw, g_dlc_chunk);
     g_dlc_stall_timeout_s = DLC_STALL_TIMEOUT_MIN_S;
+    g_dlc_core = g_cfg.dl_shape_core;
+    g_dlc_budget_s = g_dlc_core ? dlc_core_block_timeout_s(nw) : DLC_CHUNK_BUDGET_SECS;
+    if(g_dlc_core)
+        fprintf(stderr,"[dlc] Core's download rules: %d blocks in flight per peer topped up as each lands, across chunks; stallers disconnected, never banned; no rate floor or rotation; block download timeout %ld s\n",
+                DLC_CORE_INFLIGHT, g_dlc_budget_s);
     fprintf(stderr,"[dlc] Core's shape: %d of %d live peer(s) download at once (cap %d, span %ld), %ld-block requests, window %ld blocks above the connected tip, stall timeout %ld s, cursor help at %ld staged\n",
             nw, nlive, min_workers, end_h - start_h + 1, g_dlc_chunk, g_dlc_window, g_dlc_stall_timeout_s,
             dlc_cursor_help_min_staged(g_dlc_window, g_dlc_chunk));
@@ -7526,7 +7611,7 @@ static long dl_catchup_run(const char* dir, int min_workers){
      * dedup here would misalign the indexes), so the first `ngood` pool
      * entries after the addnode block are exactly the loaded ones; every
      * other live entry stays 0 == rotation until measured. */
-    if(ngood>0){
+    if(ngood>0 && !g_dlc_core){   /* Core mode: no speed memory */
         int seed=0;
         for(int i=0;i<nlive;i++){
             for(int j=0;j<ngood;j++){
@@ -7828,7 +7913,7 @@ static long dl_catchup_run(const char* dir, int min_workers){
             }
             char flag[48]="";
             if(kids[w]!=0 && byte_rate>=0.0){
-                if(median_bps > 0.0 && dlc_replace_allowed(free_peers) && dlc_dead_weight(byte_rate, b-prev_blocks[w], floor_bps)){
+                if(!g_dlc_core && median_bps > 0.0 && dlc_replace_allowed(free_peers) && dlc_dead_weight(byte_rate, b-prev_blocks[w], floor_bps)){   /* Core has no rate floor */
                     dead_ticks[w]++;
                     if(dead_ticks[w]>=g_cfg.dead_weight_ticks){
                         long bidx = stats[w].held_idx;
@@ -8622,6 +8707,55 @@ static int dl_tip_is_ibd(void){
     unsigned long tip_time = (unsigned long)hb[68] | ((unsigned long)hb[69]<<8) | ((unsigned long)hb[70]<<16) | ((unsigned long)hb[71]<<24);
     return !dl_announce_allowed(tip_time, (long long)time(NULL), g_cfg.maxtipage > 0 ? g_cfg.maxtipage : 86400);
 }
+/* bmc.benchlog's clock (2026-10-04): CLOCK_MONOTONIC in ns with the key on,
+ * 0 with it off -- so the index timing in the choke point below reads no
+ * clock on a node that does not print it. */
+static unsigned long long bl_ns(void){
+    if (!g_cfg.benchlog) return 0;
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (unsigned long long)t.tv_sec * 1000000000ULL + (unsigned long long)t.tv_nsec;
+}
+/* ---- the finish line (2026-10-04, worklog/2026-10-04-logged-ibd-runs-plan.md
+ * part 3) ------------------------------------------------------------------
+ * ONE line, once per process, the first time the node is ready to serve RPC
+ * with every enabled index at the tip: IBD over (the latch), the UTXO set at
+ * the archive tip, the txid index covering it (runs + tail), the filter index
+ * holding its filter, and the coinstats history complete -- which on a fresh
+ * sync means the post-IBD history-base rebuild (38 m 47 s in run 31) has
+ * finished and verified, so the line marks the END of that, not the end of
+ * the download. Disabled indexes are named as skipped. Not gated by
+ * bmc.benchlog: a benchmark's finish must not depend on a debug switch, and
+ * it is one line per run. Evaluated every rotation of the worker loop (a few
+ * loads and compares) until it prints; the coinstats repair is only
+ * re-examined once a heartbeat (csi_hist_repair_tick), so that one condition
+ * is seen up to DL_HEARTBEAT_MS late -- the same latency its own
+ * "[coinstats] repair: history base rebuilt" line has. */
+static long long g_proc_start_ms = 0;   /* main()'s first statement; forks inherit it */
+static void dl_ready_check(int utxo_ok){
+    static int said = 0;
+    if (said) return;
+    extern int csi_hist_repair_state(void); extern long csi_height(void); extern int csi_worker_pid(void);
+    extern long bfi_count(void);
+    benchlog_ready_t r; memset(&r, 0, sizeof r);
+    r.ibd_over = g_dl_ibd_left;
+    r.tip = (long)*(int*)(store_buf+24);
+    r.utxo_on = utxo_ok;              r.utxo_applied = utxo_ok ? utxo_live_applied_height() : -1;
+    r.txindex_on = g_cfg.txindex;     r.txindex_covered = g_cfg.txindex ? txit_covered() : -1;
+    r.bfilter_on = g_cfg.blockfilterindex; r.bfilter_count = g_cfg.blockfilterindex ? bfi_count() : -1;
+    r.coinstats_on = g_cfg.coinstatsindex;
+    if (g_cfg.coinstatsindex){
+        r.coinstats_hist_ok = csi_hist_repair_state() == 1;   /* CSI_REPAIR_OK (coinstats_index.c) */
+        /* the fold's watermark: the worker's published height when it folds
+         * (this process's own copy is stale after the fork), else in-process */
+        r.coinstats_height = (csi_worker_pid() > 0 && g_node_status) ? (long)g_node_status->csi_folded_height : csi_height();
+    }
+    { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+      r.secs = (double)(t.tv_sec * 1000LL + t.tv_nsec / 1000000 - g_proc_start_ms) / 1000.0; }
+    char line[320];
+    if (!benchlog_ready_eval(&r, line, sizeof line)) return;
+    said = 1;
+    fprintf(stderr, "%s\n", line);
+}
 static void dl_new_block_choke(void){
     int now_tip = (int)node_public_tip(store_buf);
     if(g_dl_last_seen_tip >= 0 && now_tip > g_dl_last_seen_tip){
@@ -8686,16 +8820,25 @@ static void dl_new_block_choke(void){
                  * getrawtransaction-by-txid keeps up with the tip
                  * (idempotent by height -- a replayed height is a
                  * no-op) */
+                /* bmc.benchlog (2026-10-04, plan part 2): each index's share
+                 * of this block, outside the UTXO apply timer. bl_ns() reads
+                 * no clock with the key off, so the default costs a branch. */
+                unsigned long long bix[BL_IX_N] = {0}, bt0 = bl_ns(), bt1;
                 txit_on_block(store_buf, zh, zb, bl);
+                bt1 = bl_ns(); bix[BL_IX_TXINDEX] = bt1 - bt0;
                 dl_index_trail_tick(g_utxo_live_on ? utxo_live_applied_height() : -1);
+                bt0 = bl_ns();                          /* the trailing builders' tick is in no column */
                 tsp_on_block(store_buf, zh, zb, bl);
+                bt1 = bl_ns(); bix[BL_IX_TXOSPENDER] = bt1 - bt0; bt0 = bt1;
                 /* filter index tail: adopt/append (cheap probe when
                  * the backfill has not closed in yet) */
                 if (g_cfg.blockfilterindex)
                     bfi_on_block(store_buf, zh, zb, (unsigned long)bl);
+                bt1 = bl_ns(); bix[BL_IX_BFILTER] = bt1 - bt0; bt0 = bt1;
                 /* address index (extension): ADDs from the block,
                  * DELs/TOUCHes from its undo records */
                 axt_on_block(store_buf, zh, zb, bl);
+                bt1 = bl_ns(); bix[BL_IX_ADDR] = bt1 - bt0;
                 /* -blocknotify: after the indexes have taken the
                  * block, so a hook that queries us sees it. */
                 if (g_cfg.blocknotify[0]){
@@ -8737,22 +8880,29 @@ static void dl_new_block_choke(void){
                       unsigned char cbh[32]; sha256d(cbh, zb, 80);
                       mempool_seq_block(cbh, 'C');
                   } }
-                if (!zmqpub_active()) continue;
-                /* Publish what this block staged (the sequence topic's 'R's
-                 * and 'C') now, not at the end of a catch-up burst: a burst
-                 * of thousands of blocks would otherwise lap the ring. */
-                zmqn_drain();
-                /* The block HASH is sha256d over the 80-byte
-                 * header, REVERSED: Core's notifier flips the bytes
-                 * (data[31-i] = hash.begin()[i]) so the hashblock
-                 * topic carries the DISPLAY-order hash getblockhash
-                 * prints. Verified against real archived blocks by
-                 * tests/zmq_realblock_check. */
-                unsigned char bh[32], bhr[32];
-                sha256d(bh, zb, 80);
-                for (int zi = 0; zi < 32; zi++) bhr[zi] = bh[31 - zi];
-                zmqpub_notify("hashblock", bhr, 32);
-                zmqpub_notify("rawblock", zb, (unsigned long)bl);
+                if (zmqpub_active()){   /* was `continue` when inactive; a block so the [bench] line below still prints (2026-10-04) */
+                    bt0 = bl_ns();
+                    /* Publish what this block staged (the sequence topic's 'R's
+                     * and 'C') now, not at the end of a catch-up burst: a burst
+                     * of thousands of blocks would otherwise lap the ring. */
+                    zmqn_drain();
+                    /* The block HASH is sha256d over the 80-byte
+                     * header, REVERSED: Core's notifier flips the bytes
+                     * (data[31-i] = hash.begin()[i]) so the hashblock
+                     * topic carries the DISPLAY-order hash getblockhash
+                     * prints. Verified against real archived blocks by
+                     * tests/zmq_realblock_check. */
+                    unsigned char bh[32], bhr[32];
+                    sha256d(bh, zb, 80);
+                    for (int zi = 0; zi < 32; zi++) bhr[zi] = bh[31 - zi];
+                    zmqpub_notify("hashblock", bhr, 32);
+                    zmqpub_notify("rawblock", zb, (unsigned long)bl);
+                    bix[BL_IX_ZMQ] = bl_ns() - bt0;
+                }
+                if (g_cfg.benchlog){
+                    char bline[256]; benchlog_fmt_index(bline, sizeof bline, zh, bix);
+                    fprintf(stderr, "%s\n", bline);
+                }
             }
         }
     }
@@ -10435,6 +10585,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
          * This is the shape Core has for free: libzmq services subscribers on
          * its own I/O thread and Core's hot paths never touch them. */
         if (zmqpub_active()) zmqn_drain();
+        dl_ready_check(utxo_live_ok);   /* the [ready] finish line, once (2026-10-04) */
         if(now_ms >= next_heartbeat_ms){
             int live_peers=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) live_peers++;
             char upbuf[UPTIME_BUF];
@@ -11948,6 +12099,7 @@ static int datadir_lock_acquire(const char* effdir){
 }
 
 int main(int argc, char** argv){
+    { struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0); g_proc_start_ms = t0.tv_sec * 1000LL + t0.tv_nsec / 1000000; }   /* the [ready] line's clock */
     /* a fatal signal writes the crashing thread's stack to the log (text-
      * segment addresses only -- no core file, LimitCORE=0 stays: the seed);
      * forked workers inherit it (2026-10-03, after a crash loop left only

@@ -226,6 +226,10 @@ void txit_boot(void* store_buf){
 
 /* 1 when the tail is being maintained (base index present, file writable). */
 int txit_active(void){ return g_fd >= 0; }
+/* the highest height the txid index covers, runs and tail together (the
+ * watermark txit_on_block appends against); -1 when the tail is off. The
+ * [ready] line's txindex condition (2026-10-04). */
+long txit_covered(void){ return g_fd >= 0 ? g_covered : -1; }
 
 /* Called from the post-truncation index-rebuild callback after a reorg.
  * Records above the new tip are STALE, not harmful -- the reader recomputes

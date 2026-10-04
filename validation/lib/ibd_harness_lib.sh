@@ -314,3 +314,97 @@ ibd_rpc_recent_closes() {
     local port="$1"
     ss -tnH state time-wait "( src 127.0.0.1:$port or dst 127.0.0.1:$port )" 2>/dev/null | grep -c .   # loopback only, as above
 }
+
+# ---- logged runs: stage timing and the READY finish line (2026-10-04) ------
+# worklog/2026-10-04-logged-ibd-runs-plan.md. Both sides log per-block stage
+# times (Core: debug=bench + debug=coindb; bmc: bmc.benchlog=1), bmc downloads
+# the way Core does (bmc.dlshape=core), and both runs end at one finish line:
+# ready to serve RPC with every index at the tip.
+
+# The bmc conf lines for BENCHLOG / DLSHAPE. BENCHLOG is 0/1/empty; DLSHAPE is
+# empty or "core". Anything else is refused BEFORE anything is printed, so a
+# typo cannot become a 6-hour run with the switch silently off (the daemon
+# ignores unknown keys, node_config.c).
+#   ibd_bench_conf_lines <BENCHLOG> <DLSHAPE>   rc 1 + "FAIL ..." on a bad value
+ibd_bench_conf_lines() {
+    local bl="$1" ds="$2"
+    case "$bl" in ''|0|1) ;; *) printf 'FAIL BENCHLOG must be 0 or 1, not %s' "'$bl'"; return 1;; esac
+    case "$ds" in ''|core) ;; *) printf 'FAIL DLSHAPE must be empty or core, not %s' "'$ds'"; return 1;; esac
+    [ "$bl" = 1 ] && printf 'bmc.benchlog=1\n'
+    [ "$ds" = core ] && printf 'bmc.dlshape=core\n'
+    return 0
+}
+
+# Does a built binary know a config key? The daemon IGNORES unknown keys, so a
+# conf line for a feature the checked-out commit lacks is a run that measures
+# nothing new and says nothing. The key's name is a string literal in the
+# binary (strcmp(key,"bmc.catchupworkers") in node_config.c), so its absence
+# means the parser cannot apply it.
+#   ibd_binary_knows <binary> <key>   rc 0 known, 1 not
+ibd_binary_knows() {
+    grep -aqF -- "$2" "$1" 2>/dev/null
+}
+
+# bmc's finish line: "[ready] all indexes at height N (...) -- Ss", logged
+# once the UTXO set, txindex, bfilter and the coinstats history are all at the
+# tip. Prints "YYYY-MM-DD HH:MM:SS N" for the FIRST such line (the log's own
+# timestamp, to the second, as ibd_catchup_done_time does) and returns 0;
+# prints nothing, rc 1, when there is none yet.
+ibd_ready_line() {
+    local l
+    l=$(grep -a '\[ready\] all indexes at height [0-9]' "$1" 2>/dev/null | head -1 | tr -d '\000')
+    [ -n "$l" ] || return 1
+    l=$(printf '%s\n' "$l" \
+        | sed -nE 's/^([0-9-]+ [0-9:]+)(\.[0-9]+)? .*\[ready\] all indexes at height ([0-9]+).*/\1 \3/p')
+    [ -n "$l" ] || return 1     # a line without the log's timestamp is not a reading
+    printf '%s\n' "$l"
+}
+
+# Core's tip from its own log: the height of the LAST "UpdateTip: new best="
+# line in the final BYTES of the file (default 4 MB; with debug=bench a block
+# costs ~1.3 KB of log, so that is the last ~3,000 blocks). Reading the tail, not
+# the file, keeps a once-a-minute check cheap against a 1.2 GB log. Background
+# (assumeutxo) validation lines are not the active chain and are skipped.
+#   core_log_tip_height <debug.log> [bytes]
+core_log_tip_height() {
+    tail -c "${2:-4194304}" "$1" 2>/dev/null | grep -a 'UpdateTip: new best=' \
+        | grep -av 'background validation' | tail -1 | sed -nE 's/.* height=([0-9]+) .*/\1/p'
+}
+
+# The log's timestamp of the first UpdateTip at height H, as Core prints it
+# (2026-10-04T13:48:36Z, or with microseconds under logtimemicros). One scan of
+# the whole file; called once, after the timed span.
+#   core_log_tip_time <debug.log> <H>
+core_log_tip_time() {
+    grep -a -m1 "UpdateTip: new best=[0-9a-f]* height=$2 " "$1" 2>/dev/null | cut -d' ' -f1
+}
+
+# Are Core's indexes at the finish height? Reads a getindexinfo answer.
+#
+# NOT the "synced" field alone: on a fresh datadir every index logs "is enabled
+# at height 0" in its first second (BaseIndex::m_synced, index/base.cpp), so
+# getindexinfo says synced=true for the whole sync while the index trails the
+# tip (by ~32-42 blocks during IBD: ActivateBestChain's callback queue). Ready
+# means synced AND best_block_height >= the height the chain finished at.
+# Prints the indexes that are not there yet as "name@height" words.
+#   core_index_unready <json> <height>
+#   rc 0 every index ready; 1 some not; 2 unreadable or no index at all
+core_index_unready() {
+    printf '%s' "$1" | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin); h = int(sys.argv[1])
+except Exception:
+    sys.exit(2)
+if not isinstance(d, dict) or not d:
+    sys.exit(2)
+bad = []
+for name, v in sorted(d.items()):
+    if not isinstance(v, dict) or "best_block_height" not in v:
+        sys.exit(2)
+    if not v.get("synced") or int(v["best_block_height"]) < h:
+        bad.append("%s@%s" % (name.replace(" ", "_"), v["best_block_height"]))
+sys.stdout.write(" ".join(bad))
+sys.exit(1 if bad else 0)
+' "$2" 2>/dev/null
+}

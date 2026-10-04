@@ -113,4 +113,13 @@ static inline long long dlc_stall_clock(long long since_ms, long long last_block
 /* a peer is replaced (rotation, the rate floor) only when a replacement exists;
  * otherwise the window's tail is the only judge, as in Core */
 static inline int dlc_replace_allowed(int free_peers){ return free_peers > 0; }
+/* bmc.dlshape=core (2026-10-04): Core's block download timeout. A peer whose
+ * front in-flight block is older than BLOCK_DOWNLOAD_TIMEOUT_BASE (1) +
+ * BLOCK_DOWNLOAD_TIMEOUT_PER_PEER (0.5) x the other peers downloading, in
+ * units of the 600 s target spacing, is disconnected (net_processing.cpp:
+ * 148-150, 6113-6122). With Core's 10 download peers: 600 x 5.5 = 3,300 s. */
+static inline long dlc_core_block_timeout_s(int download_peers){
+    int others = download_peers > 1 ? download_peers - 1 : 0;
+    return (long)(600.0 * (1.0 + 0.5 * (double)others));
+}
 #endif

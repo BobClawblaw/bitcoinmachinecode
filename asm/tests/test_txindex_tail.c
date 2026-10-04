@@ -30,6 +30,7 @@ extern int  store_rd_init(void* st);
 extern int  tx_txid(void* out, const void* tx, unsigned long txlen, void* buf, unsigned long buflen);
 extern void txit_boot(void* store_buf);
 extern void txit_on_block(void* store_buf, long h, const unsigned char* blk, long blen);
+extern long txit_covered(void);   /* 2026-10-04: the [ready] line's txindex condition */
 
 static int failures = 0;
 static void ck(const char* l, long long g, long long e){
@@ -107,9 +108,11 @@ int main(void){
     txit_boot(store_buf);
     long genesis_expect = (long)(ntx_at[0] + ntx_at[1] + ntx_at[2]) * TXI_REC;
     ck("no base -> boot backfills from genesis", tail_size(), genesis_expect);
+    ck("txit_covered after the genesis backfill is the archive tip", txit_covered(), 2);
     txit_on_block(store_buf, 3, blk[3], blen[3]);
     genesis_expect += (long)ntx_at[3] * TXI_REC;
     ck("...and the live append continues from there", tail_size(), genesis_expect);
+    ck("txit_covered follows the live append", txit_covered(), 3);
     /* a run reaching h1 was committed: the tail drops everything at or
      * below it (a prefix -- the file is height-ordered) and keeps h2..h3 */
     { extern void txit_runs_advanced(long to); txit_runs_advanced(1); }
@@ -163,6 +166,7 @@ int main(void){
     txit_on_block(store_buf, 5, blk[5], blen[5]);
     expect += (long)(ntx_at[4] + ntx_at[5]) * TXI_REC;
     ck("gap h4 backfilled with h5", tail_size(), expect);
+    ck("txit_covered after a burst is the burst's top", txit_covered(), 5);
 
     /* crash shape: the write for h5 was lost entirely and h4's single
      * record was torn 7 bytes short. Reboot must truncate the torn bytes
@@ -178,6 +182,7 @@ int main(void){
     write_base(5);
     txit_boot(store_buf);
     ck("tail truncated after base rebuild", tail_size(), 0);
+    ck("txit_covered with the tail folded is the base's to_height (runs + tail)", txit_covered(), 5);
 
     printf(failures ? "\n%d FAILURE(S)\n" : "\nALL TESTS PASSED\n", failures);
     return failures ? 1 : 0;

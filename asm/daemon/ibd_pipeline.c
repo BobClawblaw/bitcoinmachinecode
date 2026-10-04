@@ -241,6 +241,181 @@ fail:
     g_last_fail = why;
     return why;
 }
+/* ==== Core's shape (2026-10-04, bmc.dlshape=core) =========================
+ * ibd_fetch_chunk_pipelined asks for the whole chunk, then waits for every
+ * block of it before the worker can ask for anything else, so each peer's
+ * pipe drains to ZERO at every chunk boundary and sits empty for a round trip
+ * plus the worker's staging work. With 16-block chunks that happens every 16
+ * blocks; run 33 (2026-10-04, quiet box) lost 31 minutes to run 31's 40-block
+ * chunks from 400,000 on, the regime where it costs most.
+ *
+ * Core keeps up to MAX_BLOCKS_IN_TRANSIT_PER_PEER = 16 blocks in flight per
+ * peer and tops the peer up on every SendMessages pass, i.e. as each block
+ * lands (net_processing.cpp:130, 6168-6191). This does the same across TWO
+ * chunks: the one being completed (A) and the worker's next claim (B, the
+ * lookahead). At most `cap` hashes are outstanding on the socket; each
+ * arrival frees a slot, filled from A first, then from B. The call returns
+ * once A is complete, exactly like the whole-chunk fetch; whatever of B has
+ * arrived is CARRIED -- parked in memory, its outstanding requests still on
+ * the socket -- and the next call, for chunk B on the same socket, adopts it.
+ * B's blocks reach the sink (the staging file) only in B's own call, so the
+ * committer and the staging layout see nothing new.
+ *
+ * Same validation as the whole-chunk path, block for block: cons_verify,
+ * placement by hash against PoW-checked headers, the prev-hash link against
+ * those headers, then the sink in ascending height order. */
+#define IBD_SIDE_BYTES (80u << 20)   /* 16 blocks at the 4 MB weight limit, plus room; virtual, MAP_NORESERVE */
+typedef struct {
+    long lo, n;                       /* the chunk: first height, block count */
+    long sent, arrived;               /* hashes requested; blocks received (stored or parked) */
+    unsigned char want[IBD_PIPE_MAX][32], prev[IBD_PIPE_MAX][32];
+    unsigned off[IBD_PIPE_MAX], len[IBD_PIPE_MAX];   /* parked bodies in buf; len 0 = not parked */
+    unsigned char* buf; unsigned used;                /* a bump allocator, reset when the side is reused */
+} ibd_side_t;
+static ibd_side_t g_sa, g_sb;         /* A: the chunk being completed; B: the lookahead */
+static int g_carry_fd = -1;           /* g_sb is a carry valid on this socket (-1: none) */
+static long g_max_inflight = 0;       /* test seam: most hashes outstanding during the last call */
+long ibd_pipeline_max_inflight(void){ return g_max_inflight; }
+void ibd_pipeline_drop_carry(void){ g_carry_fd = -1; g_sb.n = 0; }
+static int ibd_side_ready(ibd_side_t* s){
+    if (s->buf) return 1;
+    void* p = mmap(0, IBD_SIDE_BYTES, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (p == MAP_FAILED) return 0;
+    s->buf = p; return 1;
+}
+static void ibd_side_reset(ibd_side_t* s, long lo, long n){
+    s->lo = lo; s->n = n; s->sent = 0; s->arrived = 0; s->used = 0;
+    for (long i = 0; i < IBD_PIPE_MAX; i++) s->len[i] = 0;
+}
+/* the side's hashes from its headers; 0 if a header is unreadable */
+static int ibd_side_load(ibd_side_t* s, void* hst){
+    unsigned char rec[112];
+    for (long i = 0; i < s->n; i++){
+        if (hst_get_at(hst, (unsigned long long)i, rec) != 1) return 0;
+        memcpy(s->want[i], rec + 80, 32);
+        memcpy(s->prev[i], rec + 4, 32);
+    }
+    return 1;
+}
+static int ibd_park(ibd_side_t* s, long idx, const unsigned char* raw, unsigned len){
+    if (s->used + len > IBD_SIDE_BYTES) return 0;
+    memcpy(s->buf + s->used, raw, len);
+    s->off[idx] = s->used; s->len[idx] = len; s->used += len;
+    return 1;
+}
+
+long ibd_fetch_chunk_rolling(int fd, void* st, void* hst, long lo_real, long nloc,
+                             void* hst_next, long lo_next, long n_next, long cap,
+                             unsigned char* buf, unsigned buflen,
+                             void* scratch, unsigned scratch_cap)
+{
+    const long long chunk_t0 = ibd_now_ms(); g_wait_ms = 0; g_wall_ms = 0; g_max_inflight = 0;
+    int why = IBD_FAIL_ARGS;
+    static unsigned char req[IBD_PIPE_MAX][32];
+    static unsigned char gd[1 + IBD_PIPE_MAX * 36];
+    long stale = 0, next = 0, stored = 0;
+    if (nloc <= 0 || nloc > IBD_PIPE_MAX || n_next < 0 || n_next > IBD_PIPE_MAX || cap < 1 || cap > IBD_PIPE_MAX) goto fail;
+    if (!ibd_side_ready(&g_sa) || !ibd_side_ready(&g_sb)){ why = IBD_FAIL_HOLD; goto fail; }
+
+    /* adopt the carry when it is THIS chunk on THIS socket; otherwise its
+     * requests still on the socket are stale -- they will arrive, be drained
+     * as unasked, and until then count against the peer's 16 */
+    if (g_carry_fd == fd && g_sb.n == nloc && g_sb.lo == lo_real){
+        ibd_side_t t = g_sa; g_sa = g_sb; g_sb = t;
+        unsigned char rec[112];
+        for (long i = 0; i < nloc; i++){                      /* the carry must name the same blocks as the headers */
+            if (hst_get_at(hst, (unsigned long long)i, rec) != 1){ why = IBD_FAIL_HEADERS; goto fail; }
+            if (memcmp(g_sa.want[i], rec + 80, 32) != 0){
+                stale = g_sa.sent - g_sa.arrived;
+                ibd_side_reset(&g_sa, lo_real, nloc);
+                if (!ibd_side_load(&g_sa, hst)){ why = IBD_FAIL_HEADERS; goto fail; }
+                break;
+            }
+        }
+    } else {
+        if (g_carry_fd == fd && g_sb.n > 0) stale = g_sb.sent - g_sb.arrived;
+        ibd_side_reset(&g_sa, lo_real, nloc);
+        if (!ibd_side_load(&g_sa, hst)){ why = IBD_FAIL_HEADERS; goto fail; }
+    }
+    g_carry_fd = -1;                                          /* valid again only on success */
+    ibd_side_reset(&g_sb, lo_next, (hst_next && n_next > 0) ? n_next : 0);
+    if (g_sb.n && !ibd_side_load(&g_sb, hst_next)){ why = IBD_FAIL_HEADERS; goto fail; }
+
+    /* whatever the carry already holds, in order */
+    while (next < nloc && g_sa.len[next]){
+        if (g_progress) g_progress(g_progress_arg);
+        if (ibd_sink(st, lo_real + next, g_sa.want[next], g_sa.buf + g_sa.off[next], g_sa.len[next]) < 0){ why = IBD_FAIL_STORE; goto fail; }
+        g_sa.len[next] = 0; stored++; next++;
+    }
+
+    long budget = (nloc + g_sb.n) * 8 + 256;
+    while (stored < nloc && budget-- > 0){
+        /* top the peer up to `cap` in flight: A first, then the lookahead */
+        long out = (g_sa.sent - g_sa.arrived) + (g_sb.sent - g_sb.arrived) + stale;
+        long room = cap - out, k = 0;
+        while (room > 0 && g_sa.sent < nloc){ memcpy(req[k++], g_sa.want[g_sa.sent++], 32); room--; }
+        while (room > 0 && g_sb.sent < g_sb.n){ memcpy(req[k++], g_sb.want[g_sb.sent++], 32); room--; }
+        if (k > 0){
+            unsigned glen = build_getdata(gd, (const unsigned char (*)[32])req, k);
+            g_last_batch = k;
+            if (p2p_write(fd, "getdata", 7, gd, glen) < 0){ why = IBD_FAIL_WRITE; goto fail; }
+        }
+        if (out + k > g_max_inflight) g_max_inflight = out + k;
+
+        char cmd[12]; unsigned len = 0;
+        g_wait_ms += ibd_idle_before_read(fd);                /* idle = before the first byte (see above) */
+        int r = p2p_read(fd, cmd, buf, buflen, &len);
+        if (r <= 0){ why = IBD_FAIL_READ; goto fail; }
+        if (!strncmp(cmd, "ping", 12) && len == 8){ p2p_write(fd, "pong", 4, buf, 8); continue; }
+        if (strncmp(cmd, "block", 12) != 0) continue;
+        if (g_bytes) g_bytes((long)len);
+        if (len < 81) continue;
+        if (cons_verify(buf, (long)len, scratch, scratch_cap) != 1){ why = IBD_FAIL_CONSENSUS; goto fail; }
+        unsigned char bh[32];
+        block_hash(bh, buf);
+
+        long ia = -1, ib = -1;
+        for (long i = next; i < nloc; i++) if (!g_sa.len[i] && memcmp(bh, g_sa.want[i], 32) == 0){ ia = i; break; }
+        if (ia < 0) for (long i = 0; i < g_sb.n; i++) if (!g_sb.len[i] && memcmp(bh, g_sb.want[i], 32) == 0){ ib = i; break; }
+        if (ia < 0 && ib < 0){ if (stale > 0) stale--; continue; }   /* stale, unasked or duplicate: drain it */
+
+        if (ia >= 0){
+            if (ia > 0 && memcmp(buf + 4, g_sa.want[ia - 1], 32) != 0){ why = IBD_FAIL_LINK; goto fail; }
+            if (memcmp(buf + 4, g_sa.prev[ia], 32) != 0){ why = IBD_FAIL_LINK; goto fail; }
+            if (g_progress) g_progress(g_progress_arg);
+            g_sa.arrived++;
+            if (ia == next){
+                if (ibd_sink(st, lo_real + ia, bh, buf, len) < 0){ why = IBD_FAIL_STORE; goto fail; }
+                stored++; next++;
+                while (next < nloc && g_sa.len[next]){
+                    if (ibd_sink(st, lo_real + next, g_sa.want[next], g_sa.buf + g_sa.off[next], g_sa.len[next]) < 0){ why = IBD_FAIL_STORE; goto fail; }
+                    g_sa.len[next] = 0; stored++; next++;
+                }
+            } else if (!ibd_park(&g_sa, ia, buf, len)){ why = IBD_FAIL_HOLD; goto fail; }
+        } else {
+            /* the lookahead: B need not follow A (A may be a retried chunk),
+             * so the link is checked against B's own headers */
+            if (ib > 0 && memcmp(buf + 4, g_sb.want[ib - 1], 32) != 0){ why = IBD_FAIL_LINK; goto fail; }
+            if (memcmp(buf + 4, g_sb.prev[ib], 32) != 0){ why = IBD_FAIL_LINK; goto fail; }
+            if (g_progress) g_progress(g_progress_arg);   /* it DID arrive: the stall clock is about the peer */
+            g_sb.arrived++;
+            if (!ibd_park(&g_sb, ib, buf, len)){ why = IBD_FAIL_HOLD; goto fail; }
+        }
+    }
+    if (stored != nloc){ why = IBD_FAIL_BUDGET; goto fail; }
+    if (g_sb.n > 0) g_carry_fd = fd;
+    g_wall_ms = ibd_now_ms() - chunk_t0;
+    g_last_fail = 0;
+    return stored;
+fail:
+    g_carry_fd = -1; g_sb.n = 0;          /* the worker drops the socket; nothing carried survives it */
+    g_wall_ms = ibd_now_ms() - chunk_t0;
+    g_last_fail = why;
+    return why;
+}
+/* how many of the lookahead's blocks the last successful call carried */
+long ibd_pipeline_carried(void){ return g_carry_fd >= 0 ? g_sb.arrived : 0; }
+
 int ibd_pipeline_last_fail(void){ return g_last_fail; }
 const char* ibd_pipeline_fail_name(int code){
     switch(code){
