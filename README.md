@@ -397,6 +397,7 @@ log echoes the resolved values.
 | `bmc.esploraport` / `bmc.esplorabind` | `0` / `127.0.0.1` | the Esplora facade for mempool.space: a second, unauthenticated listener; keep it on loopback or behind a proxy |
 | `bmc.coinstatshistrepair` / `bmc.coinstatshistworkers` | `1` / `0` | the coinstats history base (`gettxoutsetinfo` at any height) is checked once a heartbeat and rebuilt by a supervised, niced child when missing or broken: never during initial block download, three attempts per boot; workers `0` = cores/4 (2..8), pass 3 sizes itself by free RAM |
 | `bmc.utxocompactthreshold` / `bmc.bootcatchup` | `12` / `0` | project-specific: UTXO runs that trigger compaction; run the parallel downloader inside the BOOT phase. `bmc.bootcatchup` defaults to 0 since 2026-09-24: with 1 the RPC server does not start until that download finishes, so a fresh node answers no RPC for its whole first sync. The worker's far-behind trigger still runs the downloader. Every published benchmark used 0 |
+| `bmc.benchlog` | `0` | project-specific (2026-10-04): `1` writes `[bench]` stage-timing lines for benchmark runs -- per connected block (UTXO apply split), per block's index work (txindex, txospender, bfilter, addr, zmq), per UTXO memtable flush, per download chunk; Core's counterpart is `debug=bench` + `debug=coindb`. The `[ready]` line (every enabled index at the tip after IBD) prints regardless |
 
 ## Networks: Tor, I2P, CJDNS, IPv6
 

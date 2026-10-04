@@ -273,11 +273,13 @@ static inline void tm_add(int k, u64 ns){ g_tm_tick[k] += ns; g_tm_total[k] += n
 static inline u64 tm_lap(int k, u64 t0){ u64 t1 = tm_now(); tm_add(k, t1 - t0); return t1; }
 /* after a put/del: if mac_flush ran inside it (the hook armed us), book the
  * flush's span -- the walk's own lap subtracts it from `put` */
+static void bench_flush_line(u64 ns);   /* bmc.benchlog's flush line, defined below g_apply_height */
 static inline void tm_flush_check(void){
     if (!g_tm_flush_armed) return;
     g_tm_flush_armed = 0;
     u64 t1 = tm_now();
     if (t1 > g_tm_flush_t0) tm_add(TM_FLUSH, t1 - g_tm_flush_t0);
+    if (g_cfg.benchlog) bench_flush_line(t1 > g_tm_flush_t0 ? t1 - g_tm_flush_t0 : 0);
 }
 void utxo_live_set_timing(int on){
     g_tm_on = on; txvb_set_timing(on); undo_set_coin_observer_timing(on); g_tm_flush_armed = 0;
@@ -407,8 +409,10 @@ static void compact_poll(void){
 /* mac_flush's gate: a flush is about to rewrite the manifest. It no longer
  * waits for anything -- run numbers are reserved, adoption reconciles -- it
  * just adopts a finished child first so the flush builds on the merged set. */
+static u64 g_bench_flush_ops = 0;   /* bmc.benchlog: puts+dels the flushing memtable held (op_count before the flush resets it) */
 static void compact_flush_hook(void){
     if (g_tm_on){ g_tm_flush_t0 = tm_now(); g_tm_flush_armed = 1; }   /* step-0 timing: the flush starts here */
+    g_bench_flush_ops = g_utxo_lst.op_count;
     compact_poll();
 }
 /* Leveled: which runs to merge, by size ratio (lsm_compact_pick). Sizes come
@@ -528,6 +532,44 @@ static long  g_applied_height = -1;
 /* Height whose block is currently being applied -- the key undo records are
  * filed under. Set by apply_block_at before any walk begins. */
 static long  g_apply_height = -1;
+/* ---- bmc.benchlog (2026-10-04; worklog/2026-10-04-logged-ibd-runs-plan.md
+ * part 2) ----------------------------------------------------------------
+ * Stage timing in the log, for the logged IBD runs set against Core's
+ * debug=bench. The step-0 accumulators above already time every phase of
+ * every block; these lines only PRINT them, per block and per flush, so a
+ * run's log carries the same split Core's "- Connect N transactions" /
+ * "- Verify" / "- Flush" lines carry. Off (the default): one load and one
+ * branch per block and per flush, no clock read, no format.
+ *
+ * Per block: tx and txin counts from apply_block_inner's Phase 0 parse
+ * (txin counts the coinbase's one input, as Core's nInputs does), the
+ * phases as the DIFFERENCE of the process totals across the block (a memcpy
+ * of nine u64 at the block's start, the totals at its end), and the block's
+ * wall from the read lap's own t0 to the compaction lap's own t1 -- no clock
+ * read of its own on the normal path. Phases that land outside a block
+ * (nothing between two blocks is timed) are not in any line. */
+static u64 g_blk_ntx = 0, g_blk_nin = 0;
+static void bench_flush_line(u64 ns){
+    /* the run just published is the manifest's last entry (a flush appends) */
+    u64 bytes = 0, run_no = 0;
+    if (g_utxo_lst.manifest_n > 0 && g_utxo_lst.manifest_buf){
+        memcpy(&run_no, (const unsigned char*)g_utxo_lst.manifest_buf + (g_utxo_lst.manifest_n - 1) * 16 + 8, 8);
+        char nm[64]; snprintf(nm, sizeof nm, "utxo_run_%06u.dat", (unsigned)run_no);
+        struct stat sb; if (stat(nm, &sb) == 0) bytes = (u64)sb.st_size;
+    }
+    fprintf(stderr, "[bench] flush at block %ld: %.2f ms, %llu ops, run %06u %.3f MB, runs %llu, live %llu\n",
+            g_apply_height, (double)ns / 1e6, (unsigned long long)g_bench_flush_ops, (unsigned)run_no,
+            (double)bytes / 1e6, (unsigned long long)g_utxo_lst.manifest_n, (unsigned long long)g_utxo_lst.total_live);
+}
+/* the per-block line: v0 = g_tm_total at the block's start, t0/t1 its wall */
+static void bench_block_line(long h, const u64* v0, u64 t0, u64 t1){
+    double d[TM_WALL];
+    for (int k = 0; k < TM_WALL; k++) d[k] = (double)(g_tm_total[k] - v0[k]) / 1e6;
+    fprintf(stderr, "[bench] block %ld: %llu tx, %llu txin | read %.2f | idx %.2f | verify %.2f | get %.2f | put %.2f | ckpt %.2f | flush %.2f | csi %.2f | total %.2f ms\n",
+            h, (unsigned long long)g_blk_ntx, (unsigned long long)g_blk_nin,
+            d[TM_READ], d[TM_IDX], d[TM_VERIFY], d[TM_GET], d[TM_PUT], d[TM_CKPT], d[TM_FLUSH], d[TM_CSI],
+            t1 > t0 ? (double)(t1 - t0) / 1e6 : 0.0);
+}
 /* -assumevalid (2026-09-01): the height of the operator's assumed-valid block,
  * resolved from the HEADER chain (2026-09-07; the archive index before that,
  * see utxo_live_resolve_assumevalid) at init and, while unresolved, every
@@ -1735,6 +1777,7 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
     u64 ntx = utxo_walk_read_varint(p, blkend, &consumed);
     if (!consumed) return 0;
     p += consumed;
+    g_blk_ntx = ntx; g_blk_nin = 0;   /* bmc.benchlog's per-block counts (nin filled by Phase 0) */
     if (ntx == 0) return 1;   /* matches the old loop's own (never actually
                                * hit by real chain data) empty-block behavior */
 
@@ -1802,6 +1845,7 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
         total_nin += pn_in; total_nout += pn_out;
         q += txlen;
     }
+    g_blk_nin = total_nin;
 
     /* ---- Phase 0.10 (VAL-3, audit 2026-09-03): CheckBlock's size rules and
      * ContextualCheckBlock's weight rule.
@@ -3412,7 +3456,12 @@ static long catchup_run(void* store_buf, long max_ms, int stop_at_hole){
     u64 tm_call_t0 = tm_now(), tm_tick_t0 = tm_call_t0;
     memset(g_tm_tick, 0, sizeof g_tm_tick);
     int arch_retry = 0;
+    /* bmc.benchlog: the process totals at this block's start (see
+     * bench_block_line); read once per call, the per-block cost is the copy */
+    const int bench = g_cfg.benchlog && g_tm_on;
+    u64 bench_v0[TM_N];
     for (long h = g_applied_height + 1; h <= tip; h++){
+        if (bench) memcpy(bench_v0, g_tm_total, sizeof bench_v0);
         u64 tm_r0 = tm_now();
         long len = store_read_at(store_buf, h, blockbuf, sizeof blockbuf);
         tm_lap(TM_READ, tm_r0);
@@ -3576,6 +3625,7 @@ static long catchup_run(void* store_buf, long max_ms, int stop_at_hole){
             fprintf(stderr, "[utxo_live] WARNING: failed to persist applied height %ld after block %ld -- stopping catch-up at this boundary (%ld block(s) applied this call)\n",
                     g_applied_height, h, applied);
             g_last_stop_reason = UTXO_STOP_FAIL;
+            if (bench) bench_block_line(h, bench_v0, tm_r0, tm_now());   /* block h is applied: it gets its line */
             break;
         }
         UTXO_LIVE_TEST_CRASH_HOOK(applied);
@@ -3604,6 +3654,7 @@ static long catchup_run(void* store_buf, long max_ms, int stop_at_hole){
             fprintf(stderr, "[utxo_live] shutdown requested -- stopping catch-up cleanly after height %ld (%ld block(s) applied this call, checkpoint persisted)\n",
                     h, applied);
             g_last_stop_reason = UTXO_STOP_SHUTDOWN;
+            if (bench) bench_block_line(h, bench_v0, tm_r0, tm_now());
             break;
         }
         /* The time budget, checked at the same boundary the shutdown flag
@@ -3614,6 +3665,10 @@ static long catchup_run(void* store_buf, long max_ms, int stop_at_hole){
          * makes progress. */
         if (max_ms > 0 && h < tip && mono_ms() - cu_t0 >= max_ms) {   /* h == tip: the loop ends as TIP */
             g_last_stop_reason = UTXO_STOP_BUDGET;
+            /* every bounded pass of the download ends here: without this line
+             * the last block of each pass (one every few seconds) would be
+             * missing from the log */
+            if (bench) bench_block_line(h, bench_v0, tm_r0, tm_now());
             break;
         }
 
@@ -3662,7 +3717,8 @@ static long catchup_run(void* store_buf, long max_ms, int stop_at_hole){
         compact_poll();                                   /* adopt a finished background merge */
         g_apply_lag = tip > h ? tip - h : 0;
         compact_start_async(h, "mid-catchup");
-        tm_lap(TM_FLUSH, tm_k0);                          /* inline-fallback compaction, if any, lands here */
+        u64 tm_k1 = tm_lap(TM_FLUSH, tm_k0);              /* inline-fallback compaction, if any, lands here */
+        if (bench) bench_block_line(h, bench_v0, tm_r0, tm_k1);   /* the block's wall: its read lap's t0 to this lap's t1 */
     }
     /* Caught up while bulk-sized: drop the flush thresholds back to
      * steady-state so the current WAL generation stops growing to bulk size.
