@@ -232,9 +232,14 @@ static int g_fk_locked = 0, g_fk_seq_under_lock = -1;
 static int g_fk_lock_n = 0;
 static void fk_lock(void){ g_fk_locked = 1; g_fk_lock_n++; }
 static void fk_unlock(void){ g_fk_locked = 0; }
-static unsigned long long fk_seq(void){ g_fk_seq_under_lock = g_fk_locked; return 42; }
+static unsigned long long g_fk_seq_val = 42;   /* bumped by the test as the worker would on every add and removal */
+static unsigned long long fk_seq(void){ g_fk_seq_under_lock = g_fk_locked; return g_fk_seq_val; }
 
 int main(void){
+    /* 2026-10-05: getmempoolinfo's totals are keyed on the mempool sequence,
+     * and this test's fake sequence moves only where a case bumps it; the
+     * memo is off except in the case that is about it. */
+    rpc_node_mpi_memo_enable(0);
     /* static: node_status_t now carries the 4MB submitblock channel buffer,
      * far too large for the stack. */
     static node_status_t st;
@@ -742,6 +747,50 @@ int main(void){
         ck("slot cache: the second getmempoolinfo parsed no entry (2 hits, 0 parses)", h1 - h0 == 2 && p1 == p0);
         ck("...and answers the same bytes (198)", r && S(r,"bytes") && !strcmp(S(r,"bytes"),"198"));
         rj_free(r);
+        /* ---- 2026-10-05: getmempoolinfo's totals keyed on the mempool
+         * sequence (Core keeps them incrementally; here every add and removal
+         * takes the sequence, so the same number is the same pool). Measured
+         * before: 177 ms per call at 32 clients on a 71k pool, Core 5 ms. ---- */
+        { extern long mpool_del(void*, const unsigned char*);
+          rpc_node_mpi_memo_enable(1);
+          long mh0, mw0, mh1, mw1; rpc_node_mpi_memo_stats(&mh0, &mw0);
+          r = NULL; rpc_node_dispatch("getmempoolinfo", NULL, &r, &ec, &em); rj_free(r);
+          r = NULL; rpc_node_dispatch("getmempoolinfo", NULL, &r, &ec, &em);
+          rpc_node_mpi_memo_stats(&mh1, &mw1);
+          ck("memo: the same sequence answers from the memo (one walk, then one hit), same bytes 198", mw1 - mw0 == 1 && mh1 - mh0 == 1 && r && S(r,"bytes") && !strcmp(S(r,"bytes"),"198"));
+          rj_free(r);
+          ck("test pool: del segwit", mpool_del(pool, wid) == 1); g_fk_seq_val++;
+          r = NULL; rpc_node_dispatch("getmempoolinfo", NULL, &r, &ec, &em);
+          ck("memo: a removal moved the sequence -> the call walks: size 1, bytes 85", r && S(r,"size") && !strcmp(S(r,"size"),"1") && S(r,"bytes") && !strcmp(S(r,"bytes"),"85"));
+          rj_free(r);
+          /* the contract the memo rests on, pinned: a mutation that does NOT
+           * take the sequence is served stale. daemon/mempool_seq.h: every
+           * add and every removal takes it. */
+          ck("test pool: put segwit back", mpool_put(pool, wid, wtx, wln) == 1);
+          r = NULL; rpc_node_dispatch("getmempoolinfo", NULL, &r, &ec, &em);
+          ck("memo contract: the same sequence after a put that did not bump it still answers size 1 (the worker must bump on every mutation)", r && S(r,"size") && !strcmp(S(r,"size"),"1"));
+          rj_free(r);
+          g_fk_seq_val++;
+          { int same = 1; unsigned x = 12345; int present_l = 1, present_w = 1; int steps = 0;
+            for (int step = 0; step < 60 && same; step++){
+                x = x * 1103515245u + 12345u; int pick = (x >> 16) & 1; int* pres = pick ? &present_w : &present_l;
+                const unsigned char* id = pick ? wid : lid; const unsigned char* tx = pick ? wtx : ltx; unsigned long tl = pick ? wln : lln;
+                if (*pres){ mpool_del(pool, id); *pres = 0; } else { mpool_put(pool, id, tx, tl); *pres = 1; }
+                g_fk_seq_val++; steps++;
+                rj_val* a = NULL; rpc_node_dispatch("getmempoolinfo", NULL, &a, &ec, &em);
+                rpc_node_mpi_memo_enable(0);
+                rj_val* b = NULL; rpc_node_dispatch("getmempoolinfo", NULL, &b, &ec, &em);
+                rpc_node_mpi_memo_enable(1);
+                if (!a || !b || !S(a,"size") || !S(b,"size") || strcmp(S(a,"size"), S(b,"size")) || strcmp(S(a,"bytes"), S(b,"bytes"))
+                    || strcmp(S(a,"usage"), S(b,"usage")) || strcmp(S(a,"total_fee"), S(b,"total_fee"))){
+                    same = 0; printf("      step %d: memo %s/%s vs walk %s/%s\n", step, a && S(a,"size") ? S(a,"size") : "-", a && S(a,"bytes") ? S(a,"bytes") : "-", b && S(b,"size") ? S(b,"size") : "-", b && S(b,"bytes") ? S(b,"bytes") : "-"); }
+                rj_free(a); rj_free(b);
+            }
+            ck("memo == a forced walk after 60 randomised adds and removals (size, bytes, usage, total_fee)", same && steps == 60);
+            if (!present_l) mpool_put(pool, lid, ltx, lln);
+            if (!present_w) mpool_put(pool, wid, wtx, wln);
+            g_fk_seq_val++; }
+          rpc_node_mpi_memo_enable(0); }
         ck("getmempoolinfo / getrawmempool / getmempoolentry are in the mempool lane (2)",
            rpc_node_method_lane("getmempoolinfo") == 2 && rpc_node_method_lane("getrawmempool") == 2 && rpc_node_method_lane("getmempoolentry") == 2);
         ck("getpeerinfo is not", rpc_node_method_lane("getpeerinfo") == 0);

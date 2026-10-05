@@ -747,7 +747,7 @@ int main(void) {
           { "getmempoolentry",    2, "getmempoolentry likewise" },
           { "getmempoolancestors", 2, "getmempoolancestors likewise" },
           { "gettxspendingprevout", 4, "gettxspendingprevout is EXCL (2026-10-03: its index path runs rpc_chain's refresh() and run-set readers, which only the execution lock guards; the write side also covers its static tx buffer)" },
-          { "getblock",           4, "getblock is EXCL (shared block buffer)" },
+          { "getblock",           2, "getblock is lock-free (the per-thread reader lane, 2026-10-05: its own handle and buffer; it was EXCL for the shared block buffer)" },
           { "getblockhash",       1, "getblockhash is FAST (fast lane since 2026-09-30: index records through the lane handle)" },
           { "getblockheader",     1, "getblockheader is FAST (fast lane since 2026-09-30; it was EXCL for the shared store handle, which the lane replaces)" },
           { "getblockstats",      4, "getblockstats is EXCL" },

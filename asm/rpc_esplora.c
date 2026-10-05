@@ -149,6 +149,11 @@ int esplora_merkle_branch(const u8 (*txids)[32], long n, long pos, u8 (*branch)[
  * JSON-RPC callers interleave. rpc_server.c installs the hooks. */
 static void (*g_lock)(void) = 0; static void (*g_unlock)(void) = 0;
 void esplora_set_exec_lock(void (*lock)(void), void (*unlock)(void)){ g_lock = lock; g_unlock = unlock; }
+/* 2026-10-05: the class-aware form. lock_for takes the lock the method needs
+ * (none for a lane method) and says whether it took one; preferred over the
+ * plain hook when both are installed. */
+static int (*g_lock_for)(const char*, const rj_val*) = 0;
+void esplora_set_exec_lock_for(int (*lock_for)(const char*, const rj_val*), void (*unlock)(void)){ g_lock_for = lock_for; g_unlock = unlock; }
 /* rpc_server.c names this dispatch (the route, then the method) in its
  * exec-lock wait/hold lines; weak, so the unit tests link without it. */
 extern void rpc_exec_set_label(const char*) __attribute__((weak));
@@ -156,9 +161,11 @@ extern void rpc_exec_set_context(const char*, const char*, size_t, const char*, 
 static rj_val* call(const rpc_wallet* w, const char* method, rj_val* params, long* ec, const char** em){
     rj_val* r = 0; long e = 0; const char* m = 0;
     if (rpc_exec_set_label) rpc_exec_set_label(method);
-    if (g_lock) g_lock();
+    int took = 0;
+    if (g_lock_for) took = g_lock_for(method, params);
+    else if (g_lock){ g_lock(); took = 1; }
     int ok = rpc_dispatch(method, params, w, &r, &e, &m);
-    if (g_unlock) g_unlock();
+    if (took && g_unlock) g_unlock();
     if (params) rj_free(params);
     if (ec) *ec = ok ? 0 : e;
     if (em) *em = ok ? 0 : m;
@@ -344,6 +351,8 @@ static rj_val* tx_by_id(const rpc_wallet* w, const char* txid, long* ec, const c
  * neither), the whole request takes tx_by_id. */
 extern long rpc_node_mempool_many(const unsigned char (*txid_wire)[32], long n, rpc_mp_item* out) __attribute__((weak));
 extern int  rpc_chain_tx_blockhash(const char* txid_disp, char out_disp[65]) __attribute__((weak));
+extern long rpc_chain_tx_blockhash_many(const char* const* txid_disp, long n, char (*out_disp)[65]) __attribute__((weak));
+long g_esplora_batch_lane_entries;   /* test seam: txindex-lane entries the batch made */
 static int esplora_hex_to_wire(const char* hex, unsigned char wire[32]){
     for (int i = 0; i < 32; i++){
         unsigned v = 0;
@@ -368,7 +377,7 @@ static rj_val* mempool_txs_batch(const rpc_wallet* w, const rj_val* ids){
     rj_val* arr = rj_arr();
     size_t n = (ids && ids->typ == RJ_ARR) ? ids->nitems : 0;
     if (!n) return arr;
-    if (!rpc_node_mempool_many || !rpc_chain_tx_blockhash){
+    if (!rpc_node_mempool_many || !rpc_chain_tx_blockhash_many){
         for (size_t i = 0; i < n; i++){ const char* id = ids->items[i]->str;
             if (!id || !is_hex64(id, strlen(id))) continue;
             rj_val* e = tx_by_id(w, id, 0, 0); if (e) rj_arr_push(arr, e); }
@@ -410,26 +419,40 @@ static rj_val* mempool_txs_batch(const rpc_wallet* w, const rj_val* ids){
     if (pw && pit && pdec){
         size_t ok = 0; for (size_t q = 0; q < pn; q++) ok += esplora_hex_to_wire(pid[q], pw[q]);
         if (ok == pn && rpc_node_mempool_many((const unsigned char (*)[32])pw, (long)pn, pit) >= 0){
-            for (size_t q = 0; q < pn; q++){
-                if (pit[q].present){ pdec[q] = esplora_decode_raw(w, pit[q].raw, pit[q].len); free(pit[q].raw); pit[q].raw = 0; continue; }
-                /* Under the execution lock, as every rpc_chain read is: the
-                 * txid index's run set (g_txi_runs) is rescanned in place by
-                 * irs_refresh, which zeroes each kept run's map before
-                 * copying the table back, so an unlocked lookup racing a
-                 * getrawtransaction read a NULL map with the run's counts
-                 * set. Production crashed on it eleven times on 2026-10-02
-                 * (memcmp at 0x6a61e3bd8 = the 1.43e9-record run's first
-                 * sparse probe off NULL). */
-                char bh[65];
-                if (rpc_exec_set_label) rpc_exec_set_label("txindex lookup");
-                if (g_lock) g_lock();
-                int have_bh = rpc_chain_tx_blockhash(pid[q], bh);
-                if (g_unlock) g_unlock();
-                if (have_bh){
-                    rj_val* a = rj_arr(); rj_arr_push(a, rj_str(pid[q])); rj_arr_push(a, rj_numf("%d", 1)); rj_arr_push(a, rj_str(bh));
-                    pdec[q] = call(w, "getrawtransaction", a, 0, 0);
+            /* The confirmed parents' block hashes, from the txid index under
+             * ONE txindex-lane entry (2026-10-05). This used to take the
+             * EXCLUSIVE execution lock once per parent here and once more for
+             * each getrawtransaction below -- 2N exclusive holds of ~15 ms
+             * per batch, behind which every other caller queued for 2+ s
+             * (production, 10-03..10-05: 21 such waits, all this shape).
+             * The lane serialises against irs_refresh, the in-place rewrite
+             * of the run set that crashed an UNLOCKED lookup eleven times on
+             * 2026-10-02; the execution lock is no longer what guards it. */
+            const char** need = malloc((pn ? pn : 1) * sizeof *need);
+            char (*bh)[65] = malloc((pn ? pn : 1) * 65);
+            size_t* needq = malloc((pn ? pn : 1) * sizeof *needq);
+            size_t nn = 0;
+            if (need && bh && needq){
+                for (size_t q = 0; q < pn; q++) if (!pit[q].present){ need[nn] = pid[q]; needq[nn] = q; nn++; }
+                if (nn){
+                    if (rpc_exec_set_label) rpc_exec_set_label("txindex lookup");
+                    rpc_chain_tx_blockhash_many(need, (long)nn, bh);
+                    g_esplora_batch_lane_entries++;
                 }
             }
+            for (size_t q = 0; q < pn; q++){
+                if (pit[q].present){ pdec[q] = esplora_decode_raw(w, pit[q].raw, pit[q].len); free(pit[q].raw); pit[q].raw = 0; continue; }
+            }
+            for (size_t k = 0; need && bh && needq && k < nn; k++){
+                if (!bh[k][0]) continue;
+                size_t q = needq[k];
+                /* getrawtransaction at verbosity 1 with the block hash: the
+                 * txindex lane too (rpc_chain_method_lane_p), no execution
+                 * lock -- call() takes only the lock the method needs */
+                rj_val* a = rj_arr(); rj_arr_push(a, rj_str(pid[q])); rj_arr_push(a, rj_numf("%d", 1)); rj_arr_push(a, rj_str(bh[k]));
+                pdec[q] = call(w, "getrawtransaction", a, 0, 0);
+            }
+            free(need); free(bh); free(needq);
         }
     }
     /* 5. fee and prevouts onto each decoded transaction, then the Esplora shape */
