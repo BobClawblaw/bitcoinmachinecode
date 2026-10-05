@@ -315,6 +315,35 @@ int main(void){
       int st = 0; waitpid(pid, &st, 0);
       ck("  the v1 peer wrote its version message", WIFEXITED(st) && WEXITSTATUS(st) == 0); }
 
+    printf("== 2026-10-05: an initiator's handshake against a trickling peer must end at its deadline ==\n");
+    /* The second loop ("drive the handshake to completion") charged time
+     * only on an EMPTY poll. A peer that sends one byte per poll slice keeps
+     * every poll non-empty, so `elapsed` never moved and the loop ran for
+     * as long as the peer cared to trickle -- the deadline NET-2 gave the
+     * detection loop never reached this one. The initiator skips the
+     * detection loop, so it is the shape to test: one byte every 100 ms,
+     * forever, against a 1 s budget. */
+    { int sv[2];
+      socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+      pid_t pid = fork();
+      if (pid == 0){
+          close(sv[0]);
+          unsigned char b = 0x5a;
+          for (int i = 0; i < 80; i++){ if (write(sv[1], &b, 1) != 1) break; usleep(100000); }   /* 8 s of trickle */
+          _exit(0);
+      }
+      close(sv[1]);
+      int fd = sv[0];
+      struct timespec w0, w1;
+      clock_gettime(CLOCK_MONOTONIC, &w0);
+      int hs = bmc_v2_handshake(fd, 1, 1000);        /* 1 s budget */
+      clock_gettime(CLOCK_MONOTONIC, &w1);
+      double wall = (double)(w1.tv_sec - w0.tv_sec) + 1e-9 * (double)(w1.tv_nsec - w0.tv_nsec);
+      printf("        trickling-peer initiator handshake: rc=%d wall=%.2fs\n", hs, wall);
+      ck("the handshake fails rather than following the trickle", hs == -1);
+      ck("  and it ends within 2.5x its budget", wall < 2.5);
+      close(fd); kill(pid, SIGKILL); waitpid(pid, 0, 0); }
+
     printf("== NET-2: a partial v1 prefix must time out, not spin a core ==\n");
     /* THE DEFECT. The responder's detection loop peeks rather than reads, so
      * the bytes it has seen stay in the receive queue: poll() reports POLLIN
