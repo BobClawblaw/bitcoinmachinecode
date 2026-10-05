@@ -1026,10 +1026,13 @@ long node_config_load(const char* path){
         else if(!strcmp(key,"assumevalid")){
             /* Core's -assumevalid: script evaluation is skipped for blocks
              * that are ancestors of this block; PoW, merkle, structure and
-             * every UTXO check still run. Honoured ONLY when set explicitly
-             * (2026-09-01); with no value this node verifies every script of
-             * every block, which stays the default and the README's promise.
-             * "0" disables it, as in Core. */
+             * every UTXO check still run. Unset = the chain's built-in block,
+             * exactly as Core ships it (v31: mainnet 938,343; mode 0, resolved
+             * by utxo_live_resolve_assumevalid); a hash = that block (mode 1);
+             * "0" = evaluate every script of every block (mode 2), as in Core.
+             * (The 2026-09-01 text here said the unset default verified every
+             * script; it never did -- the logged pair of 2026-10-05 shows
+             * both nodes skipping through 938,343.) */
             const char* v = val;
             if(!v || !*v || !strcmp(v,"0")){ g_cfg.assumevalid_mode = 2; applied++;
                 fprintf(stderr,"[config] assumevalid=0: every script of every block is evaluated (Core's default skips them below its built-in block)\n"); }

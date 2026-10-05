@@ -813,7 +813,12 @@ def chunk_summary(side):
     else:
         parts.append("Download chunks: no [dlc] chunk lines in this log.")
     if "dlc_last_summary" in side.misc:
-        parts.append("Last download summary: %s." % side.misc["dlc_last_summary"])
+        # The LAST summary line is printed after the download has ended, so
+        # its recv rate is ~0 and its avg is the final window's; the chunk
+        # aggregate above is the run's rate (2026-10-05: the first report
+        # showed "recv 0.0B/s (avg 51.6KB/s)" for a 774 GB run and it read
+        # as a defect).
+        parts.append("Final [dlc] summary line, after the download ended (recv is the idle tail, not the run): %s." % side.misc["dlc_last_summary"])
     if "dlc_peers_seen" in side.misc:
         parts.append("Peer status lines named %d distinct peers." % side.misc["dlc_peers_seen"])
     return " ".join(parts)

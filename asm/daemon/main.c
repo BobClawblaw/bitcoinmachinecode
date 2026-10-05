@@ -7770,12 +7770,11 @@ static long dl_catchup_run(const char* dir, int min_workers){
         {
             long cur_tip, present;
             dlc_scan_progress(&cur_tip, &present);
-            long holes = cur_tip>=0 ? (cur_tip+1-present) : 0;
             /* "holes" was the wrong word (2026-09-07): with 16 workers on
              * 40-block chunks a few hundred heights are always claimed and
              * not yet landed -- that is the download's work in progress,
              * bounded by the window, not blocks nobody will fetch. The
-             * line now says "in flight", and separately how long the
+             * line says "in flight", and separately how long the
              * OLDEST gap has been the first hole: a gap that outlives the
              * window's help timeout many times over is the one to read
              * about, and it is printed as STRANDED. */
@@ -7811,8 +7810,18 @@ static long dl_catchup_run(const char* dir, int min_workers){
                 long lag = prefix - applied; if(lag < 0) lag = 0;
                 snprintf(connbuf,sizeof connbuf," | applied=%ld lag=%ld%s", applied, lag, interleave ? "" : " (interleave off)");
             } else snprintf(connbuf,sizeof connbuf," | connect deferred (no UTXO engine in this process)");
+            /* in flight = heights the workers have CLAIMED above the stored
+             * frontier, less the chunks parked in the retry ring (claimed,
+             * held by nobody). It used to be the holes below the tip, which
+             * the in-order committer (2026-09-08) keeps at zero by
+             * construction: every run since, 33 and 34 included, printed
+             * "in flight 0" for seven hours (2026-10-05). */
+            long inflight = 0;
+            { long claimed = next_claim[DLC_CTL_CLAIM];
+              long retry = next_claim[DLC_CTL_RETRY_HEAD] - next_claim[DLC_CTL_RETRY_TAIL]; if(retry < 0) retry = 0;
+              inflight = claimed - present - retry * g_dlc_chunk; if(inflight < 0) inflight = 0; }
             fprintf(stderr,"[dlc] == elapsed %s | eta %s | overall: %ld/%ld stored (%.2f%% of real tip) | in flight %ld of window %ld through %ld (%s, %.2f%% landed)%s ==\n",
-                    elapsed, etabuf, present, end_h+1, overall_pct, holes, g_dlc_window, cur_tip, gapbuf, span_pct, connbuf);
+                    elapsed, etabuf, present, end_h+1, overall_pct, inflight, g_dlc_window, cur_tip, gapbuf, span_pct, connbuf);
         }
         /* 2026-09-08: the tick's seven dashed lines became ONE, printed at the
          * end of the tick when every number exists (recv, write, floor,
