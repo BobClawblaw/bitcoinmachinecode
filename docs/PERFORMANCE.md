@@ -110,6 +110,24 @@ at a time, and a genuinely expensive one (`getblock` verbosity 2 at 31 ms,
 `getrawmempool verbose` at 63 ms) will still queue 32 clients behind it. It is
 now a ceiling on heavy calls rather than on everything.
 
+**Update 2026-10-05 (the lanes batch, after the logged pair).** Production's
+exec-lock log showed the real shape of the stalls: 2.1–2.7 s waits behind
+holders of 0–16 ms — a convoy, not a slow call. Two causes, both fixed:
+the Esplora facade took the *exclusive* lock for every dispatch, lane
+methods included (so `getblockhash` from `/block-height/N` queued behind
+everything), and its mempool batch took it twice per parent transaction.
+Now: the facade takes the lock the method's class needs (none for a lane);
+a **txindex lane** (private store handle and block buffer, one mutex that
+`irs_refresh` also takes — a real lock, the 2026-10-02 crash was this path
+lock-free) serves `rpc_chain_tx_blockhash`, `getrawtransaction` v0/v1 and
+the batch's parent lookups, one entry per batch; `getblock` runs in a
+per-RPC-thread reader lane (class NOLOCK; 8 MB per `-rpcthreads`);
+`getmempoolinfo`'s totals are memoised on the mempool sequence (advanced on
+every accept, removal, block connect and disconnect), so the slot walk runs
+only when the pool changed. The 32-client rows before/after are in
+`docs/reports/2026-10-06-core-vs-bmc-performance-release.md`, measured with
+`validation/rpc_concurrency_bench.sh`.
+
 ## 5. Memory
 
 | | processes | RSS |
