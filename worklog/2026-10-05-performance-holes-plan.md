@@ -146,6 +146,33 @@ fallbacks. Target ≤ 90 s.
 16-block chunk. Only the benchmark mode is affected; do it if a third pair
 is scheduled, otherwise document it as the known difference.
 
+### B7. An eviction the holder never answers (found during run 35; small; done on the branch)
+Run 35 at 19:57:44Z: the holder of the window's oldest chunk was "dropped"
+twelve times (2 s doubling to 64 s) and never printed its drop line or
+released the chunk; nine workers idle at the full window, 64 chunks staged,
+the applier at 0 CPU for 7 minutes. Run 34 had it four times, ~20 minutes
+each (Core-mode's 1,200 s read timeout), 78 minutes in all — most of what
+the pair report called "download-bound under random peers"; B6 above is
+smaller than this. The cursor help was published every time and read by
+nobody (its only reader was the claim path; `cursorhelp 0` both runs).
+Fix: the second eviction of the same holder for the same chunk rings the
+chunk from the parent (Core: a disconnected staller's blocks are
+re-requested elsewhere at once); the full-window wait loop takes the cursor
+help; the eviction signal shuts the worker's socket (`mux_budget_fd`, as the
+relay legs); a drop that arrives outside the fetch is acknowledged in the
+log instead of being reset silently; the eviction line names the holder's
+phase, its age there, and its /proc state, wchan and syscall. Gate:
+test_dialhelper (the unanswered-eviction and cursor-taker cases,
+revert-checked), test_v2transport (the handshake's second loop gained the
+real-time deadline; a trickling peer held it 8 s on a 1 s budget before).
+The next ranked run (36) shows `unanswered N` on the status line and no
+`[bench] block` gap over 60 s that is not a flush. Open: the exact wait the
+worker sat in for 415 s. The log places it outside the fetch (its own
+120 s alarm never fired either, and no drop line or failed-fetch line was
+printed); the eviction line now answers this on the first recurrence.
+Run 35 was stopped at 21:00Z (72%) for the re-run; its logs are in
+`bench/run35/` (debug.log copied out of the datadir).
+
 ## Part C — later, not for the first release
 - UTXO on disk 12.8 GB vs Core's 10.6: run encoding (compressed scripts and
   varint amounts as Core's `CTxOutCompressor`). Space, not speed.
