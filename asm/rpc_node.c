@@ -1136,10 +1136,34 @@ void rpc_node_set_cluster_limits(long count, long size_kvb){
     if (count > 0) g_limit_cluster_count = count;
     if (size_kvb > 0) g_limit_cluster_size_kvb = size_kvb;
 }
+/* 2026-10-05: getmempoolinfo's totals keyed on the mempool SEQUENCE.
+ * Core keeps m_total_fee / totalTxSize incrementally on every add and
+ * remove, so its call is O(1). This node's pool is shared memory the worker
+ * owns, and every mutation -- add, eviction, expiry, reorg, block removal,
+ * replacement -- takes the sequence number (daemon/mempool_seq.h, Core's
+ * GetAndIncrementSequence), so the totals are a pure function of it: the
+ * same sequence is the same pool. The walk below (a memcmp per slot through
+ * the parse cache) runs only when the sequence moved; the pollers that call
+ * this every few seconds get the memo. Measured 2026-10-05 before this:
+ * 177 ms per call at 32 clients on a 71,348-transaction pool (Core 5 ms).
+ * rpc_node_mpi_memo_enable(0) forces the walk; the test compares the two. */
+static struct { unsigned long long seq; long count; unsigned long long bytes, total_fee, blob; int valid; } g_mpi_memo;
+static int g_mpi_memo_on = 1; static long g_mpi_memo_hits, g_mpi_memo_walks;
+void rpc_node_mpi_memo_enable(int on){ g_mpi_memo_on = on; if (!on) g_mpi_memo.valid = 0; }
+void rpc_node_mpi_memo_stats(long* hits, long* walks){ if (hits) *hits = g_mpi_memo_hits; if (walks) *walks = g_mpi_memo_walks; }
 static int cmd_getmempoolinfo(rj_val** res){
     long count = 0; unsigned long long bytes = 0, total_fee = 0, blob_used = 0;
     if (g_mph.mp){
         mpl();
+        unsigned long long seq = 0; int have_seq = g_mpi_memo_on && g_mph.mempool_sequence != 0;
+        if (have_seq) seq = g_mph.mempool_sequence();
+        if (have_seq && g_mpi_memo.valid && g_mpi_memo.seq == seq){
+            count = g_mpi_memo.count; bytes = g_mpi_memo.bytes; total_fee = g_mpi_memo.total_fee; blob_used = g_mpi_memo.blob;
+            g_mpi_memo_hits++;
+            mpu();
+            goto render;
+        }
+        g_mpi_memo_walks++;
         count = g_mph.count ? g_mph.count(g_mph.mp) : 0;
         /* total_fee in ONE pass over the policy nodes. It used to come from a
          * pol_entry() call per mempool slot, and pol_entry is a linear scan of
@@ -1167,8 +1191,10 @@ static int cmd_getmempoolinfo(rj_val** res){
                 if (g_mph.polstate && g_mph.pol_entry && g_mph.pol_entry(g_mph.polstate,e.txid,&f,&s)) total_fee += f;
             }
         }
+        if (have_seq){ g_mpi_memo.seq = seq; g_mpi_memo.count = count; g_mpi_memo.bytes = bytes; g_mpi_memo.total_fee = total_fee; g_mpi_memo.blob = blob_used; g_mpi_memo.valid = 1; }
         mpu();
     }
+render:;
     rj_val* o = rj_obj();
     rj_obj_set(o, "loaded", rj_bool(1));
     rj_obj_set(o, "size", rj_numf("%ld", count));

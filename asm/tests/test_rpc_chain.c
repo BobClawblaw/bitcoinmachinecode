@@ -24,6 +24,8 @@
 #include "../rpc_chain.h"
 #include "../rpc_node.h"      /* rpc_mempool_hooks (the CPFP-selection section) */
 #include <stdio.h>
+#include <pthread.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -407,6 +409,23 @@ static long scan_stub_run(const unsigned char* spks, const unsigned int* spklens
 static long pub_tip_one(void){ return 1; }
 static long pub_tip_untracked(void){ return -2; }
 
+/* 2026-10-05: lane lookups racing the index's rewrite. irs_refresh remaps the
+ * run set IN PLACE (it zeroes each kept run's map while rebuilding the table),
+ * which is what segfaulted production eleven times on 2026-10-02 when a lookup
+ * ran with no lock; the txindex lane's mutex is what serialises the two now.
+ * A miss during a rewrite is honest (the run is being replaced); a WRONG hash
+ * is not, and a crash is the failure the lane exists to prevent. */
+extern int rpc_chain_tx_blockhash(const char*, char[65]);
+typedef struct { const char* const* ids; const char* const* blks; volatile int* stop; long calls, wrong; } race_t;
+static void* race_lookups(void* a){
+    race_t* r = a; char bh[65];
+    while (!*r->stop)
+        for (int i = 0; i < 4; i++){
+            int hit = rpc_chain_tx_blockhash(r->ids[i], bh); r->calls++;
+            if (hit && strcmp(bh, r->blks[i])) r->wrong++;
+        }
+    return NULL;
+}
 int main(void){
     /* ---- -blockversion is honoured ONLY where Core honours it (2026-09-06) --
      * Core: node/miner.cpp:148 applies -blockversion under
@@ -2097,7 +2116,23 @@ int main(void){
             if (!rpc_chain_tx_blockhash(ids[i], bh) || strcmp(bh, blks[i])){ right = 0; printf("      (%.16s -> %s, want %s)\n", ids[i], bh, blks[i]); }
         ck("rpc_chain_tx_blockhash: every fixture tx's block hash, from the index alone", right);
         ck("...and 0 for a txid the index does not hold, or a malformed one",
-           !rpc_chain_tx_blockhash("0000000000000000000000000000000000000000000000000000000000000001", bh) && !rpc_chain_tx_blockhash("zz", bh)); } }
+           !rpc_chain_tx_blockhash("0000000000000000000000000000000000000000000000000000000000000001", bh) && !rpc_chain_tx_blockhash("zz", bh));
+        /* 2026-10-05: 32 threads of lane lookups while this thread deletes
+         * and rebuilds the index files (the directory changes, so every
+         * irs_refresh rescans and remaps) */
+        { volatile int stop = 0; static race_t rr[32]; pthread_t th[32];
+          for (int i = 0; i < 32; i++){ rr[i].ids = ids; rr[i].blks = blks; rr[i].stop = &stop; rr[i].calls = rr[i].wrong = 0; pthread_create(&th[i], NULL, race_lookups, &rr[i]); }
+          struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0); int rewrites = 0;
+          do {
+              unlink("txindex.dat"); unlink("txindex.tail"); unlink("txindex.r000000002-000000002.dat");
+              build_fixture_txindex(1, 3); rewrites++;
+              clock_gettime(CLOCK_MONOTONIC, &t1);
+          } while ((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000 < 400);
+          stop = 1; long calls = 0, wrong = 0;
+          for (int i = 0; i < 32; i++){ pthread_join(th[i], NULL); calls += rr[i].calls; wrong += rr[i].wrong; }
+          printf("      %ld lane lookups on 32 threads during %d index rewrites, %ld wrong\n", calls, rewrites, wrong);
+          ck("32 lane lookups racing the index rewrite: no crash, no wrong answer (the lane serialises irs_refresh)", calls > 0 && wrong == 0);
+          ck("...and the index still answers after the rewrites", rpc_chain_tx_blockhash(ids[0], bh) && !strcmp(bh, blks[0])); } } }
 
     { /* 2026-09-19 (run-28 bench fidelity, defect B): an index CONFIGURED OFF
        * is Core without the option, whatever files the datadir holds. The

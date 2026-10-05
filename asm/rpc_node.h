@@ -658,6 +658,8 @@ const char* rpc_node_method_at(int i);
  * set), or -1 (not ours -- caller keeps looking). */
 int  rpc_node_method_lane(const char* method);   /* 2 = the mempool lane: no execution lock, its own mutex (2026-09-30) */
 void rpc_node_mpc_stats(long* hits, long* parses); /* the per-slot parse cache's counters; test hook */
+void rpc_node_mpi_memo_enable(int on);               /* 2026-10-05: getmempoolinfo's sequence-keyed totals; 0 = always walk (test seam) */
+void rpc_node_mpi_memo_stats(long* hits, long* walks);
 int rpc_node_dispatch(const char* method, const rj_val* params,
                       rj_val** result, long* ec, const char** em);
 

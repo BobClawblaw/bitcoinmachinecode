@@ -56,12 +56,24 @@ long rpc_node_mempool_many(const unsigned char (*w)[32], long n, rpc_mp_item* ou
  * segfaulted on it eleven times. Count the calls made without the lock. */
 static int g_idx_calls = 0, g_idx_unlocked = 0;
 static int g_locks, g_unlocks;
+/* 2026-10-05: the lookup runs in rpc_chain's txindex LANE (its own mutex
+ * guards irs_refresh), so the batch must call the _many form ONCE with NO
+ * execution lock held -- taking the exclusive lock per parent was the convoy
+ * production logged for two days. g_idx_unlocked now counts the opposite
+ * fault: a lookup made WITH the execution lock held. */
+static int g_many_calls = 0;
 int rpc_chain_tx_blockhash(const char* t, char out[65]){
     if (!g_batch_on) return 0;
-    g_idx_calls++; if (g_locks - g_unlocks != 1) g_idx_unlocked++;
+    g_idx_calls++;
     if (!strcmp(t, TX2) || !strcmp(t, TX3) || !strcmp(t, "5555555555555555555555555555555555555555555555555555555555555555")){
         snprintf(out, 65, "%s", BH); return 1; }
-    return 0;
+    out[0] = 0; return 0;
+}
+long rpc_chain_tx_blockhash_many(const char* const* ids, long n, char (*out)[65]){
+    g_many_calls++; if (g_locks - g_unlocks != 0) g_idx_unlocked++;
+    long hits = 0;
+    for (long i = 0; i < n; i++){ out[i][0] = 0; hits += rpc_chain_tx_blockhash(ids[i], out[i]); }
+    return hits;
 }
 long axt_read_events(int type, const unsigned char hash[32], long min_height,
                      int (*cb)(void*, int, const unsigned char*, unsigned, unsigned long long, unsigned), void* ctx){
@@ -333,15 +345,15 @@ int main(void){
       g_mp_on = 1;
       g_batch_on = 0; g_pool_takes = 0;
       rj_val* a = POST("/internal/mempool/txs", body); char* sa = g_out ? strndup(g_out, g_outlen) : 0; int takes_old = g_pool_takes;
-      g_batch_on = 1; g_pool_takes = 0; g_idx_calls = g_idx_unlocked = 0;
+      g_batch_on = 1; g_pool_takes = 0; g_idx_calls = g_idx_unlocked = 0; g_many_calls = 0;
       rj_val* b = POST("/internal/mempool/txs", body); char* sb = g_out ? strndup(g_out, g_outlen) : 0; int takes_new = g_pool_takes;
       ok(a && b && a->nitems == 3 && b->nitems == 3, "POST /internal/mempool/txs: all three transactions, both paths");
       ok(sa && sb && !strcmp(sa, sb), "...the batched reply is byte-identical to the per-transaction one (fee, prevouts from pool and index)");
       if (sa && sb && strcmp(sa, sb)) printf("      per-tx: %.300s\n      batch : %.300s\n", sa, sb);
       ok(takes_old == 9 && takes_new == 2, "...pool-lock takes: 9 per-transaction (3 x 3) -> 2 batched (one slice of txs, one of parents)");
       if (!(takes_old == 9 && takes_new == 2)) printf("      takes per-tx %d, batched %d\n", takes_old, takes_new);
-      ok(g_idx_calls > 0 && g_idx_unlocked == 0, "...every txid-index lookup ran under the execution lock (irs_refresh rewrites the run set in place)");
-      if (!(g_idx_calls > 0 && g_idx_unlocked == 0)) printf("      index lookups %d, without the lock %d\n", g_idx_calls, g_idx_unlocked);
+      ok(g_idx_calls > 0 && g_many_calls == 1 && g_idx_unlocked == 0, "...the txid-index lookups ran as ONE lane batch with no execution lock held (2026-10-05: the lane guards irs_refresh, not the exclusive lock)");
+      if (!(g_idx_calls > 0 && g_many_calls == 1 && g_idx_unlocked == 0)) printf("      index lookups %d in %d batch call(s), with the exec lock held %d\n", g_idx_calls, g_many_calls, g_idx_unlocked);
       rj_val* v7 = (b && b->nitems == 3) ? rj_obj_get(b->items[2], "vin") : 0;
       rj_val* p7 = (v7 && v7->nitems) ? v7->items[0] : 0;
       ok(p7 && rj_obj_get(p7, "prevout") && !strcmp(S(rj_obj_get(p7, "prevout"), "value"), "3000000"), "...0x77..'s prevout came from its unconfirmed parent in the pool (3,000,000 sat)");
