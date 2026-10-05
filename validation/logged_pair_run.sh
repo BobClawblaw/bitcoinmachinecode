@@ -116,7 +116,7 @@ if at_or_after a; then
     # The watcher: move the running copy aside, then rename the new one in
     # (a new inode; a bash still reading the old file keeps reading it).
     tsx=$(date -u +%Y%m%dT%H%M%SZ)
-    for f in core_bench_watch.sh lib/ibd_harness_lib.sh; do
+    for f in core_bench_watch.sh lib/ibd_harness_lib.sh proc_sampler.sh; do
         [ -e "$WATCHDIR/$f" ] && { run mv "$WATCHDIR/$f" "$WATCHDIR/$f.pre-logged-$tsx" || die "mv aside $f failed"; }
         run cp "$REPO/validation/$f" "$WATCHDIR/$f.new" || die "cp $f failed"
         run mv "$WATCHDIR/$f.new" "$WATCHDIR/$f" || die "install $f failed"

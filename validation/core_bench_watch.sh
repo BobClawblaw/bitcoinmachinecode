@@ -51,6 +51,17 @@ w(){ echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*" >> "$OUT"; }
 hms(){ printf '%d h %d m %d s' $(($1/3600)) $(($1%3600/60)) $(($1%60)); }
 listening(){ ss -ltnH "( sport = :$PORT )" 2>/dev/null | grep -q .; }
 w "START watching $DD (rpc :$PORT); bench started $(cat "$DD/BENCH_START.txt" 2>/dev/null || echo '?'); ready step $( [ "$WATCH_READY" = 1 ] && echo on || echo off)"
+# CPU time and peak memory beside the run (operator rule 2026-10-05: every
+# run, both sides, the same way as bmc's harness). /proc only, plus systemd's
+# own accounting for the unit -- neither is an RPC to the node.
+SAMPLER="$(dirname "$0")/proc_sampler.sh"; CORE_EXE=${CORE_EXE:-/storage/bitcoin-core-v31.1/bin/bitcoind}
+if [ -f "$SAMPLER" ]; then
+    setsid nohup bash "$SAMPLER" --exe "$CORE_EXE" "$DD/proc.log" 5 > /dev/null 2>&1 < /dev/null &
+    SAMPLER_PID=$!; trap 'kill "$SAMPLER_PID" 2>/dev/null' EXIT
+    w "SAMPLER pid=$SAMPLER_PID $DD/proc.log every 5 s (cpu, rss, pss, peaks) for $CORE_EXE"
+else w "WARN no $SAMPLER -- no CPU/memory sampling"; fi
+mem_line(){ { [ -s "$DD/proc.log" ] && tail -1 "$DD/proc.log" | cut -d' ' -f2- || echo "no proc.log"; }
+            echo "systemd MemoryPeak=$(systemctl show bitcoin-core-bench.service -p MemoryPeak --value 2>/dev/null) CPUUsageNSec=$(systemctl show bitcoin-core-bench.service -p CPUUsageNSec --value 2>/dev/null)"; }
 seen=""; tw_said=0; off=0
 while :; do
     for c in $(ibd_rpc_clients "$PORT"); do
@@ -76,6 +87,7 @@ while :; do
         start=$(cat "$DD/BENCH_START.txt" 2>/dev/null)
         el=$(( $(date -u -d "$end" +%s) - $(date -u -d "$start" +%s) ))
         w "IBD_END $end (from the log) elapsed=${el}s = $(hms "$el")"
+        w "MEM at IBD_END: $(mem_line | tr '\n' ' ')"
         break
     fi
     # the node gone before its end line: the run is over and says so
@@ -129,6 +141,7 @@ while :; do
     case $r in
         0) te=$(date -u -d "$now" +%s)
            w "READY_INDEXES $now (getindexinfo #$n) every index at >= $READY_H elapsed=$((te - T0))s = $(hms $((te - T0)))"
+           w "MEM at READY: $(mem_line | tr '\n' ' ')"
            exit 0;;
         1) w "WAIT index(es) below $READY_H: $un -- next getindexinfo in ${TICK} s";;
         *) w "WARN getindexinfo unreadable (rc=$rc) -- next try in ${TICK} s"
