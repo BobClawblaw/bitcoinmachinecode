@@ -563,6 +563,10 @@ tests/test_truncate: tests/test_truncate.c bitcoin_store.o $(IDXOBJS) $(TEST_TMP
 # the real LSM UTXO store.
 tests/test_undo_log: tests/test_undo_log.c daemon/undo_log.o $(UTXOLSMOBJS) $(TEST_TMPDIR_H)
 	$(CC) $(CFLAGS) -o $@ tests/test_undo_log.c daemon/undo_log.o $(UTXOLSMOBJS)
+# the applier's put phase, split, at production sizing (plan B1, 2026-10-05):
+# a benchmark, not a gate test -- `make tests/bench_utxo_put && tests/bench_utxo_put`
+tests/bench_utxo_put: tests/bench_utxo_put.c daemon/undo_log.o $(UTXOLSMOBJS) $(TEST_TMPDIR_H)
+	$(CC) $(CFLAGS) -o $@ tests/bench_utxo_put.c daemon/undo_log.o $(UTXOLSMOBJS)
 
 # The asm twin vs the C oracle, on identical op streams. The C oracle is
 # compiled with objcopy-prefixed symbols (ref_*) so both link into one

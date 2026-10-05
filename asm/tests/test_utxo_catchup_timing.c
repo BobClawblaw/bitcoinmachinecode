@@ -57,6 +57,12 @@ extern void utxo_live_close(void);
 
 /* the instrumentation under test (daemon/utxo_live.c) */
 extern void utxo_live_set_timing(int on);
+/* 2026-10-05 (plan B2): the resolved undo capture and its sampled check */
+extern unsigned long long utxo_live_put_split_us(int k);   /* 0 ins, 1 get, 2 undo record, 3 del, 4 wal */
+extern void utxo_live_test_set_resolved_sample(int n);
+extern void utxo_live_test_capture_counts(long* resolved, long* sampled, long* unresolved);
+typedef struct { u8 txid[32]; u32 index; u64 value; u32 height; u8 is_coinbase; unsigned short slen; u8 script[10000]; } undo_rec_t;
+extern long undo_load(long height, undo_rec_t* out, long max_recs);
 extern void utxo_live_timing_reset(void);
 extern unsigned long long utxo_live_timing_us(int phase);
 /* phase indices, mirroring utxo_live.c's enum */
@@ -353,15 +359,21 @@ int main(void){
 
         capture_begin("catchup_bench.log");
         u64 t0 = now_us();
+        unsigned long long sp_undo0 = utxo_live_put_split_us(2), sp_del0 = utxo_live_put_split_us(3), sp_ins0 = utxo_live_put_split_us(0);
         long ar = utxo_live_catchup(store_buf);
         u64 wall_call = now_us() - t0;
         char* log = capture_end("catchup_bench.log");
         g_cfg.benchlog = 0;
         ck("C catch-up applied the whole chain", ar, NBLOCKS);
+        /* the capture's own split (undo_log.c's counters, switched on with the
+         * benchlog): 50 spends wrote 50 records and did 50 dels -- both > 0 us */
+        ckm("C the capture's record-write counter advanced (the split timing was on)", utxo_live_put_split_us(2) > sp_undo0);
+        ckm("C the capture's del counter advanced", utxo_live_put_split_us(3) > sp_del0);
+        ckm("C the insert counter advanced", utxo_live_put_split_us(0) > sp_ins0);
 
         int seen[NBLOCKS]; memset(seen, 0, sizeof seen);
-        int bad_fmt = 0, bad_counts = 0, bad_sum = 0, extra = 0, nflush = 0, bad_flush = 0;
-        double verify_spend = 0.0, total_sum = 0.0;
+        int bad_fmt = 0, bad_counts = 0, bad_sum = 0, extra = 0, nflush = 0, bad_flush = 0, bad_split = 0;
+        double verify_spend = 0.0, total_sum = 0.0, undo_sum = 0.0, ins_sum = 0.0;
         const char* p = log ? log : "";
         while (*p){
             const char* e = strchr(p, '\n'); size_t n = e ? (size_t)(e - p) : strlen(p);
@@ -370,10 +382,11 @@ int main(void){
             const char* b = strstr(line, "[bench] block ");
             const char* f = strstr(line, "[bench] flush at block ");
             if (b){
-                long h; unsigned long long ntx, nin; double v[8], tot; int used = 0;
-                int k = sscanf(b, "[bench] block %ld: %llu tx, %llu txin | read %lf | idx %lf | verify %lf | get %lf | put %lf | ckpt %lf | flush %lf | csi %lf | total %lf ms%n",
-                               &h, &ntx, &nin, &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &tot, &used);
-                if (k != 12 || b[used] != 0){ bad_fmt++; printf("     bad block line: %s\n", b); }
+                long h; unsigned long long ntx, nin; double v[8], tot, sp[5]; int used = 0;
+                /* 2026-10-05: the split of put follows the total (plan B1) */
+                int k = sscanf(b, "[bench] block %ld: %llu tx, %llu txin | read %lf | idx %lf | verify %lf | get %lf | put %lf | ckpt %lf | flush %lf | csi %lf | total %lf ms | put.ins %lf | put.get %lf | put.undo %lf | put.del %lf | put.wal %lf%n",
+                               &h, &ntx, &nin, &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &tot, &sp[0], &sp[1], &sp[2], &sp[3], &sp[4], &used);
+                if (k != 17 || b[used] != 0){ bad_fmt++; printf("     bad block line: %s\n", b); }
                 else if (h < 0 || h >= NBLOCKS) extra++;
                 else {
                     seen[h]++;
@@ -383,6 +396,10 @@ int main(void){
                     if (sum > tot + 0.08) bad_sum++;               /* eight values rounded to 0.01 */
                     if (h >= NCB) verify_spend += v[2];
                     total_sum += tot;
+                    /* the split is inside put: five values rounded to 0.01 */
+                    { double ss = 0; for (int q = 0; q < 5; q++){ if (sp[q] < 0) bad_split++; ss += sp[q]; }
+                      if (ss > v[4] + 0.06) bad_split++;
+                      undo_sum += sp[2]; ins_sum += sp[0]; }
                 }
             }
             if (f){
@@ -401,11 +418,56 @@ int main(void){
         ckm("C tx and txin counts match the block (coinbase-only 1/1, spend blocks 6/6)", bad_counts == 0);
         ckm("C phases are non-negative and sum within the block's total", bad_sum == 0);
         ckm("C the spend blocks' verify column is non-zero (the script pass ran)", verify_spend > 0.0);
+        ckm("C the put split is non-negative and sums within put", bad_split == 0);
+        ckm("C put.undo is non-zero over the chain (every block commits its undo run)", undo_sum > 0.0);
+        ckm("C put.ins is non-zero over the chain (every block creates outputs)", ins_sum > 0.0);
         ckm("C the block totals sum to no more than the call's wall", total_sum <= (double)wall_call / 1000.0 + 0.01 * NBLOCKS);
         ckm("C a forced memtable flush writes [bench] flush lines", nflush >= 2);
         ckm("C every flush line parses, with ops, the run's size and the run count", bad_flush == 0);
         printf("     C: %d flush line(s), block totals %.2f ms, call wall %.2f ms\n", nflush, total_sum, (double)wall_call / 1000.0);
         if (log){ echo_lines_with(log, "[bench] flush"); echo_lines_with(log, "[bench] block 159:"); free(log); }
+        utxo_live_close();
+    }
+
+    /* ---------------- D: the undo capture takes Phase 1's resolved prevout (plan B2, 2026-10-05) ----------------
+     * The applier used to look every spent prevout up a second time inside
+     * undo_capture_and_del. Now it hands the capture what tx_verify resolved,
+     * and every Nth input still does the lookup and compares. The records
+     * written must be the coin's own (creation height, is_coinbase, value,
+     * script), not the spending block's. */
+    {
+        tt_subdir("resolved");
+        memset(store_buf,0,sizeof store_buf);
+        utxo_live_set_timing(1);
+        g_cfg.benchlog = 0;
+        ck("D store_init", store_init(store_buf), 1);
+        ck("D utxo_live_init", utxo_live_init("."), 1);
+        build_chain(0x74000000u);
+        utxo_live_test_set_resolved_sample(4);
+        long r0, s0, u0, r1, s1, u1;
+        utxo_live_test_capture_counts(&r0, &s0, &u0);
+        long ar = utxo_live_catchup(store_buf);
+        utxo_live_test_capture_counts(&r1, &s1, &u1);
+        utxo_live_test_set_resolved_sample(64);
+        ck("D catch-up applied the whole chain", ar, NBLOCKS);
+        ck("D every spend was captured from the resolved ledger (50 spends)", r1 - r0, NSPENDBLK * PERBLK);
+        ck("D one in four of each block's spends was also checked against the store (gi is per block: 5 inputs -> 1)", s1 - s0, NSPENDBLK * (PERBLK / 4));
+        ck("D none fell back to the looking-up capture", u1 - u0, 0);
+        int bad = 0;
+        for (long j = 0; j < NSPENDBLK; j++){
+            static undo_rec_t recs[16];
+            long n = undo_load(NCB + j, recs, 16);
+            if (n != PERBLK){ bad++; printf("     h=%ld: %ld undo record(s), want %d\n", NCB + j, n, PERBLK); continue; }
+            int seen[PERBLK]; memset(seen, 0, sizeof seen);
+            for (long i = 0; i < n; i++){
+                long k = (long)recs[i].height - j * PERBLK;
+                if (k < 0 || k >= PERBLK || seen[k]++ || recs[i].is_coinbase != 1 || recs[i].value != 50000000ULL
+                    || recs[i].slen != 1 || recs[i].script[0] != 0x51 || memcmp(recs[i].txid, cb_txids[j * PERBLK + k], 32) != 0){
+                    bad++; printf("     h=%ld rec %ld: height %u cb %u value %llu slen %u\n", NCB + j, i, recs[i].height, recs[i].is_coinbase, (unsigned long long)recs[i].value, recs[i].slen);
+                }
+            }
+        }
+        ckm("D every undo record carries the spent coin's own height, is_coinbase=1, value and script", bad == 0);
         utxo_live_close();
     }
 
