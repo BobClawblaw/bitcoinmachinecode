@@ -82,12 +82,23 @@ static int undo_fd_for(long height){
 int undo_exists(long height){ return us_exists(height); }
 /* close block `height`'s run with the END marker (creating the run if the
  * block spent nothing). 1 ok, -1 write failure. */
+/* 2026-10-05 (bmc.benchlog): the split of undo_capture_and_del + undo_commit,
+ * so the applier's `put` phase can be read as get / undo write / del / commit.
+ * Four clock reads per spent input when on; off (the default) costs one load
+ * and one branch per call. utxo_live.c turns it on with the benchlog. */
+static int g_undo_split_timing = 0;
+static u64 g_undo_split_ns[4];   /* 0 the prevout get, 1 the record write, 2 the del, 3 undo_commit */
+static u64 undo_clock_ns(void);
+void undo_set_split_timing(int on){ g_undo_split_timing = on; }
+unsigned long long undo_split_ns(int k){ return (k >= 0 && k < 4) ? g_undo_split_ns[k] : 0; }
 long undo_commit(long height){
+    u64 t0 = g_undo_split_timing ? undo_clock_ns() : 0;
     int fd = undo_fd_for(height);
     if (fd < 0) return -1;
     u8 end[UNDO_REC_HDR]; us_make_end(end, height);
     long w = write(fd, end, UNDO_REC_HDR);
     undo_close_current();
+    if (g_undo_split_timing) g_undo_split_ns[3] += undo_clock_ns() - t0;
     return w == UNDO_REC_HDR ? 1 : -1;
 }
 
@@ -315,26 +326,54 @@ static inline u64 undo_clock_ns(void){
     return (u64)t.tv_sec * 1000000000ULL + (u64)t.tv_nsec;
 }
 
-long undo_capture_and_del(void* lst, void* u, long height,
-                           const u8 txid[32], u32 index){
-    u64 value = 0;
-    unsigned long utxo_height = 0, is_coinbase = 0;
-    const u8* script = 0;
-    unsigned long slen = 0;
-    long r = utxo_lsm_get(lst, u, txid, index, &value, &utxo_height, &is_coinbase, &script, &slen);
-    if (r != 1) return r;   /* 0 not-found, -1 err: pass through unchanged */
-    if (undo_append_record(height, txid, index, value, (u32)utxo_height, (u8)is_coinbase, script, (u16)slen) != 1)
-        return -1;
+/* the del + the coin observer, shared by the two captures; ts2 = the clock
+ * before the del (0 when the split timing is off) */
+static long capture_tail(void* lst, void* u, const u8 txid[32], u32 index, u64 value,
+                         unsigned long utxo_height, unsigned long is_coinbase, const u8* script, unsigned long slen, u64 ts2){
     /* copy the script before the del: get()'s pointer is only valid until
      * the next LSM call, and the observer needs the exact bytes */
     static u8 scbuf[10000];
     unsigned long scn = slen <= sizeof scbuf ? slen : 0;
     if (scn && g_undo_coin_obs) memcpy(scbuf, script, scn);
     long d = utxo_lsm_del(lst, u, txid, index);
+    if (g_undo_split_timing) g_undo_split_ns[2] += undo_clock_ns() - ts2;
     if (d == 1 && g_undo_coin_obs && scn == slen){
         u64 t0 = g_undo_obs_timing ? undo_clock_ns() : 0;
         g_undo_coin_obs(txid, index, value, (u64)utxo_height, (u64)is_coinbase, scbuf, slen);
         if (g_undo_obs_timing) g_undo_obs_ns += undo_clock_ns() - t0;
     }
     return d;
+}
+long undo_capture_and_del(void* lst, void* u, long height,
+                           const u8 txid[32], u32 index){
+    u64 value = 0;
+    unsigned long utxo_height = 0, is_coinbase = 0;
+    const u8* script = 0;
+    unsigned long slen = 0;
+    u64 ts0 = g_undo_split_timing ? undo_clock_ns() : 0;
+    long r = utxo_lsm_get(lst, u, txid, index, &value, &utxo_height, &is_coinbase, &script, &slen);
+    u64 ts1 = g_undo_split_timing ? undo_clock_ns() : 0;
+    if (g_undo_split_timing) g_undo_split_ns[0] += ts1 - ts0;
+    if (r != 1) return r;   /* 0 not-found, -1 err: pass through unchanged */
+    long ar = undo_append_record(height, txid, index, value, (u32)utxo_height, (u8)is_coinbase, script, (u16)slen);
+    u64 ts2 = g_undo_split_timing ? undo_clock_ns() : 0;
+    if (g_undo_split_timing) g_undo_split_ns[1] += ts2 - ts1;
+    if (ar != 1)
+        return -1;
+    return capture_tail(lst, u, txid, index, value, utxo_height, is_coinbase, script, slen, ts2);
+}
+/* 2026-10-05 (plan B2): the same capture with the prevout ALREADY RESOLVED --
+ * the applier passes what tx_verify's Phase 1 looked up for this input
+ * (txvb_last_in_prevout) instead of asking the store a second time. The
+ * record written, the del and the observer call are byte-for-byte what
+ * undo_capture_and_del does after its get; the get is the only difference.
+ * Return: the del's (1 / 0 / -1), -1 on a record write failure. */
+long undo_capture_and_del_resolved(void* lst, void* u, long height, const u8 txid[32], u32 index,
+                                   u64 value, u32 utxo_height, u8 is_coinbase, const u8* script, u16 slen){
+    u64 ts1 = g_undo_split_timing ? undo_clock_ns() : 0;
+    long ar = undo_append_record(height, txid, index, value, utxo_height, is_coinbase, script, slen);
+    u64 ts2 = g_undo_split_timing ? undo_clock_ns() : 0;
+    if (g_undo_split_timing) g_undo_split_ns[1] += ts2 - ts1;
+    if (ar != 1) return -1;
+    return capture_tail(lst, u, txid, index, value, utxo_height, is_coinbase, script, slen, ts2);
 }
