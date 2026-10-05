@@ -150,6 +150,13 @@ setsid nohup nice -n "$NICE" src/asm/daemon/bmcbitcoind serve "$DEST/data" > con
 echo $! > daemon.pid; sleep 8
 kill -0 "$(cat daemon.pid)" 2>/dev/null || { ph "FAIL daemon exited at once"; echo FAIL > RESULT; exit 1; }
 ph "DAEMON pid=$(cat daemon.pid) epoch=$T0"
+# CPU time and peak memory beside the run (operator rule 2026-10-05: every
+# run, both sides, the same way). /proc only -- never an RPC to the node.
+if [ -f src/validation/proc_sampler.sh ]; then
+    setsid nohup bash src/validation/proc_sampler.sh --cwd "$DEST/data" "$DEST/proc.log" 5 > /dev/null 2>&1 < /dev/null &
+    echo $! > sampler.pid; ph "SAMPLER pid=$(cat sampler.pid) proc.log every 5 s (cpu, rss, pss, peaks)"
+else ph "WARN no src/validation/proc_sampler.sh in this ref -- no CPU/memory sampling"; fi
+mem_line(){ [ -s proc.log ] && tail -1 proc.log | cut -d' ' -f2- || echo "no proc.log"; }
 
 # A missing helper is a benchmark that cannot be compared with Core: the node
 # skips index work Core does. The pre-launch check above covers the build;
@@ -214,6 +221,7 @@ while :; do
     END_TS=$(ibd_log_tip_time "$LOG")
     END_EPOCH=$(date -u -d "$END_TS" +%s 2>/dev/null || echo 0)
     ph "IBD_END $END_TS UTC (from the log) elapsed=$(( END_EPOCH - T0 ))s -- applied=$1 stored=$2/$3 oracle=$theirs"
+    ph "MEM at IBD_END: $(mem_line)"
 
     ph "TIP reached: applied=$1 tip=$3 oracle=$theirs elapsed=$(( $(date +%s)-T0 ))s (RPC to the node is allowed from here)"
 
@@ -236,6 +244,7 @@ while :; do
             ph "WARN no [ready] line within ${rw}s of the tip (READY_TIMEOUT_S=$READY_TIMEOUT_S; daemon $(kill -0 "$(cat daemon.pid)" 2>/dev/null && echo alive || echo GONE)) -- READY not recorded"
         fi
     fi
+    ph "MEM at ready: $(mem_line)"
 
     # ------------------------------------------------------------------
     # THE CAPSTONE. Three ways this has lied, all fixed here:

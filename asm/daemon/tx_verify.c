@@ -1679,6 +1679,28 @@ static void txvb_verify_all(txvb_in_t* flat, txvb_result_t* res, u64 total, unsi
  * single-threaded export discipline as the VAL-1 fees ledger. */
 static u64* g_tx_sigops = 0;  static u64 g_tx_sigops_cap = 0;  static u64 g_tx_sigops_n = 0;
 unsigned long long* txvb_last_tx_sigops(unsigned long long* n){ if(n) *n = g_tx_sigops_n; return (unsigned long long*)g_tx_sigops; }
+/* 2026-10-05 (plan B2): the resolved prevout of input gi (flat, block order,
+ * non-coinbase txs) of the LAST call -- value, creation height, is_coinbase,
+ * the scriptPubKey copy in g_spk_pool and its owning tx index. The applier's
+ * undo capture used to look every prevout up AGAIN (utxo_lsm_get, the run
+ * lookup for a coin outside the memtable: 1.3-2 us late in the chain, the
+ * largest part of `put` in the logged pair of 2026-10-05); this hands it the
+ * answer Phase 1 already has. 1 = filled; 0 = no such input. Valid until the
+ * next call: txvb_last_resolve_gen() is the stamp the caller compares. */
+static txvb_in_t* g_flat; static u64 g_in_height_n; static u64* g_in_height; static u32* g_in_txidx; static u8* g_in_cb; static u64 g_resolve_gen;
+int txvb_last_in_prevout(unsigned long long gi, unsigned long long* value, unsigned long long* height, unsigned long long* is_cb,
+                         const unsigned char** spk, unsigned int* spklen, unsigned int* tx_index){
+    if (gi >= g_in_height_n || !g_flat || !g_in_cb) return 0;
+    const txvb_in_t* in = &g_flat[gi];
+    if (value) *value = in->value;
+    if (height) *height = g_in_height[gi];
+    if (is_cb) *is_cb = g_in_cb[gi];
+    if (spk) *spk = g_spk_pool.buf + in->spk_off;
+    if (spklen) *spklen = in->spklen;
+    if (tx_index) *tx_index = g_in_txidx[gi];
+    return 1;
+}
+unsigned long long txvb_last_resolve_gen(void){ return g_resolve_gen; }
 
 /* VAL-4 / BIP68 (audit 2026-09-03): the per-input prevout CREATION HEIGHTS,
  * flat and in the same order as `flat`, with each input's owning transaction
@@ -1693,6 +1715,12 @@ unsigned long long* txvb_last_tx_sigops(unsigned long long* n){ if(n) *n = g_tx_
  * drifts. Same seam as txvb_last_tx_sigops. */
 static u64* g_in_height = 0;  static u64 g_in_height_cap = 0;  static u64 g_in_height_n = 0;
 static u32* g_in_txidx  = 0;  static u64 g_in_txidx_cap  = 0;
+static u8*  g_in_cb     = 0;  static u64 g_in_cb_cap     = 0;   /* 2026-10-05: is_coinbase per input, beside the heights */
+/* the flat per-input array of the LAST tx_verify_block_connect_all call;
+ * file-scope since 2026-10-05 so the resolved prevouts can be read back by
+ * the applier (txvb_last_in_prevout) -- the arena was already persistent */
+static txvb_in_t* g_flat = 0;        static u64 g_flat_cap = 0;
+static u64 g_resolve_gen = 0;        /* +1 per call that filled the ledgers */
 unsigned long long* txvb_last_in_heights(unsigned long long* n, unsigned int** txidx){
     if (n) *n = g_in_height_n;
     if (txidx) *txidx = g_in_txidx;
@@ -1894,15 +1922,17 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
         { /* VAL-4/BIP68: one slot per INPUT, sized here alongside the sigop ledger */
           u64* hp = grow_arena((void**)&g_in_height, &g_in_height_cap, total_nin * sizeof(u64));
           u32* xp = grow_arena((void**)&g_in_txidx,  &g_in_txidx_cap,  total_nin * sizeof(u32));
+          u8*  cp = grow_arena((void**)&g_in_cb,     &g_in_cb_cap,     total_nin * sizeof(u8));
           /* total_nin == 0 is a coinbase-only block: grow_arena returns NULL
            * for a zero-byte request, which is not a failure. Only a genuine
            * allocation failure is. */
-          if (total_nin && (!hp || !xp)){ *reason = "oom: bip68 height ledger"; return 0; }
+          if (total_nin && (!hp || !xp || !cp)){ *reason = "oom: bip68 height ledger"; return 0; }
           if (total_nin){
               memset(g_in_height, 0, total_nin * sizeof(u64));
               memset(g_in_txidx,  0, total_nin * sizeof(u32));
+              memset(g_in_cb,     0, total_nin * sizeof(u8));
           }
-          g_in_height_n = total_nin; }
+          g_in_height_n = total_nin; g_resolve_gen++; }
         u64* p = grow_arena((void**)&g_tx_sigops, &g_tx_sigops_cap, ntx * sizeof(u64));
         if (!p){ *reason = "out of memory"; *fail_tx_index = 0; return 0; }
         memset(g_tx_sigops, 0, ntx * sizeof(u64));
@@ -1915,7 +1945,6 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
         }
     }
 
-    static txvb_in_t* g_flat = 0;        static u64 g_flat_cap = 0;
     static txvb_result_t* g_res = 0;     static u64 g_res_cap = 0;
     static txvb_txrange_t* g_ranges = 0; static u64 g_ranges_cap = 0;
     /* g_spk_pool is file-scope (see its own comment, near bytepool_alloc) --
@@ -1984,7 +2013,7 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
          * this accumulator (see the VAL_MAX_MONEY bound the caller applies
          * against the resulting fee). */
         if (in->tx_index < g_tx_in_sums_n) g_tx_in_sums[in->tx_index] += value;
-        if (gi < g_in_height_n){ g_in_height[gi] = uheight; g_in_txidx[gi] = (u32)in->tx_index; }
+        if (gi < g_in_height_n){ g_in_height[gi] = uheight; g_in_txidx[gi] = (u32)in->tx_index; g_in_cb[gi] = (u8)ucb; }
         if (!txvb_classify(in, height, flags, value, uheight, ucb, spk, spklen,
                            &g_spk_pool, &has_taproot, reason)) {
             *fail_tx_index = in->tx_index; goto fail;

@@ -34,6 +34,18 @@ static inline long dlc_announced_height(const long* hs, int n){
     free(v);
     return r;
 }
+/* ---- the header peer (2026-10-05) ------------------------------------------
+ * bmc (the default): DLC_HDR_PROBE_N candidates are asked for the first
+ * header page at once and the fastest leads the sync; the others are the
+ * fallbacks the try loop walks when the leader fails, stops answering, is
+ * behind, or is on a stale branch (dlc_headers_probe, main.c). A peer that
+ * stops answering after pages have landed is rolled back and the next
+ * candidate continues; the longest chain seen is taken if no one completes.
+ * Core syncs headers from ONE peer (net_processing.cpp: nSyncStarted is 0 or
+ * 1; a second peer is only tried after the first times out), so
+ * bmc.dlshape=core keeps the single pick, in the shuffled pool's order.
+ * Stated divergence in the default mode: Core's header sync is as fast as
+ * its one draw; this node's is as fast as the best of four. */
 /* does a header chain ending at chain_tip fall short of what the pool announces? */
 static inline int dlc_chain_falls_short(long chain_tip, long announced){
     return announced > 0 && chain_tip + DLC_HDR_BEHIND_MAX < announced;

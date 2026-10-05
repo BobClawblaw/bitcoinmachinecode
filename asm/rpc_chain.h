@@ -90,6 +90,12 @@ int rpc_chain_dispatch(const char* method, const rj_val* params,
  * connection's own thread), 2 = yes but may be slow (getchaintxstats' first
  * build, the waitfor* family), 0 = needs the execution lock. */
 int rpc_chain_method_lane(const char* method);
+/* 2026-10-05: the same, decided from the params too (getrawtransaction's
+ * verbosity picks the txindex lane or the write lock). */
+int rpc_chain_method_lane_p(const char* method, const rj_val* params);
+/* the block hashes of confirmed transactions from the txid index, under ONE
+ * txindex-lane entry; no execution lock needed. out[i][0] == 0 = not held. */
+long rpc_chain_tx_blockhash_many(const char* const* txid_disp, long n, char (*out_disp)[65]);
 
 /* getchaintxstats' cumulative-count cache: the count through height h on the
  * current chain (-1 unknown), and how many block prefixes it has read in

@@ -175,6 +175,9 @@ static void* rawtx_wait(void* a){
     s->ms = call_ms("getrawtransaction", "[\"1111111111111111111111111111111111111111111111111111111111111111\"]", s->out, sizeof s->out);
     return NULL;
 }
+/* 2026-10-05: getblock in the per-thread reader lane -- many at once, the same answer */
+typedef struct { char params[200]; double ms; char out[65536]; } gb_t;
+static void* getblock_thread(void* a){ gb_t* g = a; g->ms = call_ms("getblock", g->params, g->out, sizeof g->out); return NULL; }
 static void* hold_lock(void* a){
     long ms = (long)a;
     rpc_exec_hold_for_test(1);
@@ -207,7 +210,45 @@ static void scenario_lock(const char* m){
     pthread_t th; pthread_create(&th, NULL, hold_lock, (void*)700L);
     struct timespec settle = { 0, 150 * 1000000L }; nanosleep(&settle, NULL);
     probe_one("execution lock held", m);
-    if (!strcmp(m, "uptime")) probe_lookups("execution lock held", 1);   /* once per scenario, under the same hold */
+    if (!strcmp(m, "uptime")){
+        probe_lookups("execution lock held", 1);   /* once per scenario, under the same hold */
+        /* 2026-10-05: getrawtransaction at verbosity 1 runs in the txindex
+         * LANE -- its own mutex, handle and block buffer -- so it answers
+         * under the held write lock; verbosity 2 reads the undo file through
+         * the write-locked path and waits for the hold. The pair is the
+         * check: the lane call's bound AND the write-locked call's wait. */
+        const char* tx = "1111111111111111111111111111111111111111111111111111111111111111";
+        char p1[200]; snprintf(p1, sizeof p1, "[\"%s\",1,\"%s\"]", tx, g_hash1);
+        char p2[200]; snprintf(p2, sizeof p2, "[\"%s\",2,\"%s\"]", tx, g_hash1);
+        char out[8192];
+        double lane_ms = call_ms("getrawtransaction", p1, out, sizeof out);
+        int lane_json = strstr(out, "\"error\"") != NULL || strstr(out, "\"result\"") != NULL;
+        char label[256];
+        snprintf(label, sizeof label, "execution lock held: getrawtransaction verbosity 1 (txindex lane) answers in %.1f ms (bound 100 ms)", lane_ms);
+        ck(label, lane_json && lane_ms < 100.0);
+        /* getblock: the per-thread reader lane (2026-10-05). Under the held
+         * write lock it answers; sixteen at once answer the same bytes. */
+        { char pb[200]; snprintf(pb, sizeof pb, "[\"%s\",0]", g_hash1);
+          double gb_ms = call_ms("getblock", pb, out, sizeof out);
+          snprintf(label, sizeof label, "execution lock held: getblock verbosity 0 (reader lane; the synthetic blocks carry no transactions to render) answers in %.1f ms (bound 100 ms)", gb_ms);
+          ck(label, strstr(out, "\"result\":\"") != NULL && gb_ms < 100.0);
+          static gb_t g[16]; pthread_t gth[16];
+          for (int i = 0; i < 16; i++){ snprintf(g[i].params, sizeof g[i].params, "[\"%s\",0]", g_hash1); pthread_create(&gth[i], NULL, getblock_thread, &g[i]); }
+          int same = 1, all200 = 1; double worst = 0;
+          for (int i = 0; i < 16; i++){ pthread_join(gth[i], NULL);
+              const char* b0 = strstr(g[0].out, "\r\n\r\n"); const char* bi = strstr(g[i].out, "\r\n\r\n");
+              if (!b0 || !bi || strcmp(b0, bi)) same = 0;
+              if (strncmp(g[i].out, "HTTP/1.1 200", 12)) all200 = 0;
+              if (g[i].ms > worst) worst = g[i].ms; }
+          snprintf(label, sizeof label, "16 concurrent getblock calls under the held lock: all 200, byte-identical bodies, worst %.1f ms", worst);
+          ck(label, same && all200 && worst < 1000.0);
+          if (!(same && all200)) for (int i = 0; i < 16; i += 5) printf("      [%d] %.0f ms: %.160s\n", i, g[i].ms, strstr(g[i].out, "{") ? strstr(g[i].out, "{") : g[i].out); }
+        /* LAST, because it waits the hold out: the write-locked path. Every
+         * lane probe above ran while the lock was still held. */
+        double excl_ms = call_ms("getrawtransaction", p2, out, sizeof out);
+        snprintf(label, sizeof label, "...verbosity 2 (write-locked) waited for the hold: %.0f ms (>= 250)", excl_ms);
+        ck(label, excl_ms >= 250.0);
+    }
     pthread_join(th, NULL);
 }
 
@@ -397,7 +438,11 @@ int main(void){
       pthread_join(th, NULL);
       printf("      getrawtransaction answered after %.0f ms: %.120s\n", rb.ms, strstr(rb.out, "{") ? strstr(rb.out, "{") : rb.out);
       ck("F: the call completed after the pool lock was released (>= 1.9 s, an answer)", rb.ms >= 1900 && strstr(rb.out, "\"error\"") != NULL);
-      ck("F: the execution lock was yielded for the consult", rpc_exec_yields() > y0);
+      /* 2026-10-05: getrawtransaction at verbosity 0/1 runs in the txindex
+       * LANE and never takes the execution lock, so there is nothing to
+       * yield any more -- the exclusive probe above answered because the
+       * consult held no lock at all, which is the stronger property. */
+      ck("F: the consult held no execution lock (the lane; no yield recorded)", rpc_exec_yields() == y0);
       rpc_node_set_mempool(NULL); }
 
     rpc_server_stop();

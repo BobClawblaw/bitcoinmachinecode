@@ -342,7 +342,7 @@ def parse_core_watch(path, side):
 RE_BMC_BLOCK = re.compile(r"\[bench\] block (\d+):(.*)$")
 RE_BMC_INDEX = re.compile(r"\[bench\] index (\d+):(.*)$")
 RE_BMC_OTHER = re.compile(r"\[bench\] (\S+)(.*)$")
-RE_PART = re.compile(r"^\s*([A-Za-z_][\w-]*)\s+([\d.]+)\s*(ms|s|us)?\s*$")
+RE_PART = re.compile(r"^\s*([A-Za-z_][\w.-]*)\s+([\d.]+)\s*(ms|s|us)?\s*$")   # "put.ins": a sub-stage (2026-10-05)
 RE_TXCOUNTS = re.compile(r"(\d+)\s*tx\b.*?(\d+)\s*txin")
 RE_MS_ANY = re.compile(r"([\d.]+)\s*ms\b")
 RE_TOTAL_MS = re.compile(r"total[ =:]+([\d.]+)\s*ms")
@@ -739,7 +739,9 @@ def render(core, bmc, size):
             g = bmc.segs[k]
             wall = walls["bmc"].get(k)
             total = g.st.get("total", 0)
-            parts = sum(g.st.get(x, 0) for x in stages)
+            # a dotted stage ("put.ins") is a split of its parent and is
+            # already inside it: shown as a column, not subtracted again
+            parts = sum(g.st.get(x, 0) for x in stages if "." not in x)
             ixsum = sum(g.st.get("ix:" + x, 0) for x in ixcols)
             row = [fs(wall), fmt_h(g.blocks), fs(total / 1000)]
             row += [fs(g.st.get(x, 0) / 1000) for x in stages]
@@ -957,7 +959,7 @@ some line with a NUL \x00 in it
 2026-10-05 01:00:20.001 [bench] index 2: txindex 1.0 | txospender 1.0 | bfilter 2.0 | addr 0.5 | zmq 0.5 ms
 2026-10-05 01:00:20.002 [bench] memflush: 1000 records, 2 MB in 480.0 ms
 2026-10-05 01:00:25.000 [utxo_live] catchup progress: height=2/3 (66.7%) 0.1 blk/s
-2026-10-05 01:00:30.000 [bench] block 3: 1 tx, 0 txin | read 0.1 | idx 0.1 | verify 0.0 | get 0.0 | put 0.1 | ckpt 0.0 | flush 0.0 | csi 0.0 | total 0.4 ms
+2026-10-05 01:00:30.000 [bench] block 3: 1 tx, 0 txin | read 0.1 | idx 0.1 | verify 0.0 | get 0.0 | put 0.1 | ckpt 0.0 | flush 0.0 | csi 0.0 | total 0.4 ms | put.ins 0.04 | put.get 0.01 | put.undo 0.02 | put.del 0.01 | put.wal 0.02
 2026-10-05 01:00:30.001 [bench] index 3: txindex 0.1 | txospender 0.0 | bfilter 0.1 | addr 0.0 | zmq 0.1 ms
 2026-10-05 01:00:31.000 [dlc] catch-up done: 3 new blocks written
 2026-10-05 01:00:45.678 [ready] all indexes at height 3 (utxo 3, txindex 3, bfilter 3, coinstats 3) -- 15s
@@ -1045,6 +1047,9 @@ def selftest():
         ck("bmc block lines per segment", (g0.blocks, g1.blocks), (1, 2))
         ck("bmc stage 'flush' seg 1", g1.st.get("flush"), 500.0)
         ck("bmc total seg 1", g1.st.get("total"), 510.4)
+        ck("the 2026-10-05 split fields parse (put.ins, seg 1)", g1.st.get("put.ins"), 0.04)
+        ck("...and put.wal", g1.st.get("put.wal"), 0.02)
+        ck("a block line without the split still parses (seg 1 has both shapes: 2 blocks)", g1.blocks, 2)
         ck("a NUL byte does not hide the next line (block 2 read)", g1.st.get("read"), 1.1)
         ck("bmc index line txindex seg 1", g1.st.get("ix:txindex"), 1.1)
         ck("bmc index line zmq seg 0", g0.st.get("ix:zmq"), 0.4)

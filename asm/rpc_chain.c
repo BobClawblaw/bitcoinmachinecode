@@ -149,13 +149,23 @@ static u8*  g_blockbuf = NULL;
  *
  * Shared by every lane, and so locked on its own: the hash->height table
  * (g_idx_mu -- folded by refresh, read by the by-hash lookups) and the
- * computed-chainwork fallback (g_cw_mu). g_blockbuf and read_block stay
- * write-lock-only; no lane method calls them.
+ * computed-chainwork fallback (g_cw_mu). read_block writes CUR_BB: the
+ * shared g_blockbuf under the write lock, the txindex lane's own buffer in
+ * that lane (2026-10-05); no other lane method calls it.
  *
  * Lock order: exec lock -> a lane mutex -> g_idx_mu / g_cw_mu. No lane mutex
  * is ever held while taking the exec lock or another lane's mutex. */
 static __thread u8* t_st = NULL;
 #define CUR_ST (t_st ? t_st : g_st)
+/* 2026-10-05: the block buffer a thread reads through, by the same rule as
+ * t_st: the txindex lane's private buffer (g_tbb, below) when a thread is
+ * in that lane, the shared g_blockbuf -- write-lock-only -- otherwise. Every
+ * read_block and every reader of its bytes goes through CUR_BB, and the
+ * "which height does it hold" mark follows the buffer (cur_bb_h). */
+static __thread u8* t_blockbuf = NULL; static __thread long t_blockbuf_h = -1;
+#define CUR_BB (t_blockbuf ? t_blockbuf : g_blockbuf)
+static long g_blockbuf_h = -1;
+static long* cur_bb_h(void){ return t_blockbuf ? &t_blockbuf_h : &g_blockbuf_h; }
 static pthread_mutex_t g_idx_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_cw_mu  = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_fast_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -510,19 +520,18 @@ static int read_block_prefix(long h, u8* out, size_t n){
     if (pread(fd, out, n, (off_t)(meta[0] + 8)) != (ssize_t)n) return -1;
     return 1;
 }
-/* Whole block into g_blockbuf. Returns size, or -3 unavailable / -1 error. */
-/* Which height g_blockbuf currently holds, -1 when its contents are unknown.
- * read_block is the only writer of g_blockbuf, so this is the whole truth,
+/* Whole block into CUR_BB. Returns size, or -3 unavailable / -1 error. */
+/* Which height CUR_BB currently holds, -1 when its contents are unknown.
+ * read_block is the only writer of CUR_BB, so this is the whole truth,
  * and it lets a caller that parsed a block keep using its offsets without
  * copying the bytes out: it can ask whether the buffer still holds its
  * block and re-read only if something else has been through since. */
-static long g_blockbuf_h = -1;
 static long read_block(long h){
-    long r = store_read_at(g_st, (unsigned long)h, g_blockbuf, BLOCKBUF_CAP);
-    if (r == -3 || r == -2){ g_blockbuf_h = -1; return -3; }
-    if (r < 0){ g_blockbuf_h = -1; return -1; }
-    if (r < 81){ g_blockbuf_h = -1; return -3; } /* hole / short */
-    g_blockbuf_h = h;
+    long r = store_read_at(CUR_ST, (unsigned long)h, CUR_BB, BLOCKBUF_CAP);
+    if (r == -3 || r == -2){ (*cur_bb_h()) = -1; return -3; }
+    if (r < 0){ (*cur_bb_h()) = -1; return -1; }
+    if (r < 81){ (*cur_bb_h()) = -1; return -3; } /* hole / short */
+    (*cur_bb_h()) = h;
     return r;
 }
 
@@ -1817,7 +1826,7 @@ static int cmd_getblock(const rj_val* params, rj_val** res, long* ec, const char
     long len = read_block(h);
     if (len == -3){ *ec = -1; *em = "Block not available (pruned data)"; return 0; }
     if (len < 0){ *ec = -1; *em = "Block not found on disk"; return 0; }
-    const u8* blk = g_blockbuf; const u8* end = blk + len;
+    const u8* blk = CUR_BB; const u8* end = blk + len;
     if (verbosity <= 0){
         char* hx = malloc((size_t)len*2 + 1); if (!hx){ *ec = -7; *em = "out of memory"; return 0; }
         hex_of(hx, blk, (size_t)len); *res = rj_str(hx); free(hx); return 1;
@@ -1832,8 +1841,15 @@ static int cmd_getblock(const rj_val* params, rj_val** res, long* ec, const char
     /* per-tx fees for verbosity 2: prevout values from the block's undo file
      * (in block order, non-coinbase inputs). undo_n < 0 -> undo pruned/absent
      * (fee omitted, honest -- we keep only a recent-heights window). */
-    static u64 undo_vals[600000]; long undo_n = -1, undo_cur = 0;
-    if (verbosity >= 2) undo_n = undo_block_values(h, undo_vals, (long)(sizeof undo_vals / sizeof undo_vals[0]));
+    enum { UNDO_CAP = 600000 };
+    /* per thread, not static: getblock runs in the reader lane, several at
+     * once (2026-10-05); allocated on a thread's first verbosity >= 2 call */
+    static __thread u64* undo_vals; long undo_n = -1, undo_cur = 0;
+    if (verbosity >= 2){
+        if (!undo_vals) undo_vals = malloc(UNDO_CAP * sizeof *undo_vals);
+        if (!undo_vals){ rj_free(txs); if (cb) rj_free(cb); rj_free(o); *ec = -7; *em = "out of memory"; return 0; }
+        undo_n = undo_block_values(h, undo_vals, UNDO_CAP);
+    }
     /* verbosity 3 additionally carries Core's per-input `prevout`
      * {generated, height, value, scriptPubKey}. Same undo file the fees above
      * come from -- undo_block_load reads the WHOLE record (value, height,
@@ -1845,10 +1861,12 @@ static int cmd_getblock(const rj_val* params, rj_val** res, long* ec, const char
      * beside it have always come from undo_<h>.dat. RPX-2 corrected the
      * comment and wired getRAWtransaction's verbosity 2; this wires getblock's
      * verbosity 3, from the same loader. */
-    static undo_prevout_t undo_pv[600000]; long undo_pn = -1;
+    static __thread undo_prevout_t* undo_pv; long undo_pn = -1;
     u8* undo_raw = NULL;
-    if (verbosity >= 3)
-        undo_pn = undo_block_load(h, undo_pv, (long)(sizeof undo_pv / sizeof undo_pv[0]), &undo_raw);
+    if (verbosity >= 3){
+        if (!undo_pv) undo_pv = malloc(UNDO_CAP * sizeof *undo_pv);
+        if (undo_pv) undo_pn = undo_block_load(h, undo_pv, UNDO_CAP, &undo_raw);
+    }
     for (u64 i = 0; i < ntx; i++){
         txw_t w;
         if (!tx_walk(p, end, &w)){ rj_free(txs); if (cb) rj_free(cb); rj_free(o); *ec = -1; *em = "Block decode failed"; return 0; }
@@ -2073,15 +2091,96 @@ void rpc_chain_set_index_config(int txindex, int txospenderindex, int blockfilte
 static int ix_on(int v){ return v != 0; }        /* configured on, or not told */
 static irunset_t g_txi_runs;
 static int g_txi_runs_init;
+/* ---- the txindex lane (2026-10-05) --------------------------------------
+ * Production's exec-lock lines since deploy-20261003h were all one shape: a
+ * 2.1-2.7 s wait behind holders of 0-16 ms. The Esplora facade's mempool
+ * batch took the EXCLUSIVE lock twice per parent transaction -- once for
+ * rpc_chain_tx_blockhash, once for the getrawtransaction it dispatched -- so
+ * a 100-parent batch was 200 exclusive holds and every other caller queued
+ * behind the burst (a convoy, not a slow handler).
+ *
+ * The txid-index reads now run in a lane of their own: g_txi_mu, a private
+ * store handle (g_tst) and a private block buffer (g_tbb). What the lane
+ * protects is everything the index reads touch: the run set (irs_refresh
+ * rewrites g_txi_runs IN PLACE -- it zeroes each kept run's map while it
+ * rebuilds the table, which is the 2026-10-02 crash when a lookup ran with
+ * no lock at all), the tail map, and txi_verify_rec's static buffers. EVERY
+ * path into the index takes g_txi_mu, the write-locked handlers included, so
+ * a refresh is serialised against every reader whichever lock the caller
+ * holds. The mutex is recursive because the lane entry and the inner guards
+ * nest. Lock order: exec lock -> g_txi_mu -> g_idx_mu.
+ *
+ * One reader at a time inside the lane, not a reader-writer lock: the
+ * verify path's 4 MB buffers are shared statics, and a lane reader costs
+ * ~2-15 ms -- what matters is that it never waits for, and never holds up,
+ * the exclusive lock. */
+static pthread_mutex_t g_txi_mu;
+static u8 g_tst[ST_SIZE]; static int g_tst_ok; static u8* g_tbb;
+static void txi_mu_init(void) __attribute__((constructor));
+static void txi_mu_init(void){
+    pthread_mutexattr_t a; pthread_mutexattr_init(&a);
+    pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&g_txi_mu, &a); pthread_mutexattr_destroy(&a);
+}
+typedef struct { u8* st; u8* bb; long bh; int ok; } txi_lane_t;
+static txi_lane_t txi_lane_enter(void){
+    txi_lane_t sv = { t_st, t_blockbuf, t_blockbuf_h, 0 };
+    pthread_mutex_lock(&g_txi_mu);
+    if (!g_tbb) g_tbb = malloc(BLOCKBUF_CAP);
+    if (g_tbb && lane_handle_open(g_tst, &g_tst_ok)){ t_st = g_tst; t_blockbuf = g_tbb; t_blockbuf_h = -1; sv.ok = 1; }
+    return sv;
+}
+static void txi_lane_leave(const txi_lane_t* sv){
+    t_st = sv->st; t_blockbuf = sv->bb; t_blockbuf_h = sv->bh;
+    pthread_mutex_unlock(&g_txi_mu);
+}
+long g_txi_lane_entries;   /* test seam: lane entries so far */
+/* ---- the reader lane (2026-10-05): a store handle and a block buffer PER
+ * THREAD, for getblock. At 32 clients getblock <hash> 2 serialised to 704 ms
+ * a call behind the write lock while Core parallelised to 494 (one client:
+ * 75 ms here, 88 there). getblock reads the archive (now its own handle),
+ * one block (its own buffer), the hash index (g_idx_mu), chainwork.dat (a
+ * pread) and the block's undo run (us_read_run, a malloc per call), and
+ * renders into fresh JSON: nothing the write lock protects, so it runs with
+ * no execution lock, as many at once as there are RPC threads. The handles
+ * follow lanes_open (a reindex) through a generation count. */
+static long g_lanes_gen;
+static __thread u8 t_rd_st[ST_SIZE]; static __thread int t_rd_ok; static __thread u8* t_rd_bb; static __thread long t_rd_gen = -1;
+typedef txi_lane_t rd_lane_t;
+long g_rd_lane_entries;    /* test seam */
+static rd_lane_t rd_lane_enter(void){
+    rd_lane_t sv = { t_st, t_blockbuf, t_blockbuf_h, 0 };
+    if (t_rd_gen != g_lanes_gen){ if (t_rd_ok){ lane_handle_close(t_rd_st); t_rd_ok = 0; } t_rd_gen = g_lanes_gen; }
+    if (!t_rd_bb) t_rd_bb = malloc(BLOCKBUF_CAP);
+    if (!t_rd_ok){ static pthread_mutex_t open_mu = PTHREAD_MUTEX_INITIALIZER;   /* once per thread; the open is not reentrant */
+        pthread_mutex_lock(&open_mu); lane_handle_open(t_rd_st, &t_rd_ok); pthread_mutex_unlock(&open_mu); }
+    if (t_rd_bb && t_rd_ok){ t_st = t_rd_st; t_blockbuf = t_rd_bb; t_blockbuf_h = -1; sv.ok = 1; }
+    g_rd_lane_entries++;
+    return sv;
+}
+static void rd_lane_leave(const rd_lane_t* sv){ t_st = sv->st; t_blockbuf = sv->bb; t_blockbuf_h = sv->bh; }
 static void txi_open(void){
+    pthread_mutex_lock(&g_txi_mu);
     if (!g_txi_runs_init){ irs_init(&g_txi_runs, "txindex", "BMCTXIDX", TXI_REC, TXI_SPARSE); g_txi_runs_init = 1; }
     irs_refresh(&g_txi_runs);
+    pthread_mutex_unlock(&g_txi_mu);
 }
 static void txi_tail_refresh(void);
 static const u8* g_txi_tail;
-static int  txi_have(void){ if (!ix_on(g_ix_txindex)) return 0; txi_open(); if (g_txi_runs.n > 0) return 1; txi_tail_refresh(); return g_txi_tail != NULL; }
-static long txi_runs_to(void){ txi_open(); long t = -1; for (int i = 0; i < g_txi_runs.n; i++) if (g_txi_runs.r[i].to > t) t = g_txi_runs.r[i].to; return t; }
-static long txi_runs_from(void){ txi_open(); long f = -1; for (int i = 0; i < g_txi_runs.n; i++) if (f < 0 || g_txi_runs.r[i].from < f) f = g_txi_runs.r[i].from; return f; }
+static int  txi_have(void){
+    if (!ix_on(g_ix_txindex)) return 0;
+    pthread_mutex_lock(&g_txi_mu);
+    txi_open(); int r = g_txi_runs.n > 0;
+    if (!r){ txi_tail_refresh(); r = g_txi_tail != NULL; }
+    pthread_mutex_unlock(&g_txi_mu); return r; }
+static long txi_runs_to(void){
+    pthread_mutex_lock(&g_txi_mu);
+    txi_open(); long t = -1; for (int i = 0; i < g_txi_runs.n; i++) if (g_txi_runs.r[i].to > t) t = g_txi_runs.r[i].to;
+    pthread_mutex_unlock(&g_txi_mu); return t; }
+static long txi_runs_from(void){
+    pthread_mutex_lock(&g_txi_mu);
+    txi_open(); long f = -1; for (int i = 0; i < g_txi_runs.n; i++) if (f < 0 || g_txi_runs.r[i].from < f) f = g_txi_runs.r[i].from;
+    pthread_mutex_unlock(&g_txi_mu); return f; }
 
 /* ---- the incremental tail (daemon/tx_index_tail.c) ----------------------
  * Unsorted records in the same 20-byte layout, appended by the download
@@ -2145,7 +2244,7 @@ static int txi_verify_rec(const u8* r, const u8 txid_wire[32],
     for (int b = 0; b < 4; b++) ln  |= (u32)r[16+b] << (8*b);
     long blen = read_block((long)hh);
     if (blen < 81 || (u64)off + ln > (u64)blen || ln > sizeof txbuf) return 0;
-    memcpy(txbuf, g_blockbuf + off, ln);
+    memcpy(txbuf, CUR_BB + off, ln);
     u8 got[32];
     if (tx_txid(got, txbuf, ln, scratch, sizeof scratch) != 1) return 0;
     if (memcmp(got, txid_wire, 32)) return 0;          /* prefix collision */
@@ -2154,8 +2253,15 @@ static int txi_verify_rec(const u8* r, const u8 txid_wire[32],
 }
 
 /* Look a WIRE-order txid up. Returns 1 and fills height/offset/len, or 0. */
+static int txi_lookup_locked(const u8 txid_wire[32], long* h_out, u32* off_out, u32* len_out);
 static int txi_lookup(const u8 txid_wire[32], long* h_out, u32* off_out, u32* len_out){
     if (!ix_on(g_ix_txindex)) return 0;          /* txindex=0: no index, whatever the datadir holds */
+    pthread_mutex_lock(&g_txi_mu);
+    int r = txi_lookup_locked(txid_wire, h_out, off_out, len_out);
+    pthread_mutex_unlock(&g_txi_mu);
+    return r;
+}
+static int txi_lookup_locked(const u8 txid_wire[32], long* h_out, u32* off_out, u32* len_out){
     txi_open();
     for (int ri = 0; ri < g_txi_runs.n; ri++){
         const irun_t* run = &g_txi_runs.r[ri];
@@ -2236,7 +2342,7 @@ static int tsp_verify_rec(const u8* r, const u8 txid_wire[32], u32 vout, u8 spen
     if (rec.vout != vout) return 0;
     long blen = read_block((long)rec.height);
     if (blen < 81 || (u64)rec.offset + rec.len > (u64)blen || rec.len < 10) return 0;
-    const u8* tx = g_blockbuf + rec.offset; const u8* end = tx + rec.len;
+    const u8* tx = CUR_BB + rec.offset; const u8* end = tx + rec.len;
     const u8* q = tx + 4; if (q + 2 <= end && q[0] == 0 && q[1] == 1) q += 2;
     uint64_t cc = 0; u64 nin = tsp_rd_varint(q, end, &cc); if (!cc) return 0; q += cc;   /* uint64_t: tsp_rd_varint's out-param type */
     int hit = 0;
@@ -2298,11 +2404,13 @@ int rpc_chain_txospender_lookup(const unsigned char txid_wire[32], unsigned vout
  * which takes the pool lock; a caller that already knows the transaction is
  * not in the mempool -- the facade's batch, which just looked -- passes this
  * hash so the lookup goes straight to the index. 1 with out_disp (64 hex + NUL),
- * 0 when the index does not hold it. The CALLER HOLDS THE EXECUTION LOCK: the
- * run set and CUR_ST are what that lock protects (irs_refresh rewrites
- * g_txi_runs in place; 2026-10-03, production crashed without it). */
-int rpc_chain_tx_blockhash(const char* txid_disp, char out_disp[65]){
+ * 0 when the index does not hold it. 2026-10-05: runs in the txindex LANE --
+ * the caller needs NO execution lock (it used to, and the facade's batch took
+ * it once per parent: the convoy). The _many form resolves a whole batch
+ * under ONE lane entry; out[i][0] == 0 marks a miss. Returns the hit count. */
+static int tx_blockhash_in_lane(const char* txid_disp, char out_disp[65]){
     u8 disp[32], wire[32];
+    out_disp[0] = 0;
     if (!txid_disp || strlen(txid_disp) != 64) return 0;
     for (int i = 0; i < 32; i++){
         unsigned v = 0;
@@ -2315,6 +2423,20 @@ int rpc_chain_tx_blockhash(const char* txid_disp, char out_disp[65]){
     if (!read_idx_rec(th, rec)) return 0;
     hex_rev(out_disp, rec, 32); out_disp[64] = 0;
     return 1;
+}
+long rpc_chain_tx_blockhash_many(const char* const* txid_disp, long n, char (*out_disp)[65]){
+    long hits = 0;
+    txi_lane_t sv = txi_lane_enter(); g_txi_lane_entries++;
+    for (long i = 0; i < n; i++){
+        if (sv.ok) hits += tx_blockhash_in_lane(txid_disp[i], out_disp[i]);
+        else out_disp[i][0] = 0;
+    }
+    txi_lane_leave(&sv);
+    return hits;
+}
+int rpc_chain_tx_blockhash(const char* txid_disp, char out_disp[65]){
+    const char* ids[1] = { txid_disp };
+    return rpc_chain_tx_blockhash_many(ids, 1, (char (*)[65])out_disp) == 1;
 }
 
 static const char GENESIS_CB_TXID[] = "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b";
@@ -2330,7 +2452,7 @@ static int cmd_getrawtransaction(const rj_val* params, rj_val** res, long* ec, c
      * cannot drift in what they emit. `known_off` is the index's byte offset
      * (-1 when we must scan the block for it). */
     long h = -1, known_off = -1;
-    static char bs_buf[65];
+    static __thread char bs_buf[65];   /* the lane and the write-locked path run this handler at once (2026-10-05) */
     const char* bs = NULL;
     const int have_blockhash = param_present(params, 2);
     if (!have_blockhash){
@@ -2402,7 +2524,7 @@ static int cmd_getrawtransaction(const rj_val* params, rj_val** res, long* ec, c
             if (read_idx_rec(h, rec)){ hex_rev(bs_buf, rec, 32); bs = bs_buf; }
         } else {
             txi_open();
-            static char nomsg[288];
+            static __thread char nomsg[288];
             if (txi_have()){
                 /* An index EXISTS and does not hold it. Say which heights it
                  * covers: "not found" from a PARTIAL index is a different
@@ -2428,7 +2550,7 @@ static int cmd_getrawtransaction(const rj_val* params, rj_val** res, long* ec, c
     if (!bs){ *ec = -1; *em = "Block not available"; return 0; }
     long len = read_block(h);
     if (len < 0){ *ec = -1; *em = "Block not available"; return 0; }
-    const u8* blk = g_blockbuf; const u8* end = blk + len;
+    const u8* blk = CUR_BB; const u8* end = blk + len;
     u8 want[32]; for (int i = 0; i < 32; i++) want[i] = want_disp[31-i];
     u64 c; u64 ntx = read_varint(blk + 80, end, &c);
     const u8* p = blk + 80 + c;
@@ -2766,7 +2888,7 @@ int pmt_test_build_hex_pad(const u8 (*leaves)[32], u32 ntx, u32 ntx_field,
 static long pmt_block_txids(long h, u8 (*leaves)[32], u32 cap){
     long len = read_block(h);
     if (len < 80) return -1;
-    const u8* blk = g_blockbuf; const u8* end = blk + len;
+    const u8* blk = CUR_BB; const u8* end = blk + len;
     u64 c; u64 ntx = read_varint(blk + 80, end, &c);
     if (!c || ntx == 0 || ntx > cap) return -1;
     const u8* p = blk + 80 + c;
@@ -3566,7 +3688,7 @@ static int cmd_getblockstats(const rj_val* params, rj_val** res, long* ec, const
     }
     long len = read_block(h);
     if (len < 0){ *ec=-1; *em="Block not available"; return 0; }
-    const u8* blk=g_blockbuf; const u8* end=blk+len;
+    const u8* blk=CUR_BB; const u8* end=blk+len;
     u64 c; u64 ntx=read_varint(blk+80, end, &c);
     const u8* p = blk+80+c;
 
@@ -4135,6 +4257,11 @@ static void lanes_open(void){
     lane_handle_open(g_ctx_st, &g_ctx_st_ok);
     g_ctx_n = 0;
     pthread_mutex_unlock(&g_ctx_mu);
+    pthread_mutex_lock(&g_txi_mu);
+    if (g_tst_ok){ lane_handle_close(g_tst); g_tst_ok = 0; }
+    lane_handle_open(g_tst, &g_tst_ok);
+    pthread_mutex_unlock(&g_txi_mu);
+    g_lanes_gen++;   /* every thread's reader-lane handle reopens on its next entry */
 }
 
 /* Core ParseHashV(v, "blockhash"): the NAME, not a position, in the text. */
@@ -4330,12 +4457,12 @@ static int cmd_verifychain(const rj_val* params, rj_val** res, long* ec, const c
         long blen = read_block(h);
         if (blen < 81){ ok = 0; break; }          /* level 0: readable */
         if (level >= 1){
-            u8 hash[32]; sha256d(hash, g_blockbuf, 80);
+            u8 hash[32]; sha256d(hash, CUR_BB, 80);
             u8 rec[48];
             if (!read_idx_rec(h, rec) || memcmp(hash, rec, 32) != 0){ ok = 0; break; }
-            u32 bits = rd32(g_blockbuf + 72);
+            u32 bits = rd32(CUR_BB + 72);
             if (!vc_pow_ok(hash, bits)){ ok = 0; break; }
-            if (!vc_merkle_ok(g_blockbuf, blen, g_blockbuf + 36)){ ok = 0; break; }
+            if (!vc_merkle_ok(CUR_BB, blen, CUR_BB + 36)){ ok = 0; break; }
         }
         if (level >= 2){
             /* 2026-09-08: the block's undo run must exist and be closed (END) */
@@ -4602,7 +4729,7 @@ static int cmd_getblockfilter(const rj_val* params, rj_val** res, long* ec, cons
      * must then serve NOTHING rather than a filter without its prevout
      * elements. Core's getblockfilter errors "Filter not found" when the
      * index has no entry; it never constructs one ad hoc. */
-    long want_sp = gbf_count_spends(g_blockbuf, (unsigned long)blen);
+    long want_sp = gbf_count_spends(CUR_BB, (unsigned long)blen);
     if (want_sp < 0 || (ur >= 0 && ur < want_sp)) ur = -1;
     if ((ur < 0 && h != 0) || c.overflow){
         free(c.v); free(c.buf);
@@ -4616,9 +4743,9 @@ static int cmd_getblockfilter(const rj_val* params, rj_val** res, long* ec, cons
             : "this block's undo data exceeds the filter builder's bounds";
         return 0;
     }
-    unsigned char hash[32]; sha256d(hash, g_blockbuf, 80);
+    unsigned char hash[32]; sha256d(hash, CUR_BB, 80);
     static unsigned char flt[1 << 20];
-    long fl = bf_basic_build(g_blockbuf, (unsigned long)blen, hash,
+    long fl = bf_basic_build(CUR_BB, (unsigned long)blen, hash,
                              c.v, c.n, flt, sizeof flt);
     free(c.v); free(c.buf);
     if (fl < 0){ *ec = -1; *em = "filter construction failed"; return 0; }
@@ -4662,10 +4789,10 @@ static int sb_scan_block(long h,
             snprintf(sberr, sizeof sberr, "block %ld could not be read; the scan would be incomplete", h);
             *ec = -1; *em = sberr; return 0;
         }
-        unsigned char bh[32]; sha256d(bh, g_blockbuf, 80);
+        unsigned char bh[32]; sha256d(bh, CUR_BB, 80);
         int block_hit = 0;
-        const u8* p = g_blockbuf + 80;
-        const u8* end = g_blockbuf + blen;
+        const u8* p = CUR_BB + 80;
+        const u8* end = CUR_BB + blen;
         u64 cc;
         u64 ntx = read_varint(p, end, &cc);
         if (cc == 0){ *ec = -1; *em = "malformed block"; return 0; }
@@ -5208,7 +5335,7 @@ static int axr_tail_cb(void* ctx, int op, const unsigned char txid[32], unsigned
  *
  * Only the transaction EXTENTS are cached, not the bytes. Copying each block
  * out cost more than it saved on an address that touches ~100,000 distinct
- * heights -- that is ~100,000 whole-block memcpys. g_blockbuf_h says which
+ * heights -- that is ~100,000 whole-block memcpys. (*cur_bb_h()) says which
  * block the shared buffer holds, so the lazy hash re-reads only when something
  * else has been through the buffer since the parse, which inside one query is
  * never. */
@@ -5221,7 +5348,7 @@ static int axr_txid_at(long h, long txpos, unsigned char out[32]){
     if (h != cached_h){
         cached_h = -1;                   /* invalid until the walk completes */
         long blen = read_block(h); if (blen < 81) return 0;
-        const u8* blk = g_blockbuf;
+        const u8* blk = CUR_BB;
         const u8* p = blk + 80; const u8* end = blk + blen; uint64_t cc;
         uint64_t ntx = txi_rd_varint(p, end, &cc); if (!cc) return 0; p += cc;
         if ((long)ntx > cached_cap){
@@ -5259,8 +5386,8 @@ static int axr_txid_at(long h, long txpos, unsigned char out[32]){
     if (!have[txpos]){
         static u8 scratch[4u << 20];
         /* the extents are this block's; make sure the shared buffer still is */
-        if (g_blockbuf_h != h && read_block(h) < 81) return 0;
-        if (tx_txid(cached + (size_t)txpos * 32, g_blockbuf + txoff[txpos], txlen[txpos], scratch, sizeof scratch) != 1) return 0;
+        if ((*cur_bb_h()) != h && read_block(h) < 81) return 0;
+        if (tx_txid(cached + (size_t)txpos * 32, CUR_BB + txoff[txpos], txlen[txpos], scratch, sizeof scratch) != 1) return 0;
         have[txpos] = 1;
     }
     memcpy(out, cached + (size_t)txpos * 32, 32);
@@ -5818,13 +5945,31 @@ static int cmd_scantxoutset(const rj_val* params, rj_val** res, long* ec, const 
  * dispatch; 1 = fast (bounded, may run on the connection's own thread),
  * 2 = lock-free but possibly slow (a first getchaintxstats build, a 30 s
  * wait), 0 = the execution lock is required. */
+/* getrawtransaction runs in the txindex lane at verbosity 0 and 1: the
+ * mempool consult (its own lock), the index (the lane's mutex), the block
+ * (the lane's handle and buffer), and a render with no shared state.
+ * Verbosity 2 reads the undo file through the write-locked path and stays
+ * there. Decided from the PARAMS, so the server's classifier passes them
+ * (rpc_chain_method_lane_p); with no params in hand the answer is the
+ * write lock, never the lane. */
+static int grt_lane_ok(const rj_val* params){
+    if (!params) return 0;
+    long ec = 0; const char* em = 0;
+    int v = param_verbosity(params, 1, 0, &ec, &em);
+    return v != -999 && v < 2;
+}
+int rpc_chain_method_lane_p(const char* m, const rj_val* params){
+    if (!strcmp(m, "getrawtransaction")) return grt_lane_ok(params) ? 2 : 0;
+    return rpc_chain_method_lane(m);
+}
 int rpc_chain_method_lane(const char* m){
     if (!strcmp(m, "uptime") || !strcmp(m, "getblockcount") || !strcmp(m, "getbestblockhash")
      || !strcmp(m, "getblockchaininfo") || !strcmp(m, "getdifficulty") || !strcmp(m, "getindexinfo")
      || !strcmp(m, "getblockhash") || !strcmp(m, "getblockheader"))   /* 2026-09-30: the pollers' block lookups; a few preads on the lane handle, the hash index under g_idx_mu, stack buffers */
         return 1;
     if (!strcmp(m, "getchaintxstats") || !strcmp(m, "waitfornewblock")
-     || !strcmp(m, "waitforblockheight") || !strcmp(m, "waitforblock"))
+     || !strcmp(m, "waitforblockheight") || !strcmp(m, "waitforblock")
+     || !strcmp(m, "getblock"))   /* 2026-10-05: the per-thread reader lane; a block render is bounded but not trivial, so the pool, not the intake thread */
         return 2;
     return 0;
 }
@@ -5850,7 +5995,13 @@ int rpc_chain_dispatch(const char* m, const rj_val* params, rj_val** res, long* 
     if (!strcmp(m, "getchaintips")) return cmd_getchaintips(res, ec, em);
     if (!strcmp(m, "getblockhash")) FAST_LANE(cmd_getblockhash(params, res, ec, em));       /* 2026-09-30: off the execution lock */
     if (!strcmp(m, "getblockheader")) FAST_LANE(cmd_getblockheader(params, res, ec, em));
-    if (!strcmp(m, "getblock")) return cmd_getblock(params, res, ec, em);
+    if (!strcmp(m, "getblock")){                                                     /* the per-thread reader lane (2026-10-05) */
+        rd_lane_t sv = rd_lane_enter(); int r;
+        if (!sv.ok){ *ec = -28; *em = "Loading block index..."; r = 0; }
+        else r = cmd_getblock(params, res, ec, em);
+        rd_lane_leave(&sv);
+        return r;
+    }
     if (!strcmp(m, "getblockstats")) return cmd_getblockstats(params, res, ec, em);
     if (!strcmp(m, "getnetworkhashps")) return cmd_getnetworkhashps(params, res, ec, em);
     if (!strcmp(m, "getmininginfo")) return cmd_getmininginfo(res, ec, em);
@@ -5875,7 +6026,15 @@ int rpc_chain_dispatch(const char* m, const rj_val* params, rj_val** res, long* 
         return ch_unsupported(CH_NO_SNAPSHOT_LOAD, ec, em);
     if (!strcmp(m, "preciousblock") || !strcmp(m, "pruneblockchain"))
         return ch_unsupported(CH_NO_FORKCHOICE_RPC, ec, em);
-    if (!strcmp(m, "getrawtransaction")) return cmd_getrawtransaction(params, res, ec, em);
+    if (!strcmp(m, "getrawtransaction")){
+        if (!grt_lane_ok(params)) return cmd_getrawtransaction(params, res, ec, em);
+        txi_lane_t sv = txi_lane_enter(); g_txi_lane_entries++;
+        int r;
+        if (!sv.ok){ *ec = -28; *em = "Loading block index..."; r = 0; }
+        else r = cmd_getrawtransaction(params, res, ec, em);
+        txi_lane_leave(&sv);
+        return r;
+    }
     if (!strcmp(m, "gettxoutproof")) return cmd_gettxoutproof(params, res, ec, em);
     if (!strcmp(m, "verifytxoutproof")) return cmd_verifytxoutproof(params, res, ec, em);
     return -1;
