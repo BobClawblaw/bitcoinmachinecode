@@ -5877,8 +5877,9 @@ static lowwork_t g_lw;                                   /* CC-5 hold: 48 KB of 
 static int dlc_lw_get_at(void* hst, unsigned long long h, void* out){ return hst_get_at(hst, h, out); }
 extern int reorg_min_chain_work_set(void);
 static long long dlc_now_ms(void); static void dlc_fmt_rate(char* buf, size_t cap, double bytes_per_sec);   /* defined below; the progress line needs them here */
+static int g_dlc_hdr_stalled = 0;   /* the last fetch ended on a read timeout AFTER pages had landed (2026-10-05): the try loop moves on */
 static long dlc_fetch_headers(int fd, unsigned char* hst, const char* cand){
-    long have0 = hst_count(hst), added = 0; int lw_started = 0; lowwork_clear(&g_lw);
+    long have0 = hst_count(hst), added = 0; int lw_started = 0; lowwork_clear(&g_lw); g_dlc_hdr_stalled = 0;
     long long fetch_t0 = dlc_now_ms(); unsigned long held_bytes = 0;   /* for the held-region progress line */
     static unsigned char page[DLC_HDR_PAGE * 81 + 16];
     static unsigned char msg[2 << 20];
@@ -5903,7 +5904,7 @@ static long dlc_fetch_headers(int fd, unsigned char* hst, const char* cand){
             if(!strncmp(cmd, "headers", 12)) got = 1;
             else if(!strncmp(cmd, "ping", 12) && mlen == 8) p2p_write(fd, "pong", 4, msg, 8);
         }
-        if(!got){ if(added) break; return -1; }
+        if(!got){ if(added){ g_dlc_hdr_stalled = 1; break; } return -1; }
         dl_gate_account((long)mlen);                                  /* bmc.downloadratelimit: a header page is bytes too */
         unsigned long used; unsigned long cnt = dlc_varint(msg, mlen, &used);
         if(!used || cnt > DLC_HDR_PAGE || used + cnt * 81 > mlen) break;   /* malformed: stop here */
@@ -6079,6 +6080,93 @@ static long dl_header_mirror_topup(unsigned char* store){
     return n;
 }
 
+/* ---- the header probe (2026-10-05, plan B5) ---------------------------------
+ * The header phase took ONE candidate, the first of live[] in rank order, and
+ * every page of the chain came from it. Run 34 drew a 200 KB/s peer and spent
+ * 5 m 06 s holding pages until the chain passed -minimumchainwork, before the
+ * first block request; Core rerun #6 drew a fast peer and took 1 m 15 s. Ask
+ * DLC_HDR_PROBE_N candidates for the first page at once (one child each,
+ * DLC_HDR_PROBE_S cap, the ranking probe's shape), rank them by that page's
+ * rate, and let the try loop walk them in that order: the fastest leads and
+ * the rest are the fallbacks the loop already has. A page that does not link
+ * to our locator, breaks its own chain or fails PoW ranks last. Core syncs
+ * headers from ONE peer (net_processing: nSyncStarted), so bmc.dlshape=core
+ * keeps the single pick -- see dlc_rules.h. */
+#define DLC_HDR_PROBE_N 4
+#define DLC_HDR_PROBE_S 10
+typedef struct { int ok, why; long cnt, ms, bytes; } dlc_hprobe_t;   /* why: 1 no answer, 2 the page does not link, 3 the page breaks its chain or PoW */
+static const char* const dlc_hprobe_why[] = { "", "no answer", "page does not link", "page fails linkage or PoW" };
+static int dlc_headers_probe(char live[][DL_POOL_SLOT], int nlive, unsigned char* hst, int* order){
+    for(int i=0;i<nlive;i++) order[i]=i;
+    if(nlive < 2 || g_cfg.dl_shape_core) return 0;
+    int cand[DLC_HDR_PROBE_N]; int n=0;
+    for(int i=0;i<nlive && n<DLC_HDR_PROBE_N;i++){ unsigned ip; int pp; if(!dlc_parse_peer(live[i],&ip,&pp) || peer_known_no_witness(live[i])) continue; cand[n++]=i; }
+    if(n < 2) return 0;
+    unsigned char loc[DLC_HDR_LOCATOR_MAX * 32]; long lh[DLC_HDR_LOCATOR_MAX];
+    int nl = dlc_locator_build(hst, loc, lh); if(nl<=0) return 0;
+    dlc_hprobe_t* res = mmap(NULL, sizeof(dlc_hprobe_t) * DLC_HDR_PROBE_N, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
+    if(res == MAP_FAILED) return 0;
+    for(int k=0;k<n;k++){ res[k].ok=0; res[k].why=1; res[k].cnt=0; res[k].ms=0; res[k].bytes=0; }
+    long long t_all0 = dlc_now_ms();
+    pid_t kids[DLC_HDR_PROBE_N];
+    for(int k=0;k<n;k++){
+        pid_t pid=fork(); if(pid<0){ kids[k]=0; continue; }
+        if(pid==0){
+            alarm(DLC_HDR_PROBE_S);                                   /* nothing below may outlive this */
+            const char* c = live[cand[k]];
+            unsigned ip=0; int pport=0; if(!dlc_parse_peer(c,&ip,&pport)) _exit(0);
+            int cport = pport ? pport : node_config_peer_port(c);
+            dial_gate_wait();
+            int fd=tcp_connect_ip(ip,(unsigned short)htons((unsigned short)(cport ? cport : g_chainp->default_port)));
+            if(fd<0) _exit(0);
+            struct timeval tv; tv.tv_sec=DLC_HDR_PROBE_S; tv.tv_usec=0; setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
+            bmc_v2_close(fd);
+            if(node_handshake(fd)!=1 || !peer_has_witness(c)){ close(fd); _exit(0); }
+            static unsigned char page[DLC_HDR_PAGE * 81 + 16]; static unsigned char msg[2 << 20]; unsigned char stop[32]; memset(stop,0,32);
+            long plen = p2p_getheaders(page, loc, nl, stop);
+            long long t0 = dlc_now_ms();
+            if(plen<=0 || p2p_write(fd,"getheaders",10,page,(unsigned)plen)<0){ close(fd); _exit(0); }
+            unsigned mlen=0; char cmd[12]; int got=0;
+            for(int q=0;q<40 && !got;q++){ int r=p2p_read(fd,cmd,msg,sizeof msg,&mlen); if(r<=0) break;
+                if(!strncmp(cmd,"headers",12)) got=1; else if(!strncmp(cmd,"ping",12) && mlen==8) p2p_write(fd,"pong",4,msg,8); }
+            long long ms = dlc_now_ms()-t0; close(fd);
+            if(!got) _exit(0);
+            unsigned long used; unsigned long cnt = dlc_varint(msg, mlen, &used);
+            if(!used || cnt==0 || cnt>DLC_HDR_PAGE || used+cnt*81>mlen){ res[k].why=2; _exit(0); }
+            const unsigned char* first = msg+used; int at=-1;
+            for(int q=0;q<nl;q++) if(!memcmp(first+4, loc+q*32, 32)){ at=q; break; }
+            if(at<0){ res[k].why=2; _exit(0); }
+            unsigned char prev[32]; memcpy(prev, loc+at*32, 32);
+            for(unsigned long j=0;j<cnt;j++){ const unsigned char* h=first+j*81;
+                if(h[80]!=0 || memcmp(h+4,prev,32)!=0 || !pow_check(h)){ res[k].why=3; _exit(0); }
+                block_hash(prev,h); }
+            res[k].cnt=(long)cnt; res[k].ms = ms>0 ? ms : 1; res[k].bytes=(long)mlen; res[k].why=0; res[k].ok=1;
+            _exit(0);
+        }
+        kids[k]=pid;
+    }
+    /* every child is capped at DLC_HDR_PROBE_S by its own alarm, so the sequential reap ends about then */
+    for(int k=0;k<n;k++) if(kids[k]>0){ int st; if(!dl_reap_bounded(kids[k],&st,(DLC_HDR_PROBE_S+2)*1000L)) dl_kill_reap(kids[k],&st,"header probe"); }
+    double rate[DLC_HDR_PROBE_N]; int pk[DLC_HDR_PROBE_N]; int answered=0;
+    for(int k=0;k<n;k++){ rate[k] = res[k].ok ? (double)res[k].bytes * 1000.0 / (double)res[k].ms : -1.0; pk[k]=k; if(res[k].ok) answered++; }
+    for(int i=1;i<n;i++){ int v=pk[i]; int j=i-1; while(j>=0 && rate[pk[j]]<rate[v]){ pk[j+1]=pk[j]; j--; } pk[j+1]=v; }
+    /* the order: the answering candidates fastest first, then the unprobed in their rank order, then the probed that failed */
+    static unsigned char probed[DLC_MAXPOOL]; memset(probed, 0, (size_t)nlive);
+    for(int k=0;k<n;k++) probed[cand[k]] = 1;
+    int o=0;
+    for(int k=0;k<n;k++) if(res[pk[k]].ok) order[o++] = cand[pk[k]];
+    for(int i=0;i<nlive;i++) if(!probed[i]) order[o++] = i;
+    for(int k=0;k<n;k++) if(!res[pk[k]].ok) order[o++] = cand[pk[k]];
+    char line[DLC_HDR_PROBE_N * 96 + 64]; int w=0;
+    for(int k=0;k<n;k++){ int q=pk[k];
+        if(res[q].ok) w += snprintf(line+w, sizeof line-(size_t)w, "%s%s %.0f KB/s (%ld in %ld ms)", k?", ":"", live[cand[q]], rate[q]/1024.0, res[q].cnt, res[q].ms);
+        else          w += snprintf(line+w, sizeof line-(size_t)w, "%s%s %s", k?", ":"", live[cand[q]], dlc_hprobe_why[res[q].why > 3 ? 1 : res[q].why]); }
+    if(answered) fprintf(stderr,"[dlc] header probe: the first page from %d candidate(s) in %.1fs: %s -- %s leads, the rest are fallbacks\n",
+                         n, (double)(dlc_now_ms()-t_all0)/1000.0, line, live[order[0]]);
+    else fprintf(stderr,"[dlc] header probe: none of %d candidate(s) answered in %.1fs (%s) -- the rank order stands\n", n, (double)(dlc_now_ms()-t_all0)/1000.0, line);
+    munmap(res, sizeof(dlc_hprobe_t) * DLC_HDR_PROBE_N);
+    return answered;
+}
 static long dlc_headers(char live[][DL_POOL_SLOT], int nlive){
     static unsigned char hst[4096]; hst_init(hst);
     struct stat hs;
@@ -6105,11 +6193,25 @@ static long dlc_headers(char live[][DL_POOL_SLOT], int nlive){
     int tried=0, failed=0, whys[8]={0};
     long announced = dlc_announced_height(g_live_announced, nlive);   /* 2026-09-09: the pool's claim, from the ranking handshakes */
     int short_i = -1; long short_tip = -1;                             /* the longest chain that still fell short, in case every candidate does */
-    for(int i=0;i<nlive && tried<DLC_HDR_TRY_PEERS; i++){
+    static int order[DLC_MAXPOOL]; dlc_headers_probe(live, nlive, hst, order);   /* 2026-10-05: the fastest first page leads */
+    for(int oi=0;oi<nlive && tried<DLC_HDR_TRY_PEERS; oi++){
+        int i = order[oi];
         int why=0;
         long added=dlc_headers_try(live[i], hst, loc, hdrbuf, sizeof hdrbuf, &why);
         if(added<0){ failed++; if(why>=0 && why<8) whys[why]++; continue; }
         tried++;
+        if(added>0 && g_dlc_hdr_stalled){
+            /* the peer served pages and then stopped answering (2026-10-05):
+             * before, that ended the phase on whatever had landed, and the
+             * block download ran to that height. Treat it as a chain that
+             * fell short: roll back, remember it as the longest, try the
+             * next candidate; if no one does better it is taken below. */
+            long tip_now = hst_count(hst) - 1;
+            fprintf(stderr,"[dlc] headers from %s stopped answering after +%ld (chain at %ld) -- the next candidate takes over\n", live[i], added, tip_now);
+            if(tip_now > short_tip){ short_tip = tip_now; short_i = i; }
+            dlc_headers_rollback(hst, have);
+            continue;
+        }
         { long tip_now = hst_count(hst) - 1;
           if((added>0 || have>0) && dlc_chain_falls_short(tip_now, announced)){
             /* the bench took a stuck peer's stale branch, 4,500 blocks short of
