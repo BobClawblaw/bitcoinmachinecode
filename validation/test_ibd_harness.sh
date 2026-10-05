@@ -105,7 +105,7 @@ chmod 644 "$T/bin/bmc_merge_index_runs"
 out=$(ibd_require_helpers "$T/bin" bmc_build_tx_index bmc_merge_index_runs); ckc "a helper at mode 644 counts as missing" "$?" "1"
 out=$(ibd_require_helpers "$T/bin"); ckc "NO names (an empty print-runtime-helpers) is refused, not a pass" "$?" "1"
 # the list itself comes from the Makefile, so the harness and the build cannot drift
-rh=$(make -s --no-print-directory -C ../asm print-runtime-helpers 2>/dev/null)
+rh=$(MAKEFLAGS= MFLAGS= make -s --no-print-directory -C ../asm print-runtime-helpers 2>/dev/null)   # 2026-10-05: an outer make -C -j8 hands this its flags and the directory banner lands in $rh
 case " $rh " in *" bmc_build_tx_index "*" bmc_merge_index_runs"*) ck "make print-runtime-helpers names the builders and the merger" "yes" "yes";;
                 *) ck "make print-runtime-helpers names the builders and the merger" "$rh" "... bmc_build_tx_index ... bmc_merge_index_runs";; esac
 printf '2026-09-18 19:10:00.000 [boot] config: datadir=/x\n' > "$T/helpers.log"

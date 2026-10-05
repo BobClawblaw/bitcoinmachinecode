@@ -770,6 +770,57 @@ int main(void){
               ok(WIFEXITED(st8) && WEXITSTATUS(st8) == 7 && tbanned[1] == 0,
                  "at the usable floor the staller is still dropped but NOT banned (a slow peer beats no peer)");
               g_cfg.min_usable_peers = save_floor; kids[0] = 0; }
+            /* 2026-10-05 (runs 34 and 35): an eviction the holder never
+             * answers. The holder here ignores SIGUSR1 outright, as the wedged
+             * workers did: it is "dropped" at 2 s, still holds the chunk, is
+             * dropped again at 4 s -- and THAT second eviction puts the chunk
+             * on the retry ring for an idle worker, once; a third eviction
+             * does not push it twice, and a new tail starts the memory over. */
+            { pid_t hp3 = fork();
+              if (hp3 == 0){ signal(SIGUSR1, SIG_IGN); for (;;) pause(); }
+              kids[0] = opid[0] = hp3;
+              sst[0].cur_lo = 180; sst[0].cur_hi = 219; sst[0].held_idx = 2; sst[0].kill_reason = 0;
+              c[DLC_CTL_FIRST_HOLE] = 180; c[DLC_CTL_CLAIM] = 180 + 4097; c[DLC_CTL_N_STALL] = 0; c[DLC_CTL_N_UNANSWERED] = 0;
+              c[DLC_CTL_RETRY_HEAD] = 0; c[DLC_CTL_RETRY_TAIL] = 0;
+              g_dlc_stall_timeout_s = 2;
+              dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 400000, tlive, TNLIVE, tbanned);   /* a new tail: the clock starts */
+              dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 402000, tlive, TNLIVE, tbanned);   /* 2 s: evicted (ignored) */
+              ok(c[DLC_CTL_N_STALL] == 1 && dlc_retry_pop(c) == -1 && c[DLC_CTL_N_UNANSWERED] == 0,
+                 "the FIRST eviction of a holder is a signal only: nothing on the retry ring yet");
+              dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 402100, tlive, TNLIVE, tbanned);   /* the same holder again: a fresh clock */
+              dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 406100, tlive, TNLIVE, tbanned);   /* 4 s: evicted again, unanswered */
+              ok(c[DLC_CTL_N_STALL] == 2 && c[DLC_CTL_N_UNANSWERED] == 1 && dlc_retry_pop(c) == 180,
+                 "the SECOND eviction of the same holder for the same chunk puts the chunk on the retry ring (an idle worker fetches it)");
+              dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 406200, tlive, TNLIVE, tbanned);
+              dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 414200, tlive, TNLIVE, tbanned);   /* 8 s: a third eviction */
+              ok(c[DLC_CTL_N_STALL] == 3 && c[DLC_CTL_N_UNANSWERED] == 1 && dlc_retry_pop(c) == -1,
+                 "...a third eviction does not ring the same chunk twice");
+              /* the tail moves on (the helper delivered 180): the next chunk's first eviction is a signal only again */
+              sst[0].cur_lo = 220; sst[0].cur_hi = 259;
+              c[DLC_CTL_FIRST_HOLE] = 220; c[DLC_CTL_CLAIM] = 220 + 4097;
+              dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 420000, tlive, TNLIVE, tbanned);
+              dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 420100, tlive, TNLIVE, tbanned);
+              dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 420100 + g_dlc_stall_timeout_s * 1000, tlive, TNLIVE, tbanned);
+              ok(c[DLC_CTL_N_STALL] == 4 && c[DLC_CTL_N_UNANSWERED] == 1 && dlc_retry_pop(c) == -1,
+                 "a new tail starts the memory over: its first eviction rings nothing");
+              kill(hp3, SIGKILL); waitpid(hp3, NULL, 0); kids[0] = 0; }
+            /* the cursor help's taker (2026-10-05): one worker takes the
+             * committer's want through the HELPING CAS; a second asker gets
+             * nothing; a staged chunk is not taken; Core mode never takes it */
+            { int helping = 0; g_dlc_core = 0;
+              c[DLC_CTL_CURSOR_WANT] = -1; c[DLC_CTL_HELPING] = -1; c[DLC_CTL_N_CURSOR_HELP] = 0;
+              ok(dlc_take_cursor_want(c, &helping) == -1 && !helping, "no want published: nothing to take");
+              c[DLC_CTL_CURSOR_WANT] = 300;
+              ok(dlc_take_cursor_want(c, &helping) == 300 && helping == 1 && c[DLC_CTL_HELPING] == 300 && c[DLC_CTL_N_CURSOR_HELP] == 1,
+                 "the published want is taken once: HELPING carries it, the help counted");
+              int helping2 = 0;
+              ok(dlc_take_cursor_want(c, &helping2) == -1 && !helping2 && c[DLC_CTL_N_CURSOR_HELP] == 1, "a second asker gets nothing while the first is helping");
+              c[DLC_CTL_HELPING] = -1; stage_chunk(300, 40);
+              ok(dlc_take_cursor_want(c, &helping2) == -1 && !helping2, "a want that is already staged is not taken (its owner finished)");
+              dlc_stage_wipe();
+              g_dlc_core = 1;
+              ok(dlc_take_cursor_want(c, &helping2) == -1 && !helping2, "Core mode never takes the cursor help (Core asks no second peer for a block in flight)");
+              g_dlc_core = 0; c[DLC_CTL_CURSOR_WANT] = -1; c[DLC_CTL_HELPING] = -1; }
             g_dlc_stall_timeout_s = DLC_STALL_TIMEOUT_MIN_S;
             munmap((void*)c, (DLC_CTL_RING + DLC_RETRY_MAX) * sizeof(long)); }
           /* a staged chunk is visible to the stall rule's guard, and the next run's wipe */

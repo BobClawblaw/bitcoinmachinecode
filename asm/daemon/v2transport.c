@@ -291,6 +291,11 @@ int bmc_v2_handshake(int fd, int initiator, int timeout_ms){
 
     /* drive the handshake to completion */
     while (c->t.recv_state != BIP324_RECV_APP){
+        /* 2026-10-05: the real-time deadline here too. `elapsed` only moves
+         * on an empty poll, so a peer feeding one byte per slice held this
+         * loop for as long as it liked; the detection loop above was given
+         * the deadline on 2026-09-03 (NET-2) and this one was not. */
+        if (HS_EXPIRED()){ conn_free(fd); return -1; }
         struct pollfd pf = { fd, POLLIN, 0 };
         int pr = poll(&pf, 1, slice);
         if (pr < 0){
