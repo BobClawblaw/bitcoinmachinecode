@@ -34,11 +34,21 @@
     .text
 
 /* ---- operand helpers: each field operand is (base register, byte offset) ---- */
+#include "secp256k1_fe_inline.h"
+/* fe_add / fe_sub in line (secp256k1_fe_inline.h); everything else a call */
 .macro FE3 fn, b0, o0, b1, o1, b2, o2
     add   x0, \b0, #\o0
     add   x1, \b1, #\o1
     add   x2, \b2, #\o2
+    .ifc \fn, fe_add
+    FE_ADD_INLINE
+    .else
+    .ifc \fn, fe_sub
+    FE_SUB_INLINE
+    .else
     bl    _\fn
+    .endif
+    .endif
 .endm
 .macro FE2 fn, b0, o0, b1, o1
     add   x0, \b0, #\o0
