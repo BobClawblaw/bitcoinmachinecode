@@ -10,6 +10,7 @@ status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 - **Inlining (`port/osx/secp256k1_fe_inline.h`, new):** `FE_ADD_INLINE` / `FE_SUB_INLINE` are `secp256k1_fe.S`'s `_fe_add` / `_fe_sub` instruction for instruction on the same x0/x1/x2 (bit-identical, alias-safe, x3..x13 only); the `FE3` macro of `secp256k1_point.S` and `secp256k1_point_ct.S` emits them in place of the call (`.ifc`), and the ct module's direct `bl _fe_sub` negations in the loops too. x86's counterpart is `5501c764`. Two one-off negations outside the loops stay calls.
 - **Measured:** `point_double` 106 → 86 ns (1.23×, x86 saw 1.22×), `pointh_double` 91 → 89, `pointj_add_ge_ct` 122 → 122 (its time is its 12 multiplies), `glvj_ct` 22.9 → 20.5 µs, `glv_ct` unchanged at ~26. `fe_mul` is 5.2 ns, ~18 cycles for 16 mul + 16 umulh and the reduction — near what the multiplier allows; what is left is the store/load between steps, which only register-resident formulas (a rewrite of each formula, not a macro swap) would remove.
 - **Full suite:** 424 PASS, 11 SKIP, 14 N/A, 0 FAIL (449 commands; `test_pointj_add_ge_ct` runs now).
+- **Deploy:** `45fb3637` on both nodes (snapshots `bmcbitcoind.pre-45fb3637`), restarted 18:50Z; signet 325,232 and mainnet 970,215 = mempool.space, no crash/FATAL/REJECT/MUTATED lines, mainnet relay +276 accepted in its first tx window (64.6k pool).
 
 ## 2026-10-06 (evening) — `point_scalar_mul_glvj_ct` native (the Jacobian body and `pointj_add_ge_ct`)
 
