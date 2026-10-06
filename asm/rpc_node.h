@@ -196,6 +196,7 @@ typedef struct {
  * are 192 bytes (12 MB shared); scripts longer than the inline part spill
  * into continuation entries claimed with the same atomic increment. */
 #define RPC_CSI_RING           65536
+#define RPC_IXW_RING           1024     /* the index worker's ring (2026-10-06): heights, a block each */
 #define RPC_CSI_BODY           176
 #define RPC_CSI_HDR            52     /* key36 | value u64 | code u64 */
 #define RPC_CSI_INLINE         (RPC_CSI_BODY - RPC_CSI_HDR)   /* 124 script bytes inline */
@@ -457,6 +458,25 @@ typedef struct {
         volatile unsigned int       slen;           /* full script length (head) / chunk length (cont) */
         unsigned char               body[RPC_CSI_BODY];
     } csi_ring[RPC_CSI_RING];
+    /* 2026-10-06 (plan B4, daemon/index_worker.c): the index worker's ring.
+     * The applier pushes (BLOCK h) after a block is connected and the
+     * trailing builders' fold callbacks as ADV records; a forked worker
+     * consumes in order and publishes the watermarks the [ready] line and
+     * getindexinfo read while it runs (the parent's own writer state is
+     * stale from the fork until the worker stops). A full ring blocks the
+     * applier; a STOP record ends the worker after everything before it. */
+    volatile unsigned long long ixw_seq;            /* records pushed (the applier) */
+    volatile unsigned long long ixw_done_seq;       /* records consumed (the worker) */
+    volatile long long          ixw_covered;        /* the txid index's watermark, as the worker last published it */
+    volatile long long          ixw_bfi_count;      /* the filter index's count, likewise */
+    volatile unsigned long long ixw_blocks;         /* blocks the worker indexed */
+    volatile int                ixw_worker_pid;     /* 0 = no worker (inline indexing) */
+    volatile int                ixw_pause;          /* test seam: the worker holds its cursor */
+    struct {
+        volatile unsigned long long ready;          /* seq+1 once filled; 0 = empty */
+        volatile int                kind;           /* IXW_K_* (index_worker.h) */
+        volatile long long          a;              /* the height, or the fold's `to` */
+    } ixw_ring[RPC_IXW_RING];
     /* 2026-09-08: the parallel download's peers. Core's getpeerinfo during
      * IBD is where an operator watches the sync -- which peers serve blocks,
      * what is in flight, bytes per peer -- and this node's sixteen download

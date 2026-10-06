@@ -294,3 +294,24 @@ Order (A7 and A8 done 10-06): B4 → B3 (the applier target) → B8 → A5 →
 B9 → M1 alongside the Core rerun.
 Exit for the next release run: ready ≤ 4:30, applier ≤ 12,000 s,
 getrawtransaction ≤ 10 ms at 32 clients, no exclusive hold ≥ 1 s.
+
+### B4 — built 2026-10-06 (branch perf/2026-10-06-b4-index-worker)
+`daemon/index_worker.{c,h}`: the applier pushes (BLOCK h) onto a 1,024-slot
+ring in the shared status block after each connected block; a forked
+worker reads the block from the archive, runs the four writers (txid tail,
+txospender tail, filter index, address journal) and publishes the
+watermarks the `[ready]` line reads while it runs. The trailing builders'
+fold callbacks go through the ring as ADV records so the process holding
+the tail's fd is the one that rotates it. STOP drains the ring at the end
+of dl_catchup; the parent then re-boots its own writer state from the
+files (`txit_close`/`tsp_close`/`axt_close` + the boots, `bfi_close`). A
+dead worker is noticed at the next push (0), the writers are re-booted,
+and the block is indexed inline. At the tip the writers run inline as
+before. Not moved: the choke's own block read (ZMQ, mempool, notify hooks
+still need it), `csi` (inside the block line), `idx` (Phase 0.5, not
+movable). Test `tests/test_index_worker` (order across BLOCK and ADV
+records in the worker's pid, reload-retry, backpressure, STOP drain, a
+killed worker, SIGTERM ignored); revert-checked with three mutants (5, 3
+and 6 FAIL). Measurement: the next ranked run's §2 -- ix txindex/bfilter
+columns go from the applier's 693 s to the worker's lines, the applier's
+wall by as much.

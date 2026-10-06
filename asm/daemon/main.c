@@ -53,6 +53,10 @@
 #include "crash_trace.h"       /* 2026-10-03: a fatal signal leaves a stack in the log */
 #include "txann.h"             /* CC-1: tx announcement to and from inbound peers */
 #include "inbound_evict.h"     /* CC-3: Core AttemptToEvictConnection */
+#include "index_worker.h"      /* 2026-10-06 (plan B4): the index writers off the applier */
+static void ixw_catchup_stop(const char* why);
+static void ixw_catchup_start(void);
+extern void axt_set_applied_height(long (*fn)(void));   /* daemon/addr_index_tail.c */
 #include "../mempool_slot.h"    /* the structural mempool's slot layout (80-byte slots) */
 #include "anchors.h"           /* CC-4: block-relay-only legs + anchors.dat */
 #include "hdr_lowwork.h"
@@ -646,6 +650,7 @@ static void rebuild_hash_index_after_reorg(void){
      * truncation too, or the reconnected blocks would be skipped as
      * already-indexed (fires with tip == fork height on the mid-reorg
      * invocation; the post-reconnect invocation is a no-op) */
+    if (ixw_on()) ixw_catchup_stop("store truncated (reorg): the tails roll back in this process");   /* 2026-10-06 */
     { extern void txit_on_truncate(void*); txit_on_truncate(store_buf); }
     { extern void tsp_on_truncate(void*); tsp_on_truncate(store_buf); }
     { extern void axt_on_truncate(void*); axt_on_truncate(store_buf); }
@@ -3490,11 +3495,11 @@ static irunset_t g_rs_txi, g_rs_tsp;
 extern long ah_to_height(void) __attribute__((weak));   /* daemon/addr_hist.c: the history runs' reach */
 extern int  ah_run_count(void) __attribute__((weak));
 extern void axt_runs_advanced(long to);                  /* daemon/addr_index_tail.c: drop what a run now covers */
-static void on_ah_run(long to, void* ctx){ (void)ctx; axt_runs_advanced(to); }
+static void on_ah_run(long to, void* ctx){ (void)ctx; if (!(ixw_on() && ixw_push(IXW_K_ADV_AH, to))) axt_runs_advanced(to); }   /* the worker holds the tail's fd: it rotates (2026-10-06) */
 extern void txit_runs_advanced(long to);   /* daemon/tx_index_tail.c: drop what a run now covers */
 extern void tsp_runs_advanced(long to);    /* daemon/txosp_tail.c */
-static void on_txi_run(long to, void* ctx){ (void)ctx; txit_runs_advanced(to); irs_dirty(&g_rs_txi); }
-static void on_tsp_run(long to, void* ctx){ (void)ctx; tsp_runs_advanced(to); irs_dirty(&g_rs_tsp); }
+static void on_txi_run(long to, void* ctx){ (void)ctx; if (!(ixw_on() && ixw_push(IXW_K_ADV_TXI, to))) txit_runs_advanced(to); irs_dirty(&g_rs_txi); }
+static void on_tsp_run(long to, void* ctx){ (void)ctx; if (!(ixw_on() && ixw_push(IXW_K_ADV_TSP, to))) tsp_runs_advanced(to); irs_dirty(&g_rs_tsp); }
 /* One tick of every trailing index builder, at most once a second.
  *
  * 2026-09-16, found on run 26: this used to live ONLY in the caught-up loop's
@@ -7697,6 +7702,7 @@ static long dl_catchup_run(const char* dir, int min_workers){
     if(!ab){ fprintf(stderr,"[dlc] address book unavailable\n"); return 0; }
     long disc=dl_bootstrap(ab, (const char**)g_seed_hosts, g_n_seed_hosts);
     fprintf(stderr,"[dlc] discovered +%ld peers (book now %ld)\n", disc, (long)ab2_count(ab));
+    ixw_catchup_start();                              /* 2026-10-06 (plan B4): the index writers run in a worker for the catch-up */
 
     static char pool[DLC_MAXPOOL][DL_POOL_SLOT];
     static double good_ema[DLC_MAXPOOL];
@@ -8314,6 +8320,7 @@ static long dl_catchup_run(const char* dir, int min_workers){
         long done = utxo_live_catchup_bounded(store_buf, g_dlc_connect_budget_ms, 1);
         if(done > 0){ conn_total += done; dl_new_block_choke(); }
     }
+    ixw_catchup_stop("the download is over: the tip's blocks are indexed inline");   /* drains the ring first; the writers re-read their state */
     if(interleave) fprintf(stderr,"[dlc] connected %ld block(s) during the download; connected tip %ld (the rotation drains the rest)\n",
                            conn_total, utxo_live_applied_height());
     long total=*done_count;
@@ -9022,8 +9029,10 @@ static void dl_ready_check(int utxo_ok){
     r.ibd_over = g_dl_ibd_left;
     r.tip = (long)*(int*)(store_buf+24);
     r.utxo_on = utxo_ok;              r.utxo_applied = utxo_ok ? utxo_live_applied_height() : -1;
-    r.txindex_on = g_cfg.txindex;     r.txindex_covered = g_cfg.txindex ? txit_covered() : -1;
-    r.bfilter_on = g_cfg.blockfilterindex; r.bfilter_count = g_cfg.blockfilterindex ? bfi_count() : -1;
+    /* 2026-10-06: while the index worker runs, its published watermarks (this
+     * process's writer state is stale since the fork) */
+    r.txindex_on = g_cfg.txindex;     r.txindex_covered = g_cfg.txindex ? (ixw_on() ? (long)g_node_status->ixw_covered : txit_covered()) : -1;
+    r.bfilter_on = g_cfg.blockfilterindex; r.bfilter_count = g_cfg.blockfilterindex ? (ixw_on() ? (long)g_node_status->ixw_bfi_count : bfi_count()) : -1;
     r.coinstats_on = g_cfg.coinstatsindex;
     if (g_cfg.coinstatsindex){
         r.coinstats_hist_ok = csi_hist_repair_state() == 1;   /* CSI_REPAIR_OK (coinstats_index.c) */
@@ -9037,6 +9046,67 @@ static void dl_ready_check(int utxo_ok){
     if (!benchlog_ready_eval(&r, line, sizeof line)) return;
     said = 1;
     fprintf(stderr, "%s\n", line);
+}
+/* ---- the index worker's hooks and lifetime (2026-10-06, plan B4) ---------
+ * The four index writers ran here, in the applying process, serial with
+ * the apply: 693 thread-seconds over the chain in run 37. For the catch-up
+ * they run in a forked worker (daemon/index_worker.c) fed from the choke
+ * point below; at the tip (one block at a time) they run inline as before.
+ * The worker reads the block from the archive itself; this process keeps
+ * reading it too, for ZMQ, the mempool and the notify hooks. */
+_Static_assert(IXW_NS_N >= BL_IX_N, "the worker's timing slots hold every index column");
+extern long bfi_count(void);
+static long ixw_h_read(long h, unsigned char* buf, long cap){ return store_read_at(store_buf, (unsigned long)h, buf, cap); }
+static void ixw_h_reload(void){ store_reload(store_buf); }
+static void ixw_h_on_block(long h, const unsigned char* blk, long blen, unsigned long long ns[IXW_NS_N]){
+    unsigned long long t0 = bl_ns(), t1;
+    txit_on_block(store_buf, h, blk, blen);
+    t1 = bl_ns(); ns[BL_IX_TXINDEX] = t1 - t0; t0 = t1;
+    tsp_on_block(store_buf, h, blk, blen);
+    t1 = bl_ns(); ns[BL_IX_TXOSPENDER] = t1 - t0; t0 = t1;
+    if (g_cfg.blockfilterindex) bfi_on_block(store_buf, h, blk, (unsigned long)blen);
+    t1 = bl_ns(); ns[BL_IX_BFILTER] = t1 - t0; t0 = t1;
+    axt_on_block(store_buf, h, blk, blen);
+    t1 = bl_ns(); ns[BL_IX_ADDR] = t1 - t0;
+}
+static void ixw_h_adv(int kind, long to){
+    if (kind == IXW_K_ADV_TXI) txit_runs_advanced(to);
+    else if (kind == IXW_K_ADV_TSP) tsp_runs_advanced(to);
+    else if (kind == IXW_K_ADV_AH) axt_runs_advanced(to);
+}
+static long ixw_h_covered(void){ return txit_covered(); }
+static long ixw_h_bfi(void){ return bfi_count(); }
+static void ixw_h_log(long h, const unsigned long long ns[IXW_NS_N]){
+    if (!g_cfg.benchlog) return;
+    char bline[256]; benchlog_fmt_index(bline, sizeof bline, h, ns);
+    fprintf(stderr, "%s\n", bline);
+}
+static long ixw_applied_for_axt(void){ return ixw_current_height(); }   /* the address tail's applied-height seam: the height being indexed IS applied */
+static void ixw_h_in_child(void){ axt_set_applied_height(ixw_applied_for_axt); }
+static void ixw_catchup_start(void){
+    if (!g_node_status) return;                      /* the boot catch-up has no status block: inline, as before */
+    if (!(g_cfg.txindex || g_cfg.blockfilterindex || g_cfg.txospenderindex || g_cfg.addrindex)) return;
+    ixw_hooks_t hk; memset(&hk, 0, sizeof hk);
+    hk.read_block = ixw_h_read; hk.reload = ixw_h_reload; hk.on_block = ixw_h_on_block; hk.runs_advanced = ixw_h_adv;
+    hk.covered = ixw_h_covered; hk.bfi_count = ixw_h_bfi; hk.log_index = ixw_h_log; hk.in_child = ixw_h_in_child;
+    hk.block_cap = RPC_BLKSUBMIT_MAX;
+    ixw_start(g_node_status, &hk);
+}
+/* the worker is gone (stopped or dead): this process's writer state has
+ * been stale since the fork (watermarks, and the tail fds the worker may
+ * have rotated) -- re-read it from the files */
+static void ixw_reboot_writers(void){
+    extern void txit_close(void); extern void tsp_close(void); extern void axt_close(void); extern void bfi_close(void);
+    if (g_cfg.txindex){ txit_close(); txit_boot(store_buf); }
+    if (g_cfg.txospenderindex){ tsp_close(); tsp_boot(store_buf); }
+    if (g_cfg.addrindex){ axt_close(); axt_boot(store_buf); }
+    if (g_cfg.blockfilterindex) bfi_close();     /* its next on_block reopens from the files */
+}
+static void ixw_catchup_stop(const char* why){
+    if (ixw_pid() <= 0) return;
+    fprintf(stderr, "[ixw] stopping the index worker: %s\n", why);
+    ixw_stop();
+    ixw_reboot_writers();
 }
 static void dl_new_block_choke(void){
     int now_tip = (int)node_public_tip(store_buf);
@@ -9105,11 +9175,23 @@ static void dl_new_block_choke(void){
                 /* bmc.benchlog (2026-10-04, plan part 2): each index's share
                  * of this block, outside the UTXO apply timer. bl_ns() reads
                  * no clock with the key off, so the default costs a branch. */
-                unsigned long long bix[BL_IX_N] = {0}, bt0 = bl_ns(), bt1;
+                unsigned long long bix[BL_IX_N] = {0}, bt0, bt1;
+                /* 2026-10-06 (plan B4): the four writers run in the index
+                 * worker during the catch-up -- this pushes the height and
+                 * moves on; the worker prints the [bench] index line. A
+                 * worker found dead here is stopped (the writers re-read
+                 * their state from the files) and the block is indexed
+                 * inline, as every block is at the tip. */
+                int via_worker = 0;
+                if (ixw_on()){
+                    if (ixw_push(IXW_K_BLOCK, zh)) via_worker = 1;
+                    else ixw_catchup_stop("the index worker died -- indexing inline from here");
+                }
+                dl_index_trail_tick(g_utxo_live_on ? utxo_live_applied_height() : -1);   /* the trailing builders' tick is in no column */
+                if (!via_worker){
+                bt0 = bl_ns();
                 txit_on_block(store_buf, zh, zb, bl);
-                bt1 = bl_ns(); bix[BL_IX_TXINDEX] = bt1 - bt0;
-                dl_index_trail_tick(g_utxo_live_on ? utxo_live_applied_height() : -1);
-                bt0 = bl_ns();                          /* the trailing builders' tick is in no column */
+                bt1 = bl_ns(); bix[BL_IX_TXINDEX] = bt1 - bt0; bt0 = bt1;
                 tsp_on_block(store_buf, zh, zb, bl);
                 bt1 = bl_ns(); bix[BL_IX_TXOSPENDER] = bt1 - bt0; bt0 = bt1;
                 /* filter index tail: adopt/append (cheap probe when
@@ -9121,6 +9203,7 @@ static void dl_new_block_choke(void){
                  * DELs/TOUCHes from its undo records */
                 axt_on_block(store_buf, zh, zb, bl);
                 bt1 = bl_ns(); bix[BL_IX_ADDR] = bt1 - bt0;
+                }
                 /* -blocknotify: after the indexes have taken the
                  * block, so a hook that queries us sees it. */
                 if (g_cfg.blocknotify[0]){
@@ -9181,7 +9264,7 @@ static void dl_new_block_choke(void){
                     zmqpub_notify("rawblock", zb, (unsigned long)bl);
                     bix[BL_IX_ZMQ] = bl_ns() - bt0;
                 }
-                if (g_cfg.benchlog){
+                if (g_cfg.benchlog && !via_worker){
                     char bline[256]; benchlog_fmt_index(bline, sizeof bline, zh, bix);
                     fprintf(stderr, "%s\n", bline);
                 }

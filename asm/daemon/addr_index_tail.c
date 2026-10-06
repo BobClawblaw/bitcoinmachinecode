@@ -95,6 +95,11 @@ static long axt_limit(long tip){
 }
 
 int axt_active(void){ return g_fd >= 0; }
+/* 2026-10-06 (plan B4): drop this process's handle and watermark so the
+ * next *_boot re-reads them from the files -- after the index worker, which
+ * appended and rotated the tail from its own copy of this state, has
+ * stopped. */
+void axt_close(void){ if (g_fd >= 0) close(g_fd); g_fd = -1; g_covered = -1; }
 long axt_covered(void){ return g_covered; }
 
 /* ---- record pack helpers ------------------------------------------------ */
