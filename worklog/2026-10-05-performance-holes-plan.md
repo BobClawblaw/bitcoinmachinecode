@@ -305,7 +305,27 @@ call 58 vs 87 (was 73). v1 at 32 clients 9 vs 19; v3 single 84 vs 126;
 getrawmempool 114 vs 484 on pools of the same size (26.8k vs 25.5k).
 What is left in the render (perf under the arena): the descriptor
 checksum 9%, bech32 7%, sha256 5% -- Core pays the same three.
-### B8. The 100 s tail after IBD end has a 62 s pause — DIAGNOSED 10-06
+### B8. The 100 s tail after IBD end has a 62 s pause — BUILT 10-06 (branch perf/2026-10-06-b8-chainwork-in-step; gate pending)
+**Re-read on run 38 (10-06, 10:57:52 → 10:58:58), the run 37 reading
+below was wrong about the cause:** the sampler shows the daemon's RSS
+FLAT (82.8 GB) and its CPU idle (1 s per 6 s tick) across the 66 s gap,
+while the stall watcher shows one reader at queue depth 1 pulling
+~250 MB per 5 s (3.3 GB in all, io_ms ≈ wall). Nothing was faulting a
+map; one thread was blocked on small reads. The code between the gap's
+two log lines ("[dl] parallel downloader wrote" and the first catch-up
+block) is the rotation's `reorg_chainwork_sync(store_buf, 0)`: the
+parallel download never appends a chainwork record (run 39's
+chainwork.dat was 16 bytes two hours in), so the first rotation after the
+download walks every height from 1 to the tip with an 80-byte pread into
+blk files long out of the page cache — 970 k reads × ~68 µs (NVMe latency
+at queue depth 1) = 66 s, 3.4 KB read per record (one page each). Fix:
+`dl_catchup` runs a bounded sync (65,536 records) every pass, on the
+heights the committer wrote seconds earlier and still has in cache, and
+an unbounded one at the download gate, logged as "[dlc] chainwork in step
+with the archive at the download gate: N record(s) appended during the
+download". test_dlc_interleave asserts one record per stored height at the
+gate in both arms. Expected: the IBD_END → ready tail drops from 86 s to
+~20 s (14 s drain + 3 s flush + 3 s index gaps).
 Run 37's sampler and stall watcher over 04:55:36–04:56:38: the catch-up's
 applier (the dlc child) finished; the serve process took the remaining 694
 blocks ("applying before syncing legs") and sat in state D
