@@ -160,6 +160,7 @@ typedef struct {
      * flush, per download chunk (dlc_benchlog.c). Default 0: the timers run
      * either way (as Core's do); only the lines are gated. */
     int  benchlog;
+    int  async_flush;            /* bmc.asyncflush (plan B3, 2026-10-06): the UTXO memtable flush runs in a forked writer off the applier; 0 = inline, as before */
     int  esplora_port;            /* bmc.esploraport: the Esplora facade listener (0 = off) */
     char esplora_bind[64];        /* bmc.esplorabind: its address (default 127.0.0.1) */
     int upload_rate_limit_kbps;   /* bmc.uploadratelimit: max bytes SENT to peers, KB/s, node-wide (0 = off) */

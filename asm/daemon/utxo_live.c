@@ -388,8 +388,18 @@ static char g_cmp_desc[160];   /* what the running compaction is, for its comple
 static u64     g_cmp_inputs[64]; static int g_cmp_nin = 0;
 static u64     g_cmp_n_before = 0;
 static long    g_cmp_height = 0;
-static void (*g_cmp_prev_sigchld)(int) = 0;
 static int     g_cmp_fallbacks = 0;
+/* SIGCHLD is SIG_IGN in the download worker (children auto-reap), which would
+ * make waitpid lose a child's exit status. Whoever forks first takes the
+ * handler back to SIG_DFL; the last child's reaper restores it (2026-10-06:
+ * the flush writer joined the compaction child, so this is counted). */
+static int g_child_users = 0;
+static void (*g_child_prev_sigchld)(int) = 0;
+static void child_sig_acquire(void){ if (g_child_users++ == 0) g_child_prev_sigchld = signal(SIGCHLD, SIG_DFL); }
+static void child_sig_release(void){ if (g_child_users > 0 && --g_child_users == 0) signal(SIGCHLD, g_child_prev_sigchld); }
+static void fz_poll(void);
+static void fz_shutdown(void);
+static int  g_fz_enabled = 0;          /* plan B3: the async flush is installed (see the flush writer below) */
 static u64     g_cmp_old_base = ~0ULL;   /* persisted runs-only live count at fork time */
 static int     g_cmp_is_full = 0;        /* the k inputs were the whole manifest at fork */
 static u64     g_cmp_child_run = 0;      /* run_no reserved for the child's output */
@@ -437,7 +447,7 @@ static void compact_adopt(int st){
                 secs, WIFSIGNALED(st) ? "signal" : "status", WIFSIGNALED(st) ? WTERMSIG(st) : WEXITSTATUS(st), (unsigned long)g_cmp_child_run);
     }
     g_cmp_pid = 0;
-    if (g_cmp_prev_sigchld) signal(SIGCHLD, g_cmp_prev_sigchld);
+    child_sig_release();
 }
 static void compact_poll(void){
     if (!g_cmp_pid) return;
@@ -452,6 +462,7 @@ static void compact_flush_hook(void){
     if (g_tm_on){ g_tm_flush_t0 = tm_now(); g_tm_flush_armed = 1; }   /* step-0 timing: the flush starts here */
     g_bench_flush_ops = g_utxo_lst.op_count;
     compact_poll();
+    fz_poll();
 }
 /* Leveled: which runs to merge, by size ratio (lsm_compact_pick). Sizes come
  * from the run files themselves. Returns k, sets *lo. */
@@ -517,12 +528,10 @@ static int compact_start_async(long height, const char* why){
     for (int i = 0; i < g_cmp_nin; i++) memcpy(&g_cmp_inputs[i], e + (lo + i)*16 + 8, 8);
     g_cmp_n_before = g_utxo_lst.manifest_n; g_cmp_height = height;
     g_cmp_old_base = lsm_manifest_persisted_live();
-    /* SIGCHLD is SIG_IGN in the download worker (children auto-reap), which
-     * would make waitpid lose the exit status; take it back for our child. */
-    g_cmp_prev_sigchld = signal(SIGCHLD, SIG_DFL);
+    child_sig_acquire();
     pid_t p = fork();
     if (p < 0){
-        signal(SIGCHLD, g_cmp_prev_sigchld);
+        child_sig_release();
         g_cmp_fallbacks++;
         fprintf(stderr, "[utxo_live] fork for background compaction failed (%s) -- compacting inline\n", strerror(errno));
         long cr = utxo_lsm_compact_range(&g_utxo_lst, (unsigned long)lo, (unsigned long)k);
@@ -558,6 +567,7 @@ static int compact_start_async(long height, const char* why){
 /* For the daemon's shutdown path: a child mid-merge is killed, not awaited --
  * shutdown has a 90 s budget and the merge is redone next boot for free. */
 void utxo_live_compact_shutdown(void){
+    fz_shutdown();
     if (!g_cmp_pid) return;
     kill(g_cmp_pid, SIGKILL);
     int st; while (waitpid(g_cmp_pid, &st, 0) < 0 && errno == EINTR) {}
@@ -588,6 +598,7 @@ static long  g_apply_height = -1;
  * (nothing between two blocks is timed) are not in any line. */
 static u64 g_blk_ntx = 0, g_blk_nin = 0;
 static void bench_flush_line(u64 ns){
+    if (g_fz_enabled) return;              /* plan B3: the freeze and the writer's adopt print their own lines */
     /* the run just published is the manifest's last entry (a flush appends) */
     u64 bytes = 0, run_no = 0;
     if (g_utxo_lst.manifest_n > 0 && g_utxo_lst.manifest_buf){
@@ -599,6 +610,196 @@ static void bench_flush_line(u64 ns){
             g_apply_height, (double)ns / 1e6, (unsigned long long)g_bench_flush_ops, (unsigned)run_no,
             (double)bytes / 1e6, (unsigned long long)g_utxo_lst.manifest_n, (unsigned long long)g_utxo_lst.total_live);
 }
+/* ---- the flush off the applier (plan B3, 2026-10-06) -----------------------
+ * A memtable flush was the applier's: sort ~30M descriptors, write a 1-2 GB
+ * run with its Bloom filter and sparse index, fsync -- ~12 s inline, 109
+ * times a sync (1,360 s of run 38's 13,363 applier-seconds). Now the asm's
+ * threshold crossing (utxo_lsm_put/del) calls fz_hook instead of mac_flush:
+ *   - utxo_lsm_freeze copies the live table and its blob prefix into a
+ *     private copy (g_fz_table, sized like the live one), swaps the tombstone
+ *     list with a spare, reserves the generation's gen/run numbers, records
+ *     where the generation's WAL bytes end (fz_wal_end) and clears the live
+ *     table -- sub-second, the applier's whole cost;
+ *   - a forked writer builds the run from the copy (utxo_lsm_build_run) and
+ *     exits; the parent reads through the copy meanwhile (utxo_lsm_get
+ *     consults it after the live generation and before the runs);
+ *   - on exit the parent adopts: the manifest entry, a publish with the
+ *     persisted runs-only count moved by the frozen generation's net, then
+ *     the generation's WAL bytes are RETIRED rather than truncated -- a
+ *     utxo.idx checkpoint whose log_off is fz_wal_end (utxo_store_reload
+ *     replays from there; the WAL keeps growing logically) and a punched
+ *     hole over the dead bytes gives the space back. The WAL is never cut
+ *     under a reader this way, and the live generation's bytes above
+ *     fz_wal_end stay where they are.
+ * One writer at a time: a threshold crossing while one runs waits for it
+ * (the old inline cost, only under sustained pressure). A writer that dies
+ * is replaced by an inline build from the same copy -- nothing is lost, the
+ * copy is still here. Crash: before the adopt, the generation is in the WAL
+ * from log_off and its run is an orphan the boot sweep removes; between the
+ * manifest publish and the idx write, the generation replays over its run
+ * (duplicate puts, a count the reload's recount corrects -- not a loss).
+ * mac_flush's inline path (bmc.asyncflush=0, build_utxo, the tools) is
+ * unchanged except that its reset also empties utxo.idx. */
+extern long utxo_lsm_freeze(void* lst, void* u, void* fz);
+extern long utxo_lsm_build_run(void* lst, void* u, void* tomb_buf, unsigned long long tomb_n, unsigned long long gen, unsigned long long run_no);
+extern void utxo_lsm_set_freeze_hook(long (*fn)(void*, void*));
+extern void utxo_lsm_fz_enable(long on);
+static void*  g_fz_table = 0;          /* the copy (+168); 0 = async flush off */
+static pid_t  g_fz_pid = 0;
+static struct timespec g_fz_t0;
+static u64    g_fz_freeze_ns = 0;      /* the applier's cost of the last freeze */
+static u64    g_fz_ops = 0;            /* the ops the frozen generation held */
+static long   g_fz_height = 0;
+static u64    g_fz_delta = 0;          /* the frozen generation's net over the persisted runs-only count */
+static int    g_fz_delta_known = 0;
+static u64    g_wal_live_start = 0;    /* utxo.idx's log_off: the first byte of the unretired generations */
+static int    g_fz_punch_ok = -1;      /* -1 untested, 1 the WAL's filesystem punches holes, 0 it does not */
+static int    g_fz_fatal = 0;          /* an adopt failed: the next threshold crossing returns -1 (fatal, as a flush error) */
+static unsigned long g_fz_count = 0, g_fz_waits = 0, g_fz_inline = 0, g_fz_bytes_retired = 0;
+#define FZ_FALLOC_KEEP_SIZE  0x01      /* linux/falloc.h: FALLOC_FL_KEEP_SIZE */
+#define FZ_FALLOC_PUNCH_HOLE 0x02      /* FALLOC_FL_PUNCH_HOLE (needs KEEP_SIZE) -- by raw syscall, as the ioprio call above, so no feature macro is needed */
+static u64 clock_ns(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (u64)t.tv_sec * 1000000000ULL + (u64)t.tv_nsec; }
+
+/* retire the frozen generation's WAL bytes: utxo.idx {log_off = fz_wal_end,
+ * n = 0} (tmp + fsync + rename + dir fsync), the asm's idx fd repointed at
+ * the file now on disk (mac_flush's reset truncates THAT fd), the dead
+ * range punched out. Every failure here is a warning: the worst outcome is
+ * a replay of bytes the run also holds. */
+static void fz_retire_wal(void){
+    u64 off = g_utxo_lst.fz_wal_end;
+    unsigned char h[20]; u32 magic = 0x55545849u; u64 n = 0;      /* "UTXI", bitcoin_utxo_store.asm's MAGIC_IDX */
+    memcpy(h, &magic, 4); memcpy(h + 4, &off, 8); memcpy(h + 12, &n, 8);
+    int fd = open("utxo.idx.tmp", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0 || write(fd, h, 20) != 20 || fsync(fd) != 0){
+        int e = errno; if (fd >= 0) close(fd); unlink("utxo.idx.tmp");
+        fprintf(stderr, "[utxo_live] WARNING: could not write utxo.idx (%s): the retired generation replays on the next boot (duplicates, not a loss)\n", strerror(e));
+        return;
+    }
+    close(fd);
+    if (rename("utxo.idx.tmp", "utxo.idx") != 0){
+        fprintf(stderr, "[utxo_live] WARNING: rename utxo.idx.tmp -> utxo.idx failed (%s)\n", strerror(errno)); unlink("utxo.idx.tmp"); return;
+    }
+    { int dfd = open(".", O_RDONLY); if (dfd >= 0){ fsync(dfd); close(dfd); } }
+    { int nfd = open("utxo.idx", O_RDWR); if (nfd >= 0){ if (g_utxo_lst.idx_fd >= 0) close((int)g_utxo_lst.idx_fd); g_utxo_lst.idx_fd = nfd; } }
+    g_utxo_lst.ckpt_log_off = off; g_utxo_lst.ckpt_n = 0;
+    if (off > g_wal_live_start && g_fz_punch_ok != 0){
+        if (syscall(SYS_fallocate, (int)g_utxo_lst.log_fd, FZ_FALLOC_PUNCH_HOLE | FZ_FALLOC_KEEP_SIZE, (off_t)g_wal_live_start, (off_t)(off - g_wal_live_start)) == 0){
+            g_fz_punch_ok = 1; g_fz_bytes_retired += (unsigned long)(off - g_wal_live_start);
+        } else {
+            fprintf(stderr, "[utxo_live] WARNING: fallocate(PUNCH_HOLE) on utxo.dat failed (%s): retired WAL generations keep their disk space until an inline flush truncates the log\n", strerror(errno));
+            g_fz_punch_ok = 0;
+        }
+    }
+    g_wal_live_start = off;
+}
+/* the parent's half, once the writer is gone. how: 1 = it wrote the run,
+ * 2 = it had nothing to write, 0 = it failed or was lost (build inline). */
+static void fz_adopt(int how){
+    double secs; { struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1); secs = (t1.tv_sec - g_fz_t0.tv_sec) + (t1.tv_nsec - g_fz_t0.tv_nsec) / 1e9; }
+    if (g_fz_pid){ g_fz_pid = 0; child_sig_release(); }
+    if (how == 0){
+        g_fz_inline++;
+        fprintf(stderr, "[utxo_live] WARNING: the flush writer for run %lu failed after %.1fs -- writing it inline from the frozen copy\n",
+                (unsigned long)g_utxo_lst.fz_run_no, secs);
+        unlink_run(g_utxo_lst.fz_run_no);
+        long r = utxo_lsm_build_run(&g_utxo_lst, g_utxo_lst.fz_u, g_utxo_lst.fz_tomb_buf, g_utxo_lst.fz_tomb_n, g_utxo_lst.fz_gen, g_utxo_lst.fz_run_no);
+        if (r < 0){ g_fz_fatal = 1; fprintf(stderr, "[utxo_live] FATAL: the inline build of run %lu failed too -- the frozen generation stays readable in memory and in the WAL; halting at the next put\n", (unsigned long)g_utxo_lst.fz_run_no); return; }
+        how = r == 1 ? 1 : 2;
+    }
+    if (how == 1){
+        if (g_utxo_lst.manifest_n >= g_utxo_lst.manifest_cap){ g_fz_fatal = 1; fprintf(stderr, "[utxo_live] FATAL: manifest full at the adopt of run %lu\n", (unsigned long)g_utxo_lst.fz_run_no); return; }
+        unsigned char* e = (unsigned char*)g_utxo_lst.manifest_buf + g_utxo_lst.manifest_n * 16;
+        memcpy(e, &g_utxo_lst.fz_gen, 8); memcpy(e + 8, &g_utxo_lst.fz_run_no, 8);
+        g_utxo_lst.manifest_n++;
+        u64 base = lsm_manifest_persisted_live();
+        u64 persist = (base != ~0ULL && g_fz_delta_known) ? base + g_fz_delta : ~0ULL;
+        if (lsm_manifest_publish(&g_utxo_lst, persist) != 0){
+            g_utxo_lst.manifest_n--; g_fz_fatal = 1;
+            fprintf(stderr, "[utxo_live] FATAL: could not publish the manifest with run %lu (%s) -- the run is an orphan, the generation stays in the WAL; halting at the next put\n", (unsigned long)g_utxo_lst.fz_run_no, strerror(errno));
+            return;
+        }
+    }
+    fz_retire_wal();
+    g_utxo_lst.fz_active = 0; g_utxo_lst.fz_tomb_n = 0;
+    g_fz_count++;
+    if (g_cfg.benchlog){
+        u64 bytes = 0; char nm[64]; snprintf(nm, sizeof nm, "utxo_run_%06u.dat", (unsigned)g_utxo_lst.fz_run_no);
+        struct stat sb; if (how == 1 && stat(nm, &sb) == 0) bytes = (u64)sb.st_size;
+        fprintf(stderr, "[bench] flush at block %ld: %.2f ms, %llu ops, run %06u %.3f MB, runs %llu, live %llu (async: writer %.1f s, frozen at block %ld, waits %lu, inline %lu)\n",
+                g_apply_height, (double)g_fz_freeze_ns / 1e6, (unsigned long long)g_fz_ops, (unsigned)g_utxo_lst.fz_run_no,
+                (double)bytes / 1e6, (unsigned long long)g_utxo_lst.manifest_n, (unsigned long long)g_utxo_lst.total_live,
+                secs, g_fz_height, g_fz_waits, g_fz_inline);
+    }
+}
+static int fz_status_how(int st){ return WIFEXITED(st) ? (WEXITSTATUS(st) == 0 ? 1 : WEXITSTATUS(st) == 3 ? 2 : 0) : 0; }
+static void fz_poll(void){
+    if (!g_fz_pid) return;
+    int st; pid_t r = waitpid(g_fz_pid, &st, WNOHANG);
+    if (r == g_fz_pid) fz_adopt(fz_status_how(st));
+    else if (r < 0 && errno != EINTR) fz_adopt(0);          /* lost (ECHILD): the run is rebuilt inline */
+}
+static void fz_wait(void){
+    if (!g_fz_pid) return;
+    int st; pid_t r;
+    while ((r = waitpid(g_fz_pid, &st, 0)) < 0 && errno == EINTR) {}
+    fz_adopt(r == g_fz_pid ? fz_status_how(st) : 0);
+}
+void utxo_live_flush_wait(void){ fz_wait(); }
+/* utxo_lsm_put/del's threshold crossing (bitcoin_utxo_lsm.asm's mac_freeze_hook): -1 is a flush error to the caller */
+static long fz_hook(void* lst, void* u){
+    if (g_fz_fatal) return -1;
+    if (g_fz_pid){ g_fz_waits++; fz_wait(); if (g_fz_fatal) return -1; }
+    u64 t0 = clock_ns();
+    g_fz_ops = g_utxo_lst.op_count; g_fz_height = g_apply_height;
+    { u64 base = lsm_manifest_persisted_live(); g_fz_delta_known = (base != ~0ULL); g_fz_delta = g_fz_delta_known ? g_utxo_lst.total_live - base : 0; }
+    long r = utxo_lsm_freeze(lst, u, g_fz_table);      /* the compaction gate runs inside it first, as in mac_flush */
+    if (r < 0) return -1;
+    if (r == 0) return 1;                               /* nothing to flush: the ops netted to an empty generation */
+    child_sig_acquire();
+    pid_t p = fork();
+    if (p < 0){
+        child_sig_release(); g_fz_inline++;
+        fprintf(stderr, "[utxo_live] fork for the flush writer failed (%s) -- writing run %lu inline\n", strerror(errno), (unsigned long)g_utxo_lst.fz_run_no);
+        clock_gettime(CLOCK_MONOTONIC, &g_fz_t0);
+        fz_adopt(0);
+        g_fz_freeze_ns = clock_ns() - t0;
+        return g_fz_fatal ? -1 : 1;
+    }
+    if (p == 0){
+        /* the writer: no stdio, no hooks, the run from the copy, then gone */
+        utxo_lsm_set_flush_hook(0); utxo_lsm_set_freeze_hook(0);
+        long cr = utxo_lsm_build_run(lst, g_utxo_lst.fz_u, g_utxo_lst.fz_tomb_buf, g_utxo_lst.fz_tomb_n, g_utxo_lst.fz_gen, g_utxo_lst.fz_run_no);
+        _exit(cr == 1 ? 0 : cr == 0 ? 3 : 2);
+    }
+    g_fz_pid = p; clock_gettime(CLOCK_MONOTONIC, &g_fz_t0);
+    g_fz_freeze_ns = clock_ns() - t0;
+    if (g_cfg.benchlog)
+        fprintf(stderr, "[bench] freeze at block %ld: %.2f ms, %llu ops, gen %llu run %06u -> writer pid %d\n",
+                g_apply_height, (double)g_fz_freeze_ns / 1e6, (unsigned long long)g_fz_ops,
+                (unsigned long long)g_utxo_lst.fz_gen, (unsigned)g_utxo_lst.fz_run_no, (int)p);
+    return 1;
+}
+/* a flush that is complete when it returns: the freeze + the writer awaited (the caught-up downshift, tests, ops) */
+long utxo_live_flush_now(void){
+    if (!g_fz_enabled) return utxo_lsm_flush(&g_utxo_lst, g_utxo_table);
+    if (fz_hook(&g_utxo_lst, g_utxo_table) < 0) return -1;
+    fz_wait();
+    return g_fz_fatal ? -1 : 1;
+}
+/* the shutdown path: the writer gets its seconds (its run is adopted, so the
+ * next boot replays one generation less); past 30 s it is killed and the
+ * generation replays from the WAL. */
+static void fz_shutdown(void){
+    if (!g_fz_pid) return;
+    int st; pid_t r; int waited_ms = 0;
+    while ((r = waitpid(g_fz_pid, &st, WNOHANG)) == 0 && waited_ms < 30000){ usleep(100000); waited_ms += 100; }
+    if (r == g_fz_pid && fz_status_how(st) != 0){ fz_adopt(fz_status_how(st)); return; }
+    if (r == 0){ kill(g_fz_pid, SIGKILL); while (waitpid(g_fz_pid, &st, 0) < 0 && errno == EINTR) {} }
+    fprintf(stderr, "[utxo_live] shutdown: the flush writer pid %d %s (its run is an orphan; the generation replays from the WAL)\n",
+            (int)g_fz_pid, r == 0 ? "killed after 30 s" : "had failed");
+    g_fz_pid = 0; child_sig_release();
+}
+
 /* the per-block line: v0 = g_tm_total at the block's start, t0/t1 its wall */
 static void bench_block_line(long h, const u64* v0, const u64* p0, u64 t0, u64 t1){
     double d[TM_WALL], e[TMP_N];
@@ -766,6 +967,17 @@ static inline int shutdown_requested(void){ return g_shutdown_flag && *g_shutdow
 static int g_recovery_checked = 0;
 static long g_recovery_result = 0;   /* utxo_live_recover_partial_block's verdict, once */
 
+/* The WAL bytes a reload would replay: the file past utxo.idx's log_off.
+ * Plan B3 (2026-10-06) retires a flushed generation by advancing that
+ * offset and punching its bytes out, so utxo.dat's LENGTH keeps every
+ * retired byte (a hole) for the life of the store -- st_size alone would
+ * call a steady-state store "a huge tail" at every boot after a sync. */
+static unsigned long long wal_tail_bytes(void){
+    struct stat wb; if (stat("utxo.dat", &wb) != 0) return 0;
+    unsigned long long off = 0; FILE* f = fopen("utxo.idx", "rb");
+    if (f){ unsigned char h[20]; if (fread(h, 1, 20, f) == 20){ u32 m; memcpy(&m, h, 4); if (m == 0x55545849u) memcpy(&off, h + 4, 8); } fclose(f); }
+    return (unsigned long long)wb.st_size > off ? (unsigned long long)wb.st_size - off : 0;
+}
 static void* mmap_file(const char* path, u64 size){
     int fd = open(path, O_RDWR | O_CREAT, 0644);
     if (fd < 0) { fprintf(stderr, "[utxo_live] open(%s) failed: %s\n", path, strerror(errno)); return 0; }
@@ -3154,11 +3366,10 @@ int utxo_live_init(const char* dir){
      * not resident memory, so over-selecting it is cheap and under-selecting
      * it is what wedges a restart. */
     {
-        struct stat wb;
-        if (!g_bulk_mode && stat("utxo.dat", &wb) == 0 &&
-            (unsigned long long)wb.st_size >= UTXO_LIVE_BULK_WAL_BYTES) {
+        unsigned long long tail = wal_tail_bytes();
+        if (!g_bulk_mode && tail >= UTXO_LIVE_BULK_WAL_BYTES) {
             fprintf(stderr, "[utxo_live] WAL tail is %lluMB -- bulk-sizing the memtable despite gap=%ld (see incident #32)\n",
-                    (unsigned long long)(wb.st_size >> 20), boot_gap);
+                    tail >> 20, boot_gap);
             g_bulk_mode = 1;
         }
     }
@@ -3230,6 +3441,28 @@ int utxo_live_init(const char* dir){
     g_utxo_lst.manifest_buf = manifest_buf; g_utxo_lst.manifest_cap = manifest_cap;
     g_utxo_lst.scratch_buf = scratch_buf; g_utxo_lst.scratch_cap = scratch_cap;
     utxo_lsm_set_flush_hook(compact_flush_hook);   /* see "compaction in the background" */
+    /* plan B3: the frozen copy (the applier's half of a flush copies into it)
+     * and the spare tombstone list. Anonymous and private: the writer is a
+     * forked child that reads it, nobody else maps it. Untouched until the
+     * first freeze (NORESERVE; the header's blob pointer and cap are all
+     * the freeze keeps of it). */
+    g_fz_table = 0; g_fz_enabled = 0;
+    if (g_cfg.async_flush){
+        void* fzt  = mmap(0, (size_t)ustruct, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        void* fzb  = mmap(0, (size_t)blob_cap, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        void* tomb2 = malloc(tomb_cap * 36);
+        if (fzt == MAP_FAILED || fzb == MAP_FAILED || !tomb2){
+            fprintf(stderr, "[utxo_live] WARNING: no memory for the frozen memtable copy -- the flush runs inline (bmc.asyncflush=0 behaviour)\n");
+            if (fzt != MAP_FAILED) munmap(fzt, (size_t)ustruct);
+            if (fzb != MAP_FAILED) munmap(fzb, (size_t)blob_cap);
+            free(tomb2);
+        } else {
+            madvise(fzt, (size_t)ustruct, MADV_HUGEPAGE); madvise(fzb, (size_t)blob_cap, MADV_HUGEPAGE);
+            ((u64*)fzt)[2] = (u64)(uintptr_t)fzb; ((u64*)fzt)[3] = blob_cap;   /* +16 blob, +24 blob_cap: what the freeze keeps */
+            g_fz_table = fzt;
+            g_utxo_lst.fz_u = fzt; g_utxo_lst.fz_tomb_buf = tomb2;
+        }
+    }
 
     /* Prior state can exist WITHOUT a manifest: utxo_manifest.dat is only
      * ever created at the first flush, but puts/dels before that point are
@@ -3310,6 +3543,17 @@ int utxo_live_init(const char* dir){
                 "utxo_manifest.dat", (unsigned)UTXO_LIVE_MANIFEST_CAP,
                 (unsigned)UTXO_LIVE_MANIFEST_CAP);
         return 0;
+    }
+    if (g_fz_table){
+        /* plan B3: from here a threshold crossing freezes and forks instead
+         * of flushing inline. The unretired generations start at the
+         * checkpoint offset the reload restored (0 on a fresh store). */
+        g_wal_live_start = g_utxo_lst.ckpt_log_off;
+        utxo_lsm_fz_enable(1);
+        utxo_lsm_set_freeze_hook(fz_hook);
+        g_fz_enabled = 1;
+        fprintf(stderr, "[utxo_live] flush: async (a forked writer per generation; the applier pays the copy) -- unretired WAL from byte %llu\n",
+                (unsigned long long)g_wal_live_start);
     }
 
     /* A reloaded manifest can already be at or near UTXO_LIVE_MANIFEST_CAP --
@@ -3806,6 +4050,7 @@ static long catchup_run(void* store_buf, long max_ms, int stop_at_hole){
          * (applied_height reset to -1) hit this wall at height 202134. */
         u64 tm_k0 = tm_now();
         compact_poll();                                   /* adopt a finished background merge */
+        fz_poll();                                        /* ...and a finished flush writer (plan B3) */
         g_apply_lag = tip > h ? tip - h : 0;
         compact_start_async(h, "mid-catchup");
         u64 tm_k1 = tm_lap(TM_FLUSH, tm_k0);              /* inline-fallback compaction, if any, lands here */
@@ -3875,13 +4120,14 @@ static long catchup_run(void* store_buf, long max_ms, int stop_at_hole){
         if (g_utxo_lst.log_len > 0) {
             unsigned long long before_n   = (unsigned long long)g_utxo_lst.manifest_n;
             unsigned long long before_len = (unsigned long long)g_utxo_lst.log_len;
-            long fr = utxo_lsm_flush(&g_utxo_lst, g_utxo_table);
-            if (fr == 1 && g_utxo_lst.log_len == 0)
+            long fr = utxo_live_flush_now();              /* plan B3: the freeze + the writer awaited (inline when async is off) */
+            unsigned long long left = g_utxo_lst.log_len - g_utxo_lst.ckpt_log_off;   /* the bytes a reload would replay */
+            if (fr == 1 && left == 0)
                 fprintf(stderr, "[utxo_live] caught up: flushed the WAL tail (%llu bytes, manifest_n %llu -> %llu) so the next reload has nothing to replay\n",
-                        before_len, before_n, (unsigned long long)g_utxo_lst.manifest_n);
+                        before_len - (unsigned long long)g_wal_live_start, before_n, (unsigned long long)g_utxo_lst.manifest_n);
             else
-                fprintf(stderr, "[utxo_live] WARNING: catch-up WAL flush did not complete (r=%ld, log_len=%llu of %llu): a restart before the next block will replay that tail into a steady-state memtable and be very slow -- daemon/flush_wal_tail is the manual remedy\n",
-                        fr, (unsigned long long)g_utxo_lst.log_len, before_len);
+                fprintf(stderr, "[utxo_live] WARNING: catch-up WAL flush did not complete (r=%ld, %llu bytes left of %llu): a restart before the next block will replay that tail into a steady-state memtable and be very slow -- daemon/flush_wal_tail is the manual remedy\n",
+                        fr, left, before_len);
         }
         /* (The coinstats index used to seed HERE from a walk; since
          * 2026-09-10 it folds per block from block 0 through the fold
@@ -3900,6 +4146,7 @@ static long catchup_run(void* store_buf, long max_ms, int stop_at_hole){
             fprintf(stderr, "[utxo_live] WARNING: failed to persist applied height %ld (will re-apply from the prior persisted height on next boot -- safe, puts/dels are idempotent)\n", g_applied_height);
         }
         compact_poll();
+        fz_poll();
         if (!shutdown_requested()) compact_start_async(g_applied_height, "post-catchup");
     }
     return applied;
@@ -4031,6 +4278,7 @@ static void ulwc_cb(void* ctx, const u8 key36[36], u64 value, u64 code,
 }
 long utxo_live_walk_count(void){
     long n = 0;
+    fz_wait();                                            /* plan B3: the walk reads the memtable and the runs; a frozen set must be in a run first */
     if (utxo_lsm_walk(&g_utxo_lst, g_utxo_table, (void*)ulwc_cb, &n) < 0) return -1;
     return n;
 }
@@ -4040,7 +4288,7 @@ long utxo_live_walk_count(void){
  * flushes DURING a ghost/heal cycle, which production hit at bulk scale and
  * the default test-sized thresholds never reach. */
 /* Test/ops: force a flush now (same call catch-up's own cadence makes). */
-long utxo_live_flush(void){ return utxo_lsm_flush(&g_utxo_lst, g_utxo_table); }
+long utxo_live_flush(void){ return utxo_live_flush_now(); }
 
 void utxo_live_set_flush_thresholds(u64 fill, u64 op){
     g_utxo_lst.fill_threshold = fill;

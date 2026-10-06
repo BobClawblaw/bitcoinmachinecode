@@ -63,7 +63,7 @@ node_config_t g_cfg = {
     .par                   = 0,      /* Core -par default: auto              */
     .dial_rate_limit       = 0,      /* bmc.dialratelimit: off unless set */
     .download_rate_limit_kbps = 0,   /* bmc.downloadratelimit: off unless set */
-    .coinstatshist_repair = 1, .coinstatshist_workers = 0, .benchlog = 0, .esplora_port = 0, .esplora_bind = "127.0.0.1",
+    .coinstatshist_repair = 1, .coinstatshist_workers = 0, .benchlog = 0, .async_flush = 1, .esplora_port = 0, .esplora_bind = "127.0.0.1",
     .upload_rate_limit_kbps = 0,     /* bmc.uploadratelimit: off unless set */
     .catchup_workers       = 10,     /* bmc.catchupworkers: peers downloading at once. Core's preferred-download set:
                                       * MAX_OUTBOUND_FULL_RELAY_CONNECTIONS 8 + MAX_BLOCK_RELAY_ONLY_CONNECTIONS 2
@@ -384,7 +384,7 @@ static void set_defaults(void){
     g_cfg.connect_timeout_ms    = 5000;     /* Core's -timeout default */
     g_cfg.peer_timeout_s        = 60;       /* Core's -peertimeout default */
     g_cfg.port                  = 8333;
-    g_cfg.coinstatshist_repair = 1; g_cfg.coinstatshist_workers = 0; g_cfg.benchlog = 0; g_cfg.esplora_port = 0; snprintf(g_cfg.esplora_bind, sizeof g_cfg.esplora_bind, "127.0.0.1");
+    g_cfg.coinstatshist_repair = 1; g_cfg.coinstatshist_workers = 0; g_cfg.benchlog = 0; g_cfg.async_flush = 1; g_cfg.esplora_port = 0; snprintf(g_cfg.esplora_bind, sizeof g_cfg.esplora_bind, "127.0.0.1");
     g_cfg.port_explicit         = 0;
     snprintf(g_cfg.chain, sizeof g_cfg.chain, "main");
     g_cfg.listen                = 1;
@@ -789,6 +789,8 @@ long node_config_load(const char* path){
             t=clamp_int(IV,0,64,key,&bad); if(t>=0){g_cfg.coinstatshist_workers=t;applied++;} }
         else if(!strcmp(key,"bmc.benchlog")){       /* EXTENSION (2026-10-04): [bench] stage-timing lines, see node_config.h */
             g_cfg.benchlog = IV?1:0; applied++; }
+        else if(!strcmp(key,"bmc.asyncflush")){     /* EXTENSION (2026-10-06, plan B3): the memtable flush in a forked writer; 0 = inline */
+            g_cfg.async_flush = IV?1:0; applied++; }
         else if(!strcmp(key,"bmc.esploraport")){   /* EXTENSION: the Esplora facade (rpc_esplora.c), 0 = off */
             t=clamp_int(IV,0,65535,key,&bad); if(t>=0){g_cfg.esplora_port=t;applied++;} }
         else if(!strcmp(key,"bmc.esplorabind")){
@@ -1373,9 +1375,9 @@ void node_config_log(void){
             g_cfg.min_usable_peers, g_cfg.maxpool, g_cfg.dlc_chunk_blocks, g_cfg.dl_shape_core ? "core" : "bmc", g_cfg.dlc_roll_below);
     fprintf(stderr,"[config] addr : max_per_response=%d max_per_netgroup=%d\n",
             g_cfg.addr_max_per_response, g_cfg.addr_max_per_netgroup);
-    fprintf(stderr,"[config] utxo : dbcache=%dMB -> bulk_slots=2^%d bulk_blob=%dMB bulk_gap=%ld compact_at=%d\n",
+    fprintf(stderr,"[config] utxo : dbcache=%dMB -> bulk_slots=2^%d bulk_blob=%dMB bulk_gap=%ld compact_at=%d asyncflush=%d\n",
             g_cfg.dbcache_mb, g_cfg.utxo_bulk_slots_log2, g_cfg.utxo_bulk_blob_mb,
-            g_cfg.utxo_bulk_gap_blocks, g_cfg.utxo_compact_threshold);
+            g_cfg.utxo_bulk_gap_blocks, g_cfg.utxo_compact_threshold, g_cfg.async_flush);
     fprintf(stderr,"[config] pool : maxmempool=%ldMB mempoolexpiry=%ldh maxuploadtarget=%ldMB\n",
             g_cfg.maxmempool_mb, g_cfg.mempoolexpiry_h, g_cfg.maxuploadtarget_mb);
     fprintf(stderr,"[config] mpol : minrelay=%ld inc=%ld sat/vB, anc=%ld/%ldkvB desc=%ld/%ldkvB fullrbf=%d\n",
