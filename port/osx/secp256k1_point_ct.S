@@ -10,6 +10,8 @@
  *   void point_scalar_mul_gen_ct(u64 r[12], const u64 k[4]);              k*G
  *   void point_scalar_mul_win_ct(u64 r[12], const u64 xy[8], const u64 k[4]);
  *   void point_scalar_mul_glv_ct(u64 r[12], const u64 xy[8], const u64 k[4]);  k < n
+ *   void point_scalar_mul_glvj_ct(u64 r[12], const u64 xy[8], const u64 k[4]); k < n
+ *   void pointj_add_ge_ct(u64 r[12], const u64 a[12], const u64 b[8]);    gej_add_ge
  *   void point_ct_force_scan(int p);        x86's AVX2/cmov scan knob: a no-op
  *
  * The three routines after the ladder are x86 main #330/#334's (2026-09-28),
@@ -495,18 +497,6 @@ _point_scalar_mul_win_ct:
     str   x9, [sp, #\dst + \off]
     .endr
 .endm
-/* point_scalar_mul_glvj_ct(out[12], xy[8], k[4]): main's second
- * constant-time k*P (2026-10-02, x86 secp256k1_point_ct.asm: libsecp256k1's
- * ecmult_const, Jacobian, 15.9 us against 24.9). Same contract as the routine
- * below -- k < n, Jacobian out, canonical infinity (1, 1, 0) -- so until the
- * Jacobian body is ported it IS the routine below: constant time, the same
- * point, the old speed. test_pointmul_ct_variants checks it against the
- * ladder; test_pointj_add_ge_ct (its add, pointj_add_ge_ct) is N/A here. */
-    .p2align 2
-    .globl _point_scalar_mul_glvj_ct
-_point_scalar_mul_glvj_ct:
-    b     _point_scalar_mul_glv_ct
-
     .p2align 2
     .globl _point_scalar_mul_glv_ct
 _point_scalar_mul_glv_ct:
@@ -606,6 +596,419 @@ _point_scalar_mul_glv_ct:
     ldp   x29, x30, [sp], #64
     ret
 
+/* ============================================================================
+ * JACOBIAN CONSTANT-TIME GLV MULTIPLY -- libsecp256k1's secp256k1_ecmult_const
+ * (v31.1's subtree), the port of x86 main's 2026-10-02 routine (dc63c274;
+ * asm/secp256k1_point_ct.asm carries the full derivation). In short:
+ *   * signed odd digits: every 5-bit group selects +-(2i+1)P, never the
+ *     identity, and the accumulator is seeded from the top group;
+ *   * pointj_add_ge_ct, Brier-Joye's unified add (gej_add_ge, 7M + 5S): the
+ *     a == -b and the y1 == -y2 cases by csel of an alternative lambda, a =
+ *     infinity by a final csel of b;
+ *   * the Jacobian _point_double (straight-line, a = 0, prime order).
+ * The table holds odd multiples of the PUBLIC point, built with the ordinary
+ * _point_add_mixed_zr on the isomorphic curve with one shared Z.
+ * Recoding: s = (k + K)/2 mod n, s = s1 + lambda*s2, v1 = s1 + 2^128,
+ * v2 = s2 + 2^128; 26 groups of 5 bits each; a group with top bit b4 and low
+ * bits b selects entry (b4 ? b : ~b) & 15 and negates y when b4 == 0.
+ * 125 doubles + 51 adds. The digit reaches a cmp (the scan) and a mask (the
+ * y negation) only; the bit offsets depend on the group counter only.
+ * x86 scans by AVX2 or cmov per its CPU probe; the Mac has the one csel scan.
+ * fe_add / fe_sub keep every value canonical, as x86's inline FE_ADDM /
+ * FE_SUBM do, which the zero tests and the halving rely on.
+ * ========================================================================== */
+
+/* \reg := ([b + o] == 0) ? -1 : 0 (4 limbs); x9..x12 */
+.macro ZMASK reg, b, o
+    add   x13, \b, #\o
+    ldp   x9, x10, [x13]
+    ldp   x11, x12, [x13, #16]
+    orr   x9, x9, x10
+    orr   x11, x11, x12
+    orr   x9, x9, x11
+    cmp   x9, #0
+    csetm \reg, eq
+.endm
+/* [sp + d] := [sp + s] where the mask at [sp + m] meets \cond (eq: the mask
+ * is zero, ne: it is set); 4 limbs */
+.macro FCSEL d, s, m, cond
+    ldr   x15, [sp, #\m]
+    cmp   x15, #0
+    .irp off, 0, 8, 16, 24
+    ldr   x9, [sp, #\d + \off]
+    ldr   x10, [sp, #\s + \off]
+    csel  x9, x10, x9, \cond
+    str   x9, [sp, #\d + \off]
+    .endr
+.endm
+/* [b + o] := -[b + o'] mod p */
+.macro FNEG db, do, sb, so
+    add   x0, \db, #\do
+    adrp  x1, Lct_zero@PAGE
+    add   x1, x1, Lct_zero@PAGEOFF
+    add   x2, \sb, #\so
+    bl    _fe_sub
+.endm
+
+/* ----------------------------------------------------------------------------
+ * pointj_add_ge_ct(r=x0, a=x1, b=x2): r = a + b, a Jacobian (Z = 0 is
+ *   infinity), b affine and NOT infinity. secp256k1_gej_add_ge line for line,
+ *   as x86's. Result infinity is Z3 = 0. r may alias a. No branch.
+ * frame: zz 0, u2 32, s2 64, t 96, m 128, rr 160, malt 192, tt 224,
+ *   rralt 256, n 288, q 320, z3 352, x3 384, y3 416, degenerate 448,
+ *   a-infinity 456 -> 464. x19 r, x20 a, x21 b
+ * -------------------------------------------------------------------------- */
+    .p2align 2
+    .globl _pointj_add_ge_ct
+_pointj_add_ge_ct:
+    stp   x29, x30, [sp, #-48]!
+    stp   x19, x20, [sp, #16]
+    str   x21, [sp, #32]
+    mov   x29, sp
+    sub   sp, sp, #464
+    mov   x19, x0
+    mov   x20, x1
+    mov   x21, x2
+    ZMASK x14, x20, 64
+    str   x14, [sp, #456]                       /* a is infinity */
+    FE2   fe_sqr, sp, 0,   x20, 64              /* zz = Z1^2 */
+    FE3   fe_mul, sp, 32,  x21, 0,  sp, 0       /* u2 = X2*Z1^2 */
+    FE3   fe_mul, sp, 64,  x21, 32, sp, 0       /* s2 = Y2*Z1^2 */
+    FE3   fe_mul, sp, 64,  sp, 64,  x20, 64     /* s2 = S2 = Y2*Z1^3 */
+    FE3   fe_add, sp, 96,  x20, 0,  sp, 32      /* t = T = U1 + U2 */
+    FE3   fe_add, sp, 128, x20, 32, sp, 64      /* m = M = S1 + S2 */
+    ZMASK x14, sp, 128
+    str   x14, [sp, #448]                       /* degenerate = (M == 0) */
+    FE2   fe_sqr, sp, 160, sp, 96               /* rr = T^2 */
+    FNEG  sp, 192, sp, 32                       /* malt = -U2 */
+    FE3   fe_mul, sp, 224, x20, 0,  sp, 192     /* tt = -U1*U2 */
+    FE3   fe_add, sp, 160, sp, 160, sp, 224     /* rr = R = T^2 - U1*U2 */
+    FE3   fe_add, sp, 256, x20, 32, x20, 32     /* rralt = 2*S1 */
+    FE3   fe_add, sp, 192, sp, 192, x20, 0      /* malt = U1 - U2 */
+    FCSEL 256, 160, 448, eq                     /* !degenerate: rralt = rr */
+    FCSEL 192, 128, 448, eq                     /* !degenerate: malt = m */
+    FE2   fe_sqr, sp, 288, sp, 192              /* n = Malt^2 */
+    FNEG  sp, 320, sp, 96                       /* q = -T */
+    FE3   fe_mul, sp, 320, sp, 320, sp, 288     /* q = Q = -T*Malt^2 */
+    FE2   fe_sqr, sp, 288, sp, 288              /* n = Malt^4 */
+    FCSEL 288, 128, 448, ne                     /* degenerate: n = M (= 0) */
+    FE2   fe_sqr, sp, 96,  sp, 256              /* t = Ralt^2 */
+    FE3   fe_mul, sp, 352, x20, 64, sp, 192     /* Z3 = Malt*Z1 */
+    FE3   fe_add, sp, 384, sp, 96,  sp, 320     /* X3 = Ralt^2 + Q */
+    FE3   fe_add, sp, 96,  sp, 384, sp, 384
+    FE3   fe_add, sp, 96,  sp, 96,  sp, 320     /* t = 2*X3 + Q */
+    FE3   fe_mul, sp, 96,  sp, 96,  sp, 256     /* t = Ralt*(2*X3 + Q) */
+    FE3   fe_add, sp, 96,  sp, 96,  sp, 288     /* t += M^3*Malt */
+    FNEG  sp, 416, sp, 96
+    /* Y3 = -t/2: add p when odd, shift the 257-bit sum right by one */
+    ldp   x3, x4, [sp, #416]
+    ldp   x5, x6, [sp, #432]
+    and   x7, x3, #1
+    neg   x7, x7                                /* all-ones iff odd */
+    movz  x8, #0x03D1
+    movk  x8, #0x0001, lsl #32
+    neg   x8, x8                                /* p limb 0; limbs 1..3 all-ones */
+    and   x8, x8, x7
+    adds  x3, x3, x8
+    adcs  x4, x4, x7
+    adcs  x5, x5, x7
+    adcs  x6, x6, x7
+    cset  x9, cs
+    extr  x3, x4, x3, #1
+    extr  x4, x5, x4, #1
+    extr  x5, x6, x5, #1
+    extr  x6, x9, x6, #1
+    stp   x3, x4, [sp, #416]
+    stp   x5, x6, [sp, #432]
+    /* a infinity: r = (b.x, b.y, 1). a is not read past this point. */
+    ldr   x15, [sp, #456]
+    cmp   x15, #0
+    .irp off, 0, 8, 16, 24
+    ldr   x9, [sp, #384 + \off]
+    ldr   x10, [x21, #\off]
+    csel  x9, x10, x9, ne
+    str   x9, [x19, #\off]
+    ldr   x9, [sp, #416 + \off]
+    ldr   x10, [x21, #32 + \off]
+    csel  x9, x10, x9, ne
+    str   x9, [x19, #32 + \off]
+    .endr
+    mov   x11, #1
+    ldp   x9, x10, [sp, #352]
+    csel  x9, x11, x9, ne
+    csel  x10, xzr, x10, ne
+    stp   x9, x10, [x19, #64]
+    ldp   x9, x10, [sp, #368]
+    csel  x9, xzr, x9, ne
+    csel  x10, xzr, x10, ne
+    stp   x9, x10, [x19, #80]
+    add   sp, sp, #464
+    ldr   x21, [sp, #32]
+    ldp   x19, x20, [sp, #16]
+    ldp   x29, x30, [sp], #48
+    ret
+
+/* Lsc_half(r=x0, a=x1): r = a/2 mod n, a < n -- secp256k1_scalar_half:
+ * (a >> 1) + (a odd ? n//2 + 1 : 0), no overflow. Leaf. */
+    .p2align 2
+Lsc_half:
+    ldp   x3, x4, [x1]
+    ldp   x5, x6, [x1, #16]
+    and   x7, x3, #1
+    neg   x7, x7
+    extr  x3, x4, x3, #1
+    extr  x4, x5, x4, #1
+    extr  x5, x6, x5, #1
+    lsr   x6, x6, #1
+    adrp  x8, Lctj_nh1@PAGE
+    add   x8, x8, Lctj_nh1@PAGEOFF
+    ldp   x9, x10, [x8]
+    ldp   x11, x12, [x8, #16]
+    and   x9, x9, x7
+    and   x10, x10, x7
+    and   x11, x11, x7
+    and   x12, x12, x7
+    adds  x3, x3, x9
+    adcs  x4, x4, x10
+    adcs  x5, x5, x11
+    adc   x6, x6, x12
+    stp   x3, x4, [x0]
+    stp   x5, x6, [x0, #16]
+    ret
+
+/* x23 := table index, [sp + 544] := the negate mask, for group x22 of the
+ * 129-bit scalar at [sp + v]. The bit offset depends on the group counter
+ * only. */
+.macro GLVJ_DIGIT v
+    mov   x9, #5
+    mul   x9, x22, x9                           /* bit offset */
+    lsr   x10, x9, #6                           /* limb (0 or 1) */
+    and   x9, x9, #63
+    add   x11, sp, #\v
+    add   x11, x11, x10, lsl #3
+    ldp   x12, x13, [x11]
+    lsr   x12, x12, x9
+    lsl   x13, x13, #1
+    mvn   x14, x9                               /* 63 - c (the shift takes it mod 64) */
+    lsl   x13, x13, x14                         /* hi << (64 - c); 0 when c == 0 */
+    orr   x12, x12, x13
+    and   x12, x12, #31                         /* the group's 5 bits */
+    lsr   x13, x12, #4
+    eor   x13, x13, #1                          /* negative = top bit clear */
+    neg   x14, x13
+    eor   x14, x14, x12
+    and   x23, x14, #15                         /* index */
+    neg   x13, x13                              /* 0 or all-ones */
+    str   x13, [sp, #544]
+.endm
+/* T at [sp + 96] := +-entry x23 of the 16 x 64-byte table at [sp + tb]:
+ * every entry read, the digit meets only the cmp; then y := p - y under the
+ * mask (y != 0 on the curve). x23, x24 */
+.macro GLVJ_LOOKUP tb
+    add   x24, sp, #\tb
+    mov   x25, #0
+7:  cmp   x25, x23
+    .irp off, 0, 8, 16, 24, 32, 40, 48, 56
+    ldr   x9, [x24, #\off]
+    ldr   x10, [sp, #96 + \off]
+    csel  x10, x9, x10, eq
+    str   x10, [sp, #96 + \off]
+    .endr
+    add   x24, x24, #64
+    add   x25, x25, #1
+    cmp   x25, #16
+    b.lo  7b                                    /* counter only */
+    FNEG  sp, 512, sp, 128
+    FCSEL 128, 512, 544, ne
+.endm
+
+/* ----------------------------------------------------------------------------
+ * point_scalar_mul_glvj_ct(out=x0, xy=x1, k=x2): out = k*P, CONSTANT TIME in
+ *   k, Jacobian out; k < n (as point_scalar_mul_glv_ct). k == 0 yields the
+ *   canonical infinity (1, 1, 0). Falls back to point_scalar_mul_win_ct if
+ *   the split's identity check fails (a defect, never a value).
+ * frame: R 0 (96), T 96 (64), S 160, V1 192, V2 224, D 256 (96), AI 352 (96),
+ *   ZG 448, ZS 480, TMP 512, neg mask 544, ZR 576 (16 x 32),
+ *   TA 1088 (16 x 64), TL 2112 (16 x 64) -> 3136.
+ *   x19 out, x20 xy, x21 k, x22 group / table counter, x23 index, x24/x25 scan
+ * -------------------------------------------------------------------------- */
+    .p2align 2
+    .globl _point_scalar_mul_glvj_ct
+_point_scalar_mul_glvj_ct:
+    stp   x29, x30, [sp, #-64]!
+    stp   x19, x20, [sp, #16]
+    stp   x21, x22, [sp, #32]
+    stp   x23, x24, [sp, #48]
+    stp   x25, x26, [sp, #-16]!
+    mov   x29, sp
+    sub   sp, sp, #3136
+    mov   x19, x0
+    mov   x20, x1
+    mov   x21, x2
+    /* ---- s = (k + K)/2 ; s = s1 + lambda*s2 ; v = s + 2^128 ---- */
+    add   x0, sp, #160
+    mov   x1, x21
+    adrp  x2, Lctj_k@PAGE
+    add   x2, x2, Lctj_k@PAGEOFF
+    bl    _sc_add
+    add   x0, sp, #160
+    add   x1, sp, #160
+    bl    Lsc_half
+    add   x0, sp, #192
+    add   x1, sp, #224
+    add   x2, sp, #160
+    bl    _sc_split_lambda
+    cbz   w0, 9f
+    add   x0, sp, #192
+    add   x1, sp, #192
+    adrp  x2, Lctj_2p128@PAGE
+    add   x2, x2, Lctj_2p128@PAGEOFF
+    bl    _sc_add
+    add   x0, sp, #224
+    add   x1, sp, #224
+    adrp  x2, Lctj_2p128@PAGE
+    add   x2, x2, Lctj_2p128@PAGEOFF
+    bl    _sc_add
+    /* ---- odd multiples (2i+1)P, i < 16, on the isomorphic curve ---- */
+    CP64  sp, 352, x20, 0                       /* AI := (x, y, 1) */
+    SETONE sp, 416
+    add   x0, sp, #256
+    add   x1, sp, #352
+    bl    _point_double                         /* D := 2*AI ; C := D.z */
+    FE2   fe_sqr, sp, 480, sp, 320
+    FE3   fe_mul, sp, 1088, x20, 0,  sp, 480    /* TA[0] = (x*C^2, y*C^3) */
+    FE3   fe_mul, sp, 480,  sp, 480, sp, 320
+    FE3   fe_mul, sp, 1120, x20, 32, sp, 480
+    CP64  sp, 352, sp, 1088                     /* AI := (TA[0], 1) */
+    CP32  sp, 576, sp, 320                      /* ZR[0] := C */
+    mov   x22, #1
+1:  add   x0, sp, #352
+    add   x1, sp, #352
+    add   x2, sp, #256                          /* d_ge = (D.x, D.y) */
+    add   x3, sp, #576
+    add   x3, x3, x22, lsl #5                   /* &ZR[i] */
+    bl    _point_add_mixed_zr
+    add   x14, sp, #1088
+    add   x14, x14, x22, lsl #6
+    add   x13, sp, #352
+    .irp off, 0, 16, 32, 48
+    ldp   x9, x10, [x13, #\off]
+    stp   x9, x10, [x14, #\off]
+    .endr
+    add   x22, x22, #1
+    cmp   x22, #16
+    b.lo  1b                                    /* counter only */
+    FE3   fe_mul, sp, 448, sp, 416, sp, 320     /* ZG := AI.z * C */
+    /* globalz: TA[j] (j = 14..0) scaled by ZR[j+1]*...*ZR[15] */
+    CP32  sp, 480, sp, 576 + 15*32
+    mov   x22, #14
+2:  cmp   x22, #14
+    b.eq  3f
+    add   x0, sp, #480
+    add   x1, sp, #480
+    add   x2, sp, #576
+    add   x9, x22, #1
+    add   x2, x2, x9, lsl #5
+    bl    _fe_mul
+3:  FE2   fe_sqr, sp, 512, sp, 480
+    add   x0, sp, #1088
+    add   x0, x0, x22, lsl #6
+    mov   x1, x0
+    add   x2, sp, #512
+    bl    _fe_mul
+    FE3   fe_mul, sp, 512, sp, 512, sp, 480
+    add   x0, sp, #1120
+    add   x0, x0, x22, lsl #6
+    mov   x1, x0
+    add   x2, sp, #512
+    bl    _fe_mul
+    subs  x22, x22, #1
+    b.pl  2b
+    /* TL[i] = (beta*TA[i].x, TA[i].y) */
+    mov   x22, #0
+4:  add   x0, sp, #2112
+    add   x0, x0, x22, lsl #6
+    add   x1, sp, #1088
+    add   x1, x1, x22, lsl #6
+    adrp  x2, Lct_beta@PAGE
+    add   x2, x2, Lct_beta@PAGEOFF
+    bl    _fe_mul
+    add   x13, sp, #1120
+    add   x13, x13, x22, lsl #6
+    add   x14, sp, #2144
+    add   x14, x14, x22, lsl #6
+    ldp   x9, x10, [x13]
+    stp   x9, x10, [x14]
+    ldp   x9, x10, [x13, #16]
+    stp   x9, x10, [x14, #16]
+    add   x22, x22, #1
+    cmp   x22, #16
+    b.lo  4b
+    /* ---- the top group seeds R; then 25 x (5 doubles, two adds) ---- */
+    mov   x22, #25
+    GLVJ_DIGIT 192
+    GLVJ_LOOKUP 1088
+    CP64  sp, 0, sp, 96
+    SETONE sp, 64
+    b     6f
+5:  .rept 5
+    mov   x0, sp
+    mov   x1, sp
+    bl    _point_double
+    .endr
+    GLVJ_DIGIT 192
+    GLVJ_LOOKUP 1088
+    mov   x0, sp
+    mov   x1, sp
+    add   x2, sp, #96
+    bl    _pointj_add_ge_ct
+6:  GLVJ_DIGIT 224
+    GLVJ_LOOKUP 2112
+    mov   x0, sp
+    mov   x1, sp
+    add   x2, sp, #96
+    bl    _pointj_add_ge_ct
+    subs  x22, x22, #1
+    b.pl  5b                                    /* counter only */
+    /* ---- leave the isomorphic curve: Z *= ZG; Z == 0 -> (1, 1, 0) ---- */
+    FE3   fe_mul, x19, 64, sp, 64, sp, 448
+    ZMASK x14, x19, 64
+    cmp   x14, #0
+    mov   x11, #1
+    ldp   x9, x10, [sp, #0]
+    csel  x9, x11, x9, ne
+    csel  x10, xzr, x10, ne
+    stp   x9, x10, [x19, #0]
+    ldp   x9, x10, [sp, #16]
+    csel  x9, xzr, x9, ne
+    csel  x10, xzr, x10, ne
+    stp   x9, x10, [x19, #16]
+    ldp   x9, x10, [sp, #32]
+    csel  x9, x11, x9, ne
+    csel  x10, xzr, x10, ne
+    stp   x9, x10, [x19, #32]
+    ldp   x9, x10, [sp, #48]
+    csel  x9, xzr, x9, ne
+    csel  x10, xzr, x10, ne
+    stp   x9, x10, [x19, #48]
+    b     8f
+9:  mov   x0, x19                               /* the split failed its identity check */
+    mov   x1, x20
+    mov   x2, x21
+    bl    _point_scalar_mul_win_ct
+8:  /* the scalars and the selected digits' points held secrets */
+    add   x9, sp, #96
+    .irp off, 0, 16, 32, 48, 64, 80, 96, 112, 128, 144
+    stp   xzr, xzr, [x9, #\off]
+    .endr
+    add   sp, sp, #3136
+    ldp   x25, x26, [sp], #16
+    ldp   x23, x24, [sp, #48]
+    ldp   x21, x22, [sp, #32]
+    ldp   x19, x20, [sp, #16]
+    ldp   x29, x30, [sp], #64
+    ret
+
 /* point_ct_force_scan(p): x86's AVX2-or-cmov scan selection; the Mac has one
  * scan, so the knob is accepted and ignored. */
     .p2align 2
@@ -623,3 +1026,9 @@ Lct_beta:
     .quad 0xC1396C28719501EE, 0x9CF0497512F58995, 0x6E64479EAC3434E9, 0x7AE96A2B657C0710
 Lct_zero:
     .quad 0, 0, 0, 0
+Lctj_k:         /* K = (2^130 - 2^129 - 1)(1 + lambda) mod n */
+    .quad 0xB5C2C1DCDE9798D9, 0x589AE84826BA29E4, 0xC2BDD6BF7C118D6B, 0xA4E88A7DCB13034E
+Lctj_2p128:
+    .quad 0, 0, 1, 0
+Lctj_nh1:       /* n//2 + 1 */
+    .quad 0xDFE92F46681B20A1, 0x5D576E7357A4501D, 0xFFFFFFFFFFFFFFFF, 0x7FFFFFFFFFFFFFFF

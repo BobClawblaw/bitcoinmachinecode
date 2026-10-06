@@ -65,9 +65,6 @@ X86_ONLY = {
 }
 # x86 code the Mac has not ported yet, with the reason the report shows
 NOT_PORTED = {
-    # main #366+ (2026-10-02): pointj_add_ge_ct, the Jacobian add of
-    # point_scalar_mul_glvj_ct; the Mac's glvj_ct is its glv_ct until then
-    "test_pointj_add_ge_ct": "pointj_add_ge_ct not ported (glvj_ct = glv_ct on the Mac; port/OSX_STATE.md)",
 }
 FINAL_OK = {"PASS", "SKIP", "N/A"}
 
