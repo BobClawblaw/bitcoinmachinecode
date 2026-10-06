@@ -123,6 +123,11 @@ void tsp_boot(void* store_buf){
     fprintf(stderr, "[txospender] tail active: base to=%ld covered=%ld (backfilled %ld)\n", base_to, g_covered, n < 0 ? 0 : n);
 }
 int tsp_active(void){ return g_fd >= 0; }
+/* 2026-10-06 (plan B4): drop this process's handle and watermark so the
+ * next *_boot re-reads them from the files -- after the index worker, which
+ * appended and rotated the tail from its own copy of this state, has
+ * stopped. */
+void tsp_close(void){ if (g_fd >= 0) close(g_fd); g_fd = -1; g_covered = -1; }
 void tsp_on_truncate(void* store_buf){
     if (g_fd < 0) return;
     long tip = *(int*)((uint8_t*)store_buf + 24);
