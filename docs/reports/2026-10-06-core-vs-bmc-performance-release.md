@@ -1,10 +1,11 @@
 # Core v31.1 vs bmc — performance for the first release
 
 Every number here comes from a log or a script named beside it; nothing is
-estimated. The bmc numbers are run 37 (2026-10-06, main `8e81ffb5`), the
-Core numbers are rerun #6 (2026-10-04, v31.1). Run 34 is kept as the
-"before" column: the same bmc code family under Core's own download rules,
-before the 2026-10-05 batches.
+estimated. The bmc numbers are run 38 (2026-10-06, main `020b13dc`, the
+index worker of PR #390), the Core numbers are rerun #6 (2026-10-04,
+v31.1). Run 37 (main `8e81ffb5`, the same morning, before the index
+worker) and run 34 (the same bmc code family under Core's own download
+rules, before the 2026-10-05 batches) are kept as the "before" columns.
 
 ## 0. Setup
 
@@ -20,71 +21,84 @@ bmc's `[ready]` line. A proc sampler (PSS, anonymous, CPU every 5 s) ran
 beside the bmc run; Core's rerun had none (its CPU time is systemd's
 "Consumed" line; its peak memory was not captured).
 
-| | Core rerun #6 | bmc run 34 (Core's download rules) | bmc run 37 (bmc's rules, this release) |
-|---|---|---|---|
-| started (UTC) | 2026-10-04 18:20:24 | 2026-10-05 05:05:34 | 2026-10-06 00:06:24 |
-| commit | v31.1 | 56bbe8c2 | 8e81ffb5 |
-| download rules | Core's | Core's (`bmc.dlshape=core`) | bmc's (ranked peers, rotation, first-eviction reassignment) |
-| logs | `bench/core31-rerun6-20261004-logs/` | `bench/run34/` | `bench/run37/` (debug.log copied beside the harness logs) |
-| correctness | — | — | UTXO muhash identical to Core at 970,133 (harness capstone) |
+| | Core rerun #6 | bmc run 34 (Core's download rules) | bmc run 37 (bmc's rules) | bmc run 38 (+ index worker, this release) |
+|---|---|---|---|---|
+| started (UTC) | 2026-10-04 18:20:24 | 2026-10-05 05:05:34 | 2026-10-06 00:06:24 | 2026-10-06 06:42:09 |
+| commit | v31.1 | 56bbe8c2 | 8e81ffb5 | 020b13dc |
+| download rules | Core's | Core's (`bmc.dlshape=core`) | bmc's (ranked peers, rotation, first-eviction reassignment) | run 37's |
+| index writers | callback threads | on the applier | on the applier | a forked index worker during the download (PR #390) |
+| logs | `bench/core31-rerun6-20261004-logs/` | `bench/run34/` | `bench/run37/` (debug.log copied beside the harness logs) | `bench/run38/` (same) |
+| correctness | — | — | UTXO muhash identical to Core at 970,133 (harness capstone) | identical at 970,165 |
 
 ## 1. Initial block download, genesis to every index at the tip
 
-| | Core #6 | bmc 34 | bmc 37 | bmc 37 / Core |
-|---|---|---|---|---|
-| headers → first block | 1:15 | 5:06 | 1:58 | 1.57 |
-| 100,000 | 4:12 | — | 5:22 | 1.28 |
-| 200,000 | 8:15 | — | 9:22 | 1.13 |
-| 300,000 | 23:34 | — | 16:03 | 0.68 |
-| 500,000 | 2:02:42 | 1:19:05 | 0:58:53 | 0.48 |
-| 800,000 | 6:35:51 | 3:40:38 | 2:54:02 | 0.44 |
-| 900,000 | 9:01:23 | 5:23:05 | 4:03:31 | 0.45 |
-| IBD end (tip stored + applied) | 10:41:21 | 7:16:01 | 4:49:12 | 0.45 |
-| **every index at the tip** | **10:42:05** | **7:17:39** | **4:50:52** | **0.45** |
-| CPU time consumed, all processes | 13 h 50 m (journal) | — | 8 h 17 m (sampler, 29,819 s) | 0.60 |
-| peak memory | not captured | — | see §5 | — |
+| | Core #6 | bmc 34 | bmc 37 | bmc 38 | bmc 38 / Core |
+|---|---|---|---|---|---|
+| headers → first block | 1:15 | 5:06 | 1:58 | 1:39 | 1.32 |
+| 100,000 | 4:12 | — | 5:22 | 5:08 | 1.22 |
+| 200,000 | 8:15 | — | 9:22 | 9:03 | 1.10 |
+| 300,000 | 23:34 | — | 16:03 | 15:52 | 0.67 |
+| 500,000 | 2:02:42 | 1:19:05 | 0:58:53 | 0:55:42 | 0.45 |
+| 800,000 | 6:35:51 | 3:40:38 | 2:54:02 | 2:35:50 | 0.39 |
+| 900,000 | 9:01:23 | 5:23:05 | 4:03:31 | 3:35:43 | 0.40 |
+| IBD end (tip stored + applied) | 10:41:21 | 7:16:01 | 4:49:12 | 4:15:43 | 0.40 |
+| **every index at the tip** | **10:42:05** | **7:17:39** | **4:50:52** | **4:17:09** | **0.40** |
+| CPU time consumed, all processes | 13 h 50 m (journal) | — | 8 h 17 m (sampler, 29,819 s) | 7 h 48 m (sampler, 28,108 s) | 0.56 |
+| peak memory | not captured | — | see §5 | see §5 | — |
 
-Milestones and segment walls: `docs/reports/2026-10-06-run37-vs-core6-stage-report.md`
-(validation/ibd_stage_report.py). Core is ahead for the first 200,000
-blocks (by 70 s at 100,000 and 67 s at 200,000): tiny blocks, where the
-wall is round trips, not bytes, and bmc's chunked requests pay one more
-round trip per 16 blocks than Core's per-block pipeline. From 300,000 on
-bmc is ahead in every segment, by 2.1–2.5×.
+Milestones and segment walls: `docs/reports/2026-10-06-run38-vs-core6-stage-report.md`
+(validation/ibd_stage_report.py; run 37's is beside it). Core is ahead
+for the first 200,000 blocks (by 56 s at 100,000 and 48 s at 200,000):
+tiny blocks, where the wall is round trips, not bytes, and bmc's chunked
+requests pay one more round trip per 16 blocks than Core's per-block
+pipeline. From 300,000 on bmc is ahead in every segment, by 2.2–2.9×.
 
-Download, run 37: 60,650 chunks, 774 GB, 68 distinct peers; per-chunk wait
-p50 0.05 s, p90 0.15 s; 7 stall evictions over the run, every one answered
-by its worker within a millisecond and its chunk reassigned to an idle
-worker at the first signal (0 unanswered); no apply gap over 45 s during
-the download. The applier waited for blocks 2,180 s in all against Core's
-24,587 s (§2): with ranked peers the download is no longer the bound.
+Download, run 38: 60,639 chunks, 774 GB, 25 distinct peers; per-chunk wait
+p50 0.06 s, p90 0.08 s; 2 stall evictions over the run, both answered by
+their worker and the chunk reassigned at the first signal (0 unanswered;
+run 37 had 7); no apply gap over 45 s during the download. The applier
+waited for blocks 2,193 s in all against Core's 24,587 s (§2): with ranked
+peers the download is no longer the bound. Run 38 took 33 minutes off run
+37 with the download rules unchanged: the index worker (§2) took the
+index writes off the applier, and the applier's own UTXO columns fell with
+them (less contention in the applying process: get 4,650 → 4,096 s, put
+5,687 → 4,994 s).
 
 ## 2. Where the applier's time goes (thread-seconds over the whole chain)
 
-| | Core #6 | bmc 34 | bmc 37 |
-|---|---|---|---|
-| applier busy (Core: connect block; bmc: the block line's total) | 13,909 | 17,166 | 14,602 |
-| applier waiting for blocks / outside connect | 24,587 | 9,757 | 2,180 |
-| UTXO (Core: connect txs + flush + write chainstate + coins flushes; bmc: get + put + ckpt + flush) | ~11,185 | 13,863 | 11,956 |
-| ↳ put | — | 7,812 | 5,687 |
-| ↳ put split (ins / get / undo / del / wal) | — | — | 1,662 / 928 / 2,622 / 66 / 59 |
-| ↳ memtable / cache flush (inline on the applier) | 803 | 1,350 | 1,403 (110 flushes) |
-| script verification | 113 (wait on 15 threads) | 773 | 775 |
-| block read | 2,289 | 124 | 211 |
-| per-block index work on the applier (idx + csi + txindex + bfilter) | 5 | 2,360 | 2,306 |
+| | Core #6 | bmc 34 | bmc 37 | bmc 38 |
+|---|---|---|---|---|
+| applier busy (Core: connect block; bmc: the block line's total) | 13,909 | 17,166 | 14,602 | **13,363** |
+| applier waiting for blocks / outside connect | 24,587 | 9,757 | 2,180 | 2,193 |
+| UTXO (Core: connect txs + flush + write chainstate + coins flushes; bmc: get + put + ckpt + flush) | ~11,185 | 13,863 | 11,956 | 10,804 |
+| ↳ put | — | 7,812 | 5,687 | 4,994 |
+| ↳ put split (ins / get / undo / del / wal) | — | — | 1,662 / 928 / 2,622 / 66 / 59 | 1,377 / 933 / 2,242 / 57 / 44 |
+| ↳ memtable / cache flush (inline on the applier) | 803 | 1,350 | 1,403 (110 flushes) | 1,360 (109 flushes) |
+| script verification | 113 (wait on 15 threads) | 773 | 775 | 744 |
+| block read | 2,289 | 124 | 211 | 195 |
+| per-block index work on the applier (idx + csi + txindex + bfilter) | 5 | 2,360 | 2,306 | 1,576 (idx 1,149 + csi 427; txindex + bfilter 0.2) |
+| index writes off the applier (Core: callback threads; bmc: the index worker) | not logged | — | — | 688 (txindex 336 + bfilter 352; 969,746 blocks) |
 
-bmc's applier is now 5% slower per block than Core's (it was 23%). The
-UTXO put fell 27% (the undo capture reuses the resolved prevout, PR #383);
-the split names what is left: the undo record (2,622 s) and the insert
-(1,662 s) are the two halves of put, the WAL and the tombstone are
-negligible. The two columns still off Core's shape are the inline flush
-(1,403 s; Core's cache flush is 803 s and its writes are batched) and the
-inline index work (2,306 s; Core does its index writes on callback threads,
-5 s on the validation thread). Those are plan items B3 and B4
-(`worklog/2026-10-05-performance-holes-plan.md`); with both off the
-applier, the apply path would be ~10,900 s against Core's 13,909.
+bmc's applier is now 4% faster per block than Core's (run 37: 5% slower;
+run 34: 23% slower). Run 37's UTXO put fell 27% from run 34 (the undo
+capture reuses the resolved prevout, PR #383); run 38's index worker (PR
+#390) took the txindex and filter writes off the applier -- 693 s of
+inline work in run 37 became 688 s in a forked process that trails the
+applier by ~20 blocks -- and the applier's remaining columns fell with
+them (put 5,687 → 4,994 s, get 4,650 → 4,096 s: the applying process no
+longer shares its page cache and CPU with four index writers). The put
+split names what is left: the undo record (2,242 s) and the insert
+(1,377 s) are the two halves of put, the WAL and the tombstone are
+negligible. Two columns remain off Core's shape: the inline flush (1,360
+s; Core's cache flush is 803 s and its writes are batched) and the
+per-block `idx` and `csi` steps (1,576 s; Phase 0.5 and the coinstats
+fold, inside the block line). The flush is plan item B3
+(`worklog/2026-10-05-performance-holes-plan.md`); with it off the
+applier the apply path would be ~12,000 s against Core's 13,909.
 
-bmc wins the sync by overlapping download and apply, not by a faster apply
-path: the "waiting" row is the whole story of the 2.2×.
+bmc wins the sync mostly by overlapping download and apply: the "waiting"
+row is 22,400 of the 23,000 thread-seconds between the two runs. The apply
+path itself is now ahead as well, by 546 s over the chain.
 
 (The stage report's total row subtracted the put sub-timers a second time
 and printed "other = −5,289 s" on the first render of run 37; fixed in
@@ -167,13 +181,20 @@ Since `deploy-20261006b` the serve process also holds the txindex tail's
 hash table: 4 bytes a slot at ≤ 3/4 load, 128–256 MB over the fold cycle
 (not in run 37's figures).
 
-Memory, bmc run 37, proc sampler every 5 s over every process of the
-daemon's tree: anonymous (heap) memory held 26.4 GB steadily through the
-sync, peaked once at 35.2 GB (04:15Z, a compaction), PSS peaked at 67.7 GB
-(03:15Z) — PSS counts the archive's mapped pages, which the kernel drops
-under pressure, so it is a ceiling, not a footprint. A 53.6 GB anonymous
-spike at 04:57:43Z came after `[ready]`, from the harness's own capstone
-(eight hash workers for the muhash), not from the sync. Core's rerun had no
+Memory, bmc run 38, proc sampler every 5 s over every process of the
+daemon's tree: anonymous (heap) memory held 27.9 GB steadily through the
+sync (mean 27.5 GB; run 37: 26.4 GB), PSS peaked at 66.9 GB (09:30Z; run
+37: 67.7 GB) — PSS counts the archive's mapped pages, which the kernel
+drops under pressure, so it is a ceiling, not a footprint; it rises and
+falls with each memtable generation (18 → 60 GB over ~70 minutes, back to
+18 GB at the flush). The index worker added no measurable anonymous
+memory (it maps the same files). Between IBD end and two minutes after
+`[ready]` anonymous memory rose to 44.9 GB and briefly 53.6 GB (procs 7–8:
+the serve process taking the tail's blocks, then the caught-up downshift's
+compaction and fold workers), then settled at 10.6 GB at the tip. Run 37
+showed the same 53.6 GB at the same point; this report's first version
+attributed it to the harness's capstone, which in fact ran three minutes
+later (the harness polls the log every few minutes). Core's rerun had no
 sampler; the memory row has one side and is not a comparison. The plan's
 next Core rerun carries the sampler.
 
@@ -181,13 +202,14 @@ next Core rerun carries the sampler.
 
 | category | result | bmc / Core |
 |---|---|---|
-| sync, genesis to every index at the tip | **bmc, 2.2×** | 4:50:52 vs 10:42:05 |
-| every milestone from 300,000 up | **bmc, 2.1–2.5×** | §1 |
-| CPU time for the sync | **bmc** | 8 h 17 m vs 13 h 50 m |
-| download: applier time spent waiting | **bmc, 11×** less | 2,180 s vs 24,587 s |
-| headers → first block | Core | 1:58 vs 1:15 (was 5:06) |
-| the first 200,000 blocks | Core, by ~70 s | round-trip bound; §1 |
-| apply path per block (thread-seconds) | Core, by 5% | 14,602 vs 13,909 (was 23%) |
+| sync, genesis to every index at the tip | **bmc, 2.5×** | 4:17:09 vs 10:42:05 (run 37: 4:50:52) |
+| every milestone from 300,000 up | **bmc, 2.2–2.9×** | §1 |
+| CPU time for the sync | **bmc, 1.8×** less | 7 h 48 m vs 13 h 50 m |
+| download: applier time spent waiting | **bmc, 11×** less | 2,193 s vs 24,587 s |
+| headers → first block | Core | 1:39 vs 1:15 (was 5:06, then 1:58) |
+| the first 200,000 blocks | Core, by ~50 s | round-trip bound; §1 |
+| apply path per block (thread-seconds) | **bmc, by 4%** | 13,363 vs 13,909 (run 37: Core by 5%; run 34: by 23%) |
+| index writes, on the applier | parity (both off it) | 0.2 s vs 5 s; the worker's 688 s runs beside the applier as Core's callback threads do |
 | RPC: getblockcount, getblockhash, getmempoolinfo, getpeerinfo | parity | 4–5 ms both |
 | RPC: getrawmempool, 32 clients | **bmc, 2.3×**, on a pool 2.7× larger | 216 vs 496 ms |
 | RPC: getblock v2, 32 clients | mixed: wave 15% faster, median 20% slower | §3 |
@@ -202,15 +224,16 @@ next Core rerun carries the sampler.
 | peak memory | not comparable yet | Core unmeasured |
 | correctness | identical | muhash at 970,133 |
 
-Not yet beaten, with the fix named: the apply path per block (B3 async
-flush, B4 async index work; §2), the first 200,000 blocks and the header
-phase (per-block requests on the early chain; plan B9), getblock v2's
-median at 32 clients (lane width; plan A5). The memory row needs the Core
-rerun with the sampler before it can be claimed either way. The two RPC
-losses the 05:20Z rows found were fixed and deployed the same morning
-(§3).
+Not yet beaten, with the fix named: the first 200,000 blocks and the
+header phase (per-block requests on the early chain; plan B9), getblock
+v2's median at 32 clients (lane width; plan A5). The apply path per block
+moved from Core's column to bmc's with run 38 (the index worker, PR #390);
+the flush (plan B3) is the remaining column off Core's shape in §2. The
+memory row needs the Core rerun with the sampler before it can be claimed
+either way. The two RPC losses the 05:20Z rows found were fixed and
+deployed the same morning (§3).
 
-## 7. What changed between run 34 and run 37
+## 7. What changed between run 34 and run 38
 
 Runs 35 and 36 were started on the way and stopped: run 35 (main
 `0319e1eb`) at 72% when a download worker never answered its eviction and
@@ -258,9 +281,23 @@ misreporting. Neither is in the tables.
   restarts): getrawtransaction by the record's byte range and the tail's
   hash index; the BIP9 walk cached per period boundary. §3 carries the
   before/after.
-- **Not done, stated:** the double-buffered memtable flush (B3) and the
-  async index work (B4) — the flush and inline-index rows in §2 are
-  unchanged from run 34, as predicted.
+- **Index writes off the applier** (PR #390, `edb09c4c`, run 38): during
+  the download the applier pushes each connected height onto a 1,024-slot
+  ring in the shared status block and a forked index worker reads the
+  block from the archive and runs the txid tail, the txospender tail, the
+  filter index and the address journal, publishing the watermarks the
+  `[ready]` line gates on; the trailing builders' folds go through the
+  same ring so the process holding a tail's fd is the one that rotates it.
+  At the download's end a STOP record drains the ring and the parent
+  re-boots its writer state from the files; the tip's blocks are indexed
+  inline as before. Run 38: 969,746 blocks indexed in the worker, which
+  trailed the applier by ~20 blocks the whole run and stopped within 1 s
+  of the download's end; the stage report counts its lines in their own
+  column (`ixw`). Ready 4:50:52 → 4:17:09; applier 14,602 → 13,363 s.
+- **Not done, stated:** the double-buffered memtable flush (B3) — the
+  flush row in §2 is unchanged from run 34, as predicted — and the 60–70 s
+  pause after IBD end while the serve process faults the memtable in (B8,
+  diagnosed; it is inside run 38's 86 s from IBD end to ready).
 
 ## 8. Method and reproducibility
 

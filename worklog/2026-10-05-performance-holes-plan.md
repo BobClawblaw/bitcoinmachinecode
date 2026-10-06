@@ -273,7 +273,19 @@ gone from the lock log.
 The reader lane is narrower than Core's thread pool. Widen the per-thread
 lane (more concurrent readers) once A7's rwlock pattern exists; measure the
 32-client median.
-### B8. The 100 s tail after IBD end has a 62 s pause
+### B8. The 100 s tail after IBD end has a 62 s pause — DIAGNOSED 10-06
+Run 37's sampler and stall watcher over 04:55:36–04:56:38: the catch-up's
+applier (the dlc child) finished; the serve process took the remaining 694
+blocks ("applying before syncing legs") and sat in state D
+(folio_wait_bit_common) for a minute while its RSS grew 48 → 74 GB and the
+box read 11 GB -- the shared memtable (utxo_lsm_blob.map 6 GB +
+table.map 1.6 GB) and the run set being faulted into the serve process
+before its first block; no compaction ran in that window (the 13 GB merge
+started at 04:57:22, after the downshift). Dirty pages were 27 MB, so not
+writeback throttling. Fix: apply the drain in the process that already
+holds the set (the dlc child), or pre-fault the maps in the serve process
+while the download still runs. ~60 s once per sync; after B3/B4.
+Original note:
 Run 37: no block line between 04:55:36 and 04:56:38 while the daemon
 switched to live mode (relay dials); the catch-up then finished at
 9.7 blk/s. Name the pause (a checkpoint? the dial burst taking the apply
@@ -290,10 +302,13 @@ GB in a compaction). A per-subsystem `[mem]` line under benchlog at the MEM
 marks (memtable, header tree, download window, index builders, RPC caches),
 and the Core rerun WITH the sampler so the row has two sides.
 
-Order (A7 and A8 done 10-06): B4 → B3 (the applier target) → B8 → A5 →
+Order (A7, A8 and B4 done 10-06): B3 (the applier target) → B8 → A5 →
 B9 → M1 alongside the Core rerun.
 Exit for the next release run: ready ≤ 4:30, applier ≤ 12,000 s,
 getrawtransaction ≤ 10 ms at 32 clients, no exclusive hold ≥ 1 s.
+Run 38 (B4, 10-06 11:00Z): ready **4:17:09** (exit met), applier 13,363 s
+(Core 13,909; target 12,000 still open: the flush, B3), getrawtransaction
+5 ms, no exclusive hold ≥ 2 s on production.
 
 ### B4 — built 2026-10-06 (branch perf/2026-10-06-b4-index-worker)
 `daemon/index_worker.{c,h}`: the applier pushes (BLOCK h) onto a 1,024-slot
@@ -315,3 +330,16 @@ killed worker, SIGTERM ignored); revert-checked with three mutants (5, 3
 and 6 FAIL). Measurement: the next ranked run's §2 -- ix txindex/bfilter
 columns go from the applier's 693 s to the worker's lines, the applier's
 wall by as much.
+
+**DONE 10-06, run 38 (main `020b13dc`, PR #390 merged):** ready 4:17:09
+(run 37: 4:50:52), applier 14,602 → 13,363 s against Core's 13,909 -- the
+apply path is ahead of Core's for the first time. The worker indexed
+969,746 blocks (txindex 336 s + bfilter 352 s in its own process), trailed
+the applier by ~20 blocks, stopped within 1 s of the download's end, no
+unreadable block, no death. The applier's other columns fell too (put
+5,687 → 4,994, get 4,650 → 4,096): the applying process no longer shares
+its cache with the writers. Follow-ups in the same batch: the worker's
+started/stopped lines printed without a timestamp (`log_ts.h` after
+`<stdio.h>`); `validation/ibd_stage_report.py` brackets the index lines
+between the worker's started/stopped lines into an `ixw` column (off the
+wall) with a selftest check and a mutant (3 FAIL).
