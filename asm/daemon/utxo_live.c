@@ -3462,6 +3462,11 @@ int utxo_live_init(const char* dir){
             ((u64*)fzt)[2] = (u64)(uintptr_t)fzb; ((u64*)fzt)[3] = blob_cap;   /* +16 blob, +24 blob_cap: what the freeze keeps */
             g_fz_table = fzt;
             g_utxo_lst.fz_u = fzt; g_utxo_lst.fz_tomb_buf = tomb2;
+            /* M1: named for maps/smaps and the [mem] line (the writer's copy
+             * of the table and blob prefix; virtual until the first freeze) */
+            benchlog_mem_name_region(fzt, (size_t)ustruct, "utxo-frozen-table");
+            benchlog_mem_name_region(fzb, (size_t)blob_cap, "utxo-frozen-blob");
+            benchlog_mem_name_region(tomb2, tomb_cap * 36, "utxo-frozen-tombstones");
         }
     }
 
