@@ -2206,6 +2206,49 @@ static long txi_runs_from(void){
 static u64 g_txi_tail_sz;          /* mapped size, bytes (whole records only) */
 static long g_txi_tail_maxh = -1;  /* highest height among mapped records */
 
+/* ---- the tail's hash index (2026-10-06) ---------------------------------
+ * "The scan is linear, which is fine because the tail only ever holds the
+ * span since the last offline rebuild": it holds up to 20,000 blocks
+ * between folds -- 564 MB / 28M records on production, 904 MB in run 37 --
+ * and getrawtransaction for a RECENT transaction, the common query, cost
+ * 14 ms against 3 ms for one in a sorted run, the lane serialising 32
+ * clients to 374 ms. An open-addressing table of record numbers keyed by
+ * the 8-byte prefix: 4 bytes a slot, a power of two at most 3/4 full
+ * (256 MB for 45M records), built by txi_tail_refresh over the records it
+ * has not seen yet -- the first refresh after a restart indexes the whole
+ * tail (~1 s per 10M records, under the lane lock, once); a tail that
+ * shrank (folded into runs) drops it and starts over. A lookup probes from
+ * the prefix's slot to the first empty one and verifies every candidate,
+ * so a stale or duplicate record is skipped exactly as the scan skipped
+ * it. With no memory for the table the scan remains. */
+#define TXI_TIX_EMPTY 0xFFFFFFFFu
+static u32* g_txi_tix;        /* slots: a record number, or TXI_TIX_EMPTY */
+static u64  g_txi_tix_cap;    /* a power of two, >= 64 */
+static u64  g_txi_tix_n;      /* records indexed: [0, n) of the mapped tail */
+long g_txi_tail_cmp;          /* test seam: tail records whose prefix a lookup compared */
+static u64 txi_tix_slot(const u8* key8, u64 cap){
+    u64 k = 0; memcpy(&k, key8, 8);
+    return (k * 0x9E3779B97F4A7C15ull) >> (64 - __builtin_ctzll(cap));
+}
+static void txi_tix_drop(void){ free(g_txi_tix); g_txi_tix = NULL; g_txi_tix_cap = 0; g_txi_tix_n = 0; }
+static void txi_tix_build(u64 to_rec){
+    u64 from = g_txi_tix_n;
+    u64 need = to_rec + to_rec / 3 + 64, cap = 64; while (cap < need) cap <<= 1;
+    if (!g_txi_tix || cap > g_txi_tix_cap || from > to_rec){
+        txi_tix_drop(); from = 0;
+        if (to_rec >= TXI_TIX_EMPTY) return;
+        g_txi_tix = malloc((size_t)cap * sizeof *g_txi_tix);
+        if (!g_txi_tix) return;
+        memset(g_txi_tix, 0xFF, (size_t)cap * sizeof *g_txi_tix); g_txi_tix_cap = cap;
+    }
+    for (u64 i = from; i < to_rec; i++){
+        u64 sl = txi_tix_slot(g_txi_tail + i * TXI_REC, g_txi_tix_cap);
+        while (g_txi_tix[sl] != TXI_TIX_EMPTY) sl = (sl + 1) & (g_txi_tix_cap - 1);
+        g_txi_tix[sl] = (u32)i;
+    }
+    g_txi_tix_n = to_rec;
+}
+
 /* RPX-8 (audit 2026-09-03): the txid-index coverage range, in one place.
  *
  * getrawtransaction and gettxoutproof both tell a caller which heights the
@@ -2237,12 +2280,13 @@ static void txi_tail_refresh(void){
     close(fd);
     if (m == MAP_FAILED) return;
     g_txi_tail = m; g_txi_tail_sz = sz;
-    if (scanned > sz){ scanned = 0; g_txi_tail_maxh = -1; }  /* shrank: folded into a rebuilt base */
+    if (scanned > sz){ scanned = 0; g_txi_tail_maxh = -1; txi_tix_drop(); }  /* shrank: folded into a rebuilt base */
     for (u64 o = scanned; o + TXI_REC <= sz; o += TXI_REC){
         const u8* r = g_txi_tail + o;
         u32 hh = 0; for (int b = 0; b < 4; b++) hh |= (u32)r[8+b] << (8*b);
         if ((long)hh > g_txi_tail_maxh) g_txi_tail_maxh = (long)hh;
     }
+    txi_tix_build(sz / TXI_REC);
 }
 
 /* VERIFY one candidate record: read the transaction out of the archive and
@@ -2315,8 +2359,20 @@ static int txi_lookup_locked(const u8 txid_wire[32], long* h_out, u32* off_out, 
     }
     /* not in any run -- the tail covers the heights after them */
     txi_tail_refresh();
-    for (u64 o = 0; g_txi_tail && o + TXI_REC <= g_txi_tail_sz; o += TXI_REC){
+    if (g_txi_tail && g_txi_tix && g_txi_tix_n * TXI_REC == g_txi_tail_sz){
+        u64 sl = txi_tix_slot(txid_wire, g_txi_tix_cap);
+        for (u64 n = 0; n < g_txi_tix_cap; n++, sl = (sl + 1) & (g_txi_tix_cap - 1)){
+            u32 rec = g_txi_tix[sl];
+            if (rec == TXI_TIX_EMPTY) break;
+            const u8* r = g_txi_tail + (u64)rec * TXI_REC;
+            g_txi_tail_cmp++;
+            if (memcmp(r, txid_wire, 8)) continue;
+            if (txi_verify_rec(r, txid_wire, h_out, off_out, len_out)) return 1;
+        }
+    } else
+    for (u64 o = 0; g_txi_tail && o + TXI_REC <= g_txi_tail_sz; o += TXI_REC){   /* no table (no memory): the scan */
         const u8* r = g_txi_tail + o;
+        g_txi_tail_cmp++;
         if (memcmp(r, txid_wire, 8)) continue;
         if (txi_verify_rec(r, txid_wire, h_out, off_out, len_out)) return 1;
     }

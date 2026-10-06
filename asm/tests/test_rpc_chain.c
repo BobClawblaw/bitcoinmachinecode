@@ -2167,6 +2167,40 @@ int main(void){
       }
       ck("grt v1 by txid == the block path's object minus in_active_chain, member for member (blockhash, confirmations, time, blocktime included)", same);
       rj_free(fb); rj_free(bb); }
+    /* 2026-10-06: the tail is hash-indexed (txi_tix). It held up to 20,000
+     * blocks between folds (28M records on production) and every lookup
+     * for a recent transaction scanned it from the start: 14 ms a call
+     * against 3 ms for a run record, 374 ms at 32 clients. The tail is
+     * rewritten here with 100,000 random records BEFORE the fixture's
+     * (height 3, a range no block has: the verify refuses them as it
+     * refuses any stale record), through the index's own follow-the-file
+     * rule: a one-record tail first (smaller: the index is dropped and
+     * rebuilt), then the full one (larger: the new records are indexed).
+     * A lookup then compares a handful of candidates, not the tail; the
+     * scan would compare the 100,000 first. */
+    { extern long g_txi_tail_cmp;
+      long osz = 0; unsigned char* orig = NULL;
+      { FILE* f = fopen("txindex.tail", "rb"); if (f){ fseek(f, 0, SEEK_END); osz = ftell(f); fseek(f, 0, SEEK_SET); orig = malloc((size_t)osz); if (orig && fread(orig, 1, (size_t)osz, f) != (size_t)osz) osz = 0; fclose(f); } }
+      ck("tail: the fixture tail was read back", orig && osz >= 20);
+      unsigned char* rnd = malloc(100000 * 20);
+      unsigned long long x = 0x9E3779B97F4A7C15ull;
+      for (int i = 0; rnd && i < 100000; i++){
+          unsigned char* rec = rnd + i * 20;
+          for (int b = 0; b < 8; b++){ x ^= x << 13; x ^= x >> 7; x ^= x << 17; rec[b] = (unsigned char)x; }
+          rec[8] = 3; rec[9] = rec[10] = rec[11] = 0;                        /* height 3 */
+          rec[12] = 0xF0; rec[13] = 0xFF; rec[14] = 0xFF; rec[15] = 0x7F;    /* off 2 GB: outside the block */
+          rec[16] = 100; rec[17] = rec[18] = rec[19] = 0;
+      }
+      char pj[96]; snprintf(pj, sizeof pj, "[\"%s\"]", g_tx2_txid);
+      { FILE* f = fopen("txindex.tail", "wb"); if (f && rnd){ fwrite(rnd, 1, 20, f); fclose(f); } }   /* one record: smaller -> dropped and rebuilt */
+      { long e2 = 0; const char* m2 = NULL; rj_val* z = call("getrawtransaction", pj, &e2, &m2); ck("tail: with the one-record tail tx2 is NOT found (the index followed the file down)", z == NULL && e2 == -5); rj_free(z); }
+      { FILE* f = fopen("txindex.tail", "wb"); if (f && rnd && orig){ fwrite(rnd, 1, 100000 * 20, f); fwrite(orig, 1, (size_t)osz, f); fclose(f); } }
+      g_txi_tail_cmp = 0;
+      rj_val* a = call("getrawtransaction", pj, &ec, &em);
+      char want[1100]; tohex(want, g_tx2, g_tx2_len);
+      ck_str("tail index: tx2 (a tail record) resolves by txid behind 100,000 random records", a && a->typ == RJ_STR ? a->str : NULL, want);
+      ck("tail index: the lookup compared a handful of tail records, not the 100,000 before it", g_txi_tail_cmp > 0 && g_txi_tail_cmp <= 64);
+      rj_free(a); free(rnd); free(orig); }
       /* 2026-10-01: rpc_chain_tx_blockhash, the facade batch's index-only
        * lookup (getrawtransaction would consult the mempool first) */
       { extern int rpc_chain_tx_blockhash(const char*, char[65]);
