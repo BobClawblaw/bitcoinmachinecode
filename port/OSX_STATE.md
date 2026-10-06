@@ -15,6 +15,7 @@ Merge: 95 commits, two conflicts — `tx_relay.c` (main's `txr_v2_buffered` skip
 - **`test_dlc_header_probe`** (new, 4 fake peers on 127.0.0.1–4): SKIPs without the aliases via `loopback_alias.h`, and a failed peer start stops the peers already up — it had aborted and orphaned a listener that held the harness's pipe for 17 minutes.
 - **Full suite:** 423 PASS, 11 SKIP, 15 N/A, **0 FAIL** (449 commands).
 - **Deploy:** `60370d45` on both nodes (snapshots `bmcbitcoind.pre-60370d45`), started 16:55Z. Mainnet caught up 969,531 → 970,205 (`[ready]` at 970,054 in 179 s; `[ixw] index worker` started), tip = mempool.space's hash, 58k pool, `limitclustercount 64, optimal true`. Signet 325,084 → 325,220 = mempool.space, 11/11 peers. No FATAL/REJECT/crash/pool-lock lines in the first 15 minutes.
+- **Restart at login (launchd):** `~/Library/LaunchAgents/com.bmc.{mainnet,signet}.plist` run each deploy home's `start.sh` at load (`RunAtLoad`, `AbandonProcessGroup` so the node survives `start.sh` exiting, no `KeepAlive` so `stop.sh` still stops it; output to `logs/launchd.log`). Loaded 17:20Z: both printed "already running" and left the nodes alone. They fire at login, not at boot; FileVault is on, so the boot unlock is the login and the nodes come up with it.
 
 ## 2026-10-01 (22:00Z) — main #362–#365 merged (`c07d8602`): the mempool follows Core v31.1; one Core oracle; MAIN_C_HDRS
 
