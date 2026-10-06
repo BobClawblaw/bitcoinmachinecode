@@ -754,7 +754,7 @@ def render(core, bmc, size):
             tot.blocks += g.blocks
             twall += wall or 0.0
         total = tot.st.get("total", 0)
-        parts = sum(tot.st.get(x, 0) for x in stages)
+        parts = sum(tot.st.get(x, 0) for x in stages if "." not in x)   # 2026-10-06: the total row subtracted the dotted splits too (run 37: other = -5289 s)
         ixsum = sum(tot.st.get("ix:" + x, 0) for x in ixcols)
         row = [fs(twall), fmt_h(tot.blocks), fs(total / 1000)]
         row += [fs(tot.st.get(x, 0) / 1000) for x in stages]
@@ -961,6 +961,7 @@ some line with a NUL \x00 in it
 2026-10-05 01:00:25.000 [utxo_live] catchup progress: height=2/3 (66.7%) 0.1 blk/s
 2026-10-05 01:00:30.000 [bench] block 3: 1 tx, 0 txin | read 0.1 | idx 0.1 | verify 0.0 | get 0.0 | put 0.1 | ckpt 0.0 | flush 0.0 | csi 0.0 | total 0.4 ms | put.ins 0.04 | put.get 0.01 | put.undo 0.02 | put.del 0.01 | put.wal 0.02
 2026-10-05 01:00:30.001 [bench] index 3: txindex 0.1 | txospender 0.0 | bfilter 0.1 | addr 0.0 | zmq 0.1 ms
+2026-10-05 01:00:30.500 [bench] block 4: 2 tx, 2 txin | read 0.1 | idx 0.1 | verify 0.0 | get 0.0 | put 400.0 | ckpt 0.0 | flush 0.0 | csi 0.0 | total 400.5 ms | put.ins 50.0 | put.get 0.0 | put.undo 300.0 | put.del 0.0 | put.wal 50.0
 2026-10-05 01:00:31.000 [dlc] catch-up done: 3 new blocks written
 2026-10-05 01:00:45.678 [ready] all indexes at height 3 (utxo 3, txindex 3, bfilter 3, coinstats 3) -- 15s
 """
@@ -1081,6 +1082,16 @@ def selftest():
         ck("bmc ready elapsed, truncated like ibd_milestones.sh (45.678 s)", "| 0:00:45 |" in md, True)
         ck("hms truncates", hms(3599.99), "0:59:59")
         ck("bmc/Core ratio column present", "bmc/Core" in md, True)
+        # 2026-10-06: the total row's "other" subtracted the dotted splits
+        # (put.ins ...) a second time (run 37: -5289 s); it must equal the
+        # segment rows' sum
+        bt = md[md.index("## bmc: stages per segment"):]
+        hdr = [h.strip() for h in bt.splitlines()[2].split("|")]
+        oi = hdr.index("other")
+        rows = [l for l in bt.splitlines() if l.startswith("| ") and "|" in l[2:]]
+        segs = [float(l.split("|")[oi]) for l in rows if l.split("|")[1].strip()[0].isdigit()]
+        totl = [float(l.split("|")[oi]) for l in rows if "**total**" in l][0]
+        ck("bmc total row's other = the segment rows' sum (dotted splits not subtracted twice)", abs(totl - sum(segs)) < 0.06, True)
         md2 = render(None, p, 10000)
         ck("one side alone renders", "## bmc: stages per segment" in md2 and "## Core" not in md2, True)
     finally:

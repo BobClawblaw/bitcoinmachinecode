@@ -1,68 +1,140 @@
 # Core v31.1 vs bmc — performance for the first release
 
-DRAFT, being filled as run 35 completes. Every number here comes from a log
-or a script named beside it; nothing is estimated.
+Every number here comes from a log or a script named beside it; nothing is
+estimated. The bmc numbers are run 37 (2026-10-06, main `8e81ffb5`), the
+Core numbers are rerun #6 (2026-10-04, v31.1). Run 34 is kept as the
+"before" column: the same bmc code family under Core's own download rules,
+before the 2026-10-05 batches.
 
 ## 0. Setup
 
 One machine, both nodes one at a time for the sync, both live for the RPC
-rows. Core v31.1 from source (`/storage/bitcoin-core-v31.1`), bmc from main
-(commit filled in below). Sync runs: fresh datadir on the same NVMe
-(/srv/nvme8tb), `dbcache=8192`, txindex + coinstatsindex + blockfilterindex,
-assumevalid = the chain default on both (both logs show scripts skipped
-through 938,343), 10 download peers, 1,024-block window. Core: `debug=bench`,
-`debug=coindb`, `logtimemicros=1`. bmc: `bmc.benchlog=1`. The finish line on
-both sides is "every index at the tip": Core's first `getindexinfo` after its
-`UpdateTip` at the oracle's tip; bmc's `[ready]` line.
+rows. Core v31.1 from source (`/storage/bitcoin-core-v31.1`), bmc from main.
+Sync runs: fresh datadir on the same NVMe (/srv/nvme8tb), `dbcache=8192`,
+txindex + coinstatsindex + blockfilterindex, assumevalid = the chain default
+on both (both logs show scripts skipped through 938,343), 10 download peers,
+1,024-block window. Core: `debug=bench`, `debug=coindb`, `logtimemicros=1`.
+bmc: `bmc.benchlog=1`. The finish line on both sides is "every index at the
+tip": Core's first `getindexinfo` after its `UpdateTip` at the oracle's tip;
+bmc's `[ready]` line. A proc sampler (PSS, anonymous, CPU every 5 s) ran
+beside the bmc run; Core's rerun had none (its CPU time is systemd's
+"Consumed" line; its peak memory was not captured).
 
-| | Core rerun #6 | bmc run 34 (Core's download rules) | bmc run 35 (bmc's rules, optimized) |
+| | Core rerun #6 | bmc run 34 (Core's download rules) | bmc run 37 (bmc's rules, this release) |
 |---|---|---|---|
-| started (UTC) | 2026-10-04 18:20:24 | 2026-10-05 05:05:34 | |
-| commit | v31.1 | 56bbe8c2 | |
-| download rules | Core's | Core's (`bmc.dlshape=core`) | bmc's (ranked peers, rotation) |
-| logs | `bench/core31-rerun6-20261004-logs/` | `bench/run34/` | `bench/run35/` |
+| started (UTC) | 2026-10-04 18:20:24 | 2026-10-05 05:05:34 | 2026-10-06 00:06:24 |
+| commit | v31.1 | 56bbe8c2 | 8e81ffb5 |
+| download rules | Core's | Core's (`bmc.dlshape=core`) | bmc's (ranked peers, rotation, first-eviction reassignment) |
+| logs | `bench/core31-rerun6-20261004-logs/` | `bench/run34/` | `bench/run37/` (debug.log copied beside the harness logs) |
+| correctness | — | — | UTXO muhash identical to Core at 970,133 (harness capstone) |
 
 ## 1. Initial block download, genesis to every index at the tip
 
-| | Core #6 | bmc 34 | bmc 35 | best bmc / Core |
+| | Core #6 | bmc 34 | bmc 37 | bmc 37 / Core |
 |---|---|---|---|---|
-| headers → first block | 1:15 | 5:06 | | |
-| 500,000 | 2:02:42 | 1:19:05 | | |
-| 800,000 | 6:35:51 | 3:40:38 | | |
-| 900,000 | 9:01:23 | 5:23:05 | | |
-| IBD end (tip stored + applied) | 10:41:21 | 7:16:01 | | |
-| **every index at the tip** | **10:42:05** | **7:17:39** | | |
-| CPU time consumed (journal / proc sampler) | 13 h 50 m | — | | |
-| peak RSS | — (not captured) | — | | |
+| headers → first block | 1:15 | 5:06 | 1:58 | 1.57 |
+| 100,000 | 4:12 | — | 5:22 | 1.28 |
+| 200,000 | 8:15 | — | 9:22 | 1.13 |
+| 300,000 | 23:34 | — | 16:03 | 0.68 |
+| 500,000 | 2:02:42 | 1:19:05 | 0:58:53 | 0.48 |
+| 800,000 | 6:35:51 | 3:40:38 | 2:54:02 | 0.44 |
+| 900,000 | 9:01:23 | 5:23:05 | 4:03:31 | 0.45 |
+| IBD end (tip stored + applied) | 10:41:21 | 7:16:01 | 4:49:12 | 0.45 |
+| **every index at the tip** | **10:42:05** | **7:17:39** | **4:50:52** | **0.45** |
+| CPU time consumed, all processes | 13 h 50 m (journal) | — | 8 h 17 m (sampler, 29,819 s) | 0.60 |
+| peak memory | not captured | — | see §5 | — |
+
+Milestones and segment walls: `docs/reports/2026-10-06-run37-vs-core6-stage-report.md`
+(validation/ibd_stage_report.py). Core is ahead for the first 200,000
+blocks (by 70 s at 100,000 and 67 s at 200,000): tiny blocks, where the
+wall is round trips, not bytes, and bmc's chunked requests pay one more
+round trip per 16 blocks than Core's per-block pipeline. From 300,000 on
+bmc is ahead in every segment, by 2.1–2.5×.
+
+Download, run 37: 60,650 chunks, 774 GB, 68 distinct peers; per-chunk wait
+p50 0.05 s, p90 0.15 s; 7 stall evictions over the run, every one answered
+by its worker within a millisecond and its chunk reassigned to an idle
+worker at the first signal (0 unanswered); no apply gap over 45 s during
+the download. The applier waited for blocks 2,180 s in all against Core's
+24,587 s (§2): with ranked peers the download is no longer the bound.
 
 ## 2. Where the applier's time goes (thread-seconds over the whole chain)
 
-| | Core #6 | bmc 34 | bmc 35 |
+| | Core #6 | bmc 34 | bmc 37 |
 |---|---|---|---|
-| applier busy | 13,909 | 17,166 | |
-| applier waiting for blocks | 24,587 | 9,757 | |
-| UTXO (Core: connect txs + flush + write chainstate + coins flushes; bmc: get + put + ckpt + flush) | ~11,000 | 13,863 | |
-| ↳ put | — | 7,812 | |
-| ↳ memtable / cache flush | 803 | 1,350 | |
-| script verification | 113 (wait on 15 threads) | 773 | |
-| block read | 2,289 | 124 | |
-| per-block index work on the applier | 5 | 2,360 | |
+| applier busy (Core: connect block; bmc: the block line's total) | 13,909 | 17,166 | 14,602 |
+| applier waiting for blocks / outside connect | 24,587 | 9,757 | 2,180 |
+| UTXO (Core: connect txs + flush + write chainstate + coins flushes; bmc: get + put + ckpt + flush) | ~11,185 | 13,863 | 11,956 |
+| ↳ put | — | 7,812 | 5,687 |
+| ↳ put split (ins / get / undo / del / wal) | — | — | 1,662 / 928 / 2,622 / 66 / 59 |
+| ↳ memtable / cache flush (inline on the applier) | 803 | 1,350 | 1,403 (110 flushes) |
+| script verification | 113 (wait on 15 threads) | 773 | 775 |
+| block read | 2,289 | 124 | 211 |
+| per-block index work on the applier (idx + csi + txindex + bfilter) | 5 | 2,360 | 2,306 |
+
+bmc's applier is now 5% slower per block than Core's (it was 23%). The
+UTXO put fell 27% (the undo capture reuses the resolved prevout, PR #383);
+the split names what is left: the undo record (2,622 s) and the insert
+(1,662 s) are the two halves of put, the WAL and the tombstone are
+negligible. The two columns still off Core's shape are the inline flush
+(1,403 s; Core's cache flush is 803 s and its writes are batched) and the
+inline index work (2,306 s; Core does its index writes on callback threads,
+5 s on the validation thread). Those are plan items B3 and B4
+(`worklog/2026-10-05-performance-holes-plan.md`); with both off the
+applier, the apply path would be ~10,900 s against Core's 13,909.
+
+bmc wins the sync by overlapping download and apply, not by a faster apply
+path: the "waiting" row is the whole story of the 2.2×.
+
+(The stage report's total row subtracted the put sub-timers a second time
+and printed "other = −5,289 s" on the first render of run 37; fixed in
+`validation/ibd_stage_report.py` with a self-test check, same day.)
 
 ## 3. RPC, 32 simultaneous clients × 5 calls, median ms (validation/rpc_concurrency_bench.sh)
 
 Measured 2026-10-05 before the lane work (bmc pool 71,348 tx, Core pool
-29,961 tx; fixed-work rows use block 969,000), and again after it.
+29,961 tx), and 2026-10-06 05:20Z after it (bmc pool 64,793 tx, Core pool
+24,074 tx; Core re-measured the same minute). Fixed-work rows use block
+969,000 (`00000000000000000000fb6c31229d2253cd7161c9cb72cf03d2e3d847e9a22a`)
+and its second transaction (`75fbbbf4…1d70`). Both nodes live on the same
+box, both at the tip, loopback.
 
-| method | Core | bmc before | bmc after |
-|---|---|---|---|
-| getblockcount | 5 | 5 | |
-| getblockhash | 5 | 5 | |
-| getmempoolinfo | 5 | 177 | |
-| getrawmempool | 687 | 249 | |
-| getblock (verbosity 2) | 494 | 704 | |
-| getrawtransaction | 6 | 6 | |
-| getpeerinfo | 7 | 5 | |
-| exec-lock waits ≥ 2 s per day under BlockYard + mempool.space | n/a | ~10 | |
+| method | Core (10-05) | bmc before | Core (10-06) | bmc after |
+|---|---|---|---|---|
+| getblockcount | 5 | 5 | 5 | 4 |
+| getblockhash | 5 | 5 | 5 | 4 |
+| getmempoolinfo | 5 | 177 | 5 | 5 |
+| getrawmempool | 687 | 249 | 496 | 216 (pool 2.7× Core's) |
+| getblock (verbosity 2) | 494 | 704 | 498 | 597 (wave wall 4,107 ms vs Core's 4,829) |
+| getrawtransaction (verbosity 1) | 6 | 6 | 5 | **382** |
+| getpeerinfo | 7 | 5 | 6 | 5 |
+| exec-lock waits ≥ 2 s per day under BlockYard + mempool.space | n/a | ~10 | n/a | 0 since the deploy (17:46Z 10-05) |
+
+Two rows need words:
+
+- **getrawtransaction** is a loss, and the 10-05 "6 vs 6" row did not show
+  it (the transaction it used is not recorded; today's row is pinned
+  above). Single-client the call costs 14 ms on bmc against Core's 4 ms at
+  every verbosity (0: 14 vs 4; 1: 14 vs 2; 2: 25 vs 7); at 32 clients bmc
+  serialises to 382 ms while Core stays at 5. Cause, by design and
+  documented in `rpc_chain.c` ("the txindex lane"): one reader at a time
+  inside the lane (its verify path shares static 4 MB buffers), and a
+  lookup reads the whole block to extract one transaction where Core
+  reads the transaction at its file offset. The lane removed the convoy
+  it was built for (the exec-lock row); it did not make the call fast.
+  Fix: per-thread lane buffers under a reader-writer lock (concurrency),
+  and the transaction's byte offset in the txindex record (the 14 ms).
+- **getblock verbosity 2** at 32 clients: bmc's wave finishes 15% sooner
+  (4,107 ms vs 4,829 ms) but the median call is 20% slower (597 vs 498):
+  the reader lane serves fewer calls at once than Core's thread pool, so
+  throughput is higher and latency is worse. Single-client bmc is ahead at
+  every verbosity (v1 5 vs 8, v2 73 vs 91, v3 102 vs 140 ms).
+
+The 7 exclusive holds over 2 s since the deploy were all `getdeploymentinfo`
+(2.0–2.1 s each, 1–2 callers queued behind each): it re-walks the BIP9 state
+from genesis on every call (~10k header reads) where Core caches it per
+period. No caller waited ≥ 2 s. Fix in the plan: Core's per-period cache,
+served from the reader lane.
 
 ## 4. Modules (from docs/reports/2026-09-28-the-module-benchmarks-gaps-closed.md)
 
@@ -71,82 +143,114 @@ ahead of Core; signature verification at parity with libsecp256k1.
 
 ## 5. Disk and memory
 
-| | Core | bmc |
+| | Core | bmc (run 37 datadir, 2026-10-06 05:15Z) |
 |---|---|---|
-| UTXO set on disk | 10.6 GB | 12.8 GB |
-| txindex | — | 2.6× smaller than Core's |
-| undo | — | 2.5× larger (carries spent scripts; feeds the address history) |
+| blocks | 721 GB | 721 GB |
+| UTXO set on disk | 11 GB (chainstate) | 13 GB (the compacted run; a superseded 13 GB run not yet reclaimed when measured) |
+| txindex | 70 GB | 28 GB (2.5× smaller) |
+| block filters | 13 GB | 13 GB |
+| undo | 101 GB (rev files) | 2.5× larger (carries spent scripts; feeds the address history) — 2026-10-05 measurement |
+| coinstats history | — | 0.9 GB |
+
+Memory, bmc run 37, proc sampler every 5 s over every process of the
+daemon's tree: anonymous (heap) memory held 26.4 GB steadily through the
+sync, peaked once at 35.2 GB (04:15Z, a compaction), PSS peaked at 67.7 GB
+(03:15Z) — PSS counts the archive's mapped pages, which the kernel drops
+under pressure, so it is a ceiling, not a footprint. A 53.6 GB anonymous
+spike at 04:57:43Z came after `[ready]`, from the harness's own capstone
+(eight hash workers for the muhash), not from the sync. Core's rerun had no
+sampler; the memory row has one side and is not a comparison. The plan's
+next Core rerun carries the sampler.
 
 ## 6. Verdict, category by category
 
-(filled when run 35 and the post-change RPC rows are in)
+| category | result | bmc / Core |
+|---|---|---|
+| sync, genesis to every index at the tip | **bmc, 2.2×** | 4:50:52 vs 10:42:05 |
+| every milestone from 300,000 up | **bmc, 2.1–2.5×** | §1 |
+| CPU time for the sync | **bmc** | 8 h 17 m vs 13 h 50 m |
+| download: applier time spent waiting | **bmc, 11×** less | 2,180 s vs 24,587 s |
+| headers → first block | Core | 1:58 vs 1:15 (was 5:06) |
+| the first 200,000 blocks | Core, by ~70 s | round-trip bound; §1 |
+| apply path per block (thread-seconds) | Core, by 5% | 14,602 vs 13,909 (was 23%) |
+| RPC: getblockcount, getblockhash, getmempoolinfo, getpeerinfo | parity | 4–5 ms both |
+| RPC: getrawmempool, 32 clients | **bmc, 2.3×**, on a pool 2.7× larger | 216 vs 496 ms |
+| RPC: getblock v2, 32 clients | mixed: wave 15% faster, median 20% slower | §3 |
+| RPC: getblock, single client, every verbosity | **bmc** | §3 |
+| RPC: getrawtransaction | **Core** | 382 vs 5 ms at 32 clients; 14 vs 4 single |
+| RPC lock-ups under BlockYard + mempool.space | **bmc** (was ~10/day) | 0 waits ≥ 2 s since the deploy |
+| modules (archive read, MuHash, hashes, AEAD, sigs) | **bmc or parity** | §4 |
+| txindex on disk | **bmc, 2.5× smaller** | 28 vs 70 GB |
+| UTXO set on disk | Core (a trade: 2 GB) | 13 vs 11 GB |
+| undo on disk | Core (by design: spent scripts) | 2.5× |
+| peak memory | not comparable yet | Core unmeasured |
+| correctness | identical | muhash at 970,133 |
 
-## 7. What changed between run 34 and run 35
+Not yet beaten, with the fix named: getrawtransaction (the lane's single
+reader and whole-block read; §3), the apply path per block (B3 async flush,
+B4 async index work; §2), the first 200,000 blocks and the header phase
+(per-block requests on the early chain; a later item), getblock v2's median
+at 32 clients (lane width). The memory row needs the Core rerun with the
+sampler before it can be claimed either way.
 
-All in PR #383 (main `0319e1eb`), gated 447/447, each test revert-checked:
+## 7. What changed between run 34 and run 37
 
-- **UTXO put** (`47c6e12c`): the undo capture reused Phase 1's resolved
-  prevout instead of looking it up again (the second lookup was 1.29 of the
-  2.30 µs per spent input with runs on disk). Bench, one pinned core, 2^25
-  slots, 20M coins: 2.30 → 1.13 µs per spent input. Every 64th input is
-  still re-resolved and compared (the 2026-09-01 inconsistency guard).
-- **RPC** (`3b807cc6`): the Esplora facade had taken the exclusive execution
-  lock for every dispatch, lane methods included — the production convoy
-  (2.1–2.7 s waits behind 0–16 ms holders). It now takes what the method's
-  class needs. A txindex lane (private store handle and block buffer, one
-  mutex `irs_refresh` also takes) serves `rpc_chain_tx_blockhash` and
-  `getrawtransaction` v0/v1; the facade's mempool batch enters it once per
-  batch; `getblock` runs in a per-RPC-thread reader lane; `getmempoolinfo`'s
-  totals are memoised on the mempool sequence.
-- **Header sync** (`c5aecada`): the first 2,000-header page is asked of four
-  peers at once and the fastest leads, with the others as fallbacks; off
-  under `bmc.dlshape=core` (Core syncs headers from one peer).
-- **Not done, stated:** the double-buffered memtable flush (plan B3) and the
-  async index work (B4) — the flush column and the inline index columns in
-  §2 are therefore expected to be unchanged in run 35.
-- **Download rules:** run 34 ran Core's (`bmc.dlshape=core`); run 35 runs
-  bmc's own (ranked peers, rotation), which is what a release ships.
-- **Found during run 35, fixed after it (not in run 35's numbers):** an
-  eviction the holder never answers. At 19:57:44Z the worker holding the
-  window's oldest chunk (560,689–560,704) was "dropped" twelve times, 2 s
-  doubling to 64 s, and never printed its drop line, never released the
-  chunk; the other nine workers sat at the full window polling an empty
-  retry ring with 64 chunks staged above the hole, the applier idle, the
-  whole process set at 0 CPU for 7 minutes (proc.log 19:58–20:04). Run 34
-  had the same shape four times at 878k, 910k, 915k and 925k, each ~20
-  minutes (Core-mode's 1,200 s read timeout), 78 minutes in all — most of
-  what the pair report called "download-bound under random peers". The
-  committer's cursor help (30 s, a third of the window staged) was published
-  every time and read by nobody: its only reader was the claim path, and
-  every idle worker was in the full-window wait loop. Run 35 was stopped at
-  21:00Z (72% stored) on the operator's instruction and re-run as run 36 on
-  the fix. What the logs could and could not establish: the worker's own
-  120 s stall alarm never fired either, and the worker neither printed a
-  drop line nor failed a fetch visibly, which places it outside the fetch
-  (dialing, in a handshake, or reading the chunk's headers) when the
-  evictions arrived — the one place where a received signal was reset
-  without a word before the next fetch. The exact wait it sat in for 415 s
-  with no bytes and no CPU is not in the log; the kernel's hung-task
-  warnings were already exhausted on this box. Five changes on the fix
-  branch: the second eviction of the same holder for the same chunk puts
-  the chunk on the retry ring from the parent's side (Core's semantics: a
-  disconnected staller's blocks are re-requested elsewhere at once); the
-  wait loop takes the cursor help; the eviction signal shuts the worker's
-  socket down (the relay legs' arming), so a worker blocked in a handshake
-  or a read sees it; a drop that arrives outside the fetch is acknowledged
-  in the log instead of discarded; and the eviction line now names the
-  holder's phase, how long it has been there, and its kernel state, wait
-  channel and syscall. Also found reading for this: the BIP324 handshake's
-  second loop had no real-time deadline, so a trickling peer could hold it
-  indefinitely (relay legs; the download workers speak v1). All of it is
-  revert-checked in `test_dialhelper` and `test_v2transport`.
+Runs 35 and 36 were started on the way and stopped: run 35 (main
+`0319e1eb`) at 72% when a download worker never answered its eviction and
+the window sat 7 minutes; run 36 (main `12ed7aa1`, the first fix) at 70.5%
+by the operator, for a clean run once the fix's own log lines were found
+misreporting. Neither is in the tables.
+
+- **UTXO put** (`47c6e12c`, PR #383): the undo capture reused Phase 1's
+  resolved prevout instead of looking it up again (1.29 of the 2.30 µs per
+  spent input with runs on disk). Bench, one pinned core, 2^25 slots, 20M
+  coins: 2.30 → 1.13 µs per spent input. Every 64th input is still
+  re-resolved and compared (the 2026-09-01 inconsistency guard). Run 37:
+  put 7,812 → 5,687 s.
+- **RPC** (`3b807cc6`, PR #383): the Esplora facade had taken the exclusive
+  execution lock for every dispatch, lane methods included — the production
+  convoy (2.1–2.7 s waits behind 0–16 ms holders). It now takes what the
+  method's class needs. A txindex lane (private store handle and block
+  buffer, one mutex `irs_refresh` also takes) serves
+  `rpc_chain_tx_blockhash` and `getrawtransaction` v0/v1; the facade's
+  mempool batch enters it once per batch; `getblock` runs in a per-RPC-thread
+  reader lane; `getmempoolinfo`'s totals are memoised on the mempool
+  sequence. Production: 0 waits ≥ 2 s since the deploy.
+- **Header sync** (`c5aecada`, PR #383): the first 2,000-header page is asked
+  of four peers at once and the fastest leads (run 37: 1,155 KB/s chosen in
+  0.4 s), with the others as fallbacks. Headers → first block 5:06 → 1:58.
+- **Eviction** (PR #384, `ea7a41f5`): an eviction the holder never answers.
+  Run 35's holder was "dropped" twelve times and never released its chunk;
+  run 34 had the same shape four times at ~20 minutes each (78 minutes of
+  what the pair report had called "download-bound under random peers").
+  The eviction signal now shuts the worker's socket so a handshake or read
+  ends; the full-window wait loop takes the committer's cursor help; the
+  eviction line names the holder's phase and kernel state; the BIP324
+  handshake's second loop got a real-time deadline.
+- **Eviction accounting and reassignment** (PR #385, `ca9796a4`): run 36's
+  log showed the fix's lines misreporting (an answered eviction called
+  unanswered; a stale flag printing "acknowledged late" after every drop)
+  and the window still sitting 15–30 s on each eviction while the evicted
+  worker redialed. The worker now counts the evictions it acts on and the
+  parent reads it; the first eviction puts the chunk on the retry ring
+  (Core's semantics: a disconnected staller's blocks are re-requested at
+  once) and the evicted worker releases a chunk its redial finds delivered.
+  Run 37: 7 evictions, 7 reassigned, 0 unanswered, 3 released on redial.
+- **Not done, stated:** the double-buffered memtable flush (B3) and the
+  async index work (B4) — the flush and inline-index rows in §2 are
+  unchanged from run 34, as predicted.
 
 ## 8. Method and reproducibility
 
 - Sync pair: `validation/logged_pair_run.sh` (Core) and
   `validation/fresh_ibd_run.sh` with `BENCHLOG=1 READY_WAIT=1` (bmc);
-  `validation/ibd_stage_report.py` builds the stage tables from the two logs.
-- RPC: `validation/rpc_concurrency_bench.sh`.
-- CPU/RSS: Core from systemd's "Consumed" journal line; bmc from
-  `validation/proc_sampler.sh` beside the run.
+  `validation/ibd_stage_report.py` builds the stage tables from the two logs
+  (`--selftest` first).
+- RPC: `validation/rpc_concurrency_bench.sh <url> <cookie> 32 5 <method> [params]`,
+  both nodes in the same minute, the block and transaction pinned in §3.
+- CPU/memory: Core from systemd's "Consumed" journal line; bmc from
+  `validation/proc_sampler.sh` beside the run (PSS, anonymous, peaks; MEM
+  lines at IBD_END and READY in phase.log).
+- Stalls: `validation/stall_watch.sh` beside the run dumps PSI, per-process
+  state and sockets whenever the stored counter stops for 30 s.
 - Never an RPC call to a node during its timed run.

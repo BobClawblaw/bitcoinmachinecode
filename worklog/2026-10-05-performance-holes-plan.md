@@ -229,3 +229,56 @@ late-ack line beside one).
 Exit for the whole plan: one ranked-peer mainnet sync (benchlog on) at
 ≤ 4:45 to `[ready]`, and a week of production with zero exec-lock waits
 ≥ 2 s under BlockYard and mempool.space.
+
+## 2026-10-06 — run 37 against the targets, and the next holes
+
+Run 37 (main `8e81ffb5`, ranked peers, benchlog): ready at **4:50:52**
+against the ≤ 4:45 exit above (6 minutes short), Core 10:42:05; applier
+14,602 thread-seconds against the ≤ 12,000 target (Core 13,909); put 5,687
+(target ≤ 4,500; split: undo 2,622, ins 1,662, get 928, del 66, wal 59);
+headers → first block 1:58 (target ≤ 90 s); exec-lock waits ≥ 2 s: 0 since
+the 10-05 deploy; `getmempoolinfo` 5 ms (target ≤ 22). Report:
+`docs/reports/2026-10-06-core-vs-bmc-performance-release.md`.
+
+Found by the post-run RPC rows and the run-37 log, in the order to take them:
+
+### A7. getrawtransaction: 14 ms single, 382 ms at 32 clients (Core 4 / 5)
+The txindex lane admits one reader (shared static 4 MB verify buffers) and
+a lookup reads the whole block to extract one transaction. Two steps:
+per-thread lane buffers under a reader-writer lock (`irs_refresh` the only
+writer) — the 32-client row falls to the single-call cost; then the
+transaction's byte offset in the txindex record so the read is the
+transaction, not the block — the 14 ms. The second changes the record
+format (a rebuild; the builders are in place). Test: the #373 race test
+over the rwlock; a differential of 1,000 random txids against the oracle.
+### A8. getdeploymentinfo holds the exclusive lock 2.0–2.1 s
+It re-walks the BIP9 state from genesis on every call (~10k header reads
+and MTPs). Cache the state per period boundary as Core's version-bits
+cache does; serve from the reader lane. Test: a regtest signalling period
+walked cached and uncached gives the same answer. Measure: the hold is
+gone from the lock log.
+### A5 (rest). getblock v2 at 32 clients: median 597 vs 498, wave 15% faster
+The reader lane is narrower than Core's thread pool. Widen the per-thread
+lane (more concurrent readers) once A7's rwlock pattern exists; measure the
+32-client median.
+### B8. The 100 s tail after IBD end has a 62 s pause
+Run 37: no block line between 04:55:36 and 04:56:38 while the daemon
+switched to live mode (relay dials); the catch-up then finished at
+9.7 blk/s. Name the pause (a checkpoint? the dial burst taking the apply
+lock?) from the log's split, then move it off the apply path. Small.
+### B9. The first 200,000 blocks: Core ahead by ~70 s
+Round-trip bound on tiny blocks: bmc asks for 16-block chunks per round
+trip, Core pipelines per block. A per-peer in-flight pipeline across chunk
+boundaries on the early chain (what `dlshape=core` already does) under the
+ranked rules until blocks reach ~100 KB. Measure: the 100,000 and 200,000
+milestones.
+### M1. Memory: name the 26 GB
+Anonymous memory held 26.4 GB through the sync with dbcache=8192 (peak 35.2
+GB in a compaction). A per-subsystem `[mem]` line under benchlog at the MEM
+marks (memtable, header tree, download window, index builders, RPC caches),
+and the Core rerun WITH the sampler so the row has two sides.
+
+Order: A8 (small, production-visible) → A7 step 1 (small) → B4 → B3 (the
+applier target) → A7 step 2 → B8 → A5 → B9 → M1 alongside the Core rerun.
+Exit for the next release run: ready ≤ 4:30, applier ≤ 12,000 s,
+getrawtransaction ≤ 10 ms at 32 clients, no exclusive hold ≥ 1 s.
