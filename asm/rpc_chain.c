@@ -520,6 +520,21 @@ static int read_block_prefix(long h, u8* out, size_t n){
     if (pread(fd, out, n, (off_t)(meta[0] + 8)) != (ssize_t)n) return -1;
     return 1;
 }
+/* `len` bytes of block `h` from byte `off` of its serialisation (2026-10-06:
+ * one transaction by the txindex record's offset, as Core's GetTransaction
+ * reads it from the block file at its position -- not the whole block into
+ * CUR_BB). 1 ok / -3 unavailable or hole / -2 outside the block / -1 error. */
+static int read_block_range(long h, u64 off, u32 len, u8* out){
+    u64 meta[3];
+    int r = store_get_at(CUR_ST, (u64)h, meta);
+    if (r != 1) return r == -3 ? -3 : -1;
+    if (meta[1] == 0) return -3;                       /* hole record */
+    if (off + len > meta[1]) return -2;
+    int fd = store_rd_fd(CUR_ST, (unsigned)meta[2]);
+    if (fd < 0) return -1;
+    if (pread(fd, out, len, (off_t)(meta[0] + 8 + off)) != (ssize_t)len) return -1;
+    return 1;
+}
 /* Whole block into CUR_BB. Returns size, or -3 unavailable / -1 error. */
 /* Which height CUR_BB currently holds, -1 when its contents are unknown.
  * read_block is the only writer of CUR_BB, so this is the whole truth,
@@ -2236,18 +2251,25 @@ static void txi_tail_refresh(void){
  * here instead of ever being returned as a wrong answer. */
 static int txi_verify_rec(const u8* r, const u8 txid_wire[32],
                           long* h_out, u32* off_out, u32* len_out){
-    static u8 txbuf[4u << 20];
-    static u8 scratch[4u << 20];
     u32 hh = 0, off = 0, ln = 0;
     for (int b = 0; b < 4; b++) hh  |= (u32)r[8+b]  << (8*b);
     for (int b = 0; b < 4; b++) off |= (u32)r[12+b] << (8*b);
     for (int b = 0; b < 4; b++) ln  |= (u32)r[16+b] << (8*b);
-    long blen = read_block((long)hh);
-    if (blen < 81 || (u64)off + ln > (u64)blen || ln > sizeof txbuf) return 0;
-    memcpy(txbuf, CUR_BB + off, ln);
-    u8 got[32];
-    if (tx_txid(got, txbuf, ln, scratch, sizeof scratch) != 1) return 0;
-    if (memcmp(got, txid_wire, 32)) return 0;          /* prefix collision */
+    /* 2026-10-06: the transaction's bytes alone, by the record's range.
+     * This read the WHOLE block into the lane's 4 MB buffer and copied the
+     * transaction out of it -- 14 ms a call on a 2 MB block against Core's
+     * 4 -- and its two static 4 MB buffers were the reason the lane
+     * admitted one reader at a time. A record whose range falls outside the
+     * block fails here, as a stale record always did. */
+    if (ln == 0 || ln > (4u << 20)) return 0;
+    u8* txbuf = malloc(ln); u8* scratch = malloc(ln);
+    int ok = 0;
+    if (txbuf && scratch && read_block_range((long)hh, off, ln, txbuf) == 1){
+        u8 got[32];
+        ok = tx_txid(got, txbuf, ln, scratch, ln) == 1 && memcmp(got, txid_wire, 32) == 0;   /* a prefix collision fails the compare */
+    }
+    free(txbuf); free(scratch);
+    if (!ok) return 0;
     *h_out = (long)hh; *off_out = off; *len_out = ln;
     return 1;
 }
@@ -2440,6 +2462,13 @@ int rpc_chain_tx_blockhash(const char* txid_disp, char out_disp[65]){
 }
 
 static const char GENESIS_CB_TXID[] = "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b";
+long g_txi_fast_hits;   /* test seam: getrawtransaction answers served from the record's range (2026-10-06) */
+/* splice TxToUniv's members into our object to keep Core's order */
+static void grt_splice(rj_val* o, rj_val* t){
+    for (size_t k = 0; k < t->nmembers; k++){ rj_obj_set(o, t->members[k].key, t->members[k].val); t->members[k].val = NULL; }
+    for (size_t k = 0; k < t->nmembers; k++) free(t->members[k].key);
+    free(t->members); t->nmembers = 0; t->members = NULL; rj_free(t);
+}
 static int cmd_getrawtransaction(const rj_val* params, rj_val** res, long* ec, const char** em){
     long tip = refresh();
     const char* txs = rpc_param_str(params, 0, ec, em); if (!txs) return 0;
@@ -2519,9 +2548,43 @@ static int cmd_getrawtransaction(const rj_val* params, rj_val** res, long* ec, c
 
         long th; u32 toff, tlen;
         if (txi_lookup(want_wire, &th, &toff, &tlen)){
-            h = th; known_off = (long)toff; (void)tlen;
+            h = th; known_off = (long)toff;
             u8 rec[48];
             if (read_idx_rec(h, rec)){ hex_rev(bs_buf, rec, 32); bs = bs_buf; }
+            /* 2026-10-06: verbosity 0 and 1 need the transaction, its block
+             * hash and the header's time -- not the block. Read the record's
+             * range, confirm the txid (a stale record falls through to the
+             * block path below, as before), and answer: two small preads
+             * where this read the whole block and walked every transaction
+             * before this one (14 ms on a 2 MB block against Core's 4;
+             * 382 ms at 32 clients). Verbosity 2 needs the undo slice,
+             * located by the transaction's index in the block, and keeps
+             * the block path. */
+            if (verbosity <= 1 && bs && tlen > 0 && tlen <= (4u << 20)){
+                u8* tb = malloc(tlen); u8* sc = malloc(tlen);
+                txw_t w; u8 got[32];
+                int ok = tb && sc && read_block_range(h, toff, tlen, tb) == 1
+                      && tx_walk(tb, tb + tlen, &w) && w.len == tlen
+                      && tx_txid(got, tb, tlen, sc, tlen) == 1 && memcmp(got, want_wire, 32) == 0;
+                if (ok){
+                    g_txi_fast_hits++;
+                    if (verbosity <= 0){
+                        char* hx = malloc((size_t)tlen * 2 + 1);
+                        if (!hx){ free(tb); free(sc); *ec = -7; *em = "out of memory"; return 0; }
+                        hex_of(hx, tb, tlen); *res = rj_str(hx); free(hx); free(tb); free(sc); return 1;
+                    }
+                    rj_val* o = rj_obj();                          /* no in_active_chain: no blockhash was given */
+                    grt_splice(o, tx_to_json_pv(tb, &w, -1, NULL, 0));
+                    rj_obj_set(o, "blockhash", rj_str(bs));
+                    rj_obj_set(o, "confirmations", rj_numf("%ld", h > tip ? -1L : tip - h + 1));
+                    u8 hdr[80]; read_block_prefix(h, hdr, 80);
+                    rj_obj_set(o, "time", rj_numf("%u", rd32(hdr + 68)));
+                    rj_obj_set(o, "blocktime", rj_numf("%u", rd32(hdr + 68)));
+                    free(tb); free(sc);
+                    *res = o; return 1;
+                }
+                free(tb); free(sc);
+            }
         } else {
             txi_open();
             static __thread char nomsg[288];
@@ -2637,10 +2700,7 @@ static int cmd_getrawtransaction(const rj_val* params, rj_val** res, long* ec, c
             rj_val* t = tx_to_json_pv(p, &w, rt_in_total,
                                       rt_npv ? rt_pv : NULL, rt_npv);
             free(rt_raw);
-            /* splice TxToUniv's members into our object to keep Core's order */
-            for (size_t k = 0; k < t->nmembers; k++){ rj_obj_set(o, t->members[k].key, t->members[k].val); t->members[k].val = NULL; }
-            for (size_t k = 0; k < t->nmembers; k++) free(t->members[k].key);
-            free(t->members); t->nmembers = 0; t->members = NULL; rj_free(t);
+            grt_splice(o, t);
             rj_obj_set(o, "blockhash", rj_str(bs));
             rj_obj_set(o, "confirmations", rj_numf("%ld", h > tip ? -1L : tip - h + 1));   /* -1 above the connected tip (3.1) */
             u8 hdr[80]; read_block_prefix(h, hdr, 80);
@@ -3935,8 +3995,47 @@ static const b9_dep B9_REG_TAPROOT   = { "taproot",   2,  B9_ALWAYS_ACTIVE, B9_N
 
 enum { TS_DEFINED, TS_STARTED, TS_LOCKED_IN, TS_ACTIVE, TS_FAILED };
 static const char* ts_name(int s){ return s == TS_DEFINED ? "defined" : s == TS_STARTED ? "started" : s == TS_LOCKED_IN ? "locked_in" : s == TS_ACTIVE ? "active" : "failed"; }
+/* 2026-10-06: THE STATE WALK IS CACHED PER PERIOD BOUNDARY, as Core's
+ * VersionBitsCache. Production's getdeploymentinfo held the exclusive
+ * execution lock 2.0-2.1 s per call, seven times a day with one or two
+ * callers queued behind each: b9_state_for re-read ~10k headers from
+ * genesis on every call (an MTP per boundary to taproot's start, three
+ * signalling periods), twice per call for the current and the next state.
+ * Each boundary's decided state is kept with the boundary block's hash;
+ * a lookup checks the highest cached boundary at or below `prev` is still
+ * in the chain (one 48-byte index read -- the hash chain vouches for every
+ * boundary below it) and walks only the boundaries above. A failed check
+ * (a reorg past a boundary) drops that deployment's cache. ~480 entries
+ * on mainnet, 56 bytes each, keyed by the deployment's parameter block. */
+typedef struct { long p; u8 hash[32]; int state; long since; } b9_ent;
+typedef struct { const b9_dep* d; b9_ent* e; long n, cap; } b9_cache_t;
+static b9_cache_t g_b9c[8]; static int g_b9c_n;
+static pthread_mutex_t g_b9_mu = PTHREAD_MUTEX_INITIALIZER;
+long g_b9_walk_reads;                 /* test seam: headers b9_state_for's walk read */
+static int g_b9_in_walk;
+static b9_cache_t* b9_cache_for(const b9_dep* d){
+    for (int i = 0; i < g_b9c_n; i++) if (g_b9c[i].d == d) return &g_b9c[i];
+    if (g_b9c_n >= (int)(sizeof g_b9c / sizeof g_b9c[0])) return NULL;
+    g_b9c[g_b9c_n].d = d; return &g_b9c[g_b9c_n++];
+}
+static void b9_cache_put(b9_cache_t* c, long p, int state, long since){
+    if (!c || (c->n > 0 && c->e[c->n - 1].p >= p)) return;
+    u8 rec[48]; if (!read_idx_rec(p, rec)) return;    /* no hash to key it by: not cached */
+    if (c->n == c->cap){
+        long nc = c->cap ? c->cap * 2 : 64;
+        b9_ent* ne = realloc(c->e, (size_t)nc * sizeof *ne); if (!ne) return;
+        c->e = ne; c->cap = nc;
+    }
+    b9_ent* e = &c->e[c->n++]; e->p = p; memcpy(e->hash, rec, 32); e->state = state; e->since = since;
+}
+void rpc_chain_b9_cache_reset(void){
+    pthread_mutex_lock(&g_b9_mu);
+    for (int i = 0; i < g_b9c_n; i++) g_b9c[i].n = 0;
+    pthread_mutex_unlock(&g_b9_mu);
+}
 /* 1 signals, 0 does not, -1 the header is not readable (pruned / hole) */
 static int b9_signals(const b9_dep* d, long h){
+    if (g_b9_in_walk) g_b9_walk_reads++;
     u8 v4[4]; if (read_block_prefix(h, v4, sizeof v4) != 1) return -1;
     u32 v = rd32(v4);
     return (v & 0xE0000000u) == 0x20000000u && (v & (1u << d->bit)) != 0;
@@ -3947,7 +4046,9 @@ static int b9_signals(const b9_dep* d, long h){
 static int b9_mtp(long h, long* out){
     u32 t[11]; int n = 0;
     for (long i = h; i >= 0 && n < 11; i--){
-        u8 hdr[80]; if (read_block_prefix(i, hdr, 80) != 1) return 0;
+        u8 hdr[80];
+        if (g_b9_in_walk) g_b9_walk_reads++;
+        if (read_block_prefix(i, hdr, 80) != 1) return 0;
         t[n++] = rd32(hdr + 68);
     }
     if (n == 0) return 0;
@@ -3961,29 +4062,58 @@ static int b9_mtp(long h, long* out){
 static int b9_state_for(const b9_dep* d, long prev, long* since){
     *since = 0;
     if (d->start == B9_ALWAYS_ACTIVE) return TS_ACTIVE;
-    int state = TS_DEFINED; long s = 0;
-    for (long b = d->period; b - 1 <= prev; b += d->period){
+    int state = TS_DEFINED; long s = 0, b = d->period;
+    pthread_mutex_lock(&g_b9_mu);
+    b9_cache_t* c = b9_cache_for(d);
+    if (c && c->n > 0){
+        long k = c->n - 1; while (k >= 0 && c->e[k].p > prev) k--;   /* the highest cached boundary at or below prev */
+        if (k >= 0){
+            u8 rec[48];
+            if (read_idx_rec(c->e[k].p, rec) && memcmp(rec, c->e[k].hash, 32) == 0){
+                state = c->e[k].state; s = c->e[k].since; b = c->e[k].p + 1 + d->period;
+            } else c->n = 0;                                          /* a reorg past a cached boundary: start over */
+        }
+    }
+    int fail = 0;
+    g_b9_in_walk = 1;
+    if (state != TS_ACTIVE && state != TS_FAILED)
+    for (; b - 1 <= prev; b += d->period){
         long p = b - 1, m; int next = state;
         switch (state){
         case TS_DEFINED:
-            if (!b9_mtp(p, &m)) return -1;
+            if (!b9_mtp(p, &m)){ fail = 1; break; }
             if (m >= d->start) next = TS_STARTED;
             break;
         case TS_STARTED: {
             long count = 0;
-            for (long k = b - d->period; k <= p; k++){ int sg = b9_signals(d, k); if (sg < 0) return -1; count += sg; }
+            for (long k = b - d->period; k <= p; k++){ int sg = b9_signals(d, k); if (sg < 0){ fail = 1; break; } count += sg; }
+            if (fail) break;
             if (count >= d->threshold) next = TS_LOCKED_IN;
-            else { if (!b9_mtp(p, &m)) return -1; if (m >= d->timeout) next = TS_FAILED; }
+            else { if (!b9_mtp(p, &m)){ fail = 1; break; } if (m >= d->timeout) next = TS_FAILED; }
         } break;
         case TS_LOCKED_IN:
             if (p + 1 >= d->min_act) next = TS_ACTIVE;
             break;
         default: break;
         }
+        if (fail) break;
         if (next != state){ state = next; s = b; }
+        b9_cache_put(c, p, state, s);
         if (state == TS_ACTIVE || state == TS_FAILED) break;   /* terminal */
     }
+    g_b9_in_walk = 0;
+    pthread_mutex_unlock(&g_b9_mu);
+    if (fail) return -1;
     *since = s; return state;
+}
+/* test seam (2026-10-06): regtest's testdummy with a short period, so a
+ * four-block fixture crosses boundaries */
+static b9_dep g_b9_test_dummy; static int g_b9_test_dummy_on;
+void rpc_chain_b9_test_dummy(long period, long threshold){
+    g_b9_test_dummy = B9_REG_TESTDUMMY;
+    g_b9_test_dummy.period = period; g_b9_test_dummy.threshold = threshold;
+    g_b9_test_dummy_on = period > 0;
+    rpc_chain_b9_cache_reset();
 }
 /* One deployment, shaped as rpc/blockchain.cpp SoftForkDescPushBack (BIP9).
  * A walk that hits an unreadable header (a pruned node asked about taproot's
@@ -4085,7 +4215,7 @@ static int cmd_getdeploymentinfo(const rj_val* params, rj_val** res, long* ec, c
     gdi_dep(dep, "bip65",  h_cltv,   tip);
     gdi_dep(dep, "csv",    h_csv,    tip);
     gdi_dep(dep, "segwit", h_segwit, tip);
-    if (regtest){ gdi_bip9(dep, &B9_REG_TESTDUMMY, tip); gdi_bip9(dep, &B9_REG_TAPROOT, tip); }
+    if (regtest){ gdi_bip9(dep, g_b9_test_dummy_on ? &g_b9_test_dummy : &B9_REG_TESTDUMMY, tip); gdi_bip9(dep, &B9_REG_TAPROOT, tip); }
     else if (!strcmp(g_chain_name, "testnet4")) gdi_bip9(dep, &B9_T4_TAPROOT, tip);
     else if (!strcmp(g_chain_name, "signet"))   gdi_bip9(dep, &B9_SIG_TAPROOT, tip);
     else                                        gdi_bip9(dep, &B9_MAIN_TAPROOT, tip);
