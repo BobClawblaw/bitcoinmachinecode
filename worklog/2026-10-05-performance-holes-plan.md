@@ -132,6 +132,21 @@ segment is kept until its run is published, so recovery replays it.
 - Measure: flush column → ~0; the flush line still prints its wall from the
   thread.
 
+**Gate finding (10-06 18:08Z, integration tree main + M1 + B8 + B3):**
+`tests/test_utxo_lost_tombstones_bad` (the 2026-09-01 incident's repro with
+the b3d47a9 object) failed under the async flush: 701 blocks, 0 rejects, walk
+exact, no halt, 114 of 31,904 spent coins read back as live. The incident is
+the inline flush's shape: the flush lands mid-block and the same block's later
+spends look their coins up in the run it just wrote. Under the async flush the
+frozen copy answers every lookup until the writer's run is adopted at a block
+boundary, so a lying run first meets a later block's verify pass (a missing
+input, a rejected block, never a skipped spend); the 114 were point lookups
+of the adopted runs missing their tombstones (a compaction rewrote the
+offsets and the count went to 0; the walk was exact throughout). The arm now
+sets `g_cfg.async_flush = 0` and pins the inline path, which is still shipped
+(bmc.asyncflush=0, build_utxo, the tools); the shipped-object arm keeps the
+default (dfc41338 on the branch).
+
 ### B4. Index work off the applier (medium)
 `idx` 1,194 s is the Phase 0.5 index build inside `apply_block_inner`;
 txindex 329 s + bfilter 375 s + csi 460 s are the choke-point writers. Core
@@ -353,6 +368,13 @@ Run 37: no block line between 04:55:36 and 04:56:38 while the daemon
 switched to live mode (relay dials); the catch-up then finished at
 9.7 blk/s. Name the pause (a checkpoint? the dial burst taking the apply
 lock?) from the log's split, then move it off the apply path. Small.
+
+**Run 39 (10-06, main 7eb763ab, without the fix):** the same gap again,
+65 s between `[dl] parallel downloader wrote` (17:44:13.4) and the first
+drained block (17:45:18.5); the tail was 97 s from IBD end to ready (drain 23
+s, downshift flush, latch, index gaps). The test's two record assertions fail
+with both sync sites disabled (revert check 18:00Z).
+
 ### B9. The first 200,000 blocks: Core ahead by ~70 s
 Round-trip bound on tiny blocks: bmc asks for 16-block chunks per round
 trip, Core pipelines per block. A per-peer in-flight pipeline across chunk
@@ -402,6 +424,20 @@ say: with part 1 the first 200,000 blocks are at Core's pace (100,000 at
 4:16/4:20 against Core #6's 4:12; 200,000 at 8:21/8:15 against 8:15; run
 38 had 5:08 and 9:03) -- the ~50 s Core had on the early chain was the
 probe minute, not the request shape. Run 39 confirms on a full sync.
+
+**Run 39 (10-06, the full sync of the #392 build):** boot to block 1 in
+49.6 s (liveness 5.8 s, ranking 8.2 s, headers 35.3 s) against run 38's 99 s
+and Core's 75; 100,000 at 4:15 and 200,000 at 8:14 against Core's 4:12 and
+8:15. Part 1 is measured. Open question from the same run: the download
+churned peers (81 distinct against run 38's 25; the pool banned 22 of 135 by
+the end against 4 of 141; per-chunk wait sum 5,160 s against 3,591; chunk wall
+p50 0.94 s against 0.39) and ready came 17 minutes after run 38's. With every
+probe in flight at once the ranking's per-peer rate is a share of the box's
+uplink, not the peer's, which would put slow peers at the top of the ranking.
+Not isolated: the applier's own columns rose by 700 s in the same run (memtable
+insert and undo capture) with PR #392 touching neither. Run 40 is the next
+data point; if the churn repeats, rank by a second, staggered sample.
+
 ### M1. Memory: name the 26 GB — BUILT 10-06 (branch perf/2026-10-06-m1-mem-naming; gate pending)
 Anonymous memory held 26.4 GB through the sync with dbcache=8192 (peak 35.2
 GB in a compaction). A per-subsystem `[mem]` line under benchlog at the MEM
