@@ -1623,8 +1623,21 @@ static int cmd_gettxspendingprevout(const rj_val* params, rj_val** res,
  * graph has supplied the member's sigop cost (inf >= 0), and plain BIP141
  * until then; w is the BIP141 weight either way. rbf: the tx itself signals
  * BIP125, so bip125-replaceable over an ancestor set is lookups too. */
-typedef struct { unsigned char id[32]; unsigned long vs, w; long inf; unsigned char rbf; } mpe_vs_t;
+typedef struct { unsigned char id[32]; unsigned long vs, w; long inf; unsigned char rbf;
+                 /* 2026-10-06, the snapshot path (see cmd_getrawmempool): what
+                  * mpe_entry_obj used to read from the pool and its hooks,
+                  * copied under the pool lock so the build can run after it */
+                 unsigned char wtxid[32]; long tm; long long pri; unsigned long ord; } mpe_vs_t;
 static mpe_vs_t* g_mpe_vs; static unsigned long g_mpe_vs_n;
+/* 1 while verbose getrawmempool builds its entries AFTER releasing the pool
+ * lock: every per-entry input then comes from g_mpe_vs / g_mpe_inf, and
+ * nothing may touch the pool, the registry or the arrival/priority tables.
+ * Per call, under the mempool lane's mutex like the tables themselves. */
+static int g_mpe_snap;
+/* test knob: 0 forces the old all-under-the-lock build, for a byte-for-byte
+ * comparison of the two (tests/test_rpc_chunk_scale) */
+static int g_grm_snapshot = 1;
+void rpc_node_set_grm_snapshot(int on){ g_grm_snapshot = on ? 1 : 0; }
 /* the whole graph for this call, filled once by pol_entry_info_all; indexed
    by the same sorted txid order as the vsize cache above */
 static mp_entry_info* g_mpe_inf; static unsigned char (*g_mpe_inf_id)[32]; static long g_mpe_inf_n;
@@ -1710,7 +1723,10 @@ static unsigned long mpe_member_vsize(const unsigned char id[32], const unsigned
     }
     unsigned sc = 0;
     if (!memcmp(id, self, 32)) sc = selfinf->sigop_cost;
-    else if (g_mph.polstate && g_mph.pol_entry_info){
+    else if (!g_mpe_snap && g_mph.polstate && g_mph.pol_entry_info){
+        /* (snapshot mode skips it: a member the one-pass graph lacks is not
+         * in the registry -- pol_entry_info_all refuses rather than truncate
+         * -- so this lookup could only have answered "not found") */
         static mp_entry_info mi;             /* ~8 KB: kept off the stack */
         if (g_mph.pol_entry_info(g_mph.polstate, id, &mi) == 1) sc = mi.sigop_cost;
     }
@@ -1726,6 +1742,8 @@ static int mpe_member_rbf(const unsigned char id[32]){
 /* the per-entry object, shared by getmempoolentry and verbose getrawmempool */
 static int mpc_lookup_here(void* ctx, const unsigned char txid[32], mpc_entry* out);
 static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx, unsigned long len);
+static long long pri_delta_of(const unsigned char txid[32]);
+static void mpe_hex(char* dst, const unsigned char* internal);
 static int cmd_getrawmempool(const rj_val* params, rj_val** res, long* ec, const char** em){
     /* verbose (params[0]==true) -> object keyed by txid; else -> array of
      * txids (display byte order).
@@ -1806,6 +1824,23 @@ static int cmd_getrawmempool(const rj_val* params, rj_val** res, long* ec, const
     if (!g_mph.mp && g_mph.mempool_sequence) mseq = g_mph.mempool_sequence();
     if (g_mph.mp){
         static const char* HEXD = "0123456789abcdef";
+        /* 2026-10-06: the verbose call's pool-lock hold is the COPY, not the
+         * build. Until today everything below ran under mpl() -- the graph,
+         * one cluster linearization per cluster, and ~75k entry objects of
+         * rj_* allocations -- so every p2p accept in the download worker
+         * waited for a monitor's poll to finish serializing: 1.1-1.9 s holds
+         * at a ~75k pool on the Mac's mainnet node (02:57-04:09Z 10-02, the
+         * caller BlockYard's getrawmempool(true) poll; note item 24 for x86).
+         * Now the pass under the lock records, per entry, everything the
+         * builder reads from the pool or its hooks -- weight and BIP125 from
+         * the slot cache, the wtxid (one sha256d over the bytes, which exist
+         * only in the pool), the arrival time, the prioritisetransaction
+         * delta -- takes the one-pass graph and the sequence number, and lets
+         * go. The sort, the cluster builds and the JSON then run on the
+         * call's own tables (g_mpe_snap). Same answer byte for byte
+         * (tests/test_rpc_chunk_scale compares it with the old path). A call
+         * whose tables did not build (no one-pass graph, an allocation that
+         * failed) keeps the old shape: it still needs the per-txid lookups. */
         mpl();
         unsigned long n = mp_slot_count(g_mph.mp);
         /* ONE parse per transaction for the whole call: fill the vsize cache
@@ -1819,12 +1854,21 @@ static int cmd_getrawmempool(const rj_val* params, rj_val** res, long* ec, const
             if (g_mpe_vs){
                 for (unsigned long i=0;i<n;i++){ mp_ent e2;
                     if (mp_slot(g_mph.mp,i,&e2) != 1) continue;
-                    memcpy(g_mpe_vs[g_mpe_vs_n].id, e2.txid, 32);
+                    mpe_vs_t* v = &g_mpe_vs[g_mpe_vs_n];
+                    memcpy(v->id, e2.txid, 32);
                     { unsigned char rbf = 0;
-                      g_mpe_vs[g_mpe_vs_n].w = mpc_weight(n, i, &e2, &rbf);   /* 2026-09-30: the slot cache */
-                      g_mpe_vs[g_mpe_vs_n].rbf = rbf; }
-                    g_mpe_vs[g_mpe_vs_n].vs = (g_mpe_vs[g_mpe_vs_n].w+3)/4;
-                    g_mpe_vs[g_mpe_vs_n].inf = -1;
+                      v->w = mpc_weight(n, i, &e2, &rbf);   /* 2026-09-30: the slot cache */
+                      v->rbf = rbf; }
+                    v->vs = (v->w+3)/4;
+                    v->inf = -1;
+                    /* the snapshot's per-entry inputs, in the builder's order
+                     * of preference (wtxid degrades to the txid without a
+                     * hash hook, as mpe_entry_obj does) */
+                    if (g_mph.sha256d) g_mph.sha256d(v->wtxid, e2.tx, e2.len);
+                    else memcpy(v->wtxid, e2.txid, 32);
+                    v->tm = g_mph.time_of ? g_mph.time_of(e2.txid) : 0;
+                    v->pri = pri_delta_of(e2.txid);
+                    v->ord = g_mpe_vs_n;           /* the pool's order, the reply's */
                     g_mpe_vs_n++;
                 }
                 /* the whole graph in one pass; -1 means fall back per entry */
@@ -1836,33 +1880,60 @@ static int cmd_getrawmempool(const rj_val* params, rj_val** res, long* ec, const
                         g_mpe_inf_n = g_mph.pol_entry_info_all(g_mph.polstate, g_mpe_inf, g_mpe_inf_id, (unsigned)n);
                     if (g_mpe_inf_n < 0){ free(g_mpe_inf); free(g_mpe_inf_id); g_mpe_inf=0; g_mpe_inf_id=0; }
                 }
-                qsort(g_mpe_vs, g_mpe_vs_n, sizeof *g_mpe_vs, mpe_vs_cmp);
-                for (long q=0;q<g_mpe_inf_n;q++){
-                    long k = mpe_vs_find(g_mpe_inf_id[q]);
-                    if (k >= 0){ g_mpe_vs[k].inf = q;
-                                 g_mpe_vs[k].vs = mpe_adj_vsize(g_mpe_vs[k].w, g_mpe_inf[q].sigop_cost); }
-                }
-                /* chunk cache: only with the one-pass graph (the lookup it
-                 * drives reads g_mpe_inf); without it, per-entry builds */
-                if (g_mpe_inf && g_mpe_vs_n)
-                    g_mpe_chunk = (mpe_chunk_t*)calloc(g_mpe_vs_n, sizeof *g_mpe_chunk);
             }
         }
-        for (unsigned long i=0;i<n;i++){ mp_ent e;
-            if (mp_slot(g_mph.mp,i,&e) != 1) continue;
-            char hx[65];
-            for (int k=0;k<32;k++){ unsigned char b=e.txid[31-k]; hx[k*2]=HEXD[b>>4]; hx[k*2+1]=HEXD[b&15]; }
-            hx[64]=0;
-            if (!verbose){ rj_arr_push(out, rj_str(hx)); continue; }
-            /* the same builder getmempoolentry uses, under the same pool lock */
-            rj_obj_set(out, hx, mpe_entry_obj(e.txid, e.tx, e.len));
+        /* chunk cache: only with the one-pass graph (the lookup it drives
+         * reads g_mpe_inf); without it, per-entry builds. Allocated here, under
+         * the lock, because the snapshot path needs it: without it
+         * mpe_chunk_of would fall back to the registry lookup. */
+        if (g_mpe_vs && g_mpe_inf && g_mpe_vs_n)
+            g_mpe_chunk = (mpe_chunk_t*)calloc(g_mpe_vs_n, sizeof *g_mpe_chunk);
+        /* the snapshot is complete: let the pool go before any of the work */
+        unsigned long* ordk = 0;
+        int snap = g_grm_snapshot && g_mpe_vs && g_mpe_inf && g_mpe_chunk;
+        if (snap) ordk = (unsigned long*)malloc((g_mpe_vs_n ? g_mpe_vs_n : 1) * sizeof *ordk);
+        if (!ordk) snap = 0;
+        if (snap){
+            if (g_mph.mempool_sequence) mseq = g_mph.mempool_sequence();
+            mpu();
+            g_mpe_snap = 1;
         }
+        if (g_mpe_vs){
+            qsort(g_mpe_vs, g_mpe_vs_n, sizeof *g_mpe_vs, mpe_vs_cmp);
+            for (long q=0;q<g_mpe_inf_n;q++){
+                long k = mpe_vs_find(g_mpe_inf_id[q]);
+                if (k >= 0){ g_mpe_vs[k].inf = q;
+                             g_mpe_vs[k].vs = mpe_adj_vsize(g_mpe_vs[k].w, g_mpe_inf[q].sigop_cost); }
+            }
+        }
+        if (snap){
+            for (unsigned long k=0;k<g_mpe_vs_n;k++) ordk[g_mpe_vs[k].ord] = k;
+            for (unsigned long j=0;j<g_mpe_vs_n;j++){
+                const mpe_vs_t* v = &g_mpe_vs[ordk[j]];
+                char hx[65]; mpe_hex(hx, v->id);
+                rj_obj_set(out, hx, mpe_entry_obj(v->id, NULL, 0));
+            }
+        } else {
+            for (unsigned long i=0;i<n;i++){ mp_ent e;
+                if (mp_slot(g_mph.mp,i,&e) != 1) continue;
+                char hx[65];
+                for (int k=0;k<32;k++){ unsigned char b=e.txid[31-k]; hx[k*2]=HEXD[b>>4]; hx[k*2+1]=HEXD[b&15]; }
+                hx[64]=0;
+                if (!verbose){ rj_arr_push(out, rj_str(hx)); continue; }
+                /* the same builder getmempoolentry uses, under the same pool lock */
+                rj_obj_set(out, hx, mpe_entry_obj(e.txid, e.tx, e.len));
+            }
+        }
+        g_mpe_snap = 0;
+        free(ordk);
         free(g_mpe_chunk); g_mpe_chunk = 0;
         free(g_mpe_vs); g_mpe_vs = 0; g_mpe_vs_n = 0;
         free(g_mpe_inf); free(g_mpe_inf_id); g_mpe_inf = 0; g_mpe_inf_id = 0; g_mpe_inf_n = 0;
-        /* still inside the lock that covered the walk above */
-        if (g_mph.mempool_sequence) mseq = g_mph.mempool_sequence();
-        mpu();
+        if (!snap){
+            /* still inside the lock that covered the walk above */
+            if (g_mph.mempool_sequence) mseq = g_mph.mempool_sequence();
+            mpu();
+        }
     }
     if (want_seq){
         rj_val* o = rj_obj();
@@ -1941,7 +2012,7 @@ static int mpc_lookup_bulk(void* ctx, const unsigned char txid[32], mpc_entry* o
     if (k < 0 || g_mpe_vs[k].inf < 0) return 0;
     const mp_entry_info* inf = &g_mpe_inf[g_mpe_vs[k].inf];
     memset(out, 0, sizeof *out);
-    long long modified = (long long)inf->fee + pri_delta_of(txid);
+    long long modified = (long long)inf->fee + (g_mpe_snap ? g_mpe_vs[k].pri : pri_delta_of(txid));
     out->fee = modified < 0 ? 0 : (uint64_t)modified;
     { unsigned long long bps = g_mph.bytespersigop ? g_mph.bytespersigop() : 20;
       unsigned long long w = g_mpe_vs[k].w;
@@ -2020,7 +2091,11 @@ static int mpe_chunk_of(const unsigned char txid[32], unsigned long long* fee,
  * per-member body of the verbose getmempoolancestors/-descendants forms). */
 static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx, unsigned long len){
     rj_val* o = rj_obj();
-    unsigned long w = mp_tx_weight(tx, len);
+    /* snapshot mode: tx is NULL and every input below comes from the call's
+     * tables (copied under the pool lock); the lock is not held here */
+    long sk = g_mpe_snap ? mpe_vs_find(txid) : -1;
+    if (g_mpe_snap && sk < 0) return o;              /* not reachable: the walk is over the table */
+    unsigned long w = g_mpe_snap ? g_mpe_vs[sk].w : mp_tx_weight(tx, len);
 
     mp_entry_info inf; int have_inf = 0;
     /* Prefer the one-pass graph when this call built one; otherwise ask per
@@ -2032,7 +2107,7 @@ static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx,
      * spentby and both counts. The suite caught it immediately. */
     long myinf = (g_mpe_vs && g_mpe_inf) ? mpe_inf_lookup(txid) : -1;
     if (myinf >= 0){ inf = g_mpe_inf[myinf]; have_inf = 1; }
-    else if (g_mph.polstate && g_mph.pol_entry_info)
+    else if (!g_mpe_snap && g_mph.polstate && g_mph.pol_entry_info)
         have_inf = (int)g_mph.pol_entry_info(g_mph.polstate, txid, &inf);
     if (!have_inf) inf.sigop_cost = 0;
     /* vsize is Core's entry size, the sigops-adjusted one (see
@@ -2041,7 +2116,8 @@ static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx,
     unsigned long vs = mpe_adj_vsize(w, inf.sigop_cost);
     rj_obj_set(o, "vsize", rj_numf("%lu", vs));
     rj_obj_set(o, "weight", rj_numf("%lu", w));
-    rj_obj_set(o, "time", rj_numf("%ld", g_mph.time_of ? g_mph.time_of(txid) : 0));
+    rj_obj_set(o, "time", rj_numf("%ld", g_mpe_snap ? g_mpe_vs[sk].tm
+                                          : (g_mph.time_of ? g_mph.time_of(txid) : 0)));
     rj_obj_set(o, "height", rj_numf("%d", 0));   /* documented gap: entry height untracked */
 
     /* ancestor/descendant sums of the same entry size, over set members
@@ -2061,20 +2137,21 @@ static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx,
     /* Core's IsRBFOptIn: the tx signals itself, or an unconfirmed ancestor
      * does (the set above holds self as well). Full-RBF does not enter into
      * it -- v31.1 reports signalling, not replaceability under its policy. */
-    if (!rbf) rbf = mp_tx_signals_rbf(tx, len);
+    if (!rbf) rbf = g_mpe_snap ? g_mpe_vs[sk].rbf : mp_tx_signals_rbf(tx, len);
     rj_obj_set(o, "descendantcount", rj_numf("%d", desc_n));
     rj_obj_set(o, "descendantsize", rj_numf("%llu", desc_vs));
     rj_obj_set(o, "ancestorcount", rj_numf("%d", anc_n));
     rj_obj_set(o, "ancestorsize", rj_numf("%llu", anc_vs));
 
     { unsigned char wt[32]; char whx[65];
-      if (g_mph.sha256d){ g_mph.sha256d(wt, tx, len); mpe_hex(whx, wt); }
+      if (g_mpe_snap) mpe_hex(whx, g_mpe_vs[sk].wtxid);
+      else if (g_mph.sha256d){ g_mph.sha256d(wt, tx, len); mpe_hex(whx, wt); }
       else mpe_hex(whx, txid);                       /* degrade: txid */
       rj_obj_set(o, "wtxid", rj_str(whx)); }
 
     { rj_val* fees = rj_obj();
       unsigned long long base = have_inf ? inf.fee : 0;
-      long long modified = (long long)base + pri_delta_of(txid);   /* prioritisetransaction */
+      long long modified = (long long)base + (g_mpe_snap ? g_mpe_vs[sk].pri : pri_delta_of(txid));   /* prioritisetransaction */
       long long am = modified < 0 ? -modified : modified;
       rj_obj_set(fees, "base", mpe_amount(base));
       rj_obj_set(fees, "modified", rj_numf("%s%lld.%08lld", modified<0?"-":"", am/100000000LL, am%100000000LL));

@@ -11,11 +11,17 @@
  *   - cluster builds during ONE bulk call == multi-member clusters in the pool
  *     (a per-member build would be 25x that);
  *   - every entry carries both keys;
- *   - the bulk answer equals the per-txid getmempoolentry answer for a sample.
+ *   - the bulk answer equals the per-txid getmempoolentry answer for a sample;
+ *   - (2026-10-06) the pool-lock hold: the verbose call copies what it needs
+ *     under the lock and builds after it, so its hold is a fraction of the
+ *     call, and its answer is byte-identical to the old all-under-the-lock
+ *     build (rpc_node_set_grm_snapshot(0)) -- with arrival times, wtxids and
+ *     prioritisetransaction deltas in play, the three inputs the snapshot
+ *     carries that the pool used to supply mid-build.
  *
- * The call's wall time is printed, not asserted: the whole call runs under the
- * pool lock, so it IS the lock hold other work waits on, and the number to
- * compare is before/after on the same box (see docs/PARITY_RPC_FIELDS.md).
+ * The call's wall time is printed, not asserted (the number to compare is
+ * before/after on the same box, see docs/PARITY_RPC_FIELDS.md). The lock hold
+ * is asserted only relative to the old path's, on the same pool.
  *
  * Usage: ./tests/test_rpc_chunk_scale [entries]   (default 32000)
  */
@@ -57,6 +63,19 @@ static int fails;
 static void ck(const char* l, int c){ printf("%s %s\n", c ? "ok  :" : "FAIL:", l); if (!c) fails++; }
 static double now_ms(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
                             return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6; }
+
+/* the pool lock, timed: the longest single hold since the last reset */
+static double g_lock_at, g_hold_max; static long g_takes, g_releases;
+static void t_lock(void){ g_lock_at = now_ms(); g_takes++; }
+static void t_unlock(void){ double h = now_ms() - g_lock_at; if (h > g_hold_max) g_hold_max = h; g_releases++; }
+/* an arrival time and a "wtxid" that differ per entry, so a snapshot that
+ * paired them with the wrong txid would show in the byte comparison */
+static long t_time_of(const unsigned char* txid){ return 1700000000L + txid[0] * 257L + txid[1]; }
+static void t_sha256d(unsigned char* out, const void* p, unsigned long n){
+    const unsigned char* b = (const unsigned char*)p; unsigned long long h = 1469598103934665603ULL;
+    for (unsigned long i = 0; i < n; i++){ h ^= b[i]; h *= 1099511628211ULL; }
+    for (int i = 0; i < 32; i++){ h ^= (unsigned long long)i; h *= 1099511628211ULL; out[i] = (unsigned char)(h >> 29); }
+}
 
 static unsigned long mk_tx1(unsigned char* t, const unsigned char prev[32],
                             unsigned long long val, unsigned tag){
@@ -121,6 +140,8 @@ int main(int argc, char** argv){
     h.polstate = polstate; h.pol_entry = mpool_policy_entry;
     h.pol_entry_info = mpool_policy_entry_info;
     h.pol_entry_info_all = mpool_policy_entry_info_all;
+    h.lock = t_lock; h.unlock = t_unlock;
+    h.time_of = t_time_of; h.sha256d = t_sha256d;
     rpc_node_set_mempool(&h);
 
     long ec = 0; const char* em = NULL;
@@ -172,6 +193,65 @@ int main(int argc, char** argv){
     }
     snprintf(what, sizeof what, "bulk chunk fields equal getmempoolentry's on %d sampled entries", sampled);
     ck(what, agree && sampled > 0);
+
+    /* ---- the pool-lock hold, and the same answer, old path vs snapshot ----
+     * three prioritisetransaction deltas first (a chain's head, a chain's
+     * middle, a singleton): the delta moves fees.modified and, through the
+     * cluster's modified fees, the chunk -- read from the pool's table by the
+     * old path mid-build, from the snapshot by the new one */
+    if (n > 40){
+        const int pick[3] = { 0, 12, n - 1 };
+        for (int q = 0; q < 3; q++){
+            char pa[160]; snprintf(pa, sizeof pa, "[\"%s\", 0, %d]", all->members[pick[q]].key, 4000 + 1000 * q);
+            rj_val* pp = rj_parse(pa, strlen(pa)); rj_val* pr = NULL;
+            rpc_node_dispatch("prioritisetransaction", pp, &pr, &ec, &em);
+            rj_free(pr); rj_free(pp);
+        }
+    }
+    char* body[2] = { NULL, NULL }; long blen[2] = { 0, 0 };
+    double hold[2] = { 0, 0 }, wall[2] = { 0, 0 };
+    long takes0 = g_takes, rel0 = g_releases;
+    for (int mode = 0; mode < 2; mode++){
+        rpc_node_set_grm_snapshot(mode);
+        hold[mode] = 1e18; wall[mode] = 1e18;
+        for (int rep = 0; rep < 3; rep++){
+            rj_val* pv = rj_parse("[true]", 6); rj_val* r = NULL;
+            g_hold_max = 0;
+            double a = now_ms();
+            rpc_node_dispatch("getrawmempool", pv, &r, &ec, &em);
+            double ms = now_ms() - a;
+            if (g_hold_max < hold[mode]) hold[mode] = g_hold_max;
+            if (ms < wall[mode]) wall[mode] = ms;
+            if (rep == 0 && r){ free(body[mode]); body[mode] = rj_write_alloc(r, 0, &blen[mode]); }
+            rj_free(r); rj_free(pv);
+        }
+    }
+    rpc_node_set_grm_snapshot(1);
+    /* a release missed would read as NO hold (nothing timed it), so the
+     * hold check below is only meaningful with the takes and releases paired */
+    snprintf(what, sizeof what, "every pool-lock take was released (%ld takes, %ld releases)",
+             g_takes - takes0, g_releases - rel0);
+    ck(what, g_takes - takes0 == g_releases - rel0 && g_takes > takes0);
+    { /* the deltas took: the comparison above covered a moved fees.modified */
+      int moved = 0;
+      rj_val* pv = rj_parse("[true]", 6); rj_val* r = NULL;
+      rpc_node_dispatch("getrawmempool", pv, &r, &ec, &em);
+      for (int m = 0; r && m < (int)r->nmembers; m++){
+          rj_val* f = rj_obj_get(r->members[m].val, "fees");
+          rj_val* fb = f ? rj_obj_get(f, "base") : NULL; rj_val* fm = f ? rj_obj_get(f, "modified") : NULL;
+          if (fb && fm && strcmp(fb->str, fm->str)) moved++;
+      }
+      rj_free(r); rj_free(pv);
+      snprintf(what, sizeof what, "the three prioritisetransaction deltas show in fees.modified (%d entries)", moved);
+      ck(what, n <= 40 || moved == 3); }
+    printf("  pool-lock hold, best of 3: %.1f ms building under the lock (call %.1f ms), "
+           "%.1f ms copying under it (call %.1f ms)\n", hold[0], wall[0], hold[1], wall[1]);
+    ck("the snapshot answer is byte-identical to the all-under-the-lock answer",
+       body[0] && body[1] && blen[0] == blen[1] && !memcmp(body[0], body[1], (size_t)blen[0]));
+    snprintf(what, sizeof what, "the pool lock is held for under half the old hold (%.1f ms against %.1f ms)",
+             hold[1], hold[0]);
+    ck(what, hold[1] < hold[0] * 0.5);
+    free(body[0]); free(body[1]);
 
     rj_free(all);
     rpc_node_set_mempool(NULL);

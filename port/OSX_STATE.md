@@ -4,6 +4,12 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-10-06 (late) — verbose `getrawmempool` holds the pool lock for the copy, not the build (shared C)
+
+The fix for note item 24, on our side. `cmd_getrawmempool` (rpc_node.c) used to build every entry's JSON — the cluster linearizations and ~75k `rj_*` trees — inside `mpl()`, so each BlockYard poll held the cross-process pool lock 1.1–1.9 s with the worker's p2p accepts waiting behind it. Now the pass under the lock records per entry what the builder used to read from the pool and its hooks (slot-cache weight and BIP125, the wtxid's sha256d over the bytes, `time_of`, the `prioritisetransaction` delta, the pool order), takes the one-pass graph, allocates the chunk cache, reads `mempool_sequence`, and releases; the sort, cluster builds and JSON then run on the call's tables (`g_mpe_snap` makes `mpe_entry_obj` / `mpe_member_vsize` / `mpc_lookup_bulk` touch nothing shared). The per-call tables were already guarded by the mempool lane's own mutex, not by the pool lock. The wtxid is NOT cached across calls in the slot cache: that cache is keyed on txid + length, which a same-length witness replacement would defeat. A call whose tables did not build keeps the old under-the-lock path (it needs the per-txid lookups).
+- **Proof:** `test_rpc_chunk_scale` (32,000-entry production-shaped pool, timed lock hooks, `time_of` / `sha256d` hooks, three priority deltas): hold 160.9 → 13.2 ms, wall unchanged, the answer byte-identical to the old path (`rpc_node_set_grm_snapshot(0)`, a new test knob), takes == releases. Mutations each fail it: no pri snapshot, no time snapshot, wtxid = txid, the pool order lost, the early release dropped (caught only by the takes/releases count — a timer-only lock reads a missed release as no hold).
+- **Full suite:** 424 PASS, 11 SKIP, 14 N/A, 0 FAIL. Docs: FEATURE_GAPS.md RPC-12 "2026-10-06", note item 24 marked fixed on bmc_osx with what main should take.
+
 ## 2026-10-06 (night) — fe_add / fe_sub in line in the point formulas; `a2ccdea7` deployed
 
 - **Deploy:** `a2ccdea7` (the native `glvj_ct`) on both nodes (snapshots `bmcbitcoind.pre-a2ccdea7`), restarted 18:07Z by stop.sh/start.sh; mainnet tip 970,211 and signet 325,225 = mempool.space, 10/10 peers each, no crash/FATAL/REJECT lines.

@@ -2462,6 +2462,26 @@ pool, so none of them waits on the worker there (`getblocktemplate` does,
 under the exclusive lock, and stays so: a miner's call, not a poller's).
 The block lane with a private buffer remains the next step for `getblock`.
 
+**2026-10-06: verbose `getrawmempool` holds the pool lock for the copy, not
+the build** (bmc_osx; x86 note item 24). The Mac's mainnet node logged the
+holder shape on 10-02: `getrawmempool held 1919 ms` with a
+`tx_accept_validate_p2p` in the worker waiting 1,496 ms behind it, 1.1-1.9 s
+at a ~75k pool, polled by BlockYard's `getrawmempool(true)` -- the JSON for
+every entry (the cluster linearizations, the rj_* tree) was built inside
+`mpl()`. Now the pass under the lock records what the entry builder reads
+from the pool and its hooks (slot-cache weight and BIP125, the wtxid's
+sha256d over the bytes, the arrival time, the prioritisetransaction
+delta), takes the one-pass graph and the sequence number, and releases;
+the sort, the cluster builds and the JSON run on the call's own tables
+(`g_mpe_snap`). `tests/test_rpc_chunk_scale` on its 32,000-entry
+production-shaped pool: the hold went 160.9 ms -> 13.2 ms, the call's wall
+time unchanged, the answer byte-identical to the old path's
+(`rpc_node_set_grm_snapshot(0)`) with arrival times, wtxids and three
+priority deltas in play; the takes and releases are counted so a missed
+release cannot pass as a short hold. A call whose tables did not build
+(no one-pass graph, an allocation failure) keeps the old under-the-lock
+shape, because it still needs the per-txid lookups.
+
 ### The wallet has no reorg awareness (WAL-13)
 
 `wallet_scan.c`'s on-disk record is `u32 height | txid | vout | value`

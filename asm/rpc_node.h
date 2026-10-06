@@ -630,6 +630,9 @@ void rpc_node_set_mempool(const rpc_mempool_hooks* h);
  * fees.chunk). A test reads the delta across one bulk getrawmempool to pin
  * the cost model: one build per CLUSTER, never one per member. */
 unsigned long rpc_node_cluster_builds(void);
+/* test knob (2026-10-06): 0 = verbose getrawmempool builds under the pool
+   lock as before; 1 (default) = it copies under the lock and builds after */
+void rpc_node_set_grm_snapshot(int on);
 
 /* Hand the RPC layer the persistent address book (daemon/addrbook.c v2), so
  * getnodeaddresses/getaddrmaninfo report real recorded peers. Injected as
