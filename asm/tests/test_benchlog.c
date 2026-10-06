@@ -22,6 +22,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/mman.h>
 #include "../daemon/node_config.h"
 #include "../daemon/benchlog.h"
 #include "../daemon/dlc_benchlog.h"
@@ -126,6 +127,40 @@ int main(void){
       r.txindex_on = 0; r.txindex_covered = -1; r.bfilter_on = 0; r.coinstats_on = 0; r.coinstats_hist_ok = 0;
       ckm("ready: utxo alone -> 1", benchlog_ready_eval(&r, out, sizeof out) == 1);
       cks("ready: ...line", out, "[ready] all indexes at height 900 (utxo; skipped: txindex, bfilter, coinstats history) -- 81234.6s"); }
+
+    /* ---- the [mem] line (M1, 2026-10-06): a 48 MB anonymous region, touched
+     * and named, must appear under its name with its size; the totals come
+     * from smaps_rollup. The name check is skipped on a kernel without
+     * PR_SET_VMA_ANON_NAME (maps shows no "[anon:bl_probe]"). */
+    printf("\n-- the [mem] line\n");
+    {
+        size_t len = 48u << 20;
+        unsigned char* p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        ckm("mem: mmap 48 MB", p != MAP_FAILED);
+        memset(p, 0x5a, len);
+        benchlog_mem_name_region(p, len, "bl_probe");
+        int named = 0;
+        { FILE* mf = fopen("/proc/self/maps", "r"); char l[512];
+          while (mf && fgets(l, sizeof l, mf)) if (strstr(l, "[anon:bl_probe]")) named = 1;
+          if (mf) fclose(mf); }
+        char big[2048];
+        int n = benchlog_mem_line(big, sizeof big, "test");
+        printf("     %s\n", big);
+        ckm("mem: the line is non-empty and bounded", n > 0 && n < (int)sizeof big);
+        ckm("mem: starts with the tag and the totals", strncmp(big, "[mem] test: pss ", 16) == 0 && strstr(big, " MB (anon ") != NULL);
+        ckm("mem: the totals are non-zero (smaps_rollup read)", strstr(big, "pss 0 MB") == NULL);
+        if (named){
+            const char* e = strstr(big, "| bl_probe ");
+            long mb = e ? strtol(e + 11, NULL, 10) : -1;
+            printf("     bl_probe entry: %ld MB\n", mb);
+            ckm("mem: the named region is listed by name with its size (48 MB, +/-1)", mb >= 47 && mb <= 49);
+        } else printf("     (kernel has no PR_SET_VMA_ANON_NAME: name check skipped)\n");
+        ckm("mem: entries under 16 MB fold into 'other'", strstr(big, "| other ") != NULL);
+        /* a cap too small for the list still yields a bounded, NUL-terminated prefix */
+        char small[40]; int m = benchlog_mem_line(small, sizeof small, "t");
+        ckm("mem: a small cap is honoured", m < (int)sizeof small && strlen(small) < sizeof small && strncmp(small, "[mem] t: pss ", 13) == 0);
+        munmap(p, len);
+    }
 
     printf("\n%s (%d failures)\n", failures == 0 ? "ALL TESTS PASSED" : "TESTS FAILED", failures);
     return failures ? 1 : 0;
