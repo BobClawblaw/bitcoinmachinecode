@@ -46,4 +46,39 @@ typedef struct {
 } benchlog_ready_t;
 int benchlog_ready_eval(const benchlog_ready_t* r, char* out, size_t cap);
 
+/* ---- the [mem] line (plan M1, 2026-10-06) --------------------------------
+ * This process's memory by mapping, proportional set size (Pss: a page
+ * shared with a forked child counts once, split between them), largest
+ * first, read from /proc/self/smaps:
+ *
+ *   [mem] at IBD end: pss 18765 MB (anon 8284, file 10409, shmem 72) | utxo-memtable 6791 | hdr-tree 1024 | utxo_lsm_blob.map 1623 | ... | other 212
+ *
+ * An anonymous region named with benchlog_mem_name_region shows under that
+ * name; an unnamed one is "anon"; a file-backed mapping is its basename;
+ * entries under 16 MB are summed as "other". The totals come from
+ * /proc/self/smaps_rollup. The sampler beside a benchmark run sums Pss_Anon
+ * across the tree the same way; summing "Anonymous" counted the worker's
+ * inherited copy-on-write pages once per forked child (13 x 1.4 GB on run
+ * 39), which is how 27.9 GB of "anonymous memory" got into a report.
+ * Returns the length written; when /proc/self/smaps cannot be read the
+ * line says so and the return is still its length. */
+int benchlog_mem_line(char* out, size_t cap, const char* tag);
+/* name an anonymous mapping for /proc/PID/maps, smaps and the line above
+ * (prctl PR_SET_VMA_ANON_NAME, Linux 5.17+; a kernel without it, or a
+ * region that is not anonymous, is a silent no-op). The name is copied
+ * by the kernel: a literal or a static string, at most 79 bytes,
+ * [A-Za-z0-9._-] and space. A malloc'd block is fine: the range is
+ * trimmed to whole pages (its first and last partial page stay unnamed).
+ * Header-only so any file can name what it allocates without a new link
+ * dependency. */
+#include <sys/syscall.h>
+#include <unistd.h>
+static inline void benchlog_mem_name_region(const void* p, size_t len, const char* name){
+    unsigned long a = (unsigned long)p, e = a + len, pg = 4096;
+    if (!p || !len || !name) return;
+    a = (a + pg - 1) & ~(pg - 1); e &= ~(pg - 1);
+    if (e <= a) return;
+    (void)syscall(SYS_prctl, 0x53564d41L /* PR_SET_VMA */, 0L /* PR_SET_VMA_ANON_NAME */, a, e - a, name);
+}
+
 #endif

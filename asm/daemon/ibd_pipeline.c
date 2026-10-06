@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <sys/mman.h>
 #include "ibd_pipeline.h"
+#include "benchlog.h"      /* benchlog_mem_name_region (M1, 2026-10-06) */
 
 #define IBD_PIPE_MAX 256          /* chunk sizes in use are 40; the cap bounds the arrays */
 /* Out-of-order arrivals are HELD until every earlier height in the chunk has
@@ -221,6 +222,7 @@ long ibd_fetch_chunk_pipelined(int fd, void* st, void* hst, long lo_real, long n
                 hold = mmap(0, IBD_HOLD_BYTES, PROT_READ | PROT_WRITE,
                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
                 if (hold == MAP_FAILED){ hold = 0; why = IBD_FAIL_HOLD; goto fail; }
+                benchlog_mem_name_region(hold, IBD_HOLD_BYTES, "dlc-hold");   /* M1 */
             }
             if (held_bytes + len > IBD_HOLD_BYTES){ why = IBD_FAIL_HOLD; goto fail; }   /* a peer answering wildly out of order */
             memcpy(hold + held_bytes, buf, len);
@@ -281,6 +283,7 @@ static int ibd_side_ready(ibd_side_t* s){
     if (s->buf) return 1;
     void* p = mmap(0, IBD_SIDE_BYTES, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (p == MAP_FAILED) return 0;
+    benchlog_mem_name_region(p, IBD_SIDE_BYTES, "dlc-side");   /* M1: 80 MiB virtual per side, ~16 blocks touched */
     s->buf = p; return 1;
 }
 static void ibd_side_reset(ibd_side_t* s, long lo, long n){

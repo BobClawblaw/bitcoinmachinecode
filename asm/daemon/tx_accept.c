@@ -31,6 +31,7 @@
 #include <stdint.h>
 #include "log_ts.h"
 #include "node_config.h"
+#include "benchlog.h"      /* benchlog_mem_name_region (M1, 2026-10-06) */
 #include "mempool_seq.h"   /* the ZMQ sequence topic's C event (tx_accept_block_connect_h) */
 
 typedef unsigned char u8;
@@ -204,6 +205,12 @@ int tx_dispatch_init(void){
         return 0;
     }
     utxo_init(g_table, slots, blob, blob_cap);
+    /* M1 (2026-10-06): named for maps/smaps and the [mem] line; the serve
+     * parent allocates these and every fork inherits them */
+    benchlog_mem_name_region(g_table, (size_t)ustruct, "txdv-table");
+    benchlog_mem_name_region(blob, (size_t)blob_cap, "txdv-blob");
+    benchlog_mem_name_region(tomb_buf, (size_t)(tomb_cap*36), "txdv-tombstones");
+    benchlog_mem_name_region(scratch_buf, (size_t)scratch_cap, "txdv-flush-scratch");
 
     memset(&g_lst, 0, sizeof g_lst);
     g_lst.op_threshold = op_threshold;

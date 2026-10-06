@@ -502,6 +502,7 @@ static long htidx_file_heights(void){
 static int build_hash_index(void){
     ht_idx=malloc(24 + (size_t)HT_SLOTS*48 + 64);   /* last slot may need a full --- actually over-allocate */
     if(!ht_idx){ fprintf(stderr,"alloc idx failed\n"); return -1; }
+    benchlog_mem_name_region(ht_idx, 24 + (size_t)HT_SLOTS*48 + 64, "block-hash-index");   /* M1: 384 MiB, inherited by every fork */
     idx_init(ht_idx, HT_SLOTS);
     if(idx_build_from_file(ht_idx, "index.dat")<0){ fprintf(stderr,"no index.dat for hash index\n"); return -1; }
     g_htidx_next = htidx_file_heights();
@@ -664,6 +665,7 @@ static void rebuild_hash_index_after_reorg(void){
 static int build_inmem_hash_index(void){
     ht_idx=malloc(24 + (size_t)HT_SLOTS*48 + 64);
     if(!ht_idx){ fprintf(stderr,"alloc idx failed\n"); return -1; }
+    benchlog_mem_name_region(ht_idx, 24 + (size_t)HT_SLOTS*48 + 64, "block-hash-index");
     idx_init(ht_idx, HT_SLOTS);
     int tip = *(int*)(store_buf+24);        /* same tip source the rest of main.c uses */
     static unsigned char sb[8<<20];
@@ -5489,6 +5491,7 @@ static int dlc_committer_run(volatile long* ctl, long start_h, long end_h, void*
                              void (*synced)(void* st)){
     unsigned char* buf = mmap(0, DLC_STAGE_MAX_BYTES, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if(buf == MAP_FAILED){ fprintf(stderr, "[dlc committer] cannot map the chunk buffer\n"); return 1; }
+    benchlog_mem_name_region(buf, DLC_STAGE_MAX_BYTES, "dlc-stage");   /* M1: 256 MiB virtual, a chunk touched */
     long fh = ctl[DLC_CTL_FIRST_HOLE]; if(fh < start_h) fh = start_h;
     while(fh <= end_h && present && present(fh)) fh++;
     if(fh > ctl[DLC_CTL_FIRST_HOLE]) ctl[DLC_CTL_FIRST_HOLE] = fh;
@@ -9020,6 +9023,9 @@ static int dl_ibd_latch(int tip_is_old){
         g_dl_ibd_left = 1;
         if(g_node_status) g_node_status->ibd_left = 1;
         fprintf(stderr,"[dl] leaving initial block download (latching to false, as Core does)\n");
+        /* M1 (2026-10-06): this process's memory by mapping at the MEM mark
+         * the sampler beside a benchmark run also takes (bmc.benchlog) */
+        if(g_cfg.benchlog){ static char m[2048]; benchlog_mem_line(m, sizeof m, "at IBD end"); fprintf(stderr, "%s\n", m); }
     }
     if(g_dl_ibd_left && g_node_status) g_node_status->ibd_left = 1;   /* republished: no boot-order dependence on the zeroed block */
     return g_dl_ibd_left ? 0 : tip_is_old;
@@ -9081,6 +9087,7 @@ static void dl_ready_check(int utxo_ok){
     if (!benchlog_ready_eval(&r, line, sizeof line)) return;
     said = 1;
     fprintf(stderr, "%s\n", line);
+    if(g_cfg.benchlog){ static char m[2048]; benchlog_mem_line(m, sizeof m, "at ready"); fprintf(stderr, "%s\n", m); }   /* M1: the second MEM mark */
 }
 /* ---- the index worker's hooks and lifetime (2026-10-06, plan B4) ---------
  * The four index writers ran here, in the applying process, serial with
