@@ -161,6 +161,8 @@ class Side:
         self.chunks = []      # dict per chunk line
         self.other_bench = {}  # kind -> [count, ms]
         self.lines = 0
+        self.ixw_on = False    # 2026-10-06: between "[ixw] index worker pid N started" and "... stopped" the
+                               # [bench] index lines are the forked worker's: off the applier's wall (plan B4)
 
     def seg(self, h, size):
         k = h // size
@@ -420,6 +422,16 @@ def parse_bmc(path, size, side=None):
             side.lines += 1
             if "\x00" in line:
                 line = line.replace("\x00", "")
+            if "[ixw] index worker pid" in line:
+                if " started" in line:
+                    side.ixw_on = True
+                    side.inc("ixw_starts")
+                elif " stopped" in line:
+                    side.ixw_on = False
+                    mb = re.search(r"stopped: (\d+) block", line)
+                    if mb:
+                        side.inc("ixw_blocks", int(mb.group(1)))
+                continue
             if "[bench] " in line:
                 m = RE_BMC_BLOCK.search(line)
                 if m:
@@ -441,9 +453,10 @@ def parse_bmc(path, size, side=None):
                 if m:
                     h = int(m.group(1))
                     s = side.seg(h, size)
+                    pre = "ixw:" if side.ixw_on else "ix:"
                     for k, v in parse_parts(m.group(2)).items():
-                        s.add("ix:" + k, v)
-                    s.inc("index_lines")
+                        s.add(pre + k, v)
+                    s.inc("ixw_lines" if side.ixw_on else "index_lines")
                     continue
                 m = RE_BENCH_CHUNK.search(line)
                 if m:
@@ -717,20 +730,28 @@ def render(core, bmc, size):
         seen = []
         for g in bmc.segs.values():
             for k in g.st:
-                if not k.startswith("ix:") and k != "total" and k not in seen:
+                if not k.startswith("ix:") and not k.startswith("ixw:") and k != "total" and k not in seen:
                     seen.append(k)
         stages = [k for k in BMC_STAGES if k in seen] + [k for k in seen if k not in BMC_STAGES]
         if not stages:
             stages = list(BMC_STAGES)
         ixs = []
+        have_ixw = False
         for g in bmc.segs.values():
             for k in g.st:
                 if k.startswith("ix:") and k[3:] not in ixs:
                     ixs.append(k[3:])
+                if k.startswith("ixw:"):
+                    have_ixw = True
+                    if k[4:] not in ixs:
+                        ixs.append(k[4:])
         ixcols = [k for k in BMC_INDEX if k in ixs] + [k for k in ixs if k not in BMC_INDEX]
         if not ixcols:
             ixcols = list(BMC_INDEX)
-        cols = ["wall", "blocks", "total"] + stages + ["other"] + ["ix " + k for k in ixcols] + ["outside"]
+        cols = ["wall", "blocks", "total"] + stages + ["other"] + ["ix " + k for k in ixcols]
+        if have_ixw:
+            cols.append("ixw")
+        cols.append("outside")
         P("| segment | " + " | ".join(cols) + " |")
         P("|---|" + "---|" * len(cols))
         tot = Seg()
@@ -747,6 +768,8 @@ def render(core, bmc, size):
             row += [fs(g.st.get(x, 0) / 1000) for x in stages]
             row.append(fs((total - parts) / 1000))
             row += [fs(g.st.get("ix:" + x, 0) / 1000) for x in ixcols]
+            if have_ixw:
+                row.append(fs(sum(g.st.get("ixw:" + x, 0) for x in ixcols) / 1000))
             row.append(fs(wall - (total + ixsum) / 1000) if wall is not None else "--")
             P("| %s | %s |" % (seg_label(k, size, top), " | ".join(row)))
             for kk, v in g.st.items():
@@ -760,14 +783,26 @@ def render(core, bmc, size):
         row += [fs(tot.st.get(x, 0) / 1000) for x in stages]
         row.append(fs((total - parts) / 1000))
         row += [fs(tot.st.get("ix:" + x, 0) / 1000) for x in ixcols]
+        if have_ixw:
+            row.append(fs(sum(tot.st.get("ixw:" + x, 0) for x in ixcols) / 1000))
         row.append(fs(twall - (total + ixsum) / 1000))
         P("| **total** | %s |" % " | ".join(row))
         P("")
         P("total = the block line's own total; other = total minus the named stages. "
-          "ix = the choke-point index work outside the block total ([bench] index lines). "
-          "outside = wall minus (total + ix): download waits and everything off the apply "
+          "ix = the choke-point index work outside the block total ([bench] index lines "
+          "printed by the applying process: on its wall). "
+          + ("ixw = the same writers run in the forked index worker (the [bench] index lines "
+             "between its started and stopped lines): off the apply path, not in outside. "
+             if have_ixw else "")
+          + "outside = wall minus (total + ix): download waits and everything off the apply "
           "path. bmc applies on a pipeline, so outside is not idle time by itself.")
         P("")
+        if have_ixw:
+            P("Index worker (plan B4): %s block(s) indexed in the worker over %d start(s); "
+              "worker time by writer: %s." % (
+                  fmt_h(bmc.misc.get("ixw_blocks", 0)), bmc.misc.get("ixw_starts", 0),
+                  ", ".join("%s %.1f s" % (x, tot.st.get("ixw:" + x, 0) / 1000) for x in ixcols)))
+            P("")
     if bmc:
         if bmc.other_bench:
             P("Other bmc [bench] lines: " + "; ".join(
@@ -955,9 +990,12 @@ SAMPLE_BMC = """\
 2026-10-05 01:00:10.000 [bench] block 1: 1 tx, 0 txin | read 0.5 | idx 0.1 | verify 0.0 | get 0.0 | put 0.2 | ckpt 0.0 | flush 0.0 | csi 0.1 | total 1.0 ms
 2026-10-05 01:00:10.001 [bench] index 1: txindex 0.2 | txospender 0.1 | bfilter 0.3 | addr 0.0 | zmq 0.4 ms
 some line with a NUL \x00 in it
+[ixw] index worker pid 5 started: the applier pushes heights, the worker writes the txid tail, the txospender tail, the filter index and the address journal
 2026-10-05 01:00:20.000 [bench] block 2: 10 tx, 10 txin | read 1.0 | idx 1.0 | verify 4.0 | get 2.0 | put 1.0 | ckpt 0.0 | flush 500.0 | csi 0.5 | total 510.0 ms
 2026-10-05 01:00:20.001 [bench] index 2: txindex 1.0 | txospender 1.0 | bfilter 2.0 | addr 0.5 | zmq 0.5 ms
 2026-10-05 01:00:20.002 [bench] memflush: 1000 records, 2 MB in 480.0 ms
+2026-10-05 01:00:21.000 [ixw] stopping the index worker: the download is over: the tip's blocks are indexed inline
+[ixw] index worker pid 5 stopped: 1 block(s) indexed, covered 2, filters 3
 2026-10-05 01:00:25.000 [utxo_live] catchup progress: height=2/3 (66.7%) 0.1 blk/s
 2026-10-05 01:00:30.000 [bench] block 3: 1 tx, 0 txin | read 0.1 | idx 0.1 | verify 0.0 | get 0.0 | put 0.1 | ckpt 0.0 | flush 0.0 | csi 0.0 | total 0.4 ms | put.ins 0.04 | put.get 0.01 | put.undo 0.02 | put.del 0.01 | put.wal 0.02
 2026-10-05 01:00:30.001 [bench] index 3: txindex 0.1 | txospender 0.0 | bfilter 0.1 | addr 0.0 | zmq 0.1 ms
@@ -1052,7 +1090,12 @@ def selftest():
         ck("...and put.wal", g1.st.get("put.wal"), 0.02)
         ck("a block line without the split still parses (seg 1 has both shapes: 2 blocks)", g1.blocks, 2)
         ck("a NUL byte does not hide the next line (block 2 read)", g1.st.get("read"), 1.1)
-        ck("bmc index line txindex seg 1", g1.st.get("ix:txindex"), 1.1)
+        # 2026-10-06 (plan B4): block 2's index line sits between the worker's
+        # started and stopped lines, so it is worker time (ixw:), off the wall;
+        # block 3's, after the stop, is the applier's (ix:)
+        ck("bmc index line txindex seg 1 = the inline line only (block 3)", g1.st.get("ix:txindex"), 0.1)
+        ck("...the worker's line is ixw:txindex (block 2)", g1.st.get("ixw:txindex"), 1.0)
+        ck("the worker's block count from its stopped line", b.misc.get("ixw_blocks"), 1)
         ck("bmc index line zmq seg 0", g0.st.get("ix:zmq"), 0.4)
         ck("bmc tx/txin seg 1", (g1.tx, g1.txin), (11, 10))
         ck("other [bench] kinds counted with their ms", b.other_bench.get("memflush"), [1, 480.0])
@@ -1082,6 +1125,8 @@ def selftest():
         ck("bmc ready elapsed, truncated like ibd_milestones.sh (45.678 s)", "| 0:00:45 |" in md, True)
         ck("hms truncates", hms(3599.99), "0:59:59")
         ck("bmc/Core ratio column present", "bmc/Core" in md, True)
+        ck("the bmc table carries an ixw column and the worker summary line (plan B4)",
+           "| ixw |" in md and "Index worker (plan B4): 1 block(s) indexed in the worker over 1 start(s)" in md, True)
         # 2026-10-06: the total row's "other" subtracted the dotted splits
         # (put.ins ...) a second time (run 37: -5289 s); it must equal the
         # segment rows' sum

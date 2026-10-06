@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <stdio.h>
+#include "log_ts.h"   /* after <stdio.h>: the log's timestamps (the worker's started/stopped lines printed bare in run 38) */
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
