@@ -242,7 +242,17 @@ the 10-05 deploy; `getmempoolinfo` 5 ms (target ≤ 22). Report:
 
 Found by the post-run RPC rows and the run-37 log, in the order to take them:
 
-### A7. getrawtransaction: 14 ms single, 382 ms at 32 clients (Core 4 / 5)
+### A7. getrawtransaction: 14 ms single, 382 ms at 32 clients (Core 4 / 5) — DONE 10-06 (#387, #388)
+Done the same morning, measured on production after `deploy-20261006b`:
+3 ms single, 5 ms at 32 clients, for a transaction in a run or in the
+tail (Core 3 / 5). Three causes, not two: the whole-block verify, the
+handler's second read and walk, and -- the one the 05:20Z row could not
+see -- the linear scan of the unsorted tail (564 MB on production) for
+every recent transaction. The record format did not need to change: the
+record already carries the offset and length; the reads just never used
+them. The lane is still one reader at a time (its static buffers are
+gone, so a reader-writer lock is now possible: A5's lane-width work).
+Original note:
 The txindex lane admits one reader (shared static 4 MB verify buffers) and
 a lookup reads the whole block to extract one transaction. Two steps:
 per-thread lane buffers under a reader-writer lock (`irs_refresh` the only
@@ -251,7 +261,9 @@ transaction's byte offset in the txindex record so the read is the
 transaction, not the block — the 14 ms. The second changes the record
 format (a rebuild; the builders are in place). Test: the #373 race test
 over the rwlock; a differential of 1,000 random txids against the oracle.
-### A8. getdeploymentinfo holds the exclusive lock 2.0–2.1 s
+### A8. getdeploymentinfo holds the exclusive lock 2.0–2.1 s — DONE 10-06 (#387)
+Cached per period boundary with the boundary hash; production: 1.6 s once
+after a restart, then 4 ms; 5 ms at 32 clients. Original note:
 It re-walks the BIP9 state from genesis on every call (~10k header reads
 and MTPs). Cache the state per period boundary as Core's version-bits
 cache does; serve from the reader lane. Test: a regtest signalling period
@@ -278,7 +290,7 @@ GB in a compaction). A per-subsystem `[mem]` line under benchlog at the MEM
 marks (memtable, header tree, download window, index builders, RPC caches),
 and the Core rerun WITH the sampler so the row has two sides.
 
-Order: A8 (small, production-visible) → A7 step 1 (small) → B4 → B3 (the
-applier target) → A7 step 2 → B8 → A5 → B9 → M1 alongside the Core rerun.
+Order (A7 and A8 done 10-06): B4 → B3 (the applier target) → B8 → A5 →
+B9 → M1 alongside the Core rerun.
 Exit for the next release run: ready ≤ 4:30, applier ≤ 12,000 s,
 getrawtransaction ≤ 10 ms at 32 clients, no exclusive hold ≥ 1 s.
