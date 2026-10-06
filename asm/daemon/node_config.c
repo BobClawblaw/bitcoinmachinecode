@@ -42,6 +42,8 @@ node_config_t g_cfg = {
     .min_usable_peers      = 8,
     .maxpool               = 2048,
     .dlc_chunk_blocks      = 16,
+    .dl_shape_core         = 0,
+    .dlc_roll_below        = 0,
     .addr_max_per_response = 256,
     .addr_max_per_netgroup = 16,
     .utxo_bulk_slots_log2  = 22,
@@ -61,7 +63,7 @@ node_config_t g_cfg = {
     .par                   = 0,      /* Core -par default: auto              */
     .dial_rate_limit       = 0,      /* bmc.dialratelimit: off unless set */
     .download_rate_limit_kbps = 0,   /* bmc.downloadratelimit: off unless set */
-    .coinstatshist_repair = 1, .coinstatshist_workers = 0, .esplora_port = 0, .esplora_bind = "127.0.0.1",
+    .coinstatshist_repair = 1, .coinstatshist_workers = 0, .benchlog = 0, .esplora_port = 0, .esplora_bind = "127.0.0.1",
     .upload_rate_limit_kbps = 0,     /* bmc.uploadratelimit: off unless set */
     .catchup_workers       = 10,     /* bmc.catchupworkers: peers downloading at once. Core's preferred-download set:
                                       * MAX_OUTBOUND_FULL_RELAY_CONNECTIONS 8 + MAX_BLOCK_RELAY_ONLY_CONNECTIONS 2
@@ -280,6 +282,8 @@ static void set_defaults(void){
     g_cfg.min_usable_peers      = 8;
     g_cfg.maxpool               = 2048;
     g_cfg.dlc_chunk_blocks      = 16;
+    g_cfg.dl_shape_core         = 0;
+    g_cfg.dlc_roll_below        = 0;
     g_cfg.addr_max_per_response = 256;
     g_cfg.addr_max_per_netgroup = 16;
     g_cfg.proxyrandomize        = 1;     /* Core DEFAULT_PROXYRANDOMIZE */
@@ -380,7 +384,7 @@ static void set_defaults(void){
     g_cfg.connect_timeout_ms    = 5000;     /* Core's -timeout default */
     g_cfg.peer_timeout_s        = 60;       /* Core's -peertimeout default */
     g_cfg.port                  = 8333;
-    g_cfg.coinstatshist_repair = 1; g_cfg.coinstatshist_workers = 0; g_cfg.esplora_port = 0; snprintf(g_cfg.esplora_bind, sizeof g_cfg.esplora_bind, "127.0.0.1");
+    g_cfg.coinstatshist_repair = 1; g_cfg.coinstatshist_workers = 0; g_cfg.benchlog = 0; g_cfg.esplora_port = 0; snprintf(g_cfg.esplora_bind, sizeof g_cfg.esplora_bind, "127.0.0.1");
     g_cfg.port_explicit         = 0;
     snprintf(g_cfg.chain, sizeof g_cfg.chain, "main");
     g_cfg.listen                = 1;
@@ -783,6 +787,8 @@ long node_config_load(const char* path){
             g_cfg.coinstatshist_repair = IV?1:0; applied++; }
         else if(!strcmp(key,"bmc.coinstatshistworkers")){
             t=clamp_int(IV,0,64,key,&bad); if(t>=0){g_cfg.coinstatshist_workers=t;applied++;} }
+        else if(!strcmp(key,"bmc.benchlog")){       /* EXTENSION (2026-10-04): [bench] stage-timing lines, see node_config.h */
+            g_cfg.benchlog = IV?1:0; applied++; }
         else if(!strcmp(key,"bmc.esploraport")){   /* EXTENSION: the Esplora facade (rpc_esplora.c), 0 = off */
             t=clamp_int(IV,0,65535,key,&bad); if(t>=0){g_cfg.esplora_port=t;applied++;} }
         else if(!strcmp(key,"bmc.esplorabind")){
@@ -1022,10 +1028,13 @@ long node_config_load(const char* path){
         else if(!strcmp(key,"assumevalid")){
             /* Core's -assumevalid: script evaluation is skipped for blocks
              * that are ancestors of this block; PoW, merkle, structure and
-             * every UTXO check still run. Honoured ONLY when set explicitly
-             * (2026-09-01); with no value this node verifies every script of
-             * every block, which stays the default and the README's promise.
-             * "0" disables it, as in Core. */
+             * every UTXO check still run. Unset = the chain's built-in block,
+             * exactly as Core ships it (v31: mainnet 938,343; mode 0, resolved
+             * by utxo_live_resolve_assumevalid); a hash = that block (mode 1);
+             * "0" = evaluate every script of every block (mode 2), as in Core.
+             * (The 2026-09-01 text here said the unset default verified every
+             * script; it never did -- the logged pair of 2026-10-05 shows
+             * both nodes skipping through 938,343.) */
             const char* v = val;
             if(!v || !*v || !strcmp(v,"0")){ g_cfg.assumevalid_mode = 2; applied++;
                 fprintf(stderr,"[config] assumevalid=0: every script of every block is evaluated (Core's default skips them below its built-in block)\n"); }
@@ -1109,6 +1118,20 @@ long node_config_load(const char* path){
          * keeps 16 in flight per peer, refilled as each lands; ours is one
          * getdata per chunk. 4..64: the staging buffer is sized for 64. */
         else if(!strcmp(key,"bmc.dlcchunk"))          { t=clamp_int(IV,4,64,key,&bad);     if(t>=0){g_cfg.dlc_chunk_blocks=t;applied++;} }
+        else if(!strcmp(key,"bmc.dlcrollbelow"))      { t=clamp_int(IV,0,100000000,key,&bad); if(t>=0){g_cfg.dlc_roll_below=t;applied++;} }   /* plan B9 (2026-10-06) */
+        /* 2026-10-04: the download's SHAPE. "bmc" (the default) is this
+         * node's own: whole-chunk requests, peers ranked by a header sample
+         * and picked by speed, slow peers rotated, dead weight and stallers
+         * banned for the run, a 120 s no-block budget. "core" copies Bitcoin
+         * Core v31.1's rules (net_processing.cpp): 16 blocks in flight per
+         * peer topped up as each lands, peers in random order with no speed
+         * ranking, no rotation or rate floor, a staller disconnected but
+         * never banned, and Core's block download timeout -- so a benchmark
+         * against Core compares validation, not download policy. */
+        else if(!strcmp(key,"bmc.dlshape")){
+            if(!strcmp(val,"core")) { g_cfg.dl_shape_core = 1; applied++; }
+            else if(!strcmp(val,"bmc")) { g_cfg.dl_shape_core = 0; applied++; }
+            else { fprintf(stderr,"[config] bmc.dlshape=%s: expected core or bmc -- ignoring\n", val); bad++; } }
         else if(!strcmp(key,"bmc.addrmaxperresponse")){ t=clamp_int(IV,1,1000,key,&bad);   if(t>=0){g_cfg.addr_max_per_response=t;applied++;} }
         else if(!strcmp(key,"bmc.addrmaxpernetgroup")){ t=clamp_int(IV,1,256,key,&bad);    if(t>=0){g_cfg.addr_max_per_netgroup=t;applied++;} }
         else if(!strcmp(key,"bmc.utxobulkgapblocks")) { t=clamp_int(IV,0,1000000,key,&bad);if(t>=0){g_cfg.utxo_bulk_gap_blocks=t;applied++;} }
@@ -1345,9 +1368,9 @@ void node_config_log(void){
             g_cfg.max_connections, outbound, g_cfg.max_outbound,
             g_cfg.max_block_relay_only, g_cfg.max_feeler,
             g_cfg.max_connections-outbound, g_cfg.feeler_interval_ms/1000);
-    fprintf(stderr,"[config] peers: min_bps=%.0f ticks=%d min_usable=%d pool=%d dlc_chunk=%d\n",
+    fprintf(stderr,"[config] peers: min_bps=%.0f ticks=%d min_usable=%d pool=%d dlc_chunk=%d dlshape=%s dlcrollbelow=%ld\n",
             g_cfg.dead_weight_bps, g_cfg.dead_weight_ticks,
-            g_cfg.min_usable_peers, g_cfg.maxpool, g_cfg.dlc_chunk_blocks);
+            g_cfg.min_usable_peers, g_cfg.maxpool, g_cfg.dlc_chunk_blocks, g_cfg.dl_shape_core ? "core" : "bmc", g_cfg.dlc_roll_below);
     fprintf(stderr,"[config] addr : max_per_response=%d max_per_netgroup=%d\n",
             g_cfg.addr_max_per_response, g_cfg.addr_max_per_netgroup);
     fprintf(stderr,"[config] utxo : dbcache=%dMB -> bulk_slots=2^%d bulk_blob=%dMB bulk_gap=%ld compact_at=%d\n",

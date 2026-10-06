@@ -49,6 +49,30 @@ ZMQPORT=${ZMQPORT:-28484}
 # match the Core baseline's protocol (txindex, blockfilterindex, maxconnections)
 # without editing this file.
 EXTRA_CONF=${EXTRA_CONF:-}
+# LOGGED RUNS (2026-10-04, worklog/2026-10-04-logged-ibd-runs-plan.md):
+#   BENCHLOG=1    adds bmc.benchlog=1: a per-block stage line ([bench] block H:
+#                 read/idx/verify/get/put/ckpt/flush/csi ms), a per-block index
+#                 line ([bench] index H: txindex/txospender/bfilter/addr/zmq),
+#                 a line per memtable flush and per download chunk. Read by
+#                 validation/ibd_stage_report.py.
+#   DLSHAPE=core  adds bmc.dlshape=core: download the way Core v31.1 does (16
+#                 in flight per peer topped up across chunk boundaries, random
+#                 replacement peers, no ranking/rotation/eviction, a staller
+#                 disconnected but never banned, Core's block-download timeout).
+# Both are checked against the BUILT binary: the daemon ignores keys it does
+# not know, so a commit without the feature would run 6 h measuring nothing.
+BENCHLOG=${BENCHLOG:-0}
+DLSHAPE=${DLSHAPE:-}
+# READY (2026-10-04): after IBD_END, wait -- reading the log only -- for the
+# daemon's "[ready] all indexes at height N" line (UTXO set, txindex, bfilter
+# and the coinstats history all at the tip: the "ready to serve RPC" finish
+# line, Core's READY_INDEXES) and record it in phase.log BEFORE the capstone's
+# RPC calls start. READY_WAIT=auto (default) waits only when the built daemon
+# carries that line; 1 always waits; 0 never does. READY_TIMEOUT_S bounds the
+# wait (default 6 h; run 31's post-IBD coinstats history rebuild alone took
+# 38 m 47 s).
+READY_WAIT=${READY_WAIT:-auto}
+READY_TIMEOUT_S=${READY_TIMEOUT_S:-21600}
 . "$(dirname "$0")/lib/ibd_harness_lib.sh"
 ORACLE=${ORACLE:-"/storage/bitcoin-core-v31.1/bin/bitcoin-cli -conf=/storage/core-oracle/bitcoin.conf -datadir=/storage/core-oracle"}
 PH="$DEST/phase.log"; PROG="$DEST/progress.log"
@@ -59,6 +83,9 @@ mkdir -p "$DEST" && cd "$DEST" || exit 2
 : > "$PH"; : > "$PROG"; rm -f RESULT 2>/dev/null
 
 ph "START host=$(hostname) kernel=$(uname -r) workers=${WORKERS:-derived(10)}"
+# A bad BENCHLOG/DLSHAPE/READY_WAIT value fails here, before a clone or a build.
+BENCH_CONF=$(ibd_bench_conf_lines "$BENCHLOG" "$DLSHAPE") || { ph "$BENCH_CONF"; echo FAIL > RESULT; exit 1; }
+case "$READY_WAIT" in auto|0|1) ;; *) ph "FAIL READY_WAIT must be auto, 0 or 1, not '$READY_WAIT'"; echo FAIL > RESULT; exit 1;; esac
 [ -d src ] || git clone -q /storage/bitcoinmachinecode src
 # Hard-reset to the REMOTE ref. `checkout <branch>` on an existing clone keeps
 # whatever that branch pointed at when it was cloned, which silently built the
@@ -80,6 +107,14 @@ HELPERS=$(make -s -C src/asm print-runtime-helpers 2>/dev/null)
 # shellcheck disable=SC2086  # one word per helper, by design
 hc=$(ibd_require_helpers src/asm/daemon $HELPERS) || { ph "FAIL build: $hc"; echo FAIL > RESULT; exit 1; }
 ph "BUILD ok ($hc: $HELPERS)"
+if [ "$BENCHLOG" = 1 ] && ! ibd_binary_knows src/asm/daemon/bmcbitcoind bmc.benchlog; then
+    ph "FAIL build: commit $COMMIT does not know bmc.benchlog (the daemon would ignore it)"; echo FAIL > RESULT; exit 1; fi
+if [ "$DLSHAPE" = core ] && ! ibd_binary_knows src/asm/daemon/bmcbitcoind bmc.dlshape; then
+    ph "FAIL build: commit $COMMIT does not know bmc.dlshape (the daemon would ignore it)"; echo FAIL > RESULT; exit 1; fi
+if [ "$READY_WAIT" = auto ]; then
+    if ibd_binary_knows src/asm/daemon/bmcbitcoind 'all indexes at height'; then READY_WAIT=1; else READY_WAIT=0; fi
+fi
+ph "READY wait $( [ "$READY_WAIT" = 1 ] && echo "on (timeout ${READY_TIMEOUT_S}s)" || echo off)"
 
 mkdir -p data
 cp src/config/bitcoin.sample.conf data/bitcoin.conf 2>/dev/null
@@ -106,14 +141,22 @@ zmqpubhashtx=tcp://127.0.0.1:$ZMQPORT
 zmqpubrawtx=tcp://127.0.0.1:$ZMQPORT
 CONF
 fi
+[ -n "$BENCH_CONF" ] && printf '# logged run (BENCHLOG=%s DLSHAPE=%s)\n%s\n' "$BENCHLOG" "$DLSHAPE" "$BENCH_CONF" >> data/bitcoin.conf
 [ -n "$EXTRA_CONF" ] && printf '%s\n' "$EXTRA_CONF" >> data/bitcoin.conf
-ph "CONF port=$P2P rpcport=$RPC dbcache=8192 workers=${WORKERS:-derived(10)} coinstatsindex=1 nice=$NICE parity=$PARITY extra=[$(printf '%s' "$EXTRA_CONF" | tr '\n' ' ')]"
+ph "CONF port=$P2P rpcport=$RPC dbcache=8192 workers=${WORKERS:-derived(10)} coinstatsindex=1 nice=$NICE parity=$PARITY benchlog=$BENCHLOG dlshape=${DLSHAPE:-default} extra=[$(printf '%s' "$EXTRA_CONF" | tr '\n' ' ')]"
 
 T0=$(date +%s); echo "$T0" > epoch.start
 setsid nohup nice -n "$NICE" src/asm/daemon/bmcbitcoind serve "$DEST/data" > console.log 2>&1 < /dev/null &
 echo $! > daemon.pid; sleep 8
 kill -0 "$(cat daemon.pid)" 2>/dev/null || { ph "FAIL daemon exited at once"; echo FAIL > RESULT; exit 1; }
 ph "DAEMON pid=$(cat daemon.pid) epoch=$T0"
+# CPU time and peak memory beside the run (operator rule 2026-10-05: every
+# run, both sides, the same way). /proc only -- never an RPC to the node.
+if [ -f src/validation/proc_sampler.sh ]; then
+    setsid nohup bash src/validation/proc_sampler.sh --cwd "$DEST/data" "$DEST/proc.log" 5 > /dev/null 2>&1 < /dev/null &
+    echo $! > sampler.pid; ph "SAMPLER pid=$(cat sampler.pid) proc.log every 5 s (cpu, rss, pss, peaks)"
+else ph "WARN no src/validation/proc_sampler.sh in this ref -- no CPU/memory sampling"; fi
+mem_line(){ [ -s proc.log ] && tail -1 proc.log | cut -d' ' -f2- || echo "no proc.log"; }
 
 # A missing helper is a benchmark that cannot be compared with Core: the node
 # skips index work Core does. The pre-launch check above covers the build;
@@ -178,8 +221,30 @@ while :; do
     END_TS=$(ibd_log_tip_time "$LOG")
     END_EPOCH=$(date -u -d "$END_TS" +%s 2>/dev/null || echo 0)
     ph "IBD_END $END_TS UTC (from the log) elapsed=$(( END_EPOCH - T0 ))s -- applied=$1 stored=$2/$3 oracle=$theirs"
+    ph "MEM at IBD_END: $(mem_line)"
 
     ph "TIP reached: applied=$1 tip=$3 oracle=$theirs elapsed=$(( $(date +%s)-T0 ))s (RPC to the node is allowed from here)"
+
+    # READY: still log-only. The capstone below disables the network and
+    # walks the UTXO set over RPC; run before READY, it would slow the very
+    # index work READY times. The line may already be in the log (the monitor
+    # looks every 5 minutes), so the FIRST one is taken, whenever it was.
+    if [ "$READY_WAIT" = 1 ]; then
+        rw=0; rl=""
+        until rl=$(ibd_ready_line "$LOG"); do
+            [ "$rw" -ge "$READY_TIMEOUT_S" ] && break
+            kill -0 "$(cat daemon.pid)" 2>/dev/null || break
+            sleep 30; rw=$((rw + 30))
+        done
+        if [ -n "$rl" ]; then
+            read -r R_D R_T R_H <<< "$rl"
+            R_E=$(date -u -d "$R_D $R_T" +%s 2>/dev/null || echo 0)
+            ph "READY $R_D $R_T UTC (from the log) height=$R_H elapsed=$(( R_E - T0 ))s after_ibd_end=$(( R_E - END_EPOCH ))s -- $(grep -a -m1 '\[ready\] all indexes at height' "$LOG" | tr -d '\000' | cut -d' ' -f3- | cut -c1-200)"
+        else
+            ph "WARN no [ready] line within ${rw}s of the tip (READY_TIMEOUT_S=$READY_TIMEOUT_S; daemon $(kill -0 "$(cat daemon.pid)" 2>/dev/null && echo alive || echo GONE)) -- READY not recorded"
+        fi
+    fi
+    ph "MEM at ready: $(mem_line)"
 
     # ------------------------------------------------------------------
     # THE CAPSTONE. Three ways this has lied, all fixed here:

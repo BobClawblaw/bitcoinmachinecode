@@ -21,6 +21,7 @@
  * misbehaviour exactly as Core does ("inv message size = %u").
  */
 #include <stddef.h>
+#include <sys/stat.h>
 
 #define INV_ENTRY   36                 /* type u32 LE + 32-byte hash */
 #define INV_MAX_SZ  50000              /* Core's MAX_INV_SZ */
@@ -154,7 +155,53 @@ int serve_locator_from(const unsigned char* pl, unsigned long plen, void* htidx,
  * call (rax..r11 are clobbered by any call). */
 static const volatile long long* g_connected_tip = 0;
 void serve_set_connected_tip_ptr(const volatile long long* p){ g_connected_tip = p; }
+
+/* Follow the archive (2026-10-03). The serve process and its inbound children
+ * hold a store handle whose idx_len (st+16) and tip (st+24) were read at boot;
+ * the download worker -- another process -- appends every later block, and
+ * nothing moved them. serve_idx_topup kept the HASH index current (getdata
+ * works), but every reader of the stored tip -- getheaders, getblocks and the
+ * tip-watch that announces a new block -- was capped at the boot height:
+ * production's serve process reported tip=969479 at shutdown after nine hours
+ * in which the chain passed 969,528, and a Core peer that dialled a freshly
+ * synced bmc got an empty headers reply (validation/wtxid_relay_regtest_e2e.sh
+ * found it). When index.dat has grown, move the two fields -- the tip from
+ * idxscan_tip, which skips a zero-padded tail (idx_len/48-1 does not) -- and
+ * fold the new heights into the hash index. Only those two fields: writers
+ * take the append lock and find the true tip themselves
+ * (idxscan_append_locked), so no append cursor is touched here. One fstat per
+ * call, and only when the file grew more. */
+extern long idxscan_tip(void) __attribute__((weak));
+extern long serve_idx_topup(void) __attribute__((weak));
+extern long serve_reorg_check(void) __attribute__((weak));   /* daemon/main.c, 2026-10-04 */
+static long g_followed_len = -1;            /* index.dat size this process last followed */
+static void serve_store_follow(const void* stc){
+    char* st = (char*)stc;
+    int fd = (int)*(long*)(st + 8);
+    struct stat sb;
+    if (fd < 0 || fstat(fd, &sb) != 0) return;
+    long len = (long)sb.st_size - (long)(sb.st_size % 48);
+    /* A reorg (2026-10-04): the worker rebuilt and bumped the generation;
+     * rebuild our index and let the tip move BACK to the new branch's, once
+     * -- forward-only following kept the old branch's height */
+    if (serve_reorg_check && serve_reorg_check()){
+        long tip = idxscan_tip ? idxscan_tip() : len / 48 - 1;
+        *(long*)(st + 16) = len; *(int*)(st + 24) = (int)tip; g_followed_len = len;
+        return;
+    }
+    /* keyed on the FILE, not on idx_len: the accept path refreshes idx_len
+     * (st+16) before forking a child but never the tip, so a child starts
+     * with idx_len current and st+24 at the boot height (seen in a live
+     * child under gdb: 5808 = 121 records, tip 0) */
+    if (len == g_followed_len) return;
+    g_followed_len = len;
+    long tip = idxscan_tip ? idxscan_tip() : len / 48 - 1;
+    if (len > *(long*)(st + 16)) *(long*)(st + 16) = len;
+    if (tip > (long)*(int*)(st + 24)) *(int*)(st + 24) = (int)tip;   /* never moved back */
+    if (serve_idx_topup) serve_idx_topup();
+}
 long serve_public_tip(const void* st){
+    serve_store_follow(st);
     long stored = (long)*(const int*)((const char*)st + 24);
     if (!g_connected_tip) return stored;
     long long cap = *g_connected_tip;

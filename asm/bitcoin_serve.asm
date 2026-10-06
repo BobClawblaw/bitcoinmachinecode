@@ -55,6 +55,7 @@ extern serve_block_ctx_ok
     extern mpool_init
     extern mpool_put
     extern mpool_get
+    extern txann_txid_for_wtxid     ; BIP339 (2026-10-03): getdata(MSG_WTX) -> the txid we announced
     extern mpool_count
     extern tx_dispatch_init
     extern tx_policy_init
@@ -215,6 +216,7 @@ s_ivo:    dq 0            ; offset of the first entry
 s_p:      dq 0
 s_abound: dq 0        ; getaddr reply: loop bound (min(book,1000)), kept in MEMORY
 s_n:      dq 0
+s_wtxtid: times 32 db 0   ; BIP339: the txid a getdata(MSG_WTX) resolved to
 s_served: dq 0
 s_tip:    dq 0
 s_from:   dq 0
@@ -1007,6 +1009,8 @@ node_serve_loop:
     and  r9d, 0x3fffffff
     cmp  r9d, 1
     je   .gd_tx
+    cmp  r9d, 5              ; MSG_WTX (BIP339): this peer negotiated wtxid relay
+    je   .gd_wtx
     cmp  r9d, 4
     je   .gd_cmpct
     cmp  r9d, 2
@@ -1200,6 +1204,26 @@ node_serve_loop:
     mov  rbx, [s_ptr]
     jmp  .gd_next
 
+.gd_wtx:
+    ; BIP339 (2026-10-03): the hash is a wtxid -- ours, from an MSG_WTX inv
+    ; txann_tick sent this peer. The pool indexes txids only, so txann's map
+    ; gives the txid back; then the pool, served in the WITNESS form (BIP339:
+    ; MSG_WTX always means the full serialization). Unknown -> notfound.
+    mov  [s_ptr], rbx
+    lea  rdi, [rbx+4]
+    lea  rsi, [s_wtxtid]
+    call txann_txid_for_wtxid
+    mov  rbx, [s_ptr]
+    test eax, eax
+    jz   .gd_miss
+    mov  rdi, [mp_cur]
+    lea  rsi, [s_wtxtid]
+    lea  rdx, [s_n]
+    call mpool_get
+    mov  rbx, [s_ptr]
+    test rax, rax
+    jz   .gd_miss
+    jmp  .gdtx_have
 .gd_tx:
     ; txid at rbx+4; mpool_get(mp_cur, txid, &s_n) -> ptr or 0
     mov  [s_ptr], rbx

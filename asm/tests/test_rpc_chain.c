@@ -24,6 +24,8 @@
 #include "../rpc_chain.h"
 #include "../rpc_node.h"      /* rpc_mempool_hooks (the CPFP-selection section) */
 #include <stdio.h>
+#include <pthread.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -407,6 +409,23 @@ static long scan_stub_run(const unsigned char* spks, const unsigned int* spklens
 static long pub_tip_one(void){ return 1; }
 static long pub_tip_untracked(void){ return -2; }
 
+/* 2026-10-05: lane lookups racing the index's rewrite. irs_refresh remaps the
+ * run set IN PLACE (it zeroes each kept run's map while rebuilding the table),
+ * which is what segfaulted production eleven times on 2026-10-02 when a lookup
+ * ran with no lock; the txindex lane's mutex is what serialises the two now.
+ * A miss during a rewrite is honest (the run is being replaced); a WRONG hash
+ * is not, and a crash is the failure the lane exists to prevent. */
+extern int rpc_chain_tx_blockhash(const char*, char[65]);
+typedef struct { const char* const* ids; const char* const* blks; volatile int* stop; long calls, wrong; } race_t;
+static void* race_lookups(void* a){
+    race_t* r = a; char bh[65];
+    while (!*r->stop)
+        for (int i = 0; i < 4; i++){
+            int hit = rpc_chain_tx_blockhash(r->ids[i], bh); r->calls++;
+            if (hit && strcmp(bh, r->blks[i])) r->wrong++;
+        }
+    return NULL;
+}
 int main(void){
     /* ---- -blockversion is honoured ONLY where Core honours it (2026-09-06) --
      * Core: node/miner.cpp:148 applies -blockversion under
@@ -806,6 +825,19 @@ int main(void){
     ck("chaininfo.warnings is empty array", G(r,"warnings") && G(r,"warnings")->typ == RJ_ARR && G(r,"warnings")->nitems == 0);
     ck_str("chaininfo first key", r && r->nmembers ? r->members[0].key : NULL, "chain");
     rj_free(r);
+    /* Core latches IBD false (m_cached_is_ibd, 2026-10-01): once the worker
+     * has left IBD, a tip older than maxtipage does not put the node back */
+    { extern void rpc_chain_set_ibd_left_ptr(const volatile int*);
+      static volatile int left = 0;
+      rpc_chain_set_ibd_left_ptr(&left);
+      r = call("getblockchaininfo", "[]", &ec, &em);
+      ck_str("chaininfo.initialblockdownload, not yet left (2009 tip)", S(r,"initialblockdownload"), "1");
+      rj_free(r);
+      left = 1;
+      r = call("getblockchaininfo", "[]", &ec, &em);
+      ck_str("chaininfo.initialblockdownload latched false after leaving, despite the 2009 tip", S(r,"initialblockdownload"), "0");
+      rj_free(r);
+      rpc_chain_set_ibd_left_ptr(NULL); }
 
     /* ---- getrawtransaction ---- */
     { char p[256];
@@ -1093,6 +1125,29 @@ int main(void){
       ck("getnetworkhashps by height returns a number", r && r->typ == RJ_NUM); rj_free(r);
       expect_err("gnh nblocks=0 rejected", "getnetworkhashps", "[0]", -8, "Invalid nblocks. Must be a positive number or -1.");
       expect_err("gnh height out of range", "getnetworkhashps", "[120, 999]", -8, "Block does not exist at specified height");
+
+      /* 2026-10-03: past the end of chainwork.dat the lookup continues from
+       * the file's last record instead of walking from genesis (production:
+       * getmininginfo held the exec lock 149.5 s walking 969,700 headers).
+       * The fixture's four blocks each carry work 0x100010001. */
+      { extern long g_cw_header_reads; extern void rpc_chain_test_cw_reset(void);
+        rj_val* bh = call("getblockhash", "[3]", &ec, &em);
+        char q[96]; snprintf(q, sizeof q, "[\"%s\"]", bh && bh->str ? bh->str : "");
+        unlink("chainwork.dat"); rpc_chain_test_cw_reset(); g_cw_header_reads = 0;
+        rj_val* h0 = call("getblockheader", q, &ec, &em);
+        ck_str("no chainwork.dat: tip chainwork from the genesis walk", S(h0,"chainwork"), "0000000000000000000000000000000000000000000000000000000400040004");
+        long walk = g_cw_header_reads; rj_free(h0);
+        unsigned char rec[32]; memset(rec, 0, sizeof rec);
+        rec[0] = 1; rec[2] = 1; rec[4] = 1;                 /* h0: 0x100010001, little-endian */
+        rec[16] = 2; rec[18] = 2; rec[20] = 2;              /* h1: 0x200020002 */
+        FILE* f = fopen("chainwork.dat", "wb"); if (f){ fwrite(rec, 1, 32, f); fclose(f); }
+        rpc_chain_test_cw_reset(); g_cw_header_reads = 0;
+        rj_val* h1 = call("getblockheader", q, &ec, &em);
+        ck_str("chainwork.dat through height 1: the tip's chainwork is unchanged", S(h1,"chainwork"), "0000000000000000000000000000000000000000000000000000000400040004");
+        printf("      header reads: genesis walk %ld, from the file's end %ld\n", walk, g_cw_header_reads);
+        ck("...and only the two missing headers were read (not the whole chain)", walk == 4 && g_cw_header_reads == 2);
+        rj_free(h1); rj_free(bh);
+        unlink("chainwork.dat"); rpc_chain_test_cw_reset(); }
 
       r = call("getmininginfo", "[]", &ec, &em);
       ck_str("mininginfo.blocks", S(r,"blocks"), "3");
@@ -1790,6 +1845,34 @@ int main(void){
           rj_free(r);
       }
       rpc_chain_set_chainparams("main", 210000, 0, 0, 0x1d00ffffu, 0); }
+    /* 2026-10-06: the BIP9 state walk is cached per period boundary (Core's
+     * VersionBitsCache). On production the walk re-read ~10k headers from
+     * genesis on every call and held the exclusive lock 2 s. testdummy with
+     * a 2-block period crosses boundaries at 1 and 3 on this fixture: the
+     * first call walks (reads headers), the second at the same tip reads
+     * none for the walk and answers the same, a reset walks again. */
+    { extern long g_b9_walk_reads; extern void rpc_chain_b9_test_dummy(long, long); extern void rpc_chain_b9_cache_reset(void);
+      rpc_chain_set_chainparams("regtest", 210000, 0, 0, 0x1d00ffffu, 0);
+      rpc_chain_b9_test_dummy(2, 1);
+      g_b9_walk_reads = 0;
+      rj_val* a = call("getdeploymentinfo", "[]", &ec, &em);
+      long r1 = g_b9_walk_reads;
+      rj_val* b = call("getdeploymentinfo", "[]", &ec, &em);
+      long r2 = g_b9_walk_reads - r1;
+      rj_val* da = a ? rj_obj_get(rj_obj_get(a, "deployments"), "testdummy") : NULL;
+      rj_val* db = b ? rj_obj_get(rj_obj_get(b, "deployments"), "testdummy") : NULL;
+      long la = 0, lb = 0; char* sa = da ? rj_write_alloc(da, 0, &la) : NULL; char* sb = db ? rj_write_alloc(db, 0, &lb) : NULL;
+      ck("bip9 cache: the first walk reads headers (period 2: boundaries 1 and 3)", r1 > 0);
+      ck("bip9 cache: the second call at the same tip reads NO header for the walk (cached boundaries, verified by the boundary's hash)", r2 == 0);
+      ck("bip9 cache: testdummy's object is the same from the cache as from the walk", sa && sb && la == lb && !memcmp(sa, sb, (size_t)la));
+      ck("bip9 cache: testdummy crossed its first boundary (started, since 2)", db && rj_obj_get(db, "bip9") && S(rj_obj_get(db, "bip9"), "status") && !strcmp(S(rj_obj_get(db, "bip9"), "status"), "started")
+                                                                              && !strcmp(S(rj_obj_get(db, "bip9"), "since"), "2"));
+      rpc_chain_b9_cache_reset(); g_b9_walk_reads = 0;
+      rj_val* c = call("getdeploymentinfo", "[]", &ec, &em);
+      ck("bip9 cache: after a reset the walk reads again, as many as the first time", g_b9_walk_reads == r1);
+      free(sa); free(sb); rj_free(a); rj_free(b); rj_free(c);
+      rpc_chain_b9_test_dummy(0, 0);
+      rpc_chain_set_chainparams("main", 210000, 0, 0, 0x1d00ffffu, 0); }
     expect_err("getdeploymentinfo on an unknown hash -> -5", "getdeploymentinfo",
                "[\"00000000000000000000000000000000000000000000000000000000deadbeef\"]",
                -5, "Block not found");
@@ -2052,7 +2135,97 @@ int main(void){
           rj_free(a); rj_free(b);
       }
       ck("every fixture tx resolves by txid alone", all);
-      ck("...and byte-identically to the blockhash path (one render path)", same); }
+      ck("...and byte-identically to the blockhash path (one render path)", same);
+    /* 2026-10-06: by txid (the index), verbosity 0 and 1 are served from
+     * the record's byte range -- two small reads, not the block and a
+     * walk of every transaction before this one (14 ms vs Core's 4 on
+     * mainnet; 382 ms at 32 clients). The answer must be the block
+     * path's, member for member, with in_active_chain the only
+     * difference (Core: only with an explicit blockhash). */
+    { extern long g_txi_fast_hits;
+      char q0[200], q1[320];
+      snprintf(q0, sizeof q0, "[\"%s\", 0]", g_tx1_txid);
+      long f0 = g_txi_fast_hits; long ec0 = 0; const char* em0 = NULL;
+      rj_val* fa = call("getrawtransaction", q0, &ec0, &em0);
+      { char want[1100]; tohex(want, g_tx1, g_tx1_len); ck_str("grt v0 by txid: the raw hex", fa && fa->typ == RJ_STR ? fa->str : NULL, want); }
+      ck("grt v0 by txid took the record-range path (test seam counts it)", g_txi_fast_hits == f0 + 1);
+      rj_free(fa);
+      snprintf(q0, sizeof q0, "[\"%s\", 1]", g_tx2_txid);
+      snprintf(q1, sizeof q1, "[\"%s\", 1, \"%s\"]", g_tx2_txid, g_hash[3]);
+      f0 = g_txi_fast_hits;
+      rj_val* fb = call("getrawtransaction", q0, &ec0, &em0);
+      ck("grt v1 by txid took the record-range path", g_txi_fast_hits == f0 + 1);
+      rj_val* bb = call("getrawtransaction", q1, &ec0, &em0);
+      int same = fb && bb && fb->typ == RJ_OBJ && bb->typ == RJ_OBJ && bb->nmembers == fb->nmembers + 1
+                 && !strcmp(bb->members[0].key, "in_active_chain") && !rj_obj_get(fb, "in_active_chain");
+      for (size_t k = 0; same && k < fb->nmembers; k++){
+          if (strcmp(fb->members[k].key, bb->members[k + 1].key)){ same = 0; break; }
+          long la = 0, lb = 0;
+          char* a = rj_write_alloc(fb->members[k].val, 0, &la); char* b = rj_write_alloc(bb->members[k + 1].val, 0, &lb);
+          if (!a || !b || la != lb || memcmp(a, b, (size_t)la)) same = 0;
+          free(a); free(b);
+      }
+      ck("grt v1 by txid == the block path's object minus in_active_chain, member for member (blockhash, confirmations, time, blocktime included)", same);
+      rj_free(fb); rj_free(bb); }
+    /* 2026-10-06: the tail is hash-indexed (txi_tix). It held up to 20,000
+     * blocks between folds (28M records on production) and every lookup
+     * for a recent transaction scanned it from the start: 14 ms a call
+     * against 3 ms for a run record, 374 ms at 32 clients. The tail is
+     * rewritten here with 100,000 random records BEFORE the fixture's
+     * (height 3, a range no block has: the verify refuses them as it
+     * refuses any stale record), through the index's own follow-the-file
+     * rule: a one-record tail first (smaller: the index is dropped and
+     * rebuilt), then the full one (larger: the new records are indexed).
+     * A lookup then compares a handful of candidates, not the tail; the
+     * scan would compare the 100,000 first. */
+    { extern long g_txi_tail_cmp;
+      long osz = 0; unsigned char* orig = NULL;
+      { FILE* f = fopen("txindex.tail", "rb"); if (f){ fseek(f, 0, SEEK_END); osz = ftell(f); fseek(f, 0, SEEK_SET); orig = malloc((size_t)osz); if (orig && fread(orig, 1, (size_t)osz, f) != (size_t)osz) osz = 0; fclose(f); } }
+      ck("tail: the fixture tail was read back", orig && osz >= 20);
+      unsigned char* rnd = malloc(100000 * 20);
+      unsigned long long x = 0x9E3779B97F4A7C15ull;
+      for (int i = 0; rnd && i < 100000; i++){
+          unsigned char* rec = rnd + i * 20;
+          for (int b = 0; b < 8; b++){ x ^= x << 13; x ^= x >> 7; x ^= x << 17; rec[b] = (unsigned char)x; }
+          rec[8] = 3; rec[9] = rec[10] = rec[11] = 0;                        /* height 3 */
+          rec[12] = 0xF0; rec[13] = 0xFF; rec[14] = 0xFF; rec[15] = 0x7F;    /* off 2 GB: outside the block */
+          rec[16] = 100; rec[17] = rec[18] = rec[19] = 0;
+      }
+      char pj[96]; snprintf(pj, sizeof pj, "[\"%s\"]", g_tx2_txid);
+      { FILE* f = fopen("txindex.tail", "wb"); if (f && rnd){ fwrite(rnd, 1, 20, f); fclose(f); } }   /* one record: smaller -> dropped and rebuilt */
+      { long e2 = 0; const char* m2 = NULL; rj_val* z = call("getrawtransaction", pj, &e2, &m2); ck("tail: with the one-record tail tx2 is NOT found (the index followed the file down)", z == NULL && e2 == -5); rj_free(z); }
+      { FILE* f = fopen("txindex.tail", "wb"); if (f && rnd && orig){ fwrite(rnd, 1, 100000 * 20, f); fwrite(orig, 1, (size_t)osz, f); fclose(f); } }
+      g_txi_tail_cmp = 0;
+      rj_val* a = call("getrawtransaction", pj, &ec, &em);
+      char want[1100]; tohex(want, g_tx2, g_tx2_len);
+      ck_str("tail index: tx2 (a tail record) resolves by txid behind 100,000 random records", a && a->typ == RJ_STR ? a->str : NULL, want);
+      ck("tail index: the lookup compared a handful of tail records, not the 100,000 before it", g_txi_tail_cmp > 0 && g_txi_tail_cmp <= 64);
+      rj_free(a); free(rnd); free(orig); }
+      /* 2026-10-01: rpc_chain_tx_blockhash, the facade batch's index-only
+       * lookup (getrawtransaction would consult the mempool first) */
+      { extern int rpc_chain_tx_blockhash(const char*, char[65]);
+        int right = 1; char bh[65];
+        for (int i = 0; i < 4; i++)
+            if (!rpc_chain_tx_blockhash(ids[i], bh) || strcmp(bh, blks[i])){ right = 0; printf("      (%.16s -> %s, want %s)\n", ids[i], bh, blks[i]); }
+        ck("rpc_chain_tx_blockhash: every fixture tx's block hash, from the index alone", right);
+        ck("...and 0 for a txid the index does not hold, or a malformed one",
+           !rpc_chain_tx_blockhash("0000000000000000000000000000000000000000000000000000000000000001", bh) && !rpc_chain_tx_blockhash("zz", bh));
+        /* 2026-10-05: 32 threads of lane lookups while this thread deletes
+         * and rebuilds the index files (the directory changes, so every
+         * irs_refresh rescans and remaps) */
+        { volatile int stop = 0; static race_t rr[32]; pthread_t th[32];
+          for (int i = 0; i < 32; i++){ rr[i].ids = ids; rr[i].blks = blks; rr[i].stop = &stop; rr[i].calls = rr[i].wrong = 0; pthread_create(&th[i], NULL, race_lookups, &rr[i]); }
+          struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0); int rewrites = 0;
+          do {
+              unlink("txindex.dat"); unlink("txindex.tail"); unlink("txindex.r000000002-000000002.dat");
+              build_fixture_txindex(1, 3); rewrites++;
+              clock_gettime(CLOCK_MONOTONIC, &t1);
+          } while ((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000 < 400);
+          stop = 1; long calls = 0, wrong = 0;
+          for (int i = 0; i < 32; i++){ pthread_join(th[i], NULL); calls += rr[i].calls; wrong += rr[i].wrong; }
+          printf("      %ld lane lookups on 32 threads during %d index rewrites, %ld wrong\n", calls, rewrites, wrong);
+          ck("32 lane lookups racing the index rewrite: no crash, no wrong answer (the lane serialises irs_refresh)", calls > 0 && wrong == 0);
+          ck("...and the index still answers after the rewrites", rpc_chain_tx_blockhash(ids[0], bh) && !strcmp(bh, blks[0])); } } }
 
     { /* 2026-09-19 (run-28 bench fidelity, defect B): an index CONFIGURED OFF
        * is Core without the option, whatever files the datadir holds. The

@@ -25,7 +25,7 @@ rm -f build_gen.h.tmp
 
 # ---- the arch-neutral C the daemon links (from DAEMONSRCS + DAEMON_RPCOBJS) ----
 CSRC=(
-  daemon/main.c daemon/private_broadcast.c daemon/fee_estimator.c daemon/fee_hooks.c
+  daemon/main.c daemon/crash_trace.c daemon/index_worker.c daemon/benchlog.c daemon/dlc_benchlog.c daemon/private_broadcast.c daemon/fee_estimator.c daemon/fee_hooks.c
   daemon/archive_reindex.c daemon/utxo_live.c daemon/lsm_manifest.c daemon/block_witness.c
   daemon/tx_accept.c daemon/zmq_notify.c daemon/zmq_pub.c daemon/reorg.c daemon/minchainwork.c
   daemon/notify.c daemon/undo_log.c daemon/locator_build.c daemon/archive_verify.c

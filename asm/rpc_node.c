@@ -398,10 +398,15 @@ static void peer_common_fields(rj_val* o, const rpc_peer_t* p)
      * printed as 0.0 would read as a perfect link. Omitted, like Core. */
     if (p->min_ping_us > 0)
         rj_obj_set(o, "minping", rj_numf("%.6f", (double)p->min_ping_us / 1e6));
-    /* connection_type: what this node actually runs. Core also has
-     * block-relay-only, manual, feeler and addr-fetch; none of those exist
-     * here, so none are claimed. */
-    rj_obj_set(o, "connection_type", rj_str(p->inbound ? "inbound" : "outbound-full-relay"));
+    /* connection_type: inbound, or the outbound kind the worker recorded
+     * (2026-10-01: block-relay-only and manual exist here and were all
+     * reported as outbound-full-relay). Feeler and addr-fetch connections are
+     * not held in a peer slot, so they never appear, as in Core's listing of
+     * a short-lived feeler. */
+    { const char* ct = p->inbound ? "inbound"
+                     : p->conn_type == 1 ? "block-relay-only"
+                     : p->conn_type == 2 ? "manual" : "outbound-full-relay";
+      rj_obj_set(o, "connection_type", rj_str(ct)); }
     /* Core's per-message byte breakdown. A peer that has exchanged nothing
      * of a kind gets no entry for it, which is what Core does. The maps
      * themselves are ALWAYS present -- Core pushes both objects even when
@@ -1005,6 +1010,42 @@ long rpc_node_mempool_rawtx(const unsigned char txid_wire[32], unsigned char* ou
     return r;
 }
 
+/* Many mempool transactions at once (2026-10-01): raw bytes and base fee for
+ * each, copied out under ONE pool-lock hold per slice of RPC_MP_MANY_SLICE.
+ * The Esplora facade's POST /internal/mempool/txs looked each transaction up
+ * through three or more RPCs, each taking the pool lock, so a batch of N cost
+ * about N x (2 + inputs) takes; the lock's log showed the result -- 1-2 s waits
+ * for the worker's tx_accept with no hold over 1 s, a convoy of short takes
+ * (mempool.space re-syncing after a restart). The slice bound keeps one hold
+ * short enough that the worker is not starved the other way.
+ * out[i].raw is malloc'd (caller frees) when out[i].present. Returns how many
+ * were present, or -1 when this process has no pool hooks. */
+#define RPC_MP_MANY_SLICE 256
+long rpc_node_mempool_many(const unsigned char (*txid_wire)[32], long n, rpc_mp_item* out){
+    if (!g_mph.mp || !g_mph.get) return -1;
+    long found = 0;
+    for (long i = 0; i < n; i++){ out[i].present = 0; out[i].raw = 0; out[i].len = 0; out[i].fee = 0; }
+    for (long s = 0; s < n; s += RPC_MP_MANY_SLICE){
+        long e = s + RPC_MP_MANY_SLICE < n ? s + RPC_MP_MANY_SLICE : n;
+        mpl();
+        for (long i = s; i < e; i++){
+            unsigned long len = 0;
+            const unsigned char* tx = g_mph.get(g_mph.mp, txid_wire[i], &len);
+            if (!tx || !len) continue;
+            unsigned char* c = (unsigned char*)malloc(len);
+            if (!c) continue;
+            memcpy(c, tx, len);
+            out[i].raw = c; out[i].len = len; out[i].present = 1; found++;
+            mp_entry_info inf;
+            if (g_mph.polstate && g_mph.pol_entry_info && g_mph.pol_entry_info(g_mph.polstate, txid_wire[i], &inf))
+                out[i].fee = (long long)inf.fee;       /* fees.base, as getmempoolentry reports it */
+            else out[i].fee = -1;
+        }
+        mpu();
+    }
+    return found;
+}
+
 /* Slot layout per mempool_slot.h / bitcoin_mempool.asm's header (same walk
  * daemon/reorg.c uses): +0 n, +8 mask, +16 blob, then MPOOL_SLOT_BYTES slots
  * at +40 -- [+0 len][+8 txid[32]][+40 blob_off][+48 wtxid[32]], len==~0
@@ -1095,10 +1136,34 @@ void rpc_node_set_cluster_limits(long count, long size_kvb){
     if (count > 0) g_limit_cluster_count = count;
     if (size_kvb > 0) g_limit_cluster_size_kvb = size_kvb;
 }
+/* 2026-10-05: getmempoolinfo's totals keyed on the mempool SEQUENCE.
+ * Core keeps m_total_fee / totalTxSize incrementally on every add and
+ * remove, so its call is O(1). This node's pool is shared memory the worker
+ * owns, and every mutation -- add, eviction, expiry, reorg, block removal,
+ * replacement -- takes the sequence number (daemon/mempool_seq.h, Core's
+ * GetAndIncrementSequence), so the totals are a pure function of it: the
+ * same sequence is the same pool. The walk below (a memcmp per slot through
+ * the parse cache) runs only when the sequence moved; the pollers that call
+ * this every few seconds get the memo. Measured 2026-10-05 before this:
+ * 177 ms per call at 32 clients on a 71,348-transaction pool (Core 5 ms).
+ * rpc_node_mpi_memo_enable(0) forces the walk; the test compares the two. */
+static struct { unsigned long long seq; long count; unsigned long long bytes, total_fee, blob; int valid; } g_mpi_memo;
+static int g_mpi_memo_on = 1; static long g_mpi_memo_hits, g_mpi_memo_walks;
+void rpc_node_mpi_memo_enable(int on){ g_mpi_memo_on = on; if (!on) g_mpi_memo.valid = 0; }
+void rpc_node_mpi_memo_stats(long* hits, long* walks){ if (hits) *hits = g_mpi_memo_hits; if (walks) *walks = g_mpi_memo_walks; }
 static int cmd_getmempoolinfo(rj_val** res){
     long count = 0; unsigned long long bytes = 0, total_fee = 0, blob_used = 0;
     if (g_mph.mp){
         mpl();
+        unsigned long long seq = 0; int have_seq = g_mpi_memo_on && g_mph.mempool_sequence != 0;
+        if (have_seq) seq = g_mph.mempool_sequence();
+        if (have_seq && g_mpi_memo.valid && g_mpi_memo.seq == seq){
+            count = g_mpi_memo.count; bytes = g_mpi_memo.bytes; total_fee = g_mpi_memo.total_fee; blob_used = g_mpi_memo.blob;
+            g_mpi_memo_hits++;
+            mpu();
+            goto render;
+        }
+        g_mpi_memo_walks++;
         count = g_mph.count ? g_mph.count(g_mph.mp) : 0;
         /* total_fee in ONE pass over the policy nodes. It used to come from a
          * pol_entry() call per mempool slot, and pol_entry is a linear scan of
@@ -1126,8 +1191,10 @@ static int cmd_getmempoolinfo(rj_val** res){
                 if (g_mph.polstate && g_mph.pol_entry && g_mph.pol_entry(g_mph.polstate,e.txid,&f,&s)) total_fee += f;
             }
         }
+        if (have_seq){ g_mpi_memo.seq = seq; g_mpi_memo.count = count; g_mpi_memo.bytes = bytes; g_mpi_memo.total_fee = total_fee; g_mpi_memo.blob = blob_used; g_mpi_memo.valid = 1; }
         mpu();
     }
+render:;
     rj_val* o = rj_obj();
     rj_obj_set(o, "loaded", rj_bool(1));
     rj_obj_set(o, "size", rj_numf("%ld", count));
@@ -2828,13 +2895,28 @@ static int cmd_importmempool(const rj_val* params, rj_val** res, long* ec, const
     return 1;
 }
 
+/* Core's decode-failure messages (2026-10-03, rpc/mempool.cpp v31.1):
+ * sendrawtransaction "TX decode failed. Make sure the tx has at least one
+ * input."; testmempoolaccept and submitpackage name the offending hex,
+ * "TX decode failed: <hex> Make sure the tx has at least one input.", and
+ * refuse the whole call. Returned through *em, so per thread and sized to
+ * the hex. */
+#define CORE_DECODE_MSG "TX decode failed. Make sure the tx has at least one input."
+static const char* core_decode_msg_hex(const char* hex){
+    static __thread char* b; static __thread size_t cap;
+    size_t need = strlen(hex) + 80;
+    if (need > cap){ char* nb = (char*)realloc(b, need); if (!nb) return "TX decode failed"; b = nb; cap = need; }
+    snprintf(b, cap, "TX decode failed: %s Make sure the tx has at least one input.", hex);
+    return b;
+}
+
 static int cmd_sendrawtransaction(const rj_val* params, rj_val** res, long* ec, const char** em){
     if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
         params->items[0]->typ != RJ_STR){
         *ec = -8; *em = "Invalid parameter, hexstring required"; return 0; }
     const char* hex = params->items[0]->str;
     size_t hl = strlen(hex);
-    if ((hl & 1) || hl/2 == 0 || hl/2 > RPC_TXSUBMIT_MAX){ *ec = -22; *em = "TX decode failed"; return 0; }
+    if ((hl & 1) || hl/2 == 0 || hl/2 > RPC_TXSUBMIT_MAX){ *ec = -22; *em = CORE_DECODE_MSG; return 0; }
     unsigned long n = (unsigned long)(hl/2);
     static unsigned char stage[RPC_TXSUBMIT_MAX];   /* under g_submit_lock */
     char                 txidhex[65];               /* 2026-09-30: read after the wait, so not shared */
@@ -2845,11 +2927,11 @@ static int cmd_sendrawtransaction(const rj_val* params, rj_val** res, long* ec, 
     submit_lock();
     int okhex = 1;
     for (unsigned long i=0;i<n;i++){ int hi=srt_hex1(hex[i*2]),lo=srt_hex1(hex[i*2+1]); if(hi<0||lo<0){okhex=0;break;} stage[i]=(unsigned char)((hi<<4)|lo); }
-    if (!okhex){ submit_unlock(); *ec=-22; *em="TX decode failed"; return 0; }
+    if (!okhex){ submit_unlock(); *ec=-22; *em=CORE_DECODE_MSG; return 0; }
 
     /* txid for the success result (display order) */
     { unsigned char id[32]; static unsigned char scratch[RPC_TXID_SCRATCH];   /* RPC-20 */
-      if (!tx_txid(id, stage, n, scratch, sizeof scratch)){ submit_unlock(); *ec=-22; *em="TX decode failed"; return 0; }
+      if (!tx_txid(id, stage, n, scratch, sizeof scratch)){ submit_unlock(); *ec=-22; *em=CORE_DECODE_MSG; return 0; }
       static const char* HEXD = "0123456789abcdef";
       for (int i=0;i<32;i++){ unsigned char b=id[31-i]; txidhex[i*2]=HEXD[b>>4]; txidhex[i*2+1]=HEXD[b&15]; }
       txidhex[64]=0; }
@@ -2883,12 +2965,15 @@ static int cmd_sendrawtransaction(const rj_val* params, rj_val** res, long* ec, 
 
     /* wait for the worker to ack this exact seq */
     int waited = 0, done = 0, result = 0;
+    char detail[512]; detail[0] = 0;
     reason[0] = 0;
     while (waited < g_srt_wait_us){
         if (s->tx_submit_ack == myseq){ __atomic_thread_fence(__ATOMIC_ACQUIRE);   /* ARM64: the result/reason loads after the ack (the worker fenced before publishing it) */
             result = s->tx_submit_result;
             memcpy(reason, (const void*)s->tx_submit_reason, sizeof reason);
             reason[sizeof reason-1]=0;
+            memcpy(detail, (const void*)s->tx_submit_detail, sizeof detail);
+            detail[sizeof detail-1] = 0;
             done = 1; break;
         }
         struct timespec ts = {0, SRT_POLL_US*1000L}; nanosleep(&ts, NULL);
@@ -2899,8 +2984,11 @@ static int cmd_sendrawtransaction(const rj_val* params, rj_val** res, long* ec, 
     if (!done){ *ec=-4; *em="Transaction submission timed out"; return 0; }
     if (result == 1){ *res = rj_str(txidhex); return 1; }
     /* worker put a negative Core error code in result and the reason text */
-    static __thread char embuf[160];                /* returned through *em: per thread since the wait released the lock (2026-09-30) */
-    snprintf(embuf, sizeof embuf, "%s", reason[0] ? reason : "transaction rejected");
+    static __thread char embuf[640];                /* returned through *em: per thread since the wait released the lock (2026-09-30) */
+    /* Core: the error is TxValidationState::ToString() -- "reason, debug"
+     * when there is a debug message (2026-10-03) */
+    if (reason[0] && detail[0]) snprintf(embuf, sizeof embuf, "%s, %s", reason, detail);
+    else snprintf(embuf, sizeof embuf, "%s", reason[0] ? reason : "transaction rejected");
     *ec = result < 0 ? result : -26; *em = embuf;
     return 0;
 }
@@ -2930,7 +3018,7 @@ static int cmd_sendrawtransaction(const rj_val* params, rj_val** res, long* ec, 
 #define TMA_MAX 25
 
 static int tma_stage(node_status_t* s, const unsigned char* tx, unsigned long n,
-                     int* result_out, char reason[128], unsigned long long* fee_out){
+                     int* result_out, char reason[128], unsigned long long* fee_out, char detail[512]){
     memcpy((void*)s->tx_submit_buf, tx, n);
     s->tx_submit_len = n;
     s->tx_submit_result = 0;
@@ -2947,6 +3035,7 @@ static int tma_stage(node_status_t* s, const unsigned char* tx, unsigned long n,
             *fee_out = s->tx_submit_fee;
             memcpy(reason, (const void*)s->tx_submit_reason, 128);
             reason[127] = 0;
+            if (detail){ memcpy(detail, (const void*)s->tx_submit_detail, 512); detail[511] = 0; }
             return 1;
         }
         struct timespec ts = {0, SRT_POLL_US*1000L}; nanosleep(&ts, NULL);
@@ -3022,10 +3111,10 @@ static int cmd_submitpackage(const rj_val* params, rj_val** res, long* ec, const
             submit_unlock(); *ec = -22; *em = "TX decode failed"; return 0; }
         size_t hl = strlen(e->str);
         if (hl % 2 || hl/2 == 0 || total + hl/2 > sizeof raw){
-            submit_unlock(); *ec = -22; *em = "TX decode failed"; return 0; }
+            submit_unlock(); *ec = -22; *em = core_decode_msg_hex(e->str); return 0; }
         for (size_t k = 0; k < hl/2; k++){
             int a = srt_hex1(e->str[k*2]), b = srt_hex1(e->str[k*2+1]);
-            if (a < 0 || b < 0){ submit_unlock(); *ec = -22; *em = "TX decode failed"; return 0; }
+            if (a < 0 || b < 0){ submit_unlock(); *ec = -22; *em = core_decode_msg_hex(e->str); return 0; }
             raw[total + k] = (unsigned char)((a<<4)|b);
         }
         off[i] = total; tlen[i] = hl/2; total += hl/2;
@@ -3050,7 +3139,8 @@ static int cmd_submitpackage(const rj_val* params, rj_val** res, long* ec, const
     static int  r_result[RPC_PKG_MAX];
     static unsigned long long r_fee[RPC_PKG_MAX], r_vsize[RPC_PKG_MAX];
     static char r_reason[RPC_PKG_MAX][64];
-    char pmsg[128]; pmsg[0] = 0;
+    static char r_detail[RPC_PKG_MAX][512];          /* Core's debug message per member (2026-10-03) */
+    char pmsg[320]; pmsg[0] = 0;
     unsigned long long eff_fee = 0, eff_vsize = 0;
     static unsigned char replaced[RPC_PKG_REPLACED_MAX][32];
     int n_replaced = 0;
@@ -3060,8 +3150,10 @@ static int cmd_submitpackage(const rj_val* params, rj_val** res, long* ec, const
             r_fee[i]    = st->pkg_fee[i];
             r_vsize[i]  = st->pkg_vsize[i];
             snprintf(r_reason[i], sizeof r_reason[i], "%s", (const char*)st->pkg_reason[i]);
+            snprintf(r_detail[i], sizeof r_detail[i], "%s", (const char*)st->pkg_detail[i]);
         }
-        snprintf(pmsg, sizeof pmsg, "%s", (const char*)st->tx_submit_reason);
+        snprintf(pmsg, sizeof pmsg, "%s", st->pkg_msg_full[0] ? (const char*)st->pkg_msg_full   /* the full package_msg (2026-10-01) */
+                                                         : (const char*)st->tx_submit_reason);
         eff_fee = st->pkg_eff_fee; eff_vsize = st->pkg_eff_vsize;
         n_replaced = st->pkg_replaced_n;
         if (n_replaced > RPC_PKG_REPLACED_MAX) n_replaced = RPC_PKG_REPLACED_MAX;
@@ -3085,16 +3177,26 @@ static int cmd_submitpackage(const rj_val* params, rj_val** res, long* ec, const
         rj_val* e = rj_obj();
         rj_obj_set(e, "txid", rj_str(thex));
         rj_obj_set(e, "vsize", rj_numf("%llu", (unsigned long long)r_vsize[i]));
-        if (r_result[i]){
+        if (r_result[i] > 0){
+            /* 2026-10-01, Core AcceptPackage's three valid kinds (the worker's
+             * txsub_package_accept): 1 accepted alone -- its own feerate,
+             * including only itself; 2 accepted in the package evaluation --
+             * the package feerate over those members; 3 already in the
+             * mempool -- base fee only (Core: "unknown whether package
+             * feerate was used when it was originally submitted"). */
             rj_val* f = rj_obj();
             rj_obj_set(f, "base", mpe_amount(r_fee[i]));
-            if (eff_vsize){
+            if (r_result[i] == 1 && r_vsize[i]){
+                rj_obj_set(f, "effective-feerate", mpe_amount(r_fee[i] * 1000ULL / r_vsize[i]));
+                rj_val* inc = rj_arr(); rj_arr_push(inc, rj_str(whex));
+                rj_obj_set(f, "effective-includes", inc);
+            } else if (r_result[i] == 2 && eff_vsize){
                 /* Core reports this per KvB, as an amount */
                 unsigned long long per_kvb = eff_fee * 1000ULL / eff_vsize;
                 rj_obj_set(f, "effective-feerate", mpe_amount(per_kvb));
                 rj_val* inc = rj_arr();
                 for (int k = 0; k < n; k++){
-                    if (!r_result[k]) continue;
+                    if (r_result[k] != 2) continue;
                     unsigned char wk[32]; char wkhex[65];
                     tx_wtxid(wk, raw + off[k], tlen[k]);
                     mpe_hex(wkhex, wk);
@@ -3104,7 +3206,10 @@ static int cmd_submitpackage(const rj_val* params, rj_val** res, long* ec, const
             }
             rj_obj_set(e, "fees", f);
         } else if (r_reason[i][0]){
-            rj_obj_set(e, "error", rj_str(r_reason[i]));
+            /* Core: it->second.m_state.ToString() -- "reason, debug" */
+            if (r_detail[i][0]){ char full[600]; snprintf(full, sizeof full, "%.63s, %.511s", r_reason[i], r_detail[i]);
+                                 rj_obj_set(e, "error", rj_str(full)); }
+            else rj_obj_set(e, "error", rj_str(r_reason[i]));
         }
         rj_obj_set(results, whex, e);
     }
@@ -3129,13 +3234,17 @@ static int cmd_submitpackage(const rj_val* params, rj_val** res, long* ec, const
  * (rpc/mempool.cpp): the value is TxValidationState::ToString(), which is the
  * reject reason on its own when there is no debug message, and "reason, debug"
  * when there is. It is OMITTED for missing-inputs, where Core takes the other
- * branch and pushes only the reason. This node carries no separate debug
- * message, so details equals the reason -- which is precisely Core's output in
- * the no-debug-message case, not an approximation of it. */
-static void tma_set_reject(rj_val* e, const char* rsn){
+ * branch and pushes only the reason. 2026-10-03: the worker returns Core's
+ * debug message beside the reason (tx_submit_detail); empty means Core has
+ * none, and details is then the reason alone, as in Core. */
+static void tma_set_reject(rj_val* e, const char* rsn, const char* detail){
     rj_obj_set(e, "reject-reason", rj_str(rsn));
-    if (strcmp(rsn, "missing-inputs") != 0)
-        rj_obj_set(e, "reject-details", rj_str(rsn));
+    if (strcmp(rsn, "missing-inputs") != 0){
+        if (detail && detail[0]){
+            char full[640]; snprintf(full, sizeof full, "%s, %s", rsn, detail);
+            rj_obj_set(e, "reject-details", rj_str(full));
+        } else rj_obj_set(e, "reject-details", rj_str(rsn));
+    }
 }
 
 static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, const char** em){
@@ -3157,13 +3266,18 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
     for (size_t i = 0; i < list->nitems; i++){
         if (list->items[i]->typ != RJ_STR){ submit_unlock(); *ec = -22; *em = "TX decode failed"; return 0; }
         const char* hex = list->items[i]->str; size_t hl = strlen(hex);
-        if ((hl & 1) || hl/2 < 10 || hl/2 > RPC_TXSUBMIT_MAX){ submit_unlock(); *ec = -22; *em = "TX decode failed"; return 0; }
+        if ((hl & 1) || hl/2 < 10 || hl/2 > RPC_TXSUBMIT_MAX){ submit_unlock(); *ec = -22; *em = core_decode_msg_hex(hex); return 0; }
         lens[i] = (unsigned long)(hl/2);
         for (unsigned long k = 0; k < lens[i]; k++){
             int hi = srt_hex1(hex[k*2]), lo = srt_hex1(hex[k*2+1]);
-            if (hi < 0 || lo < 0){ submit_unlock(); *ec = -22; *em = "TX decode failed"; return 0; }
+            if (hi < 0 || lo < 0){ submit_unlock(); *ec = -22; *em = core_decode_msg_hex(hex); return 0; }
             stage[i][k] = (unsigned char)((hi<<4)|lo);
         }
+        /* Core decodes every entry before validating any, and an undecodable
+         * one refuses the whole call (2026-10-03: this reported it as one
+         * entry's reject-reason) */
+        { unsigned char id_[32]; static unsigned char sc_[RPC_TXID_SCRATCH];
+          if (tx_txid(id_, stage[i], lens[i], sc_, sizeof sc_) != 1){ submit_unlock(); *ec = -22; *em = core_decode_msg_hex(hex); return 0; } }
     }
 
     static const char* HEXD = "0123456789abcdef";
@@ -3201,6 +3315,7 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
         static int r_result[TMA_MAX];
         static unsigned long long r_fee[TMA_MAX], r_vsize[TMA_MAX];
         static char r_reason[TMA_MAX][64];
+        static char r_detail[TMA_MAX][512];
         char pmsg[128]; pmsg[0] = 0;
         unsigned long long eff_fee = 0, eff_vsize = 0;
         if (got){
@@ -3209,6 +3324,7 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
                 r_fee[i]    = s->pkg_fee[i];
                 r_vsize[i]  = s->pkg_vsize[i];
                 snprintf(r_reason[i], sizeof r_reason[i], "%s", (const char*)s->pkg_reason[i]);
+                snprintf(r_detail[i], sizeof r_detail[i], "%s", (const char*)s->pkg_detail[i]);
             }
             snprintf(pmsg, sizeof pmsg, "%s", (const char*)s->tx_submit_reason);
             eff_fee = s->pkg_eff_fee; eff_vsize = s->pkg_eff_vsize;
@@ -3245,18 +3361,35 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
                 /* no member was individually validated: `allowed` is OMITTED,
                  * which is exactly how Core marks that */
                 rj_obj_set(e, "package-error", rj_str(pmsg));
-            } else if (r_result[i]){
+            } else if (r_result[i] < 0){
+                /* not evaluated: an earlier member failed and Core's
+                 * AcceptMultipleTransactions stopped there (2026-10-01) --
+                 * Core prints only the txid and wtxid for such a member */
+            } else if (r_result[i] == 1){
                 rj_obj_set(e, "allowed", rj_bool(1));
                 rj_obj_set(e, "vsize", rj_numf("%llu", (unsigned long long)r_vsize[i]));
                 rj_val* f = rj_obj();
                 rj_obj_set(f, "base", mpe_amount(r_fee[i]));
+                if (!eff_vsize && r_vsize[i]){
+                    /* no package aggregate (testmempoolaccept validates each
+                     * member alone): the effective feerate is the member's own
+                     * and it includes only itself, as Core reports for
+                     * PackageTestAccept (2026-10-01) */
+                    rj_obj_set(f, "effective-feerate", mpe_amount(r_fee[i] * 1000ULL / r_vsize[i]));
+                    unsigned char ik[32], wk[32]; char wkhex[65]; rj_val* inc = rj_arr();
+                    if (tx_txid(ik, raw + off[i], lens[i], sc, sizeof sc) == 1){
+                        int sw = lens[i] > 6 && raw[off[i]+4] == 0x00 && raw[off[i]+5] == 0x01;
+                        if (sw && g_mph.sha256d) g_mph.sha256d(wk, raw + off[i], lens[i]); else memcpy(wk, ik, 32);
+                        mpe_hex(wkhex, wk); rj_arr_push(inc, rj_str(wkhex)); }
+                    rj_obj_set(f, "effective-includes", inc);
+                }
                 if (eff_vsize){
                     /* the feerate the package was ACTUALLY weighed against,
                      * and the members whose fee and vsize went into it */
                     rj_obj_set(f, "effective-feerate", mpe_amount(eff_fee * 1000ULL / eff_vsize));
                     rj_val* inc = rj_arr();
                     for (int k = 0; k < n; k++){
-                        if (!r_result[k]) continue;
+                        if (r_result[k] != 1) continue;   /* -1 = not evaluated */
                         unsigned char ik[32], wk[32]; char wkhex[65];
                         if (tx_txid(ik, raw + off[k], lens[k], sc, sizeof sc) != 1) continue;
                         int sw = lens[k] > 6 && raw[off[k]+4] == 0x00 && raw[off[k]+5] == 0x01;
@@ -3270,7 +3403,7 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
                 rj_obj_set(e, "fees", f);
             } else {
                 rj_obj_set(e, "allowed", rj_bool(0));
-                tma_set_reject(e, r_reason[i][0] ? r_reason[i] : "transaction rejected");
+                tma_set_reject(e, r_reason[i][0] ? r_reason[i] : "transaction rejected", r_detail[i]);
             }
             rj_arr_push(arr, e);
         }
@@ -3296,11 +3429,11 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
             for (int k=0;k<32;k++){ unsigned char b=wid[31-k]; hx[k*2]=HEXD[b>>4]; hx[k*2+1]=HEXD[b&15]; }
             hx[64]=0; rj_obj_set(e, "wtxid", rj_str(hx));
         }
-        int result = 0; char reason[128] = {0}; unsigned long long fee = 0;
+        int result = 0; char reason[128] = {0}; char detail[512] = {0}; unsigned long long fee = 0;
         if (!have_id){
             rj_obj_set(e, "allowed", rj_bool(0));
             rj_obj_set(e, "reject-reason", rj_str("TX decode failed"));
-        } else if (!tma_stage(s, stage[i], lens[i], &result, reason, &fee)){
+        } else if (!tma_stage(s, stage[i], lens[i], &result, reason, &fee, detail)){
             /* no verdict: `allowed` is OMITTED, which is exactly how Core
              * marks a transaction it could not fully validate */
             rj_obj_set(e, "reject-reason", rj_str("mempool acceptance test timed out"));
@@ -3316,7 +3449,7 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
             rj_obj_set(e, "fees", fees);
         } else {
             rj_obj_set(e, "allowed", rj_bool(0));
-            tma_set_reject(e, reason[0] ? reason : "transaction rejected");
+            tma_set_reject(e, reason[0] ? reason : "transaction rejected", detail);
         }
         rj_arr_push(arr, e);
     }
@@ -3866,9 +3999,15 @@ static pthread_mutex_t g_mpx_mu;
 static pthread_once_t g_mpx_once = PTHREAD_ONCE_INIT;
 static void mpx_init(void){ pthread_mutexattr_t a; pthread_mutexattr_init(&a); pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE); pthread_mutex_init(&g_mpx_mu, &a); pthread_mutexattr_destroy(&a); }
 int rpc_node_method_lane(const char* m){
+    /* gettxspendingprevout is NOT here (2026-10-03): its confirmed-spend
+     * path calls rpc_chain_txospender_lookup, which runs refresh() on the
+     * shared store handle and reads the txospender run set that irs_refresh
+     * rewrites in place -- the state the execution lock protects. In this
+     * lane it raced every chain RPC; the same race in the facade's txid-index
+     * lookup segfaulted production on 2026-10-02. */
     if (!strcmp(m, "getmempoolinfo") || !strcmp(m, "getrawmempool") || !strcmp(m, "getmempoolentry")
      || !strcmp(m, "getmempoolancestors") || !strcmp(m, "getmempooldescendants")
-     || !strcmp(m, "gettxspendingprevout") || !strcmp(m, "getmempoolcluster")) return 2;
+     || !strcmp(m, "getmempoolcluster")) return 2;
     return 0;
 }
 static int rpc_node_dispatch_unlocked(const char* m, const rj_val* params, rj_val** res, long* ec, const char** em);

@@ -47,6 +47,22 @@ extern void csi_hist_repair_configure(const char*, const char*, const char*, int
 extern int  csi_hist_repair_tick(long applied, int in_ibd, long long now);
 extern int  csi_hist_repair_state(void);
 extern const char* csi_hist_status(void);
+extern pid_t csi_hist_repair_pid(void);
+extern void sha256_full(unsigned char out[32], const void* data, unsigned long len);
+/* 2026-10-04: the tail as the live index writes it on a sync from block 0 --
+ * the golden base's rows under a tail header (first, last), row `gen_row`
+ * re-stamped with generation 7 (a re-seed) when >= 0. Written in place: the
+ * library keeps the tail open. */
+static void write_tail(long first, long last, long gen_row){
+    int in = open("base.golden", O_RDONLY), fd = open(CSH_FILE, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    csh_header_t hd; memset(&hd, 0, sizeof hd); hd.magic = CSH_MAGIC; hd.version = 1; hd.rec = CSH_REC; hd.first_height = first; hd.last_height = last;
+    (void)!pwrite(fd, &hd, sizeof hd, 0);
+    for (long h = 0; h <= last; h++){ csh_row_t r;
+        if (pread(in, &r, sizeof r, CSH_HDR + h * CSH_REC) != (ssize_t)sizeof r) break;
+        if (h == gen_row){ r.gen = 7; sha256_full(r.sum, &r, sizeof r - 32); }
+        (void)!pwrite(fd, &r, sizeof r, CSH_HDR + h * CSH_REC); }
+    close(in); close(fd);
+}
 static int log_has(const char* file, const char* needle){
     FILE* f = fopen(file, "r"); if (!f) return 0; char line[512]; int hit = 0;
     while (fgets(line, sizeof line, f)) if (strstr(line, needle)){ hit = 1; break; }
@@ -233,6 +249,32 @@ int main(void){
       ck("released: the builder is spawned", csi_hist_repair_tick(3, 0, now) == 2);
       st = tick_until_settled(&now);
       ck("and its base is adopted", st == 1 && csi_hist_base_to() == 3); }
+
+    printf("---- 2026-10-04: a tail written since genesis is the history; nothing is rebuilt ----\n");
+    { long long now = 3000000; int st; csi_hist_out_t o7;
+      unlink(CSH_BASE_FILE); write_tail(0, 3, -1);
+      csi_hist_repair_configure("./stub_ok.sh", ".", "regtest", 2, 1);
+      ck("during the download the tail is not judged yet (state IBD, nothing spawned)", csi_hist_repair_tick(3, 1, now) == 6 && csi_hist_repair_pid() == -1);
+      ck("after it: OK at once, no builder, no base file", csi_hist_repair_tick(3, 0, now) == 1 && csi_hist_repair_pid() == -1 && access(CSH_BASE_FILE, F_OK) != 0);
+      ck("the status names the live index's rows", strstr(csi_hist_status(), "since genesis") != 0);
+      ck("the RPC reads rows 0..3 from the tail, same digest as the built base", csi_hist_first() == 0 && csi_hist_query(3, 1, &o7) == 1 && !memcmp(golden, o7.digest, 32));
+      ck("the next tick stays OK", csi_hist_repair_tick(3, 0, now + 60) == 1 && csi_hist_repair_pid() == -1);
+      /* a tail seeded above genesis (production's snapshot boot) still needs the base */
+      write_tail(2, 3, -1); csi_hist_repair_configure("./stub_ok.sh", ".", "regtest", 2, 1);
+      ck("a tail that starts at 2: the builder is spawned", csi_hist_repair_tick(3, 0, now) == 2);
+      st = tick_until_settled(&now); ck("... and its base adopted", st == 1 && csi_hist_base_to() == 3);
+      /* a torn row in the middle: the full scan catches it */
+      unlink(CSH_BASE_FILE); write_tail(0, 3, -1);
+      { int fd = open(CSH_FILE, O_RDWR); u8 b = 0; (void)!pread(fd, &b, 1, CSH_HDR + 2 * CSH_REC + 40); b ^= 1; (void)!pwrite(fd, &b, 1, CSH_HDR + 2 * CSH_REC + 40); close(fd); }
+      csi_hist_repair_configure("./stub_ok.sh", ".", "regtest", 2, 1);
+      ck("a torn row 2 in a genesis tail: the builder is spawned", csi_hist_repair_tick(3, 0, now) == 2);
+      st = tick_until_settled(&now); ck("... and its base adopted", st == 1);
+      /* a re-seed between genesis and the tip: generations differ, the deltas break there */
+      unlink(CSH_BASE_FILE); write_tail(0, 3, 2);
+      csi_hist_repair_configure("./stub_ok.sh", ".", "regtest", 2, 1);
+      ck("a genesis tail with a later generation at row 2: the builder is spawned", csi_hist_repair_tick(3, 0, now) == 2);
+      st = tick_until_settled(&now); ck("... and its base adopted", st == 1);
+      unlink(CSH_FILE); }
     printf("%s (%d failure(s))\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED", failures);
     return failures ? 1 : 0;
 }

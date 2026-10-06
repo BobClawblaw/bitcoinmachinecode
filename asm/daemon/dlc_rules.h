@@ -34,6 +34,18 @@ static inline long dlc_announced_height(const long* hs, int n){
     free(v);
     return r;
 }
+/* ---- the header peer (2026-10-05) ------------------------------------------
+ * bmc (the default): DLC_HDR_PROBE_N candidates are asked for the first
+ * header page at once and the fastest leads the sync; the others are the
+ * fallbacks the try loop walks when the leader fails, stops answering, is
+ * behind, or is on a stale branch (dlc_headers_probe, main.c). A peer that
+ * stops answering after pages have landed is rolled back and the next
+ * candidate continues; the longest chain seen is taken if no one completes.
+ * Core syncs headers from ONE peer (net_processing.cpp: nSyncStarted is 0 or
+ * 1; a second peer is only tried after the first times out), so
+ * bmc.dlshape=core keeps the single pick, in the shuffled pool's order.
+ * Stated divergence in the default mode: Core's header sync is as fast as
+ * its one draw; this node's is as fast as the best of four. */
 /* does a header chain ending at chain_tip fall short of what the pool announces? */
 static inline int dlc_chain_falls_short(long chain_tip, long announced){
     return announced > 0 && chain_tip + DLC_HDR_BEHIND_MAX < announced;
@@ -51,6 +63,12 @@ static inline int dlc_chain_falls_short(long chain_tip, long announced){
 #define DLC_BLOCK_DOWNLOAD_WINDOW 1024L    /* Core: BLOCK_DOWNLOAD_WINDOW, above the connected tip (2026-09-29) */
 #define DLC_STALL_TIMEOUT_MIN_S 2L         /* BLOCK_STALLING_TIMEOUT_DEFAULT */
 #define DLC_STALL_TIMEOUT_MAX_S 64L        /* BLOCK_STALLING_TIMEOUT_MAX */
+/* the liveness probe's early end (2026-10-06, plan B9): once this many
+ * connects have completed, a round ends after this much quiet -- a connect
+ * still pending that long after the last completion is a dropped SYN on
+ * the kernel's retransmit clock (1 s, 3 s, 7 s), not a slow peer */
+#define DLC_PROBE_QUIET_MIN 10
+#define DLC_PROBE_QUIET_MS  2000LL
 /* every live peer downloads, up to the operator's cap and the arrays' 64 --
  * and no more than the span has chunks (2026-09-10, row 3: a reorg handoff
  * of forty blocks forked 64 helpers for one chunk) */
@@ -113,4 +131,13 @@ static inline long long dlc_stall_clock(long long since_ms, long long last_block
 /* a peer is replaced (rotation, the rate floor) only when a replacement exists;
  * otherwise the window's tail is the only judge, as in Core */
 static inline int dlc_replace_allowed(int free_peers){ return free_peers > 0; }
+/* bmc.dlshape=core (2026-10-04): Core's block download timeout. A peer whose
+ * front in-flight block is older than BLOCK_DOWNLOAD_TIMEOUT_BASE (1) +
+ * BLOCK_DOWNLOAD_TIMEOUT_PER_PEER (0.5) x the other peers downloading, in
+ * units of the 600 s target spacing, is disconnected (net_processing.cpp:
+ * 148-150, 6113-6122). With Core's 10 download peers: 600 x 5.5 = 3,300 s. */
+static inline long dlc_core_block_timeout_s(int download_peers){
+    int others = download_peers > 1 ? download_peers - 1 : 0;
+    return (long)(600.0 * (1.0 + 0.5 * (double)others));
+}
 #endif

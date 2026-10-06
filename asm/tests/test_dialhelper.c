@@ -139,6 +139,14 @@ int main(void){
     int before = mux_n_out;
     ok(dh_install_leg(h, fd, &r) == 1 && mux_n_out == before + 1, "installed as an outbound leg");
     ok(!strcmp(mux_out_host[mux_n_out - 1], host) && mux_out_fd[mux_n_out - 1] == fd, "...with its host and fd recorded");
+    /* 2026-10-04: the helper child never writes the address book, so the
+     * worker records what the peer's version said -- before, a helper-dialed
+     * peer kept services=1 and read as "no v2" at the next dial */
+    { bmc_addr_t pa; ab2_rec_t rec; memset(&rec, 0, sizeof rec);
+      ab2_t* b = addr_book(); long ix = -1;
+      if (b && bmc_addr_from_string_port(&pa, host, 8333)) ix = ab2_find(b, &pa);
+      ok(ix >= 0 && ab2_get(b, ix, &rec) == 1 && rec.services == 0x409ULL,
+         "the helper-dialed peer's real services (0x409, from its version) are in the address book"); }
     { char pv[256]; format_peer_version_info(pv, sizeof pv); ok(strstr(pv, "fakepeer") != 0, "getpeerinfo-style version text reflects the peer"); }
     ok(dh_install_leg(h, fd, &r) == 0, "a second install of the same host is refused (dedupe)");
     close(mux_out_fd[mux_n_out - 1]); mux_out_fd[mux_n_out - 1] = -1;
@@ -762,6 +770,78 @@ int main(void){
               ok(WIFEXITED(st8) && WEXITSTATUS(st8) == 7 && tbanned[1] == 0,
                  "at the usable floor the staller is still dropped but NOT banned (a slow peer beats no peer)");
               g_cfg.min_usable_peers = save_floor; kids[0] = 0; }
+            /* 2026-10-05 (runs 34 and 35): an eviction the holder never
+             * answers. The holder here ignores SIGUSR1 outright, as the wedged
+             * workers did. 2026-10-06 (run 36): the FIRST eviction puts the
+             * chunk on the retry ring for an idle worker (Core re-requests a
+             * disconnected staller's blocks at once; run 36's answered holders
+             * took 15-30 s to redial and refetch while the ring's one chunk
+             * came in 680 ms), counted as reassigned; the second eviction of
+             * the same holder for the same chunk is a diagnosis -- unanswered
+             * when the holder's evict_acks did not move -- and never rings the
+             * chunk twice; a new tail starts the memory over. */
+            { pid_t hp3 = fork();
+              if (hp3 == 0){ signal(SIGUSR1, SIG_IGN); for (;;) pause(); }
+              kids[0] = opid[0] = hp3;
+              sst[0].cur_lo = 180; sst[0].cur_hi = 219; sst[0].held_idx = 2; sst[0].kill_reason = 0; sst[0].evict_acks = 0;
+              c[DLC_CTL_FIRST_HOLE] = 180; c[DLC_CTL_CLAIM] = 180 + 4097; c[DLC_CTL_N_STALL] = 0; c[DLC_CTL_N_UNANSWERED] = 0; c[DLC_CTL_N_REASSIGNED] = 0;
+              c[DLC_CTL_RETRY_HEAD] = 0; c[DLC_CTL_RETRY_TAIL] = 0;
+              g_dlc_stall_timeout_s = 2;
+              dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 400000, tlive, TNLIVE, tbanned);   /* a new tail: the clock starts */
+              dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 402000, tlive, TNLIVE, tbanned);   /* 2 s: evicted (ignored) */
+              ok(c[DLC_CTL_N_STALL] == 1 && dlc_retry_pop(c) == 180 && c[DLC_CTL_N_REASSIGNED] == 1 && c[DLC_CTL_N_UNANSWERED] == 0,
+                 "the FIRST eviction puts the chunk on the retry ring at once (Core: re-requested elsewhere), counted as reassigned");
+              dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 402100, tlive, TNLIVE, tbanned);   /* the same holder again: a fresh clock */
+              dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 406100, tlive, TNLIVE, tbanned);   /* 4 s: evicted again, unanswered */
+              ok(c[DLC_CTL_N_STALL] == 2 && c[DLC_CTL_N_UNANSWERED] == 1 && c[DLC_CTL_N_REASSIGNED] == 1 && dlc_retry_pop(c) == -1,
+                 "the SECOND eviction of the same holder for the same chunk with its acks unmoved is UNANSWERED, and does not ring the chunk twice");
+              dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 406200, tlive, TNLIVE, tbanned);
+              dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 414200, tlive, TNLIVE, tbanned);   /* 8 s: a third eviction */
+              ok(c[DLC_CTL_N_STALL] == 3 && c[DLC_CTL_N_UNANSWERED] == 2 && c[DLC_CTL_N_REASSIGNED] == 1 && dlc_retry_pop(c) == -1,
+                 "...a third unanswered eviction counts again and still rings nothing");
+              /* the tail moves on (the ring's worker delivered 180): the next chunk's first eviction rings it */
+              sst[0].cur_lo = 220; sst[0].cur_hi = 259;
+              c[DLC_CTL_FIRST_HOLE] = 220; c[DLC_CTL_CLAIM] = 220 + 4097;
+              dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 420000, tlive, TNLIVE, tbanned);
+              dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 420100, tlive, TNLIVE, tbanned);
+              dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 420100 + g_dlc_stall_timeout_s * 1000, tlive, TNLIVE, tbanned);
+              ok(c[DLC_CTL_N_STALL] == 4 && c[DLC_CTL_N_UNANSWERED] == 2 && c[DLC_CTL_N_REASSIGNED] == 2 && dlc_retry_pop(c) == 220,
+                 "a new tail starts the memory over: its first eviction rings it, nothing is unanswered yet");
+              /* 2026-10-06 (run 36): the holder ANSWERS the first eviction
+               * (its evict_acks moves, as the worker's drop line does) and
+               * its fresh peer stalls too. The second eviction is NOT
+               * unanswered: run 36's only such line said "did not answer"
+               * with the worker's acknowledgement printed the line above. */
+              sst[0].cur_lo = 260; sst[0].cur_hi = 299; sst[0].evict_acks = 7;
+              c[DLC_CTL_FIRST_HOLE] = 260; c[DLC_CTL_CLAIM] = 260 + 4097;
+              dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 430000, tlive, TNLIVE, tbanned);
+              dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 430100, tlive, TNLIVE, tbanned);
+              { long t1 = 430100 + g_dlc_stall_timeout_s * 1000;
+                dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, t1, tlive, TNLIVE, tbanned);          /* the first eviction */
+                ok(c[DLC_CTL_N_STALL] == 5 && dlc_retry_pop(c) == 260 && c[DLC_CTL_N_REASSIGNED] == 3, "answered case: the first eviction rings the chunk");
+                sst[0].evict_acks = 8;                                                                   /* ...which the holder acts on */
+                dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, t1 + 100, tlive, TNLIVE, tbanned);    /* a fresh clock on the fresh peer */
+                dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, t1 + 100 + g_dlc_stall_timeout_s * 1000, tlive, TNLIVE, tbanned);
+                ok(c[DLC_CTL_N_STALL] == 6 && c[DLC_CTL_N_UNANSWERED] == 2 && c[DLC_CTL_N_REASSIGNED] == 3 && dlc_retry_pop(c) == -1,
+                   "an ANSWERED holder evicted again for the same chunk is not counted as unanswered, and the chunk is not ringed twice"); }
+              kill(hp3, SIGKILL); waitpid(hp3, NULL, 0); kids[0] = 0; }
+            /* the cursor help's taker (2026-10-05): one worker takes the
+             * committer's want through the HELPING CAS; a second asker gets
+             * nothing; a staged chunk is not taken; Core mode never takes it */
+            { int helping = 0; g_dlc_core = 0;
+              c[DLC_CTL_CURSOR_WANT] = -1; c[DLC_CTL_HELPING] = -1; c[DLC_CTL_N_CURSOR_HELP] = 0;
+              ok(dlc_take_cursor_want(c, &helping) == -1 && !helping, "no want published: nothing to take");
+              c[DLC_CTL_CURSOR_WANT] = 300;
+              ok(dlc_take_cursor_want(c, &helping) == 300 && helping == 1 && c[DLC_CTL_HELPING] == 300 && c[DLC_CTL_N_CURSOR_HELP] == 1,
+                 "the published want is taken once: HELPING carries it, the help counted");
+              int helping2 = 0;
+              ok(dlc_take_cursor_want(c, &helping2) == -1 && !helping2 && c[DLC_CTL_N_CURSOR_HELP] == 1, "a second asker gets nothing while the first is helping");
+              c[DLC_CTL_HELPING] = -1; stage_chunk(300, 40);
+              ok(dlc_take_cursor_want(c, &helping2) == -1 && !helping2, "a want that is already staged is not taken (its owner finished)");
+              dlc_stage_wipe();
+              g_dlc_core = 1;
+              ok(dlc_take_cursor_want(c, &helping2) == -1 && !helping2, "Core mode never takes the cursor help (Core asks no second peer for a block in flight)");
+              g_dlc_core = 0; c[DLC_CTL_CURSOR_WANT] = -1; c[DLC_CTL_HELPING] = -1; }
             g_dlc_stall_timeout_s = DLC_STALL_TIMEOUT_MIN_S;
             munmap((void*)c, (DLC_CTL_RING + DLC_RETRY_MAX) * sizeof(long)); }
           /* a staged chunk is visible to the stall rule's guard, and the next run's wipe */

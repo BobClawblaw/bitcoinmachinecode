@@ -47,6 +47,7 @@ rj_val* rj_bool(int b);
 rj_val* rj_num(const char* s);        /* verbatim number text */
 rj_val* rj_numf(const char* fmt, ...);/* printf'd number (e.g. "%llu") */
 rj_val* rj_str(const char* s);        /* JSON string (raw bytes, no quotes) */
+rj_val* rj_hex(const unsigned char* b, size_t n);   /* the bytes as a lowercase-hex string, encoded in place */
 rj_val* rj_strf(const char* fmt, ...);
 rj_val* rj_arr(void);
 rj_val* rj_obj(void);
@@ -56,6 +57,8 @@ void rj_arr_push(rj_val* a, rj_val* v);
 /* Object helpers. */
 void rj_obj_set(rj_val* o, const char* key, rj_val* v);
 rj_val* rj_obj_get(const rj_val* o, const char* key);
+int     rj_obj_del(rj_val* o, const char* key);      /* remove the first member with that key (freed); 1 if one was */
+void    rj_obj_splice(rj_val* dst, rj_val* src);     /* append src's members to dst in order and free src's shell */
 
 /* Deep copy. The result owns everything and is rj_free()d independently of
  * the source -- needed whenever a value parsed from a request has to be
@@ -138,6 +141,16 @@ const char* rj_wrong_type_msg_bare(char* buf, size_t cap, const rj_val* got, con
 
 /* Deep-free a value tree. */
 void rj_free(rj_val* v);
+/* The request arena (2026-10-06, plan A5): between rj_arena_begin() and the
+ * matching rj_arena_end() on a thread, every rj_* allocation on that thread
+ * lives in one bump arena released whole at the end; rj_free of an
+ * arena-owned value is a no-op. Nothing built under it may outlive the
+ * end. Pairs nest (one arena, released at the outermost end). */
+void rj_arena_begin(void);
+void rj_arena_end(void);
+int  rj_arena_active(void);
+long rj_arena_bytes(void);           /* bytes handed out so far, -1 with no arena (tests) */
+int  rj_arena_owns(const void* p);   /* tests */
 
 /* -------- Parser (Core UniValue::read semantics) --------
  * Parse a complete JSON document from `s` (len bytes). Returns a heap value on

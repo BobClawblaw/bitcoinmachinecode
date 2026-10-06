@@ -246,7 +246,17 @@ typedef struct {
     u8  shape;
 } txv_rawin_t;
 static txv_rawin_t* g_txv_in; static u64 g_txv_in_cap;   /* grown per transaction in txv_parse */
-typedef struct { u8 ok; char reason[64]; } txv_result_t;
+typedef struct { u8 ok; char reason[64]; int serr; } txv_result_t;
+/* Core's ScriptError for a failed input (2026-10-03). Each verify arm sets
+ * t_txv_serr on failure (the interpreter returns Core's own values; taproot
+ * leaves its code in g_tap_serr); workers carry it in g_txv_results[i].serr.
+ * The caller's thread keeps the FIRST failing input -- Core's mempool checks
+ * inputs in order and reports the first -- for tx_verify_last_script_error. */
+#include "../script_error_codes.h"
+extern __thread int g_tap_serr;               /* bitcoin_taproot_sighash.c */
+static __thread int  t_txv_serr;
+static __thread int  t_txv_fail_serr;
+static __thread long t_txv_fail_input = -1;
 static txv_result_t* g_txv_results; static u64 g_txv_results_cap;   /* grown with g_txv_in */
 
 /* ---- VAL-10 / SER-3 (audit 2026-09-03): CANONICAL CompactSize ----
@@ -635,20 +645,23 @@ static int txv_verify_one(const u8* tx, u64 txlen, u64 i, unsigned long long fla
          * strictly before any worker thread was created, and are read-only
          * from here on -- so this case is safe to run concurrently. */
         if (!g_t1_tap_built) { *reason = "internal: taproot aggregate not built"; return 0; }
-        return tapagg_verify(&g_t1_tap_pool, &g_t1_tap, in->spk,
-                             in->wit, in->witlen, in->nwit, i, flags, reason);
+        g_tap_serr = 0;
+        if (!tapagg_verify(&g_t1_tap_pool, &g_t1_tap, in->spk,
+                           in->wit, in->witlen, in->nwit, i, flags, reason)){
+            t_txv_serr = g_tap_serr ? g_tap_serr : SCRIPT_ERR_UNKNOWN_ERROR; return 0; }
+        return 1;
     }
     case TXV_SHAPE_WV0: {
         int err = sv_verify_witness_v0(in->wprog, in->wproglen, in->wit, in->witlen, in->nwit,
                                        in->value, flags, (unsigned long)i, tx, txlen, sv_work, sv_workcap);
-        if (err != 0) { *reason = in->wproglen == 20 ? "p2wpkh signature invalid" : "p2wsh script verification failed"; return 0; }
+        if (err != 0) { t_txv_serr = err; *reason = in->wproglen == 20 ? "p2wpkh signature invalid" : "p2wsh script verification failed"; return 0; }
         return 1;
     }
     case TXV_SHAPE_LEGACY: {
         u64 ltxlen; const u8* ltx = legacy_tx_view(tx, txlen, &ltxlen);
         int err = sv_verify_script(in->scriptSig, in->scriptSiglen, in->spk, in->spklen,
                                    flags, (unsigned long)i, ltx, ltxlen, sv_work, sv_workcap);
-        if (err != 0) { *reason = "legacy script verification failed"; return 0; }
+        if (err != 0) { t_txv_serr = err; *reason = "legacy script verification failed"; return 0; }
         return 1;
     }
     default: /* TXV_SHAPE_WPASS: unknown witness version, anyone-can-spend */
@@ -748,8 +761,10 @@ static void* txv_worker_thread(void* argp){
     txv_session_begin(a->key);                                   /* IR-5 */
     for (u64 i=a->lo;i<a->hi;i++){
         const char* r = 0;
+        t_txv_serr = 0;
         int ok = txv_verify_one(a->tx, a->txlen, i, a->flags, sv_work, 1<<20, &r);
         g_txv_results[i].ok = ok ? 1 : 0;
+        g_txv_results[i].serr = ok ? 0 : t_txv_serr;
         if (!ok) { size_t n=strlen(r); if(n>63)n=63; memcpy(g_txv_results[i].reason, r, n); g_txv_results[i].reason[n]=0; }
     }
     txv_session_end();
@@ -775,7 +790,9 @@ static int txv_verify_all(const u8* tx, u64 txlen, u64 nin, unsigned long long f
         txv_session_begin(key);
         for (u64 i=0;i<nin;i++){
             const char* r = 0;
+            t_txv_serr = 0;
             if (!txv_verify_one(tx, txlen, i, flags, sv_work, 1<<20, &r)) {
+                t_txv_fail_serr = t_txv_serr; t_txv_fail_input = (long)i;
                 *reason = r; txv_session_end(); return 0;
             }
         }
@@ -819,16 +836,19 @@ static int txv_verify_all(const u8* tx, u64 txlen, u64 nin, unsigned long long f
     for (u64 i=0;i<nin;i++){
         if (g_txv_results[i].ok) continue;
         if (g_txv_results[i].reason[0] != 0){
-            /* a real, reported failure */
+            /* a real, reported failure -- the lowest index, as Core reports */
             memcpy(rbuf, g_txv_results[i].reason, sizeof rbuf);
+            t_txv_fail_serr = g_txv_results[i].serr; t_txv_fail_input = (long)i;
             all_ok = 0; break;
         }
         /* blank: pthread_create failure above left this index untouched --
          * verify it inline now, in this thread, so a transient resource
          * failure never silently skips a check. */
         const char* r = 0;
+        t_txv_serr = 0;
         if (!txv_verify_one(tx, txlen, i, flags, sv_work_main, sizeof sv_work_main, &r)) {
             memcpy(rbuf, r, strlen(r)+1 > sizeof rbuf ? sizeof rbuf : strlen(r)+1);
+            t_txv_fail_serr = t_txv_serr; t_txv_fail_input = (long)i;
             all_ok = 0; break;
         }
     }
@@ -860,12 +880,19 @@ static int txv_resolve_lsm(void* ctxv, const u8 outpoint[36], u32 index,
     return utxo_lsm_get(c->lst, c->u, outpoint, index, value, height, is_coinbase, spk, spklen) == 1;
 }
 
+/* the depth of the immature coinbase spend just refused (2026-10-03): Core's
+ * debug message is "tried to spend coinbase at depth N" -- the mempool
+ * admission path reads it back for that */
+__thread long g_txv_immature_depth;
 static int txv_connect_body(const u8* tx, u64 txlen, long height, unsigned long long flags,
                             txv_resolve_fn rf, void* rctx, const char** reason){
     u64 nin;
+    t_txv_fail_serr = 0; t_txv_fail_input = -1;
     if (!txv_parse(tx, txlen, &nin, reason)) return 0;
 
     int has_taproot = 0;
+    /* a script-shape refusal below is a script failure in Core, with a code */
+    #define TXV_SHAPE_FAIL(code, msg) do { t_txv_fail_serr = (code); t_txv_fail_input = (long)i; *reason = (msg); return 0; } while (0)
 
     /* ---- pass 1 (sequential, unchanged in spirit from before): maturity
      * check + resolve every input's prevout from the confirmed UTXO set,
@@ -879,7 +906,7 @@ static int txv_connect_body(const u8* tx, u64 txlen, long height, unsigned long 
             { *reason = "input references a missing/already-spent UTXO"; return 0; }
         if (ucb) {
             long conf = height - (long)uheight;
-            if (conf < COINBASE_MATURITY) { *reason = "immature coinbase spend (100-block rule)"; return 0; }
+            if (conf < COINBASE_MATURITY) { g_txv_immature_depth = conf; *reason = "immature coinbase spend (100-block rule)"; return 0; }
         }
 
         g_txv_in[i].value = value;
@@ -890,8 +917,8 @@ static int txv_connect_body(const u8* tx, u64 txlen, long height, unsigned long 
         if (is_p2tr(spk, (u32)spklen) && (flags & TXV_FLAG_TAPROOT)) {
             has_taproot = 1;
             g_txv_in[i].shape = TXV_SHAPE_P2TR;
-            if (g_txv_in[i].scriptSiglen != 0) { *reason = "p2tr scriptSig must be empty"; return 0; }
-            if (g_txv_in[i].nwit == 0) { *reason = "p2tr empty witness"; return 0; }
+            if (g_txv_in[i].scriptSiglen != 0) TXV_SHAPE_FAIL(SCRIPT_ERR_WITNESS_MALLEATED, "p2tr scriptSig must be empty");
+            if (g_txv_in[i].nwit == 0) TXV_SHAPE_FAIL(SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY, "p2tr empty witness");
             continue;
         }
         if (flags & TXV_FLAG_WITNESS) {
@@ -903,13 +930,13 @@ static int txv_connect_body(const u8* tx, u64 txlen, long height, unsigned long 
              * the block path's wprog_off (incident 482566 tx 1499). */
             int cls = sv_classify_segwit(g_txv_in[i].spk, (u32)spklen, g_txv_in[i].scriptSig, g_txv_in[i].scriptSiglen,
                                          &wver, &wprog, &wplen, &wrapped);
-            if (cls < 0) { *reason = "p2sh-wrapped witness program: scriptSig must be exactly one push of the redeemScript"; return 0; }
+            if (cls < 0) TXV_SHAPE_FAIL(SCRIPT_ERR_WITNESS_MALLEATED_P2SH, "p2sh-wrapped witness program: scriptSig must be exactly one push of the redeemScript");
             if (cls > 0) {
-                if (!wrapped && g_txv_in[i].scriptSiglen != 0) { *reason = "witness program scriptSig must be empty"; return 0; }
+                if (!wrapped && g_txv_in[i].scriptSiglen != 0) TXV_SHAPE_FAIL(SCRIPT_ERR_WITNESS_MALLEATED, "witness program scriptSig must be empty");
                 if (wver == 0) {
                     g_txv_in[i].shape = TXV_SHAPE_WV0; g_txv_in[i].wprog = wprog; g_txv_in[i].wproglen = wplen; g_txv_in[i].wrapped = (u8)wrapped;
-                    if (wplen == 20 && g_txv_in[i].nwit != 2) { *reason = "p2wpkh needs exactly 2 witness items"; return 0; }
-                    if (wplen == 32 && g_txv_in[i].nwit < 1) { *reason = "p2wsh needs a witnessScript"; return 0; }
+                    if (wplen == 20 && g_txv_in[i].nwit != 2) TXV_SHAPE_FAIL(SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH, "p2wpkh needs exactly 2 witness items");
+                    if (wplen == 32 && g_txv_in[i].nwit < 1) TXV_SHAPE_FAIL(SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY, "p2wsh needs a witnessScript");
                 } else {
                     g_txv_in[i].shape = TXV_SHAPE_WPASS;   /* unknown version: valid under consensus flags (no DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM) */
                 }
@@ -917,7 +944,7 @@ static int txv_connect_body(const u8* tx, u64 txlen, long height, unsigned long 
             }
             /* Core VerifyScript: a witness on an input whose script is not a
              * witness program is SCRIPT_ERR_WITNESS_UNEXPECTED. */
-            if (g_txv_in[i].nwit != 0) { *reason = "unexpected witness on a non-witness script"; return 0; }
+            if (g_txv_in[i].nwit != 0) TXV_SHAPE_FAIL(SCRIPT_ERR_WITNESS_UNEXPECTED, "unexpected witness on a non-witness script");
         }
         g_txv_in[i].shape = TXV_SHAPE_LEGACY;
     }
@@ -1075,6 +1102,45 @@ int tx_verify_mempool(const u8* tx, u64 txlen, long next_height,
     unsigned long long flags = script_flags_for_block((unsigned long long)next_height, zero32);
     if (g_txv_mempool_standard) flags |= TXV_MEMPOOL_POLICY_FLAGS;
     return txv_connect_body(tx, txlen, next_height, flags, rf, rctx, reason);
+}
+#undef TXV_SHAPE_FAIL
+
+/* The inputs stage alone (2026-10-03): resolve every prevout and check
+ * coinbase maturity, no scripts -- Core's CheckTxInputs position, which
+ * comes BEFORE the fee/RBF/TRUC policy, which comes before the scripts. The
+ * RPC admission paths run this, then the policy test, then the full verify,
+ * so a tx failing more than one stage is named by the stage Core names. Same
+ * reasons as txv_connect_body's pass 1. 1 ok / 0 refused. */
+int tx_verify_mempool_inputs(const u8* tx, u64 txlen, long next_height,
+                             txv_resolve_fn rf, void* rctx, const char** reason){
+    u64 nin;
+    t_txv_fail_serr = 0; t_txv_fail_input = -1;
+    if (!txv_parse(tx, txlen, &nin, reason)) return 0;
+    for (u64 i = 0; i < nin; i++){
+        u32 index; memcpy(&index, g_txv_in[i].outpoint+32, 4);
+        u64 value=0, uheight=0, ucb=0; const u8* spk=0; unsigned long spklen=0;
+        if (!rf(rctx, g_txv_in[i].outpoint, index, &value, &uheight, &ucb, &spk, &spklen))
+            { *reason = "input references a missing/already-spent UTXO"; return 0; }
+        if (ucb){
+            long conf = next_height - (long)uheight;
+            if (conf < COINBASE_MATURITY){ g_txv_immature_depth = conf; *reason = "immature coinbase spend (100-block rule)"; return 0; }
+        }
+    }
+    return 1;
+}
+
+/* The ScriptError of the first failing input of the last txv_connect_body
+ * call on this thread, with that input's index and prevout (2026-10-03).
+ * 0 when the refusal was not a script failure. */
+int tx_verify_last_script_error(long* input_out){
+    if (input_out) *input_out = t_txv_fail_input;
+    return t_txv_fail_serr;
+}
+int tx_verify_input_prevout(long i, u8 txid_out[32], u32* vout_out){
+    if (i < 0 || !g_txv_in || (u64)i >= g_txv_in_cap) return 0;
+    memcpy(txid_out, g_txv_in[i].outpoint, 32);
+    memcpy(vout_out, g_txv_in[i].outpoint + 32, 4);
+    return 1;
 }
 
 /* ============================================================================
@@ -1613,6 +1679,28 @@ static void txvb_verify_all(txvb_in_t* flat, txvb_result_t* res, u64 total, unsi
  * single-threaded export discipline as the VAL-1 fees ledger. */
 static u64* g_tx_sigops = 0;  static u64 g_tx_sigops_cap = 0;  static u64 g_tx_sigops_n = 0;
 unsigned long long* txvb_last_tx_sigops(unsigned long long* n){ if(n) *n = g_tx_sigops_n; return (unsigned long long*)g_tx_sigops; }
+/* 2026-10-05 (plan B2): the resolved prevout of input gi (flat, block order,
+ * non-coinbase txs) of the LAST call -- value, creation height, is_coinbase,
+ * the scriptPubKey copy in g_spk_pool and its owning tx index. The applier's
+ * undo capture used to look every prevout up AGAIN (utxo_lsm_get, the run
+ * lookup for a coin outside the memtable: 1.3-2 us late in the chain, the
+ * largest part of `put` in the logged pair of 2026-10-05); this hands it the
+ * answer Phase 1 already has. 1 = filled; 0 = no such input. Valid until the
+ * next call: txvb_last_resolve_gen() is the stamp the caller compares. */
+static txvb_in_t* g_flat; static u64 g_in_height_n; static u64* g_in_height; static u32* g_in_txidx; static u8* g_in_cb; static u64 g_resolve_gen;
+int txvb_last_in_prevout(unsigned long long gi, unsigned long long* value, unsigned long long* height, unsigned long long* is_cb,
+                         const unsigned char** spk, unsigned int* spklen, unsigned int* tx_index){
+    if (gi >= g_in_height_n || !g_flat || !g_in_cb) return 0;
+    const txvb_in_t* in = &g_flat[gi];
+    if (value) *value = in->value;
+    if (height) *height = g_in_height[gi];
+    if (is_cb) *is_cb = g_in_cb[gi];
+    if (spk) *spk = g_spk_pool.buf + in->spk_off;
+    if (spklen) *spklen = in->spklen;
+    if (tx_index) *tx_index = g_in_txidx[gi];
+    return 1;
+}
+unsigned long long txvb_last_resolve_gen(void){ return g_resolve_gen; }
 
 /* VAL-4 / BIP68 (audit 2026-09-03): the per-input prevout CREATION HEIGHTS,
  * flat and in the same order as `flat`, with each input's owning transaction
@@ -1627,6 +1715,12 @@ unsigned long long* txvb_last_tx_sigops(unsigned long long* n){ if(n) *n = g_tx_
  * drifts. Same seam as txvb_last_tx_sigops. */
 static u64* g_in_height = 0;  static u64 g_in_height_cap = 0;  static u64 g_in_height_n = 0;
 static u32* g_in_txidx  = 0;  static u64 g_in_txidx_cap  = 0;
+static u8*  g_in_cb     = 0;  static u64 g_in_cb_cap     = 0;   /* 2026-10-05: is_coinbase per input, beside the heights */
+/* the flat per-input array of the LAST tx_verify_block_connect_all call;
+ * file-scope since 2026-10-05 so the resolved prevouts can be read back by
+ * the applier (txvb_last_in_prevout) -- the arena was already persistent */
+static txvb_in_t* g_flat = 0;        static u64 g_flat_cap = 0;
+static u64 g_resolve_gen = 0;        /* +1 per call that filled the ledgers */
 unsigned long long* txvb_last_in_heights(unsigned long long* n, unsigned int** txidx){
     if (n) *n = g_in_height_n;
     if (txidx) *txidx = g_in_txidx;
@@ -1753,7 +1847,7 @@ int txvb_classify(txvb_in_t* in, long height, unsigned long long flags,
                   bytepool_t* spk_pool, int* has_taproot, const char** reason){
     if (ucb) {
         long conf = height - (long)uheight;
-        if (conf < COINBASE_MATURITY) { *reason = "immature coinbase spend (100-block rule)"; return 0; }
+        if (conf < COINBASE_MATURITY) { g_txv_immature_depth = conf; *reason = "immature coinbase spend (100-block rule)"; return 0; }
     }
     in->value = value;
     if (spklen > TXV_SPK_CAP) { *reason = "prevout script too large"; return 0; }
@@ -1828,15 +1922,17 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
         { /* VAL-4/BIP68: one slot per INPUT, sized here alongside the sigop ledger */
           u64* hp = grow_arena((void**)&g_in_height, &g_in_height_cap, total_nin * sizeof(u64));
           u32* xp = grow_arena((void**)&g_in_txidx,  &g_in_txidx_cap,  total_nin * sizeof(u32));
+          u8*  cp = grow_arena((void**)&g_in_cb,     &g_in_cb_cap,     total_nin * sizeof(u8));
           /* total_nin == 0 is a coinbase-only block: grow_arena returns NULL
            * for a zero-byte request, which is not a failure. Only a genuine
            * allocation failure is. */
-          if (total_nin && (!hp || !xp)){ *reason = "oom: bip68 height ledger"; return 0; }
+          if (total_nin && (!hp || !xp || !cp)){ *reason = "oom: bip68 height ledger"; return 0; }
           if (total_nin){
               memset(g_in_height, 0, total_nin * sizeof(u64));
               memset(g_in_txidx,  0, total_nin * sizeof(u32));
+              memset(g_in_cb,     0, total_nin * sizeof(u8));
           }
-          g_in_height_n = total_nin; }
+          g_in_height_n = total_nin; g_resolve_gen++; }
         u64* p = grow_arena((void**)&g_tx_sigops, &g_tx_sigops_cap, ntx * sizeof(u64));
         if (!p){ *reason = "out of memory"; *fail_tx_index = 0; return 0; }
         memset(g_tx_sigops, 0, ntx * sizeof(u64));
@@ -1849,7 +1945,6 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
         }
     }
 
-    static txvb_in_t* g_flat = 0;        static u64 g_flat_cap = 0;
     static txvb_result_t* g_res = 0;     static u64 g_res_cap = 0;
     static txvb_txrange_t* g_ranges = 0; static u64 g_ranges_cap = 0;
     /* g_spk_pool is file-scope (see its own comment, near bytepool_alloc) --
@@ -1918,7 +2013,7 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
          * this accumulator (see the VAL_MAX_MONEY bound the caller applies
          * against the resulting fee). */
         if (in->tx_index < g_tx_in_sums_n) g_tx_in_sums[in->tx_index] += value;
-        if (gi < g_in_height_n){ g_in_height[gi] = uheight; g_in_txidx[gi] = (u32)in->tx_index; }
+        if (gi < g_in_height_n){ g_in_height[gi] = uheight; g_in_txidx[gi] = (u32)in->tx_index; g_in_cb[gi] = (u8)ucb; }
         if (!txvb_classify(in, height, flags, value, uheight, ucb, spk, spklen,
                            &g_spk_pool, &has_taproot, reason)) {
             *fail_tx_index = in->tx_index; goto fail;

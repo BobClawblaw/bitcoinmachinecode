@@ -75,6 +75,7 @@ static const char* g_tw_reason = "min relay fee not met";
 static int g_tw_verdict = 1;      /* what to report back */
 static int g_tw_saw_pkg[8];       /* tx_submit_pkg_n per submission, in order */
 static const char* g_tw_pkg_msg = "success";   /* package-level verdict */
+static int g_tw_first_fail = -1;  /* test-mode package: this member fails, later ones get no verdict */
 /* g_tw_last is captured by the PARENT before pthread_create: reading it in
  * the new thread would race the parent's first submission, which can be
  * staged and the seq bumped before the thread is ever scheduled -- the
@@ -102,10 +103,20 @@ static void* fake_txworker(void* arg){
                              pkg_ok ? (g_tw_verdict == 1 ? "" : g_tw_reason)
                                     : "package-not-validated");
                 }
-                ns->pkg_eff_fee   = 12345ull * (unsigned)pn;
-                ns->pkg_eff_vsize = 200ull   * (unsigned)pn;
+                /* as txsub_package publishes a TEST run since 2026-10-01: no
+                 * package aggregate (Core's PackageTestAccept judges each member
+                 * on its own feerate); a failing member ends the evaluation */
+                ns->pkg_eff_fee = ns->tx_submit_test ? 0 : 12345ull * (unsigned)pn;
+                ns->pkg_eff_vsize = ns->tx_submit_test ? 0 : 200ull * (unsigned)pn;
+                const char* msgout = g_tw_pkg_msg;
+                if (ns->tx_submit_test && pkg_ok && g_tw_first_fail >= 0 && g_tw_first_fail < pn){
+                    ns->pkg_result[g_tw_first_fail] = 0;
+                    snprintf((char*)ns->pkg_reason[g_tw_first_fail], sizeof ns->pkg_reason[0], "%s", g_tw_reason);
+                    for (int k = g_tw_first_fail + 1; k < pn; k++){ ns->pkg_result[k] = -1; ns->pkg_reason[k][0] = 0; }
+                    msgout = "transaction failed";
+                }
                 snprintf((char*)ns->tx_submit_reason, sizeof ns->tx_submit_reason,
-                         "%s", g_tw_pkg_msg);
+                         "%s", msgout);
             } else {
                 snprintf((char*)ns->tx_submit_reason, sizeof ns->tx_submit_reason,
                          "%s", g_tw_verdict == 1 ? "" : g_tw_reason);
@@ -218,11 +229,17 @@ static const char* S(const rj_val* o, const char* k){ rj_val* v = o ? rj_obj_get
  * that covers the txid walk, or the pair is not one snapshot. The fake lock
  * records whether it is held when the sequence is asked for. */
 static int g_fk_locked = 0, g_fk_seq_under_lock = -1;
-static void fk_lock(void){ g_fk_locked = 1; }
+static int g_fk_lock_n = 0;
+static void fk_lock(void){ g_fk_locked = 1; g_fk_lock_n++; }
 static void fk_unlock(void){ g_fk_locked = 0; }
-static unsigned long long fk_seq(void){ g_fk_seq_under_lock = g_fk_locked; return 42; }
+static unsigned long long g_fk_seq_val = 42;   /* bumped by the test as the worker would on every add and removal */
+static unsigned long long fk_seq(void){ g_fk_seq_under_lock = g_fk_locked; return g_fk_seq_val; }
 
 int main(void){
+    /* 2026-10-05: getmempoolinfo's totals are keyed on the mempool sequence,
+     * and this test's fake sequence moves only where a case bumps it; the
+     * memo is off except in the case that is about it. */
+    rpc_node_mpi_memo_enable(0);
     /* static: node_status_t now carries the 4MB submitblock channel buffer,
      * far too large for the stack. */
     static node_status_t st;
@@ -287,6 +304,23 @@ int main(void){
     r = NULL; rc = rpc_node_dispatch("getpeerinfo", NULL, &r, &ec, &em);
     ck("getpeerinfo dispatched to array", rc == 1 && r && r->typ == RJ_ARR);
     ck("getpeerinfo has 2 peers", r && r->nitems == 2);
+    /* 2026-10-01: connection_type follows the slot's recorded kind; every
+     * outbound leg used to say outbound-full-relay, hiding production's
+     * block-relay-only legs */
+    { st.peers[3].conn_type = 1; st.peers[3].relaytxes = 0; st.peers[0].conn_type = 2;
+      rj_val* r2 = NULL; long ec2 = 0; const char* em2 = NULL;
+      rpc_node_dispatch("getpeerinfo", NULL, &r2, &ec2, &em2);
+      const char *t0 = 0, *t3 = 0, *rl3 = 0;
+      for (size_t i = 0; r2 && i < r2->nitems; i++){
+          const char* a = S(r2->items[i], "addr");
+          if (a && !strcmp(a, "1.2.3.4:8333")) t0 = S(r2->items[i], "connection_type");
+          if (a && !strcmp(a, "5.6.7.8:8333")){ t3 = S(r2->items[i], "connection_type"); rl3 = S(r2->items[i], "relaytxes"); }
+      }
+      ck("a block-relay-only leg reports connection_type block-relay-only", t3 && !strcmp(t3, "block-relay-only"));
+      ck("...with relaytxes false, as Core shows it", rl3 && !strcmp(rl3, "0"));
+      ck("an addnode leg reports connection_type manual", t0 && !strcmp(t0, "manual"));
+      if (r2) rj_free(r2);
+      st.peers[3].conn_type = 0; st.peers[0].conn_type = 0; }
     /* every peer gets the shared fields, not just download workers: the two
      * builders used to emit different field sets from the same RPC. */
     { rj_val* p0 = (r && r->nitems) ? r->items[0] : NULL;
@@ -575,6 +609,27 @@ int main(void){
         h.lock = fk_lock; h.unlock = fk_unlock; h.mempool_sequence = fk_seq;
         rpc_node_set_mempool(&h); }
 
+      /* ---- rpc_node_mempool_many (2026-10-01): the facade's batched read.
+       * 602 txids (the two in the pool, 600 absent) cost ceil(602/256) = 3
+       * pool-lock takes, not 602; present ones come back byte for byte. ---- */
+      { static unsigned char ids[602][32]; static rpc_mp_item items[602];
+        memcpy(ids[0], lid, 32); memcpy(ids[1], wid, 32);
+        for (int i = 2; i < 602; i++){ memset(ids[i], 0x3C, 32); ids[i][0] = (unsigned char)i; ids[i][1] = (unsigned char)(i >> 8); }
+        extern const unsigned char* mpool_get(void*, const unsigned char*, unsigned long*);
+        rpc_mempool_hooks hm; memset(&hm, 0, sizeof hm);              /* this block's hooks add get; restored below */
+        hm.mp = pool; hm.maxbytes = 8388608; hm.count = mpool_count; hm.get = mpool_get;
+        hm.lock = fk_lock; hm.unlock = fk_unlock; hm.mempool_sequence = fk_seq;
+        rpc_node_set_mempool(&hm);
+        int before = g_fk_lock_n;
+        long got = rpc_node_mempool_many((const unsigned char (*)[32])ids, 602, items);
+        ck("mempool_many: the two pool transactions found, 600 absent ones not", got == 2 && items[0].present && items[1].present && !items[2].present && !items[601].present);
+        ck("mempool_many: the bytes are the pool's, byte for byte", items[0].len == (unsigned long)lln && !memcmp(items[0].raw, ltx, lln)
+                                                                  && items[1].len == (unsigned long)wln && !memcmp(items[1].raw, wtx, wln));
+        ck("mempool_many: 602 lookups took the pool lock 3 times (one per 256-slice), and released it", g_fk_lock_n - before == 3 && g_fk_locked == 0);
+        if (g_fk_lock_n - before != 3) printf("      lock takes: %d\n", g_fk_lock_n - before);
+        for (int i = 0; i < 602; i++) free(items[i].raw);
+        hm.get = 0; rpc_node_set_mempool(&hm); }                        /* back to the hooks the cases below expect */
+
       /* ---- gettxspendingprevout (Core lists it under Blockchain; the pool
        * enumeration lives here). LHEX spends outpoint (wire txid
        * 67452301..b1a3, vout 0), so its DISPLAY txid is that reversed. ---- */
@@ -692,9 +747,56 @@ int main(void){
         ck("slot cache: the second getmempoolinfo parsed no entry (2 hits, 0 parses)", h1 - h0 == 2 && p1 == p0);
         ck("...and answers the same bytes (198)", r && S(r,"bytes") && !strcmp(S(r,"bytes"),"198"));
         rj_free(r);
+        /* ---- 2026-10-05: getmempoolinfo's totals keyed on the mempool
+         * sequence (Core keeps them incrementally; here every add and removal
+         * takes the sequence, so the same number is the same pool). Measured
+         * before: 177 ms per call at 32 clients on a 71k pool, Core 5 ms. ---- */
+        { extern long mpool_del(void*, const unsigned char*);
+          rpc_node_mpi_memo_enable(1);
+          long mh0, mw0, mh1, mw1; rpc_node_mpi_memo_stats(&mh0, &mw0);
+          r = NULL; rpc_node_dispatch("getmempoolinfo", NULL, &r, &ec, &em); rj_free(r);
+          r = NULL; rpc_node_dispatch("getmempoolinfo", NULL, &r, &ec, &em);
+          rpc_node_mpi_memo_stats(&mh1, &mw1);
+          ck("memo: the same sequence answers from the memo (one walk, then one hit), same bytes 198", mw1 - mw0 == 1 && mh1 - mh0 == 1 && r && S(r,"bytes") && !strcmp(S(r,"bytes"),"198"));
+          rj_free(r);
+          ck("test pool: del segwit", mpool_del(pool, wid) == 1); g_fk_seq_val++;
+          r = NULL; rpc_node_dispatch("getmempoolinfo", NULL, &r, &ec, &em);
+          ck("memo: a removal moved the sequence -> the call walks: size 1, bytes 85", r && S(r,"size") && !strcmp(S(r,"size"),"1") && S(r,"bytes") && !strcmp(S(r,"bytes"),"85"));
+          rj_free(r);
+          /* the contract the memo rests on, pinned: a mutation that does NOT
+           * take the sequence is served stale. daemon/mempool_seq.h: every
+           * add and every removal takes it. */
+          ck("test pool: put segwit back", mpool_put(pool, wid, wtx, wln) == 1);
+          r = NULL; rpc_node_dispatch("getmempoolinfo", NULL, &r, &ec, &em);
+          ck("memo contract: the same sequence after a put that did not bump it still answers size 1 (the worker must bump on every mutation)", r && S(r,"size") && !strcmp(S(r,"size"),"1"));
+          rj_free(r);
+          g_fk_seq_val++;
+          { int same = 1; unsigned x = 12345; int present_l = 1, present_w = 1; int steps = 0;
+            for (int step = 0; step < 60 && same; step++){
+                x = x * 1103515245u + 12345u; int pick = (x >> 16) & 1; int* pres = pick ? &present_w : &present_l;
+                const unsigned char* id = pick ? wid : lid; const unsigned char* tx = pick ? wtx : ltx; unsigned long tl = pick ? wln : lln;
+                if (*pres){ mpool_del(pool, id); *pres = 0; } else { mpool_put(pool, id, tx, tl); *pres = 1; }
+                g_fk_seq_val++; steps++;
+                rj_val* a = NULL; rpc_node_dispatch("getmempoolinfo", NULL, &a, &ec, &em);
+                rpc_node_mpi_memo_enable(0);
+                rj_val* b = NULL; rpc_node_dispatch("getmempoolinfo", NULL, &b, &ec, &em);
+                rpc_node_mpi_memo_enable(1);
+                if (!a || !b || !S(a,"size") || !S(b,"size") || strcmp(S(a,"size"), S(b,"size")) || strcmp(S(a,"bytes"), S(b,"bytes"))
+                    || strcmp(S(a,"usage"), S(b,"usage")) || strcmp(S(a,"total_fee"), S(b,"total_fee"))){
+                    same = 0; printf("      step %d: memo %s/%s vs walk %s/%s\n", step, a && S(a,"size") ? S(a,"size") : "-", a && S(a,"bytes") ? S(a,"bytes") : "-", b && S(b,"size") ? S(b,"size") : "-", b && S(b,"bytes") ? S(b,"bytes") : "-"); }
+                rj_free(a); rj_free(b);
+            }
+            ck("memo == a forced walk after 60 randomised adds and removals (size, bytes, usage, total_fee)", same && steps == 60);
+            if (!present_l) mpool_put(pool, lid, ltx, lln);
+            if (!present_w) mpool_put(pool, wid, wtx, wln);
+            g_fk_seq_val++; }
+          rpc_node_mpi_memo_enable(0); }
         ck("getmempoolinfo / getrawmempool / getmempoolentry are in the mempool lane (2)",
            rpc_node_method_lane("getmempoolinfo") == 2 && rpc_node_method_lane("getrawmempool") == 2 && rpc_node_method_lane("getmempoolentry") == 2);
-        ck("getpeerinfo is not", rpc_node_method_lane("getpeerinfo") == 0); }
+        ck("getpeerinfo is not", rpc_node_method_lane("getpeerinfo") == 0);
+        /* 2026-10-03: it reads rpc_chain's txospender index and store handle,
+         * which only the execution lock guards */
+        ck("gettxspendingprevout is not (it reads the chain index under the execution lock)", rpc_node_method_lane("gettxspendingprevout") == 0); }
 
       /* ---- getmempoolentry: drive a REAL parent->child chain through the
        * REAL policy accept path (mpool_policy_add), then assert the graph
@@ -1693,16 +1795,33 @@ int main(void){
         ck("both members allowed", r && r->nitems == 2 &&
            S(r->items[0],"allowed") && !strcmp(S(r->items[0],"allowed"), "1") &&
            S(r->items[1],"allowed") && !strcmp(S(r->items[1],"allowed"), "1"));
-        /* the whole point of package mode: the feerate reported is the
-         * PACKAGE's, not each member's own */
+        /* 2026-10-01: Core's testmempoolaccept on an array (PackageTestAccept,
+         * package_feerates=false) reports each member's OWN feerate, and its
+         * effective-includes names only that member. This used to assert the
+         * PACKAGE feerate -- the behaviour that let a below-floor parent read
+         * allowed:true. (12345 sat / 200 vB happens to equal the old aggregate
+         * 24690 / 400, so the includes count is the discriminating check.) */
         { rj_val* f = r && r->nitems ? rj_obj_get(r->items[0],"fees") : 0;
-          ck("fees.effective-feerate is the package feerate",
+          ck("fees.effective-feerate is the member's own feerate",
              f && S(f,"effective-feerate") &&
-             !strcmp(S(f,"effective-feerate"), "0.00061725"));   /* 24690 sat / 400 vB * 1000 */
+             !strcmp(S(f,"effective-feerate"), "0.00061725"));   /* 12345 sat / 200 vB * 1000 */
           rj_val* inc = f ? rj_obj_get(f,"effective-includes") : 0;
-          ck("effective-includes names both members",
-             inc && inc->typ == RJ_ARR && inc->nitems == 2); }
+          ck("effective-includes names only the member itself",
+             inc && inc->typ == RJ_ARR && inc->nitems == 1); }
         rj_free(r); rj_free(p); }
+
+      /* the first member fails: Core stops there, and the second member gets
+       * NO verdict -- only its txid and wtxid (2026-10-01) */
+      { g_tw_first_fail = 0;
+        char j2[2400]; snprintf(j2, sizeof j2, "[[\"%s\",\"%s\"]]", TX1, TX1);
+        p = rj_parse(j2, strlen(j2));
+        r = NULL; rpc_node_dispatch("testmempoolaccept", p, &r, &ec, &em);
+        ck("first member fails: allowed false with its reason",
+           r && r->nitems == 2 && S(r->items[0],"allowed") && !strcmp(S(r->items[0],"allowed"), "0")
+           && S(r->items[0],"reject-reason") && !strcmp(S(r->items[0],"reject-reason"), "min relay fee not met"));
+        ck("...the second member has NO allowed (not evaluated), but its txid",
+           r && r->nitems == 2 && rj_obj_get(r->items[1],"allowed") == NULL && S(r->items[1],"txid"));
+        rj_free(r); rj_free(p); g_tw_first_fail = -1; }
 
       /* a package-level rejection: no member got an individual verdict, so
        * every entry carries package-error and NO `allowed` -- Core's shape */

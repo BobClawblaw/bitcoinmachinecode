@@ -117,16 +117,41 @@ def source_for_object(asmdir, path):
             return base + ext
     return None
 
+def _older_than(asmdir, target, src):
+    try:
+        return os.stat(os.path.join(asmdir, target)).st_mtime_ns < os.stat(os.path.join(asmdir, src)).st_mtime_ns
+    except OSError:
+        return False
+
 def sym_of(asmdir, path, cache_dir):
     """(defined, undefined) for one .c, .asm or .o, cached by content mtime+size.
     A .o that does not exist is read through its source (see
-    source_for_object): assembled or compiled into the cache."""
+    source_for_object): assembled or compiled into the cache. So is a .o OLDER
+    than its source (2026-10-01): under make -j8 this audit can run before make
+    has rebuilt an object left by another branch, and read the other branch's
+    symbols -- link-check failed three times in one day on a stale rpc_node.o
+    or mempool_cluster.a that the same make invocation was about to rebuild."""
     full = os.path.join(asmdir, path)
-    if path.endswith('.o') and not os.path.exists(full):
+    if path.endswith('.o'):
         src = source_for_object(asmdir, path)
-        if src is None:
-            return None
-        path, full = src, os.path.join(asmdir, src)
+        if not os.path.exists(full) or (src is not None and _older_than(asmdir, path, src)):
+            if src is None:
+                return None
+            path, full = src, os.path.join(asmdir, src)
+    if path.endswith('.a') and os.path.exists(full):
+        # an archive older than any of its members (its own rule's .c/.asm/.o
+        # prerequisites) is read as the union of those members, fresh
+        members = [m for m in RULES_FOR_SOURCES.get(path, []) if m.endswith(('.c', '.asm', '.o'))]
+        if members and any(_older_than(asmdir, path, m) or
+                           (m.endswith('.o') and source_for_object(asmdir, m) and _older_than(asmdir, path, source_for_object(asmdir, m)))
+                           for m in members):
+            dfn = set()
+            for m in members:
+                r = sym_of(asmdir, m, cache_dir)
+                if r is None:
+                    return None
+                dfn |= r[0]
+            return dfn, set()
     try:
         st = os.stat(full)
     except OSError:
@@ -157,21 +182,28 @@ def sym_of(asmdir, path, cache_dir):
             if len(parts) >= 2 and parts[-2] in 'TDBRSGVWi':
                 dfn.add(parts[-1])
         return dfn, set()
+    # Compiled into a unique name and renamed into place: a stale .o read
+    # through its source and the source itself can resolve to the same cache
+    # key and be compiled by two workers at once (2026-10-01).
+    import threading
+    tmp_obj = os.path.join(cache_dir, '%s.%d.%d.tmp.o' % (key, os.getpid(), threading.get_ident()))
     if path.endswith('.c'):
         obj = os.path.join(cache_dir, key + '.o')
         rc = 1
         for flags in CFLAG_SETS:
-            _, err, rc = run(['gcc'] + flags + ['-c', path, '-o', obj], cwd=asmdir)
+            _, err, rc = run(['gcc'] + flags + ['-c', path, '-o', tmp_obj], cwd=asmdir)
             if rc == 0:
                 break
         if rc != 0:
             return None
+        os.replace(tmp_obj, obj)
     elif path.endswith('.asm'):
         obj = os.path.join(cache_dir, key + '.o')
         inc = ['-I.'] + (['-Itests/'] if path.startswith('tests/') else [])
-        _, err, rc = run(['nasm', '-f', 'elf64'] + inc + ['-Werror', '-o', obj, path], cwd=asmdir)
+        _, err, rc = run(['nasm', '-f', 'elf64'] + inc + ['-Werror', '-o', tmp_obj, path], cwd=asmdir)
         if rc != 0:
             return None
+        os.replace(tmp_obj, obj)
     else:
         obj = full
     out, _, rc = run(['nm', '--no-sort', obj])
@@ -187,7 +219,9 @@ def sym_of(asmdir, path, cache_dir):
             und.add(name)
         elif t in 'TDBRSGVWi':          # incl. weak (V/W) and ifunc
             dfn.add(name)
-    json.dump({'def': sorted(dfn), 'undef': sorted(und)}, open(cf, 'w'))
+    tmp_cf = cf + '.%d.%d.tmp' % (os.getpid(), threading.get_ident())
+    json.dump({'def': sorted(dfn), 'undef': sorted(und)}, open(tmp_cf, 'w'))
+    os.replace(tmp_cf, cf)
     return dfn, und
 
 def selftest():
@@ -207,7 +241,14 @@ def selftest():
          "daemon/good: app.c user.c lib.c\n\tgcc -o $@ app.c user.c lib.c\n", 0),
         ("a rule whose only unresolved symbols are external (libc)",
          "daemon/ext: app.c user.c lib.c\n\tgcc -o $@ app.c user.c lib.c\n", 0),
+        ("a STALE lib.o (built before lib.c defined the symbol) is read through lib.c",
+         "lib.o: lib.c\n\tgcc -c lib.c\ndaemon/stale: app.c user.c lib.o\n\tgcc -o $@ app.c user.c lib.o\n", 0),
     ]
+    # the stale object: compiled from an EARLIER lib.c that lacks the symbol,
+    # then lib.c rewritten (newer) with it -- as after a branch switch
+    open(os.path.join(d, 'old_lib.c'), 'w').write('int other_thing = 1;\n')
+    subprocess.run(['gcc', '-c', 'old_lib.c', '-o', 'lib.o'], cwd=d, check=True)
+    os.utime(os.path.join(d, 'lib.o'), (1_000_000_000, 1_000_000_000))
     bad = 0
     for name, mk, want in cases:
         open(os.path.join(d, 'Makefile'), 'w').write("all:\n\t@true\n\n" + mk)

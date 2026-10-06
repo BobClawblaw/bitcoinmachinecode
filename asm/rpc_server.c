@@ -561,6 +561,7 @@ static void exec_lock(void);
 static void exec_rlock(void);
 static void exec_unlock(void);
 static int  rpc_method_class(const char* m);
+static int  rpc_method_class_p(const char* m, const rj_val* params);
 static __thread const char* g_exec_label;   /* defined with the lock below */
 static __thread char g_exec_ctx[160];
 static rj_val* exec_one(rj_val* req, int* status, int* is_notification) {
@@ -591,7 +592,7 @@ static rj_val* exec_one(rj_val* req, int* status, int* is_notification) {
             rj_val* result = NULL; long dec = 0; const char* dem = NULL;
             /* the lock this METHOD needs, held for its dispatch only -- a
              * batch takes it per entry (see rpc_method_class) */
-            int cls = rpc_method_class(method);
+            int cls = rpc_method_class_p(method, params);
             g_exec_label = method; g_exec_ctx[0] = 0;   /* who to name if this hold or wait is slow */
             if (cls == RPC_CLASS_EXCL) exec_lock(); else if (cls == RPC_CLASS_SHARED) exec_rlock();
             int ok = rpc_dispatch(method, params, g_wallet, &result, &dec, &dem);
@@ -643,7 +644,29 @@ static rj_val* exec_one(rj_val* req, int* status, int* is_notification) {
  * Rendering needs the lock; writing to a socket does not. Separating them
  * takes network I/O out of the critical section entirely, and the serial
  * execution contract is untouched. */
+/* 2026-10-06 (plan A5): one JSON arena per request on the thread that
+ * renders it -- the parsed request, the result tree and the reply wrapper
+ * are bump-allocated and released together after the body is written
+ * (rj_write_alloc's output buffer stays a plain malloc: send_response frees
+ * it). getblock verbosity 2 on a full block built ~400,000 values through
+ * malloc and freed them one by one: a third of its render time. */
+static char* render_request_inner(const char* body, size_t blen, size_t* outlen);
+static long g_last_render_arena_bytes = -1;   /* test seam: the arena's size when the last reply was written (-1 = no arena) */
 static char* render_request(const char* body, size_t blen, size_t* outlen) {
+    rj_arena_begin();
+    char* r = render_request_inner(body, blen, outlen);
+    g_last_render_arena_bytes = rj_arena_bytes();
+    rj_arena_end();
+    return r;
+}
+/* test seam: render one body in this process and report the arena's size */
+long rpc_render_probe(const char* body, unsigned long blen, char** out, unsigned long* outlen){
+    size_t n = 0; char* r = render_request(body, (size_t)blen, &n);
+    if (out) *out = r; else free(r);
+    if (outlen) *outlen = n;
+    return g_last_render_arena_bytes;
+}
+static char* render_request_inner(const char* body, size_t blen, size_t* outlen) {
     *outlen = 0;
     rj_val* req = rj_parse(body, blen);
     int status = HTTP_OK;
@@ -861,8 +884,12 @@ static void exec_lock_init(void){
  * made independent of what the write lock protects (see "lanes" in
  * rpc_chain.c). Adding one without that is a data race, not a slow query. */
 extern int rpc_node_method_lane(const char*) __attribute__((weak));   /* rpc_node.c: the mempool lane (2026-09-30); absent in some unit tests */
-static int rpc_method_class(const char* m){
-    int lane = rpc_chain_method_lane(m);
+static int rpc_method_class_p(const char* m, const rj_val* params);
+static int rpc_method_class(const char* m){ return rpc_method_class_p(m, NULL); }
+/* 2026-10-05: with the params in hand a method may pick a lane by them
+ * (getrawtransaction at verbosity < 2 runs in the txindex lane). */
+static int rpc_method_class_p(const char* m, const rj_val* params){
+    int lane = params ? rpc_chain_method_lane_p(m, params) : rpc_chain_method_lane(m);
     if (!lane && rpc_node_method_lane) lane = rpc_node_method_lane(m);
     if (lane == 1) return RPC_CLASS_FAST;
     if (lane == 2) return RPC_CLASS_NOLOCK;
@@ -1435,11 +1462,22 @@ static void* esp_server_thread(void* arg){
 }
 static void esp_lock(void){ exec_lock(); }
 static void esp_unlock(void){ exec_unlock(); }
+/* 2026-10-05: the facade takes the lock the METHOD needs, as the JSON-RPC
+ * path does -- none for a lane method. It took the exclusive lock for every
+ * dispatch, so its getblockhash (a FAST-lane call) waited 2 s behind a
+ * burst it had no business queueing in. Returns 1 when a lock was taken. */
+static int esp_lock_for(const char* m, const rj_val* params){
+    int cls = rpc_method_class_p(m, params);
+    if (cls == RPC_CLASS_EXCL){ exec_lock(); return 1; }
+    if (cls == RPC_CLASS_SHARED){ exec_rlock(); return 1; }
+    return 0;
+}
 /* Core's REST interface (rest=1, 2026-09-08): served by the JSON-RPC listener, dispatch-locked like the facade */
 void rpc_rest_enable(int on){ g_rest_on = on; rest_set_exec_lock(esp_lock, esp_unlock); }
 int rpc_esplora_start(const char* bind_addr, int port, char* errmsg, size_t errcap){
     if (port <= 0) return 0;
     esplora_set_exec_lock(esp_lock, esp_unlock);
+    esplora_set_exec_lock_for(esp_lock_for, esp_unlock);
     struct sockaddr_in a; memset(&a, 0, sizeof a); a.sin_family = AF_INET; a.sin_port = htons((unsigned short)port);
     if (!bind_addr || !*bind_addr) bind_addr = "127.0.0.1";
     if (inet_pton(AF_INET, bind_addr, &a.sin_addr) != 1){ snprintf(errmsg, errcap, "bmc.esplorabind=%s is not an IPv4 address", bind_addr); return -1; }

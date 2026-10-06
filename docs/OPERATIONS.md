@@ -297,7 +297,10 @@ I2P destination.
   when it is absent, spawns the builder beside its own executable, niced,
   never during initial block download, at most three attempts per boot
   with six hours between them; `bmc.coinstatshistrepair=0` turns that
-  off. A base that fails the check is renamed `*.broken-<epoch>` (delete
+  off. **A node synced from block 0 skips it** (2026-10-04): its tail
+  starts at genesis, so after the download the fold worker checks every
+  tail row once (hash and one generation, no re-seed in between) and
+  answers from the tail; a torn row or a re-seed falls back to the build. A base that fails the check is renamed `*.broken-<epoch>` (delete
   those when you have looked) and rebuilt. The builder resumes at the
   pass after its last `csh_tmp/passN.done` marker, discards scratch
   without a marker (and the old layout's `csh_*.tmp`), sizes pass 3 from
@@ -512,6 +515,19 @@ Rollback:
 ln -sfn bmcbitcoind.deploy-<previous> daemon/bmcbitcoind.live
 sudo systemctl restart bmcbitcoind
 ```
+
+A deploy is verified only when all three hold:
+
+1. a NEW block arrives and is applied: its hash equals the oracle's, and the
+   heartbeat shows `tip == stored`;
+2. at least 10 minutes in, `systemctl show -p NRestarts,ActiveState
+   bmcbitcoind` still reads `0` / `active`;
+3. the RPC clients (mempool.space, the facade) have reconnected meanwhile.
+
+The second and third are not optional. On 2026-10-02 a build applied its
+first block correctly, then crash-looped ~40 s after every start once
+mempool.space re-synced through the facade, until systemd gave up. One good
+block proves only the apply path.
 
 ## The Core oracle
 
@@ -810,6 +826,9 @@ rollback. The scratch copy needs as much space as the archive.
 | `[dial] no IPv6 on this host: ipv6 and cjdns peers are unreachable` | Enable host IPv6 (and run `cjdroute`) for `cjdnsreachable=1`. |
 | `[wallet] walletpassfile "..." not usable: <why>` / `is inside the datadir -- refusing` | Fix path and mode (absolute, outside the datadir, 0640 or stricter, not group-writable). The wallet stays locked until then. |
 | `[boot] archive check found N problem(s)` | Read the `[check]` lines above it, and do NOT assume the non-monotonic layout notice is benign. It was expected before the in-order committer (2026-09-08) and is a DEFECT after it: a fresh sync on this build must pass the check. On run 26 it meant six layout breaks, one per restart during the download, each scattering ~33 blocks into the tail gaps of older `blk` files — which disables truncation and pruning. Fixed by the append-frontier guard (2026-09-17); an archive built before that keeps its breaks until `tests/tool_archive_relayout` rewrites it. Other findings name the height. |
+| `systemctl status`: `failed (Result: core-dump)`, "Start request repeated too quickly" | A crash loop: systemd stopped restarting. Roll back first (above), then `sudo systemctl reset-failed bmcbitcoind` and start. The cause is in the log's `[crash]` lines (next row). |
+| `[crash] SIGSEGV (11) at address ...` | A fatal signal (2026-10-03, `daemon/crash_trace.c`). The lines give the fault address, RIP/RSP/RBP, a backtrace, and the stack's return addresses; resolve each with `addr2line -fe asm/daemon/bmcbitcoind.deploy-<x> <addr>` (the binary is non-PIE). There is no core file, by design: `LimitCORE=0` keeps the decrypted wallet seed off disk, and the report prints addresses only. |
+| `[rpc] getmininginfo took N ms: refresh ..., networkhashps ..., ...` | One call held the exclusive RPC lock over 1 s; every other RPC waited behind it. The split names the slow step. Seen once after a restart into catch-up (149.5 s on 2026-10-03), cause still open. |
 | a second `bmcbitcoind` with the same command line | A compaction child. Check `/proc/<pid>/exe` and the parent PID before assuming a duplicate daemon; never run two daemons on one chain directory. |
 
 ## Running more than one chain

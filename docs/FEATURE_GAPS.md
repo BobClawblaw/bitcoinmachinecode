@@ -1840,6 +1840,11 @@ the invs following on the worker's next rotations; Core returns at the same
 point for the same reason. Still not matched: inbound peers are served by the
 serve process on its own schedule, so the 5 s inbound interval Core uses is not
 modelled separately, and BIP339 `wtxidrelay` announcement remains txid-based.
+*(2026-10-03: closed. bmc sends `wtxidrelay` again and announces by wtxid
+(MSG_WTX) to a peer that negotiated it, serving the getdata(MSG_WTX) that
+follows; `validation/wtxid_relay_regtest_e2e.sh` relays both ways through two
+v31.1 nodes. Between 2026-10-01 and 10-03 `wtxidrelay` was withheld because
+Core drops MSG_TX invs from a wtxid peer.)*
 
 ## Update 2026-09-03 — TRUC sibling eviction
 

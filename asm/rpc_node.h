@@ -123,6 +123,12 @@ typedef struct {
      * Written by the worker and its pass children; inbound children leave
      * it at -1. Appended: every offset above is unchanged. */
     volatile long             best_known_height;
+    /* 2026-10-01: what kind of outbound connection this is, for getpeerinfo's
+     * connection_type: 0 outbound-full-relay, 1 block-relay-only, 2 manual
+     * (addnode, or a -connect peer). Every outbound leg used to report
+     * outbound-full-relay, so production's two block-relay-only legs were
+     * invisible. Written when the worker fills the slot. Appended. */
+    volatile int              conn_type;
 } rpc_peer_t;
 
 /* Shared live-node status. POD, fixed size, lives in a MAP_SHARED region so
@@ -190,6 +196,7 @@ typedef struct {
  * are 192 bytes (12 MB shared); scripts longer than the inline part spill
  * into continuation entries claimed with the same atomic increment. */
 #define RPC_CSI_RING           65536
+#define RPC_IXW_RING           1024     /* the index worker's ring (2026-10-06): heights, a block each */
 #define RPC_CSI_BODY           176
 #define RPC_CSI_HDR            52     /* key36 | value u64 | code u64 */
 #define RPC_CSI_INLINE         (RPC_CSI_BODY - RPC_CSI_HDR)   /* 124 script bytes inline */
@@ -451,6 +458,25 @@ typedef struct {
         volatile unsigned int       slen;           /* full script length (head) / chunk length (cont) */
         unsigned char               body[RPC_CSI_BODY];
     } csi_ring[RPC_CSI_RING];
+    /* 2026-10-06 (plan B4, daemon/index_worker.c): the index worker's ring.
+     * The applier pushes (BLOCK h) after a block is connected and the
+     * trailing builders' fold callbacks as ADV records; a forked worker
+     * consumes in order and publishes the watermarks the [ready] line and
+     * getindexinfo read while it runs (the parent's own writer state is
+     * stale from the fork until the worker stops). A full ring blocks the
+     * applier; a STOP record ends the worker after everything before it. */
+    volatile unsigned long long ixw_seq;            /* records pushed (the applier) */
+    volatile unsigned long long ixw_done_seq;       /* records consumed (the worker) */
+    volatile long long          ixw_covered;        /* the txid index's watermark, as the worker last published it */
+    volatile long long          ixw_bfi_count;      /* the filter index's count, likewise */
+    volatile unsigned long long ixw_blocks;         /* blocks the worker indexed */
+    volatile int                ixw_worker_pid;     /* 0 = no worker (inline indexing) */
+    volatile int                ixw_pause;          /* test seam: the worker holds its cursor */
+    struct {
+        volatile unsigned long long ready;          /* seq+1 once filled; 0 = empty */
+        volatile int                kind;           /* IXW_K_* (index_worker.h) */
+        volatile long long          a;              /* the height, or the fold's `to` */
+    } ixw_ring[RPC_IXW_RING];
     /* 2026-09-08: the parallel download's peers. Core's getpeerinfo during
      * IBD is where an operator watches the sync -- which peers serve blocks,
      * what is in flight, bytes per peer -- and this node's sixteen download
@@ -500,6 +526,35 @@ typedef struct {
      * unchanged. */
     volatile long long        dl_wire_sent;
     volatile long long        dl_wire_recv;
+    /* Core's m_cached_is_ibd, latched (2026-10-01): set by the download
+     * worker the first time it connects a tip within maxtipage, never
+     * cleared for the life of the process. getblockchaininfo and the tx relay
+     * read "not in IBD" from here; v31.1's UpdateIBDStatus latches the same
+     * way, so an old tip later does not put the node back into IBD.
+     * Appended: every offset above is unchanged. */
+    volatile int              ibd_left;
+    /* submitpackage's package_msg in full (2026-10-01): Core's package RBF
+     * messages carry a txid and two amounts -- ~200 characters, more than
+     * tx_submit_reason holds. Empty unless the package path wrote one; the
+     * RPC prefers it (pkg_msg, above, is 128 bytes and unused by the
+     * package path). Appended: every offset above is unchanged. */
+    char                      pkg_msg_full[320];
+    /* Core's debug message for the refusal in tx_submit_reason (2026-10-03):
+     * TxValidationState::ToString() is "reason, debug", and that is what
+     * sendrawtransaction's error, testmempoolaccept's reject-details and
+     * submitpackage's per-tx error print. Empty when Core has none (or on
+     * success). The reason stays bare: classifiers compare it. Appended:
+     * every offset above is unchanged. */
+    char                      tx_submit_detail[512];
+    /* the same for each package member, beside pkg_reason (2026-10-03) */
+    char                      pkg_detail[RPC_PKG_MAX][512];
+    /* bumped by the download worker after a reorg rebuilt its hash index
+     * (2026-10-04): the serve process and its inbound children rebuild THEIR
+     * copies when it moves -- they only ever topped up forward, so after a
+     * reorg the losing branch's hashes kept their heights and the winning
+     * branch's blocks there were never servable until a restart. Appended:
+     * every offset above is unchanged. */
+    volatile unsigned long long reorg_gen;
 } node_status_t;
 #define NODE_TIP_UNTRACKED (-2LL)
 
@@ -623,12 +678,17 @@ const char* rpc_node_method_at(int i);
  * set), or -1 (not ours -- caller keeps looking). */
 int  rpc_node_method_lane(const char* method);   /* 2 = the mempool lane: no execution lock, its own mutex (2026-09-30) */
 void rpc_node_mpc_stats(long* hits, long* parses); /* the per-slot parse cache's counters; test hook */
+void rpc_node_mpi_memo_enable(int on);               /* 2026-10-05: getmempoolinfo's sequence-keyed totals; 0 = always walk (test seam) */
+void rpc_node_mpi_memo_stats(long* hits, long* walks);
 int rpc_node_dispatch(const char* method, const rj_val* params,
                       rj_val** result, long* ec, const char** em);
 
 /* bumpfee (rpc_wallet_ops.c): raw bytes of one mempool tx, copied out under
  * the pool lock. Returns length or -1 (absent, or no pool in this process). */
 long rpc_node_mempool_rawtx(const unsigned char txid_wire[32], unsigned char* out, unsigned long cap);
+/* many at once, one pool-lock hold per slice (2026-10-01); see rpc_node.c */
+typedef struct { int present; long long fee; unsigned char* raw; unsigned long len; } rpc_mp_item;
+long rpc_node_mempool_many(const unsigned char (*txid_wire)[32], long n, rpc_mp_item* out);
 
 /* -persistmempool: the daemon's boot and shutdown hooks. Same code the
  * savemempool/importmempool RPCs use, so the two cannot drift. */

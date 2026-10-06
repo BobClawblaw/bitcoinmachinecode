@@ -1,6 +1,6 @@
 /* bitcoind.S -- adapted from the verified arm-port (origin/arm-port
  * port/arm64/bitcoind.S) to Mach-O by adapt_armport.py, then hand-gated.
- * Exports: drain_txid_scratch, g_accept_version_hook, g_cmpct_hook_blocktxn, g_cmpct_hook_cmpct, g_cmpct_hook_type, g_peer_sendcmpct, g_peer_version_len, g_peer_version_payload, g_peer_wants_addrv2, g_sync_mp, ibd_txid_scratch, node_accept_handshake, node_drain, node_fetch_headers, node_handshake, node_ibd, node_ibd_blocks, node_ibd_blocks_s, node_ibd_blocks_x, node_ibd_headers, node_make_version, node_relay_flag, node_serve_block, node_serve_block_by_hash, node_services, node_sync, node_sync_multi, node_ua_buf, node_ua_len, sync_fail_code, sync_txid_scratch */
+ * Exports: drain_txid_scratch, g_accept_version_hook, g_cmpct_hook_blocktxn, g_cmpct_hook_cmpct, g_cmpct_hook_type, g_peer_sendcmpct, g_peer_version_len, g_peer_version_payload, g_peer_wants_addrv2, g_peer_wtxidrelay, g_sync_mp, ibd_txid_scratch, node_accept_handshake, node_drain, node_fetch_headers, node_handshake, node_ibd, node_ibd_blocks, node_ibd_blocks_s, node_ibd_blocks_x, node_ibd_headers, node_make_version, node_relay_flag, node_serve_block, node_serve_block_by_hash, node_services, node_sync, node_sync_multi, node_ua_buf, node_ua_len, sync_fail_code, sync_txid_scratch */
 /* ============================================================================
  * bitcoind.S -- AArch64 (ARMv8-A) port of asm/bitcoind.asm
  * Node daemon orchestration: handshakes, headers-first sync/IBD, block serve,
@@ -197,6 +197,10 @@ _node_handshake:
 	adrp x10, _g_peer_wants_addrv2@PAGE
 	add  x10, x10, _g_peer_wants_addrv2@PAGEOFF
 	str  xzr, [x10]
+	/* BIP339: nor sent wtxidrelay */
+	adrp x10, _g_peer_wtxidrelay@PAGE
+	add  x10, x10, _g_peer_wtxidrelay@PAGEOFF
+	str  xzr, [x10]
 	/* build + send version */
 	mov  x0, sp
 	bl   _node_make_version
@@ -210,14 +214,9 @@ _node_handshake:
 	bl   _p2p_write
 	cmp  x0, #24
 	b.lt .NHfail
-	/* BIP339: advertise wtxid relay after version, before verack (x86 parity) */
-	mov  x0, x19
-	adrp x1, _wtxidrelay@PAGE
-	add  x1, x1, _wtxidrelay@PAGEOFF
-	mov  x2, #10
-	mov  x3, #0
-	mov  x4, #0
-	bl   _p2p_write
+	/* BIP339 wtxidrelay: sent with sendaddrv2 once the peer's version is in
+	 * (below), as bitcoind.asm does since 2026-10-03; the relay announces by
+	 * wtxid (MSG_WTX) to a peer that negotiated it. */
 .LNHread:
 	mov  x0, x19
 	add  x1, sp, #160                /* cmd */
@@ -257,6 +256,14 @@ _node_handshake:
 	movk w11, #0x0001, lsl #16
 	cmp  w10, w11
 	b.lt .LNH_av2_skip
+	/* BIP339 wtxidrelay first, as Core orders them; same >= 70016 gate */
+	mov  x0, x19
+	adrp x1, _wtxidrelay@PAGE
+	add  x1, x1, _wtxidrelay@PAGEOFF
+	mov  x2, #10
+	mov  x3, #0
+	mov  x4, #0
+	bl   _p2p_write
 	mov  x0, x19
 	adrp x1, _sendaddrv2@PAGE
 	add  x1, x1, _sendaddrv2@PAGEOFF
@@ -320,8 +327,13 @@ _node_handshake:
 	mov  x2, #10
 	bl   .Lcmpeq
 	cbz  x0, 3f
-	mov  x2, #10
-	b    .LNH_echo
+	/* BIP339 negotiated: remember it per leg, DON'T echo (ours went out
+	 * with the version reply above) */
+	adrp x10, _g_peer_wtxidrelay@PAGE
+	add  x10, x10, _g_peer_wtxidrelay@PAGEOFF
+	mov  x11, #1
+	str  x11, [x10]
+	b    .LNHread
 3:	add  x0, sp, #160
 	adrp x1, _sendcmpct@PAGE
 	add  x1, x1, _sendcmpct@PAGEOFF
@@ -373,6 +385,9 @@ _node_accept_handshake:
 	/* BIP155: per-handshake reset (see _node_handshake) */
 	adrp x10, _g_peer_wants_addrv2@PAGE
 	add  x10, x10, _g_peer_wants_addrv2@PAGEOFF
+	str  xzr, [x10]
+	adrp x10, _g_peer_wtxidrelay@PAGE      /* likewise (BIP339) */
+	add  x10, x10, _g_peer_wtxidrelay@PAGEOFF
 	str  xzr, [x10]
 .LAHloop:
 	mov  x0, x19
@@ -437,7 +452,14 @@ _node_accept_handshake:
 	bl   _p2p_write
 	cmp  x0, #24
 	b.lt .LAHfail
-	/* BIP339: advertise wtxid relay after version, before verack (x86 parity) */
+	/* BIP339 wtxidrelay then BIP155 sendaddrv2 -- both before verack, gated
+	 * on the peer's version >= 70016 (mirrors bitcoind.asm
+	 * _node_accept_handshake since 2026-10-03) */
+	ldr  w10, [sp, #192]
+	mov  w11, #0x1180
+	movk w11, #0x0001, lsl #16
+	cmp  w10, w11
+	b.lt .LAH_av2_skip
 	mov  x0, x19
 	adrp x1, _wtxidrelay@PAGE
 	add  x1, x1, _wtxidrelay@PAGEOFF
@@ -445,13 +467,6 @@ _node_accept_handshake:
 	mov  x3, #0
 	mov  x4, #0
 	bl   _p2p_write
-	/* BIP155 offer: if peer proto >= 70016, send sendaddrv2 before verack
-	 * (mirrors bitcoind.asm _node_accept_handshake) */
-	ldr  w10, [sp, #192]
-	mov  w11, #0x1180
-	movk w11, #0x0001, lsl #16
-	cmp  w10, w11
-	b.lt .LAH_av2_skip
 	mov  x0, x19
 	adrp x1, _sendaddrv2@PAGE
 	add  x1, x1, _sendaddrv2@PAGEOFF
@@ -496,6 +511,19 @@ _node_accept_handshake:
 	str  x11, [x10]
 	b    .LAHread_verack
 .LAH_not_sendaddrv2:
+	/* "wtxidrelay"? BIP339 negotiated (ours went out before our verack) */
+	add  x0, sp, #0
+	adrp x1, _wtxidrelay@PAGE
+	add  x1, x1, _wtxidrelay@PAGEOFF
+	mov  x2, #11          /* with the NUL: names compare the terminator */
+	bl   .Lcmpeq
+	cbz  x0, .LAH_not_wtxidrelay
+	adrp x10, _g_peer_wtxidrelay@PAGE
+	add  x10, x10, _g_peer_wtxidrelay@PAGEOFF
+	mov  x11, #1
+	str  x11, [x10]
+	b    .LAHread_verack
+.LAH_not_wtxidrelay:
 	add  x0, sp, #0
 	adrp x1, _ping@PAGE
 	add  x1, x1, _ping@PAGEOFF
@@ -2030,6 +2058,11 @@ _g_peer_version_len:
  * announcement encoding). Mirrors asm/bitcoind.asm's _g_peer_wants_addrv2. */
 	.globl _g_peer_wants_addrv2
 _g_peer_wants_addrv2:
+	.zero 8
+/* BIP339: the peer sent `wtxidrelay` before verack (per handshake, both
+ * roles); snapshotted per leg by daemon/main.c like addrv2. */
+	.globl _g_peer_wtxidrelay
+_g_peer_wtxidrelay:
 	.zero 8
 
 /* ---- RO data: wire command names + user-agent ---- */

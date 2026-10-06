@@ -78,6 +78,30 @@ static int  book_has(const char* hp, unsigned char* port_bytes){
     if (b && bmc_addr_from_string_port(&a, hp, 0)){ long i = ab2_find(b, &a); ok = i >= 0 && ab2_get(b, i, &r); if (ok && port_bytes){ port_bytes[0] = (unsigned char)(r.a.port >> 8); port_bytes[1] = (unsigned char)r.a.port; } }
     ab2_close(b); return ok; }
 extern long txrelay_announce(const int* fds, int nfds);
+/* BIP339 announce/serve (2026-10-03) */
+extern void txrelay_fd_set_wtxid(int fd, int on);
+extern void txrelay_announce_own(const u8 txid[32]);
+extern void txann_test_set_pool(void* mp);
+extern void sha256d(unsigned char out[32], const void* msg, long len);
+/* 2026-10-04: a fake v2 session -- a message held "decrypted" by a stand-in
+ * read hook while the socket itself is empty, which is what poll() cannot
+ * see. bitcoin_net.asm's p2p_read/p2p_write dispatch to these hooks for an fd
+ * flagged in g_v2_active; v2transport.c is not linked here, so this file
+ * supplies bmc_v2_has_message. */
+extern unsigned char g_v2_active[];
+extern int  (*g_v2_hook_read)(int, char*, void*, unsigned, unsigned*);
+extern long (*g_v2_hook_write)(int, const char*, unsigned, const void*, unsigned);
+static int g_fq_fd = -1, g_fq_n = 0, g_fq_pong = 0;
+static const unsigned char FQ_NONCE[8] = { 7,1,4,1,5,9,2,6 };
+int bmc_v2_has_message(int fd){ return fd == g_fq_fd && g_fq_n > 0; }
+static int fq_read(int fd, char* cmd, void* pl, unsigned cap, unsigned* plen){
+    if (fd != g_fq_fd || g_fq_n <= 0 || cap < 8) return -1;
+    memset(cmd, 0, 12); memcpy(cmd, "ping", 4); memcpy(pl, FQ_NONCE, 8); *plen = 8; g_fq_n--; return 1;
+}
+static long fq_write(int fd, const char* cmd, unsigned cl, const void* p, unsigned pl){
+    if (fd == g_fq_fd && cl == 4 && !memcmp(cmd, "pong", 4) && pl == 8 && !memcmp(p, FQ_NONCE, 8)) g_fq_pong++;
+    return 24 + (long)pl;
+}
 extern void txrelay_test_set_announce_mean_ms(long ms);
 extern long long txrelay_test_exp_draw(long mean_ms);
 extern void txrelay_announce_own(const unsigned char txid[32]);
@@ -222,6 +246,7 @@ static void send_invwtx(int peer_fd, const u8 wtxid[32]){
     p2p_write(peer_fd, "inv", 3, inv, 37);
 }
 
+static u8 g_p9[32], g_c9[32];   /* case 9's pair, replaced in case 10b */
 int main(void){
     tt_isolate();
     const msend_t* s  = &modern_spends[0];
@@ -552,6 +577,66 @@ int main(void){
         close(spB[0]); close(spB[1]);
     }
 
+    printf("\n== 8c: BIP339 -- a leg that negotiated wtxidrelay is told by wtxid and served by it ==\n");
+    {
+        /* Core drops MSG_TX invs from a peer that negotiated wtxidrelay, so a
+         * txid inv to it is lost; and the getdata it answers with names the
+         * WTXID, which the pool does not index. */
+        int spW[2];
+        ck("wtxid leg pair", socketpair(AF_UNIX, SOCK_STREAM, 0, spW) == 0);
+        { struct timeval tv = { 3, 0 }; setsockopt(spW[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv); }   /* a missing reply FAILS, it does not hang */
+        txann_test_set_pool(mp_area);
+        txrelay_test_set_announce_mean_ms(0);
+        txrelay_announce(NULL, 0);
+        u8 txid1[32]; tx_txid(txid1, s->tx, (unsigned long)s->txlen, tb, sizeof tb);   /* case 1's, pooled */
+        u8 wtxid1[32]; sha256d(wtxid1, s->tx, (long)s->txlen);
+        u8 ghost[32]; memset(ghost, 0xE1, 32);                                          /* not in the pool */
+        txrelay_fd_set_wtxid(spW[0], 1);
+        txrelay_announce_own(txid1); txrelay_announce_own(ghost);
+        int fdsW[1] = { spW[0] };
+        txrelay_announce(fdsW, 1);
+        char cmd[13]; static u8 plw[8192];
+        int plen = read_msg(spW[1], cmd, plw, sizeof plw);
+        ck("8c: the wtxid leg got ONE MSG_WTX (type 5) carrying the wtxid",
+           plen == 37 && strcmp(cmd, "inv") == 0 && plw[0] == 1 && plw[1] == 5 && memcmp(plw + 5, wtxid1, 32) == 0);
+        ck("8c: ...the tx not in the pool was not announced", no_bytes_pending(spW[1]));
+        u8 gd[1 + 2*36]; gd[0] = 2;
+        gd[1]=5; gd[2]=0; gd[3]=0; gd[4]=0; memcpy(gd+5, wtxid1, 32);
+        u8 nope[32]; memset(nope, 0xD7, 32);
+        gd[37]=5; gd[38]=0; gd[39]=0; gd[40]=0; memcpy(gd+41, nope, 32);
+        p2p_write(spW[1], "getdata", 7, gd, sizeof gd);
+        txrelay_poll_leg(spW[0], mp_area, 200);
+        plen = read_msg(spW[1], cmd, plw, sizeof plw);
+        ck("8c: getdata(MSG_WTX) served the WITNESS bytes", plen == s->txlen && strcmp(cmd, "tx") == 0 && memcmp(plw, s->tx, (size_t)s->txlen) == 0);
+        plen = read_msg(spW[1], cmd, plw, sizeof plw);
+        ck("8c: an unknown wtxid is answered with notfound", plen == 37 && strcmp(cmd, "notfound") == 0 && plw[1] == 5 && memcmp(plw + 5, nope, 32) == 0);
+        txrelay_fd_set_wtxid(spW[0], 0);
+        txrelay_announce_own(txid1); txrelay_announce(fdsW, 1);
+        plen = read_msg(spW[1], cmd, plw, sizeof plw);
+        ck("8c: the same leg without wtxidrelay is told by txid (MSG_TX)", plen == 37 && plw[1] == 1 && memcmp(plw + 5, txid1, 32) == 0);
+        txann_test_set_pool(0);
+        close(spW[0]); close(spW[1]);
+    }
+
+    printf("\n== 8d: a v2 message already decrypted is read without waiting for the next packet ==\n");
+    {
+        /* One recv can carry several v2 messages; after the first, the rest
+         * sit in the session and poll() reports the socket empty. The relay
+         * loop polled first and broke on "nothing to read" -- on an outbound
+         * leg a ping (or a getdata reply) waited for the peer's next packet. */
+        int spV[2];
+        ck("fake-v2 leg pair", socketpair(AF_UNIX, SOCK_STREAM, 0, spV) == 0);
+        int (*oldr)(int, char*, void*, unsigned, unsigned*) = g_v2_hook_read;
+        long (*oldw)(int, const char*, unsigned, const void*, unsigned) = g_v2_hook_write;
+        g_v2_hook_read = fq_read; g_v2_hook_write = fq_write;
+        g_fq_fd = spV[0]; g_fq_n = 1; g_fq_pong = 0; g_v2_active[spV[0]] = 1;
+        txrelay_poll_leg(spV[0], mp_area, 0);
+        ck("8d: the buffered ping was read (socket empty) and answered with its pong", g_fq_pong == 1 && g_fq_n == 0);
+        g_v2_active[spV[0]] = 0; g_fq_fd = -1; g_fq_n = 0;
+        g_v2_hook_read = oldr; g_v2_hook_write = oldw;
+        close(spV[0]); close(spV[1]);
+    }
+
     /* ---- 8b: the announcement timer -----------------------------------
      * Announcing the same txid to every peer at the same instant is what
      * marks a node as the ORIGIN of a transaction, so each leg carries its
@@ -653,6 +738,7 @@ int main(void){
         ck("parent + child accepted as a package", acc == 2);
         ck("under-paying parent pooled", mpool_get(mp_area, pid, &ml) != NULL);
         ck("child pooled", mpool_get(mp_area, cid, &ml) != NULL);
+        memcpy(g_p9, pid, 32); memcpy(g_c9, cid, 32);   /* case 10b replaces this pair */
     }
 
     printf("\n== 10: 1p1c -- parent arrives first, is refetched for its child ==\n");
@@ -696,6 +782,39 @@ int main(void){
         ck("parent + child accepted as a package", acc == 2);
         ck("under-paying parent pooled", mpool_get(mp_area, pid, &ml) != NULL);
         ck("child pooled", mpool_get(mp_area, cid, &ml) != NULL);
+    }
+
+    printf("\n== 10b: 1p1c package RBF -- the child pays for its parent's replacement (Core PackageRBFChecks) ==\n");
+    {
+        drain_peer(sp[1]);
+        static u8 rp[4096], rc10[4096];
+        unsigned long long tval[1] = { 10000000ull };
+        unsigned long tidx[1] = { 0 };
+        u8 to_h[20]; wallet_key_h160(to_h, cpf_dpriv);
+        /* P' spends case 9's coin (cpf_tid:0) for 20 sat: over the floor, but
+         * nowhere near the 5010 sat of case 9's parent + child it conflicts
+         * with, so alone it is "insufficient fee" -- reconsiderable */
+        long pn = wallet_send_tx(rp, sizeof rp, (u8(*)[32])cpf_tid, tidx, tval, 1,
+                                 to_h, 10000000ull - 20ull, 20ull, cpf_priv, 0);
+        ck("replacing parent signed", pn > 0);
+        u8 pid[32]; tx_txid(pid, rp, (unsigned long)pn, tb, sizeof tb);
+        unsigned long long cval[1] = { 10000000ull - 20ull };
+        long cn = wallet_send_tx(rc10, sizeof rc10, (u8(*)[32])pid, tidx, cval, 1,
+                                 to_h, 10000000ull - 20ull - 20000ull, 20000ull, cpf_dpriv, 0);
+        ck("child paying 20000 sat signed", cn > 0);
+        u8 cid[32]; tx_txid(cid, rc10, (unsigned long)cn, tb, sizeof tb);
+        unsigned long ml = 0;
+        p2p_write(sp[1], "tx", 2, rc10, (unsigned)cn);
+        long acc = txrelay_poll_leg(sp[0], mp_area, 200);
+        ck("child alone: parked", acc == 0 && mpool_get(mp_area, cid, &ml) == NULL);
+        drain_peer(sp[1]);
+        p2p_write(sp[1], "tx", 2, rp, (unsigned)pn);
+        acc = txrelay_poll_leg(sp[0], mp_area, 200);
+        ck("the pair replaces case 9's parent + child as a package", acc == 2);
+        ck("...the replacing parent is pooled", mpool_get(mp_area, pid, &ml) != NULL);
+        ck("...and its child", mpool_get(mp_area, cid, &ml) != NULL);
+        ck("...case 9's parent is evicted", mpool_get(mp_area, g_p9, &ml) == NULL);
+        ck("...and so is its child", mpool_get(mp_area, g_c9, &ml) == NULL);
     }
 
     printf("\n== 11: the package fee context does not leak ==\n");

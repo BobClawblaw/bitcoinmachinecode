@@ -371,6 +371,32 @@ int csi_hist_check(int full, char* why, unsigned long why_cap){
     if (why && why_cap) snprintf(why, why_cap, "%s", buf);
     return r;
 }
+/* 2026-10-04: the base is redundant when the tail itself starts at genesis.
+ * A node that synced from block 0 folded every block and wrote rows 0..tip
+ * (one generation: no re-seed in between), the same numbers the builder
+ * would spend ~39 min recomputing from the archive. full = check every row's
+ * hash and generation (once per boot, after the download); otherwise only
+ * the header and the first and last rows. 1 = the tail is the history. */
+static int tail_from_genesis(int full){
+    csh_header_t hd; csh_row_t row, end;
+    if (!hist_open() || pread(g_hist_fd, &hd, sizeof hd, 0) != (ssize_t)sizeof hd) return 0;
+    if (hd.first_height != 0 || hd.last_height < 0) return 0;
+    long last = (long)hd.last_height;
+    if (!tail_read_row(0, &row) || !tail_read_row(last, &end) || end.gen != row.gen){
+        if (full) fprintf(stderr, "[coinstats] the live index's rows start at genesis but row 0 or row %ld is unusable -- the base is rebuilt\n", last);
+        return 0;
+    }
+    if (full) for (long h = 1; h < last; h++){
+        csh_row_t r;
+        if (!tail_read_row(h, &r) || r.gen != row.gen){
+            fprintf(stderr, "[coinstats] the live index's rows start at genesis but row %ld is %s -- the base is rebuilt\n", h, tail_read_row(h, &r) ? "from a later re-seed" : "torn or missing");
+            return 0;
+        }
+    }
+    snprintf(g_hist_why, sizeof g_hist_why, "history from the live index, rows 0..%ld written since genesis (no base needed)", last);
+    g_hist_state = 1;
+    return 1;
+}
 
 /* ---- the repair: the builder as a supervised child ----------------------------
  * Runs in the process that folds (the download worker): once a heartbeat it
@@ -387,6 +413,7 @@ int csi_hist_check(int full, char* why, unsigned long why_cap){
 #define CSI_REPAIR_BACKOFF_S    (6 * 3600)
 static struct {
     int enabled, workers, configured, checked_full;
+    int tail_verdict;   /* the tail-from-genesis check: 0 not yet, 1 passed its full scan, -1 failed */
     char builder[512], chaindir[512], chain[16];
     pid_t pid; long long started, next_allowed; int attempts; long to;
     int state;   /* CSI_REPAIR_* */
@@ -457,6 +484,13 @@ static int repair_tick_inner(long applied, int in_ibd, long long now){
     }
     int r = csi_hist_check(!g_rep.checked_full, 0, 0); g_rep.checked_full = 1;
     if (r == 1){ if (g_rep.state != CSI_REPAIR_OK) fprintf(stderr, "[coinstats] %s\n", g_hist_why); g_rep.state = CSI_REPAIR_OK; return g_rep.state; }
+    /* no base, but the live index wrote every row from genesis (a node that
+     * synced from block 0): those rows ARE the history, so there is nothing
+     * to rebuild. Judged once the download is over, when the rows are final. */
+    if (!in_ibd && g_rep.tail_verdict >= 0){
+        int ok = tail_from_genesis(g_rep.tail_verdict == 0); g_rep.tail_verdict = ok ? 1 : -1;   /* a failed verdict is not rescanned this boot */
+        if (ok){ if (g_rep.state != CSI_REPAIR_OK) fprintf(stderr, "[coinstats] %s\n", g_hist_why); g_rep.state = CSI_REPAIR_OK; return g_rep.state; }
+    }
     if (!g_rep.enabled){ g_rep.state = CSI_REPAIR_DISABLED; return g_rep.state; }
     if (g_rep.attempts >= CSI_REPAIR_MAX_ATTEMPTS){ g_rep.state = CSI_REPAIR_GAVE_UP; return g_rep.state; }
     if (now < g_rep.next_allowed){ g_rep.state = CSI_REPAIR_BACKOFF; return g_rep.state; }

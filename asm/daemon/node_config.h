@@ -37,6 +37,8 @@ typedef struct {
     int    min_usable_peers;     /* never ban the pool below this            */
     int    maxpool;              /* candidate pool drawn from the book       */
     int    dlc_chunk_blocks;     /* blocks per download request (bmc.dlcchunk; 2026-09-30) */
+    int    dl_shape_core;        /* bmc.dlshape=core: download exactly as Core does (2026-10-04) */
+    long   dlc_roll_below;       /* bmc.dlcrollbelow=H: below height H the ranked workers keep 16 blocks in flight across chunk boundaries (plan B9, 2026-10-06); 0 = off */
 
     /* address ingestion limits (anti-eclipse; daemon/addr_ingest.c) */
     int  addr_max_per_response;
@@ -149,6 +151,15 @@ typedef struct {
     int download_rate_limit_kbps; /* bmc.downloadratelimit: max block+header download, KB/s, node-wide (0 = off) */
     int  coinstatshist_repair;    /* bmc.coinstatshistrepair: rebuild a missing/broken coinstats history base in a supervised child (default 1) */
     int  coinstatshist_workers;   /* bmc.coinstatshistworkers: the builder's worker count (0 = auto: cores/4, 2..8; pass 3 sizes itself by RAM) */
+    /* bmc.benchlog (2026-10-04, EXTENSION): 1 = stage timing in the log, for the
+     * logged IBD runs set against Core's debug=bench (worklog/2026-10-04-
+     * logged-ibd-runs-plan.md part 2). A [bench] line per connected block
+     * (utxo_live.c: the read/idx/verify/get/put/ckpt/flush/csi split the
+     * apply path already measures), per block's index work at the choke
+     * point (main.c: txindex, txospender, bfilter, addr, zmq), per memtable
+     * flush, per download chunk (dlc_benchlog.c). Default 0: the timers run
+     * either way (as Core's do); only the lines are gated. */
+    int  benchlog;
     int  esplora_port;            /* bmc.esploraport: the Esplora facade listener (0 = off) */
     char esplora_bind[64];        /* bmc.esplorabind: its address (default 127.0.0.1) */
     int upload_rate_limit_kbps;   /* bmc.uploadratelimit: max bytes SENT to peers, KB/s, node-wide (0 = off) */

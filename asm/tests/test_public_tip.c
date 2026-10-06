@@ -121,6 +121,11 @@ static void mine_range(long from, long to){
     }
 }
 
+/* daemon/main.c's serve_reorg_check (2026-10-04) is not linked here: this
+ * stub reports a reorg when the test sets the flag, once */
+static int g_fake_reorg;
+long serve_reorg_check(void){ if (g_fake_reorg){ g_fake_reorg = 0; return 1; } return 0; }
+
 int main(void){
     tt_isolate();
     memset(store_buf,0,sizeof store_buf);
@@ -173,6 +178,34 @@ int main(void){
     ck("store 10 / applied 10 -> public tip 10 (live)", utxo_live_public_tip(store_buf, 1), 10);
     ck("persisted applied height (what the parent seeds the status block from) is 10",
        utxo_live_persisted_height(), 10);
+
+    /* ---- 2026-10-03: the serve process's handle follows the archive. Its
+     * store was read at boot; the download worker (another process) appends
+     * every later block. Before, st+24 stayed at the boot height, so
+     * getheaders / getblocks / the tip-watch never went past it (production's
+     * serve process: tip=969479 at shutdown, nine hours and 49 blocks later).
+     * A copy taken before the appends stands in for that handle. ---- */
+    { static unsigned char stale[sizeof store_buf];
+      memcpy(stale, store_buf, sizeof store_buf);
+      mine_range(11, 13);
+      ck("a handle from before the appends still says 10", (long)*(int*)(stale+24), 10);
+      ck("serve_public_tip follows index.dat: the stale handle now reports 13", serve_public_tip(stale), 13);
+      ck("...its tip field moved (st+24 = 13)", (long)*(int*)(stale+24), 13);
+      ck("...and its idx_len with it (14 records)", *(long*)(stale+16), 14L*48);
+      ck("...a second call with nothing new keeps 13", serve_public_tip(stale), 13);
+      /* the shape a forked serve child starts with: idx_len already current
+       * (the accept path refreshes it), the tip still old */
+      mine_range(14, 15);
+      memcpy(stale, store_buf, sizeof store_buf); *(int*)(stale+24) = 13;
+      ck("idx_len current, tip stale at 13: serve_public_tip reports 15", serve_public_tip(stale), 15);
+      /* 2026-10-04: after a reorg the worker bumps a generation and the serve
+       * side may move its tip BACK, once (the stub below reports one reorg).
+       * Without the reorg, a handle above the archive's tip stays put. */
+      *(int*)(stale+24) = 20; g_fake_reorg = 0;
+      ck("no reorg: a handle above the archive's tip is never moved back (20)", serve_public_tip(stale), 20);
+      mine_range(16, 16); *(int*)(stale+24) = 20; g_fake_reorg = 1;
+      ck("a reorg reported: the tip moves back to the archive's (16)", serve_public_tip(stale), 16);
+      ck("...and only once (the generation is consumed)", g_fake_reorg, 0); }
 
     utxo_live_close();
     printf("\n%s (%d failures)\n", failures==0 ? "ALL TESTS PASSED" : "TESTS FAILED", failures);

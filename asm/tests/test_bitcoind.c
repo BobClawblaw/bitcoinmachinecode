@@ -138,7 +138,11 @@ int main(void){
     cki("captured UA bytes", memcmp(g_peer_version_payload+81, "/Satoshi:27.1.0/", 16)==0, 1);
     close(fd);
     { int st=0; waitpid(pid,&st,0);
-      cki("BIP339: wtxidrelay sent after version, before verack (child saw it)",
+      /* 2026-10-03: sent again (withheld 10-01..10-03 while we announced only
+       * by txid; the announcers now speak MSG_WTX to a wtxid peer). The child
+       * sets bit 0 when it did NOT see wtxidrelay; requiring a clean exit keeps
+       * a crash from passing. */
+      cki("BIP339: wtxidrelay sent after version, before verack (peer is 70016)",
           WIFEXITED(st) && (WEXITSTATUS(st) & 1)==0, 1);
       cki("BIP155: sendaddrv2 offered after version, before verack (peer is 70016)",
           WIFEXITED(st) && (WEXITSTATUS(st) & 2)==0, 1); }

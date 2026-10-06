@@ -50,8 +50,13 @@
 #include "secure_zero.h"    /* WAL-3: a memset the optimiser may not delete */
 #include "hdrrules.h"          /* VAL-5: ContextualCheckBlockHeader rules */
 #include "peer_timeout.h"      /* CC-7: -peertimeout, the handshake deadline */
+#include "crash_trace.h"       /* 2026-10-03: a fatal signal leaves a stack in the log */
 #include "txann.h"             /* CC-1: tx announcement to and from inbound peers */
 #include "inbound_evict.h"     /* CC-3: Core AttemptToEvictConnection */
+#include "index_worker.h"      /* 2026-10-06 (plan B4): the index writers off the applier */
+static void ixw_catchup_stop(const char* why);
+static void ixw_catchup_start(void);
+extern void axt_set_applied_height(long (*fn)(void));   /* daemon/addr_index_tail.c */
 #include "../mempool_slot.h"    /* the structural mempool's slot layout (80-byte slots) */
 #include "anchors.h"           /* CC-4: block-relay-only legs + anchors.dat */
 #include "hdr_lowwork.h"
@@ -85,6 +90,8 @@ static void mempool_refresh_seqlocks(void* store_buf, long now_tip);
 #include "v2transport.h"  /* BIP324 v2 encrypted transport */
 #include "wallet_pass.h"   /* wallet passphrase source (audit finding 2) */
 #include "chainparams.h" /* runtime chain selection (main / regtest)   */
+#include "benchlog.h"    /* 2026-10-04: the [bench] index line and the [ready] finish line */
+#include "dlc_benchlog.h" /* 2026-10-04: the [bench] per-chunk download line (bmc.benchlog) */
 
 /* The node log path, chain-tagged so an aggregated view can never confuse
  * chains: logs/bitcoind.log on mainnet, logs/bitcoind.<chain>.log otherwise
@@ -160,6 +167,9 @@ extern unsigned char g_peer_version_payload[512]; /* bitcoind.asm: raw capture, 
 extern long g_peer_version_len;
 extern long node_accept_handshake(int fd);
 extern long g_peer_wants_addrv2;   /* bitcoind.asm: peer sent sendaddrv2 before verack (per handshake) */
+extern long g_peer_wtxidrelay;
+extern const char* tx_accept_last_detail(void);   /* daemon/tx_accept.c: Core's debug message for the last refusal (2026-10-03) */     /* bitcoind.asm: peer sent wtxidrelay before verack -- BIP339 negotiated (2026-10-03) */
+extern void txrelay_fd_set_wtxid(int fd, int on);   /* tx_relay.c: announce to / serve this leg by wtxid */
 
 /* NODE_WITNESS (service bit 0x8) gate, checked right after every OUTBOUND
  * handshake that can lead to fetching blocks or transactions. A peer without
@@ -422,6 +432,7 @@ extern int  tsp_active(void);
 extern void tsp_on_block(void* store_buf, long h, const unsigned char* blk, long blen);
 extern void txit_on_block(void* store_buf, long h, const unsigned char* blk, long blen);
 extern void bfi_on_block(void* store_buf, long h, const unsigned char* blk, unsigned long blen);  /* daemon/bfilter_index.c */
+extern long txit_covered(void);                                               /* daemon/tx_index_tail.c: runs + tail, -1 off */
 typedef int (*bfi_undo_cb_t)(void*, const unsigned char*, unsigned int, unsigned long long,
                              unsigned int, unsigned char, const unsigned char*, unsigned short);
 extern void bfi_set_undo_replay(long (*fn)(long, bfi_undo_cb_t, void*));
@@ -567,6 +578,27 @@ long serve_idx_topup(void){
  * guess at this, it calls back through reorg_set_index_rebuild. Reuses the
  * already-allocated buffer instead of mallocing a new one each time (a reorg
  * can happen repeatedly over a process's lifetime). */
+/* the reorg generation this process's hash index reflects (node_status_t.reorg_gen) */
+static unsigned long long g_htidx_gen;
+/* The serve side's half of a reorg (2026-10-04): when the worker has rebuilt
+ * after one, rebuild this process's hash index from index.dat. Called by the
+ * serve parent at each accept (so children fork with a fresh copy) and by
+ * serve_store_follow in the children. 1 = rebuilt (the caller then lets the
+ * store tip move BACK, once), 0 = nothing to do. */
+long serve_reorg_check(void){
+    if (!g_node_status || !ht_idx) return 0;
+    unsigned long long g = g_node_status->reorg_gen;
+    if (g == g_htidx_gen) return 0;
+    g_htidx_gen = g;
+    idx_init(ht_idx, HT_SLOTS);
+    if (idx_build_from_file(ht_idx, "index.dat") < 0){
+        fprintf(stderr, "[hashidx] serve side: rebuild after a reorg FAILED; block-by-hash serving is degraded until restart\n");
+        return 1;
+    }
+    g_htidx_next = htidx_file_heights();
+    fprintf(stderr, "[hashidx] serve side: rebuilt after a reorg (generation %llu, %ld heights)\n", g, (long)idx_count(ht_idx));
+    return 1;
+}
 static void rebuild_hash_index_after_reorg(void){
     if(!ht_idx) return;
     idx_init(ht_idx, HT_SLOTS);
@@ -577,6 +609,8 @@ static void rebuild_hash_index_after_reorg(void){
         g_htidx_next = htidx_file_heights();
         fprintf(stderr,"[reorg] hash index rebuilt: %ld heights\n", (long)idx_count(ht_idx));
     }
+    /* tell the serve side (its own copies rebuild on the next check) */
+    if (g_node_status) g_htidx_gen = __sync_add_and_fetch(&g_node_status->reorg_gen, 1ULL);
     /* ---- STO-9 (audit 2026-09-03): rewind headers.dat too ----
      * Nothing here touched the header mirror, so after a reorg it kept the
      * LOSING branch's headers at fork+1..old_tip, and dl_header_mirror_topup
@@ -616,6 +650,7 @@ static void rebuild_hash_index_after_reorg(void){
      * truncation too, or the reconnected blocks would be skipped as
      * already-indexed (fires with tip == fork height on the mid-reorg
      * invocation; the post-reconnect invocation is a no-op) */
+    if (ixw_on()) ixw_catchup_stop("store truncated (reorg): the tails roll back in this process");   /* 2026-10-06 */
     { extern void txit_on_truncate(void*); txit_on_truncate(store_buf); }
     { extern void tsp_on_truncate(void*); tsp_on_truncate(store_buf); }
     { extern void axt_on_truncate(void*); axt_on_truncate(store_buf); }
@@ -1206,6 +1241,7 @@ static int   mux_out_fd[MUX_MAX_OUT];       /* persistent outbound seed fds  */
  * so it gets addrv2-encoded self-announcements (daemon/addr_self.c) */
 static unsigned char mux_out_wants_v2[MUX_MAX_OUT];
 static unsigned char mux_out_kind[MUX_MAX_OUT];         /* CC-4: LEG_FULL / LEG_BLOCK_ONLY */
+static void bo_forget(const char* host);                /* the block-only registry, below (2026-10-01) */
 static unsigned char mux_out_cmpct[MUX_MAX_OUT];        /* CC-2: the peer sent sendcmpct on this leg */
 /* 2026-09-10, Core's shape at the tip: a block announced on the leg since its
  * last pass (inv, or a pushed `headers`: we send sendheaders), and whether the
@@ -1300,6 +1336,12 @@ static int leg_tip_recent(void){
     }
     return last_t && dl_announce_allowed(last_t, (long long)time(NULL), g_cfg.maxtipage > 0 ? g_cfg.maxtipage : 86400);
 }
+/* Core: index.nHeight >= m_stop_at_height, and 0 means "no stop". Measured on
+ * v31.1 (2026-10-01): a node restarted with its tip already past the height
+ * shuts down at startup, before the next block -- so no "has the tip moved"
+ * guard. The parent seeds tip_height from the persisted applied height at
+ * boot (-1 on a fresh datadir), so the first read is the real tip. */
+static int stopatheight_reached(long long tip, long stop){ return stop > 0 && tip >= 0 && tip >= stop; }
 static void leg_note_installed(int i){
     mux_out_since[i] = (long long)time(NULL); mux_out_good[i] = 0; g_sync_fail_streak[i] = 0; mux_out_ping_sent[i] = 0; mux_out_pong_at[i] = 0; mux_out_ping_ms[i] = -1;
     mux_out_announced[i] = 0; mux_out_hb[i] = 0; mux_out_hb_since[i] = 0; mux_out_lastpass_ms[i] = 0; g_pass_last_empty[i] = 0;
@@ -1373,6 +1415,7 @@ static void leg_close_ours(int i, const char* reason, const char* detail){
     fprintf(stderr,"[dl:%d] %s connection closed ours/%s after %llds%s%s\n", i, mux_out_host[i][0] ? mux_out_host[i] : "?", reason, leg_age_s(i),
             detail && detail[0] ? " -- " : "", detail ? detail : "");
     if(mux_out_fd[i] >= 0){ bmc_v2_close(mux_out_fd[i]), close(mux_out_fd[i]); mux_out_fd[i] = -1; }
+    if(mux_out_kind[i] == LEG_BLOCK_ONLY) bo_forget(mux_out_host[i]);   /* 2026-10-01: the slot is free for another block-only host */
 }
 static void leg_close_theirs(int i, const char* how, const char* unread){
     if(g_pass_in_child) return;                        /* the parent decides from the report */
@@ -1380,6 +1423,7 @@ static void leg_close_theirs(int i, const char* how, const char* unread){
     fprintf(stderr,"[dl:%d] %s connection closed theirs (%s) after %llds; unread: %s\n", i, mux_out_host[i][0] ? mux_out_host[i] : "?", how, age, unread ? unread : "(nothing)");
     if(g_dialmem && age >= 0 && age <= DM_EARLY_S) dialmem_note_failure(g_dialmem, mux_out_host[i], age <= DM_REFUSED_S ? DM_REFUSED : DM_EARLY_DROP, dialmem_now());
     if(mux_out_fd[i] >= 0){ bmc_v2_close(mux_out_fd[i]), close(mux_out_fd[i]); mux_out_fd[i] = -1; }
+    if(mux_out_kind[i] == LEG_BLOCK_ONLY) bo_forget(mux_out_host[i]);   /* 2026-10-01 */
     mux_out_nextretry[i] = 0;   /* re-dial on the next rotation */
 }
 extern long p2p_ping(unsigned char* out, unsigned long long nonce);
@@ -1428,6 +1472,12 @@ static void leg_ping_tick(int k, long long now){
  * pass that tried something. */
 #define CONNECT_RETRY_FLOOR_MS 5500L
 #define ADDNODE_RETRY_FLOOR_MS 60000L
+/* the gap before a dead slot is looked at again (2026-10-01): under connect=
+ * Core retries its -connect peers every <= 5.5 s (ThreadOpenConnections), so a
+ * restarted peer is back within seconds; the 30 s pool rotation is for
+ * addrman-picked peers. Every dead-slot stamp goes through here -- fixing the
+ * rotation's alone was not enough: the liveness close stamped its own 30 s. */
+static long long redial_gap_ms(void){ return g_cfg.connect_only ? CONNECT_RETRY_FLOOR_MS : REDIAL_BACKOFF_MS; }
 
 /* ---- runtime peer control (RPC ctl_* channel) ---------------------------
  * The worker owns the legs, so it owns these. The parent asks; this decides.
@@ -2865,8 +2915,16 @@ static volatile sig_atomic_t mux_sync_budget_fired = 0;
  * we were going to discard anyway. */
 static volatile int mux_budget_fd = -1;
 static volatile sig_atomic_t mux_sync_budget_sig = 0;   /* WHICH signal: SIGALRM (stall) or SIGUSR1 (parent early-kill) */
+/* 2026-10-06: a download worker's phase (dlc_phase_t) at the moment the
+ * signal arrived, copied by the handler -- the late-ack line used to print
+ * the phase at the time of the CHECK, which was always "in the handshake"
+ * (the last phase set before it); -1 in the serve process and before the
+ * first phase. Written by DLC_PHASE. */
+static volatile sig_atomic_t g_dlc_phase_now = -1;
+static volatile sig_atomic_t mux_budget_phase = -1;
 static void mux_budget_alarm(int sig){
     mux_sync_budget_sig = sig;
+    mux_budget_phase = g_dlc_phase_now;
     mux_sync_budget_fired = 1;
     int fd = mux_budget_fd;
     if (fd >= 0) shutdown(fd, SHUT_RDWR);
@@ -3188,6 +3246,7 @@ static int outbound_connect_raw(const char* host, int rcv_ms, int out_port){
  * cannot hide a block from us. On shutdown they are written to anchors.dat
  * (Core's format) and dialled first on the next start. */
 static char g_bo_hosts[MAX_BLOCK_RELAY_ONLY][128];
+static long long g_bo_since[MAX_BLOCK_RELAY_ONLY];   /* when registered (2026-10-01) */
 static int  g_bo_n = 0;
 static int host_is_block_only(const char* host){
     for(int i = 0; i < g_bo_n; i++) if(!strcmp(g_bo_hosts[i], host)) return 1;
@@ -3202,8 +3261,35 @@ static int host_is_block_only(const char* host){
  * on its only leg -- Core's getpeerinfo relaytxes=false, not one
  * transaction relayed to us, ever. */
 static int bo_want(void){ if(g_cfg.connect_only) return 0; return g_cfg.max_block_relay_only < MAX_BLOCK_RELAY_ONLY ? g_cfg.max_block_relay_only : MAX_BLOCK_RELAY_ONLY; }
-static void bo_add(const char* host){ if(g_bo_n < MAX_BLOCK_RELAY_ONLY && !host_is_block_only(host)) snprintf(g_bo_hosts[g_bo_n++], sizeof g_bo_hosts[0], "%s", host); }
+static void bo_add(const char* host){
+    if(g_bo_n < MAX_BLOCK_RELAY_ONLY && !host_is_block_only(host)){
+        g_bo_since[g_bo_n] = (long long)time(NULL);
+        snprintf(g_bo_hosts[g_bo_n++], sizeof g_bo_hosts[0], "%s", host); } }
+/* The registry holds exactly the hosts that ARE block-relay-only legs or have
+ * a block-relay-only dial in flight (2026-10-01). It used to keep every host
+ * ever tried, up to MAX_BLOCK_RELAY_ONLY (8): a timed-out dial stayed
+ * "block-only" for the life of the process, so when the full-relay top-up
+ * later reached that host it came up block-relay-only, did not count toward
+ * the full-relay target, and the top-up dialled another -- production held 12
+ * legs against 8 + 2. A failed dial or a closed leg forgets the host; a prune
+ * drops anything neither live nor recently dialled. */
+static void bo_forget(const char* host){
+    for(int i = 0; i < g_bo_n; i++){
+        if(strcmp(g_bo_hosts[i], host)) continue;
+        for(int k = i; k + 1 < g_bo_n; k++){ memcpy(g_bo_hosts[k], g_bo_hosts[k+1], sizeof g_bo_hosts[0]); g_bo_since[k] = g_bo_since[k+1]; }
+        g_bo_n--; return; }
+}
+#define BO_PENDING_S 60      /* a dial helper's connect times out at 10 s; a minute is ample */
+static int bo_host_is_leg(const char* host);
+static void bo_prune(void){
+    long long now = (long long)time(NULL);
+    for(int i = 0; i < g_bo_n; ){
+        if(bo_host_is_leg(g_bo_hosts[i]) || now - g_bo_since[i] < BO_PENDING_S){ i++; continue; }
+        bo_forget(g_bo_hosts[i]);
+    }
+}
 static int legs_block_only(void){ int n = 0; for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && mux_out_kind[k] == LEG_BLOCK_ONLY) n++; return n; }
+static int bo_host_is_leg(const char* host){ for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && !strcmp(mux_out_host[k], host)) return 1; return 0; }
 /* every outbound dial funnels through here: a block-only host gets fRelay=0
  * in the version we send (the byte is per-connection already; see feelers) */
 static int outbound_connect(const char* host, int rcv_ms, int out_port){
@@ -3456,6 +3542,12 @@ static void rpc_fill_peer_slot_ex(int slot, const char* host, int already_claime
     rpc_peer_from_version(pr, p, len);
     { extern int rp_version_frelay(const unsigned char*, long);
       pr->relaytxes = rp_version_frelay(p, len) != 0; }   /* Core relaytxes: the peer's fRelay */
+    /* connection_type (2026-10-01): a host registered block-relay-only (CC-4)
+     * gets fRelay=0 from us and relays no transactions -- Core reports such a
+     * peer relaytxes false; addnode and -connect peers are Core's "manual" */
+    if (host && host_is_block_only(host)){ pr->conn_type = 1; pr->relaytxes = 0; }
+    else if (host && (g_cfg.connect_only || ctl_dial_listed(host))) pr->conn_type = 2;
+    else pr->conn_type = 0;
     /* RPC-3: a fresh, never-reused id for this connection. Assigned before
      * `used` so a reader that sees the slot live always sees a real id. */
     pr->nodeid = __sync_fetch_and_add(&g_node_status->next_nodeid, 1);
@@ -3507,11 +3599,11 @@ static irunset_t g_rs_txi, g_rs_tsp;
 extern long ah_to_height(void) __attribute__((weak));   /* daemon/addr_hist.c: the history runs' reach */
 extern int  ah_run_count(void) __attribute__((weak));
 extern void axt_runs_advanced(long to);                  /* daemon/addr_index_tail.c: drop what a run now covers */
-static void on_ah_run(long to, void* ctx){ (void)ctx; axt_runs_advanced(to); }
+static void on_ah_run(long to, void* ctx){ (void)ctx; if (!(ixw_on() && ixw_push(IXW_K_ADV_AH, to))) axt_runs_advanced(to); }   /* the worker holds the tail's fd: it rotates (2026-10-06) */
 extern void txit_runs_advanced(long to);   /* daemon/tx_index_tail.c: drop what a run now covers */
 extern void tsp_runs_advanced(long to);    /* daemon/txosp_tail.c */
-static void on_txi_run(long to, void* ctx){ (void)ctx; txit_runs_advanced(to); irs_dirty(&g_rs_txi); }
-static void on_tsp_run(long to, void* ctx){ (void)ctx; tsp_runs_advanced(to); irs_dirty(&g_rs_tsp); }
+static void on_txi_run(long to, void* ctx){ (void)ctx; if (!(ixw_on() && ixw_push(IXW_K_ADV_TXI, to))) txit_runs_advanced(to); irs_dirty(&g_rs_txi); }
+static void on_tsp_run(long to, void* ctx){ (void)ctx; if (!(ixw_on() && ixw_push(IXW_K_ADV_TSP, to))) tsp_runs_advanced(to); irs_dirty(&g_rs_tsp); }
 /* One tick of every trailing index builder, at most once a second.
  *
  * 2026-09-16, found on run 26: this used to live ONLY in the caught-up loop's
@@ -4029,7 +4121,7 @@ static long long g_dh_timeout_ms = 120000;
 /* g_in_dial_helper is declared with the leg tables above */
 /* NET-13: vpayload MUST match g_peer_version_payload -- a smaller field here
  * silently truncates the capture across the dial-helper socketpair. */
-typedef struct { int ok; unsigned char wants_addrv2; long vlen; unsigned char vpayload[512]; char why[128];
+typedef struct { int ok; unsigned char wants_addrv2; unsigned char wtxidrelay; long vlen; unsigned char vpayload[512]; char why[128];
                  unsigned long v2_len;      /* 2026-09-10: bytes of exported v2 session that follow the struct on the socketpair (0: v1) */
                } dh_result_t;
 #define DH_V2_BLOB_CAP (8u << 20)    /* 2026-09-10 (ab): 64 KB refused a headers reply in flight and closed the leg; a block in flight fits now */
@@ -4147,7 +4239,7 @@ static int dh_start_slot(const char* host, int out_port, int want_slot){
         int fd = outbound_connect(host, 300, out_port);
         static unsigned char blob[DH_V2_BLOB_CAP];
         if(fd >= 0){
-            r.ok = 1; r.wants_addrv2 = (unsigned char)g_peer_wants_addrv2;
+            r.ok = 1; r.wants_addrv2 = (unsigned char)g_peer_wants_addrv2; r.wtxidrelay = (unsigned char)g_peer_wtxidrelay;
             r.vlen = g_peer_version_len > 0 && g_peer_version_len <= 256 ? g_peer_version_len : 0;
             if(r.vlen) memcpy(r.vpayload, g_peer_version_payload, (size_t)r.vlen);
             /* the v2 session, if any, follows the struct: the parent imports it
@@ -4399,7 +4491,26 @@ static int dh_install_leg(const char* host, int fd, const dh_result_t* r){
         g_dh_v2_len = 0;
     }
     g_peer_version_len = r->vlen; if(r->vlen) memcpy(g_peer_version_payload, r->vpayload, (size_t)r->vlen);
+    /* The two things outbound_connect_raw does with the peer's version that a
+     * helper child cannot keep (2026-10-04): the helper never writes the
+     * address book (a fork's copy would vanish), and its self-address vote
+     * died with it -- so every helper-dialed peer (every re-dial and top-up
+     * since 2026-09-10) kept services=1, which reads as "no v2" at the next
+     * dial, and only the boot fill could ever teach us our own address. */
+    { unsigned long long svc = 0;
+      if (r->vlen >= 12) memcpy(&svc, r->vpayload + 4, 8);
+      if (svc){
+          bmc_addr_t pa;
+          if (bmc_addr_from_string_port(&pa, host, (unsigned short)g_chainp->default_port)){
+              ab2_t* b = addr_book();
+              if (b) ab2_add(b, &pa, svc, (unsigned)time(NULL));
+          }
+      }
+      extern void addrself_note_peer_view(const unsigned char*, long);
+      addrself_note_peer_view(r->vpayload, r->vlen); }
     g_peer_wants_addrv2 = r->wants_addrv2;
+    g_peer_wtxidrelay = r->wtxidrelay;
+    txrelay_fd_set_wtxid(fd, r->wtxidrelay);   /* BIP339, negotiated in the helper's handshake */
     int s = g_dh_last_slot; g_dh_last_slot = -1;
     if(s >= 0 && s < mux_n_out && mux_out_fd[s] < 0){                       /* a re-dial: the leg it was for is still down */
         snprintf(mux_out_host[s], sizeof mux_out_host[s], "%s", host);
@@ -4407,7 +4518,7 @@ static int dh_install_leg(const char* host, int fd, const dh_result_t* r){
         mux_out_kind[s] = host_is_block_only(host) ? LEG_BLOCK_ONLY : LEG_FULL; mux_out_cmpct[s] = 0;
         mux_out_wants_v2[s] = r->wants_addrv2;
         anchor_locator(mux_out_loc[s]); mux_out_nextretry[s] = 0;
-        fprintf(stderr,"[mux:%d] leg replaced: connected next pool peer %s (fd %d) addrv2=%d [background dial]\n", s, host, fd, (int)r->wants_addrv2);
+        fprintf(stderr,"[mux:%d] leg replaced: connected next pool peer %s (fd %d) addrv2=%d wtxid=%d [background dial]\n", s, host, fd, (int)r->wants_addrv2, (int)r->wtxidrelay);
         rpc_fill_peer_slot(s, host);
         rpc_note_peer_socket(s, fd);
         return 1;
@@ -4421,7 +4532,7 @@ static int dh_install_leg(const char* host, int fd, const dh_result_t* r){
     anchor_locator(mux_out_loc[mux_n_out]);
     mux_out_nextretry[mux_n_out] = 0;
     { char pv[256]; format_peer_version_info(pv, sizeof pv);
-      fprintf(stderr, "[dl] filled outbound %d = %s (fd %d) %s addrv2=%d [background dial]\n", mux_n_out, host, fd, pv, (int)r->wants_addrv2); }
+      fprintf(stderr, "[dl] filled outbound %d = %s (fd %d) %s addrv2=%d wtxid=%d [background dial]\n", mux_n_out, host, fd, pv, (int)r->wants_addrv2, (int)r->wtxidrelay); }
     rpc_fill_peer_slot(mux_n_out, host);
     rpc_note_peer_socket(mux_n_out, fd);
     mux_n_out++;
@@ -5002,6 +5113,17 @@ static int dl_pool_from_book(void* ab, char out[][DL_POOL_SLOT], int nitems){
  * one in each order, reached it 19.5% and 14.1% sooner than at 40, the gain
  * concentrated at 200k-300k (-23%, -25%) */
 static long g_dlc_chunk = 16;
+/* bmc.dlshape=core (2026-10-04): download exactly as Core v31.1 does -- see
+ * node_config.c and ibd_fetch_chunk_rolling. Set once per pass before any
+ * worker forks, like g_dlc_chunk. */
+static int  g_dlc_core = 0;
+/* bmc.dlcrollbelow (plan B9, 2026-10-06): below this height a ranked worker
+ * fetches with Core's rolling 16-in-flight pipeline across its chunk and
+ * its lookahead claim -- tiny early blocks are round-trip bound and the
+ * one-request-per-chunk shape pays an idle round trip per 16 blocks. The
+ * ranking, rotation, floor and eviction rules stay bmc's. 0 = never. */
+static long g_dlc_roll_below = 0;
+#define DLC_CORE_INFLIGHT 16      /* Core: MAX_BLOCKS_IN_TRANSIT_PER_PEER (net_processing.cpp:130) */
 static long g_dlc_pool_idle_pct = -1;   /* pool-wide share of worker wall-clock blocked in the socket read (2026-09-11); -1 until a chunk completes */
 /* Draw from the WHOLE address book, not a 512 slice of it. Measured
  * 2026-08-18: the book held 1,974 peers, the pool was capped at 512, the
@@ -5033,8 +5155,10 @@ static long g_live_announced[DLC_MAXPOOL];   /* each ranked live peer's start_he
  * timeout is 10 minutes (BLOCK_DOWNLOAD_TIMEOUT_BASE); this is stricter,
  * as before. */
 #define DLC_CHUNK_BUDGET_SECS 120
-#define DLC_STR_(x) #x
-#define DLC_STR(x) DLC_STR_(x)     /* the stall line prints the constant, not a copy of it */
+/* the no-block budget in force: DLC_CHUNK_BUDGET_SECS, or under
+ * bmc.dlshape=core Core's block download timeout, 600 s x (1 + 0.5 x (the
+ * other peers downloading)) (net_processing.cpp:148-150, 6113-6122) */
+static long g_dlc_budget_s = DLC_CHUNK_BUDGET_SECS;
 /* early-kill thresholds: the parent's status loop already samples each
  * worker's real /proc/<pid>/io bandwidth every 10s for the live display --
  * a connection sustaining under DLC_DEAD_WEIGHT_BPS for
@@ -5254,7 +5378,16 @@ enum { DLC_CTL_CLAIM = 0, DLC_CTL_RETRY_HEAD = 1, DLC_CTL_RETRY_TAIL = 2, DLC_CT
         * this process), the count of unclaimed usable peers (a replacement
         * exists), the stall evictions */
        DLC_CTL_APPLIED = 18, DLC_CTL_FREE_PEERS = 19, DLC_CTL_N_STALL = 20,
-       DLC_CTL_RING = 21 };
+       /* 2026-10-05 (runs 34 and 35): evictions the holder never answered --
+        * its chunk went to the retry ring from the parent's side */
+       DLC_CTL_N_UNANSWERED = 21,
+       /* 2026-10-06 (run 36): chunks the stall rule put on the retry ring
+        * at the holder's FIRST eviction (Core: a disconnected staller's
+        * blocks are re-requested elsewhere at once); unanswered above is
+        * now a diagnosis only -- run 36 counted an answered second
+        * eviction as unanswered because the parent could not see the ack */
+       DLC_CTL_N_REASSIGNED = 22,
+       DLC_CTL_RING = 23 };
 #define DLC_CURSOR_HELP_SECS 30
 /* ...and only when the pool has moved on without it: at least this many
  * chunks staged above the cursor. A 40-block chunk is 40 MB at height
@@ -5359,6 +5492,23 @@ static long dlc_stage_sink(void* st, long height, const unsigned char hash[32], 
 }
 static void dlc_stage_path(char* buf, size_t cap, long lo){ snprintf(buf, cap, DLC_STAGE_DIR "/c%ld.chunk", lo); }
 static int  dlc_stage_exists(long lo){ char p[64]; dlc_stage_path(p, sizeof p, lo); return access(p, F_OK) == 0; }
+/* The committer's cursor help, taken by ONE worker: the chunk it has waited
+ * on for DLC_CURSOR_HELP_SECS with a third of the window staged above it
+ * (DLC_CTL_CURSOR_WANT), claimed through the CAS on DLC_CTL_HELPING, and
+ * not a chunk already staged (its owner finished in the meantime). Core
+ * mode has no cursor help: Core never asks a second peer for a block in
+ * flight; its staller rule is what moves the tail. Returns the chunk's lo
+ * and sets *helping, or -1. Since 2026-10-05 this is asked from BOTH the
+ * claim and the full-window wait (see the wait loop's note). */
+static long dlc_take_cursor_want(volatile long* ctl, int* helping){
+    long want = ctl[DLC_CTL_CURSOR_WANT];
+    if(want < 0 || g_dlc_core || dlc_stage_exists(want)) return -1;
+    long cur = ctl[DLC_CTL_HELPING];
+    if(cur == want || !__sync_bool_compare_and_swap(&ctl[DLC_CTL_HELPING], cur, want)) return -1;
+    *helping = 1;
+    __sync_fetch_and_add(&ctl[DLC_CTL_N_CURSOR_HELP], 1L);
+    return want;
+}
 static int  dlc_stage_open_tmp(char* tmp, size_t cap, long lo){
     snprintf(tmp, cap, DLC_STAGE_DIR "/c%ld.w%d.tmp", lo, (int)getpid()); unlink(tmp);
     return open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
@@ -5883,8 +6033,9 @@ static lowwork_t g_lw;                                   /* CC-5 hold: 48 KB of 
 static int dlc_lw_get_at(void* hst, unsigned long long h, void* out){ return hst_get_at(hst, h, out); }
 extern int reorg_min_chain_work_set(void);
 static long long dlc_now_ms(void); static void dlc_fmt_rate(char* buf, size_t cap, double bytes_per_sec);   /* defined below; the progress line needs them here */
+static int g_dlc_hdr_stalled = 0;   /* the last fetch ended on a read timeout AFTER pages had landed (2026-10-05): the try loop moves on */
 static long dlc_fetch_headers(int fd, unsigned char* hst, const char* cand){
-    long have0 = hst_count(hst), added = 0; int lw_started = 0; lowwork_clear(&g_lw);
+    long have0 = hst_count(hst), added = 0; int lw_started = 0; lowwork_clear(&g_lw); g_dlc_hdr_stalled = 0;
     long long fetch_t0 = dlc_now_ms(); unsigned long held_bytes = 0;   /* for the held-region progress line */
     static unsigned char page[DLC_HDR_PAGE * 81 + 16];
     static unsigned char msg[2 << 20];
@@ -5909,7 +6060,7 @@ static long dlc_fetch_headers(int fd, unsigned char* hst, const char* cand){
             if(!strncmp(cmd, "headers", 12)) got = 1;
             else if(!strncmp(cmd, "ping", 12) && mlen == 8) p2p_write(fd, "pong", 4, msg, 8);
         }
-        if(!got){ if(added) break; return -1; }
+        if(!got){ if(added){ g_dlc_hdr_stalled = 1; break; } return -1; }
         dl_gate_account((long)mlen);                                  /* bmc.downloadratelimit: a header page is bytes too */
         unsigned long used; unsigned long cnt = dlc_varint(msg, mlen, &used);
         if(!used || cnt > DLC_HDR_PAGE || used + cnt * 81 > mlen) break;   /* malformed: stop here */
@@ -6085,6 +6236,93 @@ static long dl_header_mirror_topup(unsigned char* store){
     return n;
 }
 
+/* ---- the header probe (2026-10-05, plan B5) ---------------------------------
+ * The header phase took ONE candidate, the first of live[] in rank order, and
+ * every page of the chain came from it. Run 34 drew a 200 KB/s peer and spent
+ * 5 m 06 s holding pages until the chain passed -minimumchainwork, before the
+ * first block request; Core rerun #6 drew a fast peer and took 1 m 15 s. Ask
+ * DLC_HDR_PROBE_N candidates for the first page at once (one child each,
+ * DLC_HDR_PROBE_S cap, the ranking probe's shape), rank them by that page's
+ * rate, and let the try loop walk them in that order: the fastest leads and
+ * the rest are the fallbacks the loop already has. A page that does not link
+ * to our locator, breaks its own chain or fails PoW ranks last. Core syncs
+ * headers from ONE peer (net_processing: nSyncStarted), so bmc.dlshape=core
+ * keeps the single pick -- see dlc_rules.h. */
+#define DLC_HDR_PROBE_N 4
+#define DLC_HDR_PROBE_S 10
+typedef struct { int ok, why; long cnt, ms, bytes; } dlc_hprobe_t;   /* why: 1 no answer, 2 the page does not link, 3 the page breaks its chain or PoW */
+static const char* const dlc_hprobe_why[] = { "", "no answer", "page does not link", "page fails linkage or PoW" };
+static int dlc_headers_probe(char live[][DL_POOL_SLOT], int nlive, unsigned char* hst, int* order){
+    for(int i=0;i<nlive;i++) order[i]=i;
+    if(nlive < 2 || g_cfg.dl_shape_core) return 0;
+    int cand[DLC_HDR_PROBE_N]; int n=0;
+    for(int i=0;i<nlive && n<DLC_HDR_PROBE_N;i++){ unsigned ip; int pp; if(!dlc_parse_peer(live[i],&ip,&pp) || peer_known_no_witness(live[i])) continue; cand[n++]=i; }
+    if(n < 2) return 0;
+    unsigned char loc[DLC_HDR_LOCATOR_MAX * 32]; long lh[DLC_HDR_LOCATOR_MAX];
+    int nl = dlc_locator_build(hst, loc, lh); if(nl<=0) return 0;
+    dlc_hprobe_t* res = mmap(NULL, sizeof(dlc_hprobe_t) * DLC_HDR_PROBE_N, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
+    if(res == MAP_FAILED) return 0;
+    for(int k=0;k<n;k++){ res[k].ok=0; res[k].why=1; res[k].cnt=0; res[k].ms=0; res[k].bytes=0; }
+    long long t_all0 = dlc_now_ms();
+    pid_t kids[DLC_HDR_PROBE_N];
+    for(int k=0;k<n;k++){
+        pid_t pid=fork(); if(pid<0){ kids[k]=0; continue; }
+        if(pid==0){
+            alarm(DLC_HDR_PROBE_S);                                   /* nothing below may outlive this */
+            const char* c = live[cand[k]];
+            unsigned ip=0; int pport=0; if(!dlc_parse_peer(c,&ip,&pport)) _exit(0);
+            int cport = pport ? pport : node_config_peer_port(c);
+            dial_gate_wait();
+            int fd=tcp_connect_ip(ip,(unsigned short)htons((unsigned short)(cport ? cport : g_chainp->default_port)));
+            if(fd<0) _exit(0);
+            struct timeval tv; tv.tv_sec=DLC_HDR_PROBE_S; tv.tv_usec=0; setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
+            bmc_v2_close(fd);
+            if(node_handshake(fd)!=1 || !peer_has_witness(c)){ close(fd); _exit(0); }
+            static unsigned char page[DLC_HDR_PAGE * 81 + 16]; static unsigned char msg[2 << 20]; unsigned char stop[32]; memset(stop,0,32);
+            long plen = p2p_getheaders(page, loc, nl, stop);
+            long long t0 = dlc_now_ms();
+            if(plen<=0 || p2p_write(fd,"getheaders",10,page,(unsigned)plen)<0){ close(fd); _exit(0); }
+            unsigned mlen=0; char cmd[12]; int got=0;
+            for(int q=0;q<40 && !got;q++){ int r=p2p_read(fd,cmd,msg,sizeof msg,&mlen); if(r<=0) break;
+                if(!strncmp(cmd,"headers",12)) got=1; else if(!strncmp(cmd,"ping",12) && mlen==8) p2p_write(fd,"pong",4,msg,8); }
+            long long ms = dlc_now_ms()-t0; close(fd);
+            if(!got) _exit(0);
+            unsigned long used; unsigned long cnt = dlc_varint(msg, mlen, &used);
+            if(!used || cnt==0 || cnt>DLC_HDR_PAGE || used+cnt*81>mlen){ res[k].why=2; _exit(0); }
+            const unsigned char* first = msg+used; int at=-1;
+            for(int q=0;q<nl;q++) if(!memcmp(first+4, loc+q*32, 32)){ at=q; break; }
+            if(at<0){ res[k].why=2; _exit(0); }
+            unsigned char prev[32]; memcpy(prev, loc+at*32, 32);
+            for(unsigned long j=0;j<cnt;j++){ const unsigned char* h=first+j*81;
+                if(h[80]!=0 || memcmp(h+4,prev,32)!=0 || !pow_check(h)){ res[k].why=3; _exit(0); }
+                block_hash(prev,h); }
+            res[k].cnt=(long)cnt; res[k].ms = ms>0 ? ms : 1; res[k].bytes=(long)mlen; res[k].why=0; res[k].ok=1;
+            _exit(0);
+        }
+        kids[k]=pid;
+    }
+    /* every child is capped at DLC_HDR_PROBE_S by its own alarm, so the sequential reap ends about then */
+    for(int k=0;k<n;k++) if(kids[k]>0){ int st; if(!dl_reap_bounded(kids[k],&st,(DLC_HDR_PROBE_S+2)*1000L)) dl_kill_reap(kids[k],&st,"header probe"); }
+    double rate[DLC_HDR_PROBE_N]; int pk[DLC_HDR_PROBE_N]; int answered=0;
+    for(int k=0;k<n;k++){ rate[k] = res[k].ok ? (double)res[k].bytes * 1000.0 / (double)res[k].ms : -1.0; pk[k]=k; if(res[k].ok) answered++; }
+    for(int i=1;i<n;i++){ int v=pk[i]; int j=i-1; while(j>=0 && rate[pk[j]]<rate[v]){ pk[j+1]=pk[j]; j--; } pk[j+1]=v; }
+    /* the order: the answering candidates fastest first, then the unprobed in their rank order, then the probed that failed */
+    static unsigned char probed[DLC_MAXPOOL]; memset(probed, 0, (size_t)nlive);
+    for(int k=0;k<n;k++) probed[cand[k]] = 1;
+    int o=0;
+    for(int k=0;k<n;k++) if(res[pk[k]].ok) order[o++] = cand[pk[k]];
+    for(int i=0;i<nlive;i++) if(!probed[i]) order[o++] = i;
+    for(int k=0;k<n;k++) if(!res[pk[k]].ok) order[o++] = cand[pk[k]];
+    char line[DLC_HDR_PROBE_N * 96 + 64]; int w=0;
+    for(int k=0;k<n;k++){ int q=pk[k];
+        if(res[q].ok) w += snprintf(line+w, sizeof line-(size_t)w, "%s%s %.0f KB/s (%ld in %ld ms)", k?", ":"", live[cand[q]], rate[q]/1024.0, res[q].cnt, res[q].ms);
+        else          w += snprintf(line+w, sizeof line-(size_t)w, "%s%s %s", k?", ":"", live[cand[q]], dlc_hprobe_why[res[q].why > 3 ? 1 : res[q].why]); }
+    if(answered) fprintf(stderr,"[dlc] header probe: the first page from %d candidate(s) in %.1fs: %s -- %s leads, the rest are fallbacks\n",
+                         n, (double)(dlc_now_ms()-t_all0)/1000.0, line, live[order[0]]);
+    else fprintf(stderr,"[dlc] header probe: none of %d candidate(s) answered in %.1fs (%s) -- the rank order stands\n", n, (double)(dlc_now_ms()-t_all0)/1000.0, line);
+    munmap(res, sizeof(dlc_hprobe_t) * DLC_HDR_PROBE_N);
+    return answered;
+}
 static long dlc_headers(char live[][DL_POOL_SLOT], int nlive){
     static unsigned char hst[4096]; hst_init(hst);
     struct stat hs;
@@ -6111,11 +6349,25 @@ static long dlc_headers(char live[][DL_POOL_SLOT], int nlive){
     int tried=0, failed=0, whys[8]={0};
     long announced = dlc_announced_height(g_live_announced, nlive);   /* 2026-09-09: the pool's claim, from the ranking handshakes */
     int short_i = -1; long short_tip = -1;                             /* the longest chain that still fell short, in case every candidate does */
-    for(int i=0;i<nlive && tried<DLC_HDR_TRY_PEERS; i++){
+    static int order[DLC_MAXPOOL]; dlc_headers_probe(live, nlive, hst, order);   /* 2026-10-05: the fastest first page leads */
+    for(int oi=0;oi<nlive && tried<DLC_HDR_TRY_PEERS; oi++){
+        int i = order[oi];
         int why=0;
         long added=dlc_headers_try(live[i], hst, loc, hdrbuf, sizeof hdrbuf, &why);
         if(added<0){ failed++; if(why>=0 && why<8) whys[why]++; continue; }
         tried++;
+        if(added>0 && g_dlc_hdr_stalled){
+            /* the peer served pages and then stopped answering (2026-10-05):
+             * before, that ended the phase on whatever had landed, and the
+             * block download ran to that height. Treat it as a chain that
+             * fell short: roll back, remember it as the longest, try the
+             * next candidate; if no one does better it is taken below. */
+            long tip_now = hst_count(hst) - 1;
+            fprintf(stderr,"[dlc] headers from %s stopped answering after +%ld (chain at %ld) -- the next candidate takes over\n", live[i], added, tip_now);
+            if(tip_now > short_tip){ short_tip = tip_now; short_i = i; }
+            dlc_headers_rollback(hst, have);
+            continue;
+        }
         { long tip_now = hst_count(hst) - 1;
           if((added>0 || have>0) && dlc_chain_falls_short(tip_now, announced)){
             /* the bench took a stuck peer's stale branch, 4,500 blocks short of
@@ -6188,6 +6440,19 @@ typedef struct { char peer[64]; long chunks; long blocks; long guard; double las
                  /* 2026-09-08, for getpeerinfo: the handshake's facts (worker), the chunk in flight (worker), bytes on this peer (parent) */
                  unsigned proto; unsigned long long services; char subver[96]; int start_height; long long conn_time;
                  long cur_lo, cur_hi; long long bytes_peer;
+                 /* 2026-10-05: WHERE the worker is (dlc_phase_t) and since
+                  * when, written by the worker at every transition and read
+                  * by the parent for the eviction line -- run 35's holder
+                  * answered none of twelve evictions and the log could not
+                  * say whether it was dialing, shaking hands or fetching. */
+                 volatile int phase; volatile long long phase_ms;
+                 /* 2026-10-06: evictions (SIGUSR1) this worker has ACTED on --
+                  * the drop line, or the late acknowledgement. The parent
+                  * reads it before and after its signal: a second eviction
+                  * of the same holder for the same chunk is "unanswered" only
+                  * when this did not move (run 36: all 20 were answered and
+                  * the log said one was not). */
+                 volatile long evict_acks;
                  int kill_reason;          /* set by the parent before SIGUSR1: 0 dead weight, 1 stalling the window (2026-09-10) */
                  /* 2026-09-11: OCCUPANCY. The worker adds each chunk's blocked-in-read
                   * time and wall clock here; the parent prints the ratio. Measured from
@@ -6233,7 +6498,7 @@ typedef struct { char peer[64]; long chunks; long blocks; long guard; double las
 static int g_dl_wire_scope = 0;                    /* 1 inside dl_catchup; forked helpers inherit it */
 static volatile dlc_stat_t* g_dlc_me = NULL;       /* a helper's own stats slot; NULL in the parent */
 static long long dlc_now_ms(void);
-static void dlc_chunk_progress(void* arg){ (void)arg; alarm(DLC_CHUNK_BUDGET_SECS); if(g_dlc_me) g_dlc_me->last_block_ms = dlc_now_ms(); }
+static void dlc_chunk_progress(void* arg){ (void)arg; alarm((unsigned)g_dlc_budget_s); if(g_dlc_me) g_dlc_me->last_block_ms = dlc_now_ms(); }
 static int g_dlc_conn_fd = -1;                     /* the connection g_dlc_me publishes */
 static long long g_dlc_pend_sent, g_dlc_pend_recv, g_dlc_pend_spm[RPC_MSG_N], g_dlc_pend_rpm[RPC_MSG_N];
 /* The BOOT catch-up (bmc.bootcatchup=1, the default) runs before main()
@@ -6281,6 +6546,30 @@ static long long dlc_now_ms(void); static long dlc_proc_rchar(pid_t pid);   /* f
 static void dlc_fmt_rate(char* buf, size_t cap, double bytes_per_sec); /* fwd decls, defined below */
 static void dlc_fmt_bytes(char* buf, size_t cap, double bytes);
 
+/* the worker's phase, for the parent's eviction line (2026-10-05) */
+typedef enum { DLC_PH_START = 0, DLC_PH_WAIT_WINDOW, DLC_PH_HEADERS, DLC_PH_CONNECT, DLC_PH_HANDSHAKE,
+               DLC_PH_STAGE_OPEN, DLC_PH_FETCH, DLC_PH_PUBLISH, DLC_PH_BACKOFF, DLC_PH_DONE } dlc_phase_t;
+static const char* dlc_phase_name(int p){
+    static const char* n[] = { "starting", "waiting at the full window", "reading the chunk's headers", "connecting",
+                               "in the handshake", "opening the staging file", "fetching", "publishing the chunk",
+                               "backing off after a failed fetch", "done" };
+    return (p >= 0 && p < (int)(sizeof n / sizeof *n)) ? n[p] : "?";
+}
+#define DLC_PHASE(p) do{ mystat->phase=(p); mystat->phase_ms=dlc_now_ms(); g_dlc_phase_now=(p); }while(0)
+/* one line on a child's kernel state: /proc/<pid>/stat's state letter,
+ * wchan and the syscall number it is blocked in (readable by the parent:
+ * ptrace scope admits an ancestor). Best effort; "?" where unreadable. */
+static void dlc_proc_brief(pid_t pid, char* out, size_t cap){
+    char p[64], st = '?', wchan[64] = "?", sc[32] = "?";
+    snprintf(p, sizeof p, "/proc/%d/stat", (int)pid);
+    FILE* f = fopen(p, "r");
+    if(f){ char line[512]; if(fgets(line, sizeof line, f)){ char* rp = strrchr(line, ')'); if(rp && rp[1] == ' ' && rp[2]) st = rp[2]; } fclose(f); }
+    snprintf(p, sizeof p, "/proc/%d/wchan", (int)pid);
+    f = fopen(p, "r"); if(f){ if(fgets(wchan, sizeof wchan, f)){ wchan[strcspn(wchan, "\n")] = 0; if(!wchan[0]) strcpy(wchan, "0"); } fclose(f); }
+    snprintf(p, sizeof p, "/proc/%d/syscall", (int)pid);
+    f = fopen(p, "r"); if(f){ if(fgets(sc, sizeof sc, f)) sc[strcspn(sc, " \n")] = 0; fclose(f); }
+    snprintf(out, cap, "state=%c wchan=%s syscall=%s", st, wchan, sc);
+}
 static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                       int slot0, volatile long* next_claim, volatile long* done_count,
                       volatile dlc_stat_t* mystat, volatile int* claimed,
@@ -6331,6 +6620,13 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
     static unsigned char hst[64]; static unsigned char rec[112];
     int slot=slot0; long total=0; long stalled=0;
     int fd=-1; int held=-1;   /* index into live[]/claimed[] currently held, or -1 */
+    /* bmc.dlshape=core (2026-10-04): the lookahead. While chunk A is being
+     * fetched this worker also holds its NEXT claim, B, so the rolling fetch
+     * can keep 16 blocks in flight across the boundary (Core tops a peer up
+     * as each block lands). B becomes the next iteration's A. */
+    long la_lo=-1;
+    char hp2_[64]; snprintf(hp2_,sizeof hp2_,"dlc_hdr2_%d.dat",getpid());
+    static unsigned char hst2[64];
 #define DLC_RELEASE() do{ if(held>=0){ claimed[held]=0; held=-1; } }while(0)
     for(;;){
         stalled=0;                          /* per CHUNK: run 10's cascade was this counter surviving into the next chunk */
@@ -6340,19 +6636,14 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
          * the ring, and after DLC_WINDOW_HELP_SECS fetch the blocking chunk
          * ourselves rather than wait on a worker that may be gone. */
         int helping=0;
-        long lo=dlc_retry_pop(next_claim);
+        long lo=-1;
+        if(la_lo>=0){ lo=la_lo; la_lo=-1; }      /* Core mode: the lookahead claimed last time */
+        else lo=dlc_retry_pop(next_claim);
         if(lo<0){
             /* the committer's stalled cursor chunk, before anything new: one
              * helper (the CAS on HELPING), and not a chunk that is already
              * staged (the owner finished in the meantime) */
-            long want=next_claim[DLC_CTL_CURSOR_WANT];
-            if(want>=0 && !dlc_stage_exists(want)){
-                long cur=next_claim[DLC_CTL_HELPING];
-                if(cur!=want && __sync_bool_compare_and_swap(&next_claim[DLC_CTL_HELPING], cur, want)){
-                    lo=want; helping=1;
-                    __sync_fetch_and_add(&next_claim[DLC_CTL_N_CURSOR_HELP], 1L);
-                }
-            }
+            lo=dlc_take_cursor_want(next_claim, &helping);
         }
         if(lo<0){
             int waited_ticks=0;                 /* 200 ms each */
@@ -6372,7 +6663,15 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                  * through the retry ring, which this loop keeps checking. */
                 next_claim[DLC_CTL_WANT_ANCHOR]=1;   /* the parent rescans within 200 ms; our own reads must not touch our io counters */
                 lo=dlc_retry_pop(next_claim); if(lo>=0) break;
-                if(waited_ticks==0) __sync_fetch_and_add(&next_claim[DLC_CTL_N_WAIT], 1L);
+                /* 2026-10-05: the committer's cursor help was published to
+                 * DLC_CTL_CURSOR_WANT after 30 s with a third of the window
+                 * staged -- and nobody read it. The only reader was the claim
+                 * above, which a worker passes once per chunk; every worker
+                 * waiting HERE, at the full window, was exactly the one that
+                 * should have taken it. Runs 34 and 35: "cursorhelp 0" for the
+                 * whole run while 64 chunks sat staged above a 7-minute hole. */
+                lo=dlc_take_cursor_want(next_claim, &helping); if(lo>=0) break;
+                if(waited_ticks==0){ __sync_fetch_and_add(&next_claim[DLC_CTL_N_WAIT], 1L); DLC_PHASE(DLC_PH_WAIT_WINDOW); }
                 usleep(200000); waited_ticks++;
             }
             if(lo<0) lo=__sync_fetch_and_add(next_claim,g_dlc_chunk);
@@ -6381,6 +6680,7 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
         long hi=lo+g_dlc_chunk-1; if(hi>end_h) hi=end_h;
         if(dlc_chunk_all_present(lo,hi)) continue;
         mystat->cur_lo=lo; mystat->cur_hi=hi;                          /* getpeerinfo's inflight */
+        DLC_PHASE(DLC_PH_HEADERS);
 
         unlink(hp_);                       /* DMN-8: stale file from a crashed run */
         int hfd=open(hp_,O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW,0600);
@@ -6394,10 +6694,48 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
         }
         if(mf) fclose(mf);
         if(n<=0){ close(hfd); if(fd>=0) close(fd); DLC_RELEASE(); break; }
+        /* Core mode: claim the lookahead B -- a NEW chunk, only if the window
+         * allows it now (never wait for it: Core requests nothing past its
+         * window either), and its headers into hst2. A retried chunk is never
+         * a lookahead, so B is always above A and the stall rule, which keys
+         * on the chunk a worker is completing, still sees the oldest one. */
+        long bl=-1, bn=0; int hfd2=-1;
+        int rolling = g_dlc_core || lo < g_dlc_roll_below;   /* plan B9: the early chain rolls under bmc's rules too */
+        if(rolling){
+            long peek=next_claim[DLC_CTL_CLAIM], fh=next_claim[DLC_CTL_FIRST_HOLE];
+            long anchor=dlc_window_anchor(next_claim[DLC_CTL_APPLIED], fh);
+            if(peek<=end_h && dlc_window_allows(peek, anchor, g_dlc_window)){
+                bl=__sync_fetch_and_add(next_claim,g_dlc_chunk);
+                if(bl>end_h) bl=-1;
+            }
+            if(bl>=0){
+                long bh=bl+g_dlc_chunk-1; if(bh>end_h) bh=end_h;
+                unlink(hp2_);
+                hfd2=open(hp2_,O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW,0600);
+                if(hfd2>=0){
+                    unlink(hp2_);
+                    *(int*)((char*)hst2+0)=hfd2; *(long*)((char*)hst2+8)=0;
+                    FILE* mf2=fopen("headers.dat","rb");
+                    for(long k=bl;k<=bh;k++){
+                        if(mf2 && fseek(mf2,k*112,SEEK_SET)==0 && fread(rec,1,112,mf2)==112){ if(hst_append(hst2,rec,rec+80)<0) break; bn++; }
+                        else break;
+                    }
+                    if(mf2) fclose(mf2);
+                }
+                if(bn<=0){ if(hfd2>=0) close(hfd2); hfd2=-1; dlc_retry_push(next_claim, bl); bl=-1; bn=0; }   /* cannot stage it: give it back */
+            }
+        }
 
-        int guard=0, chunk_ok=0;
+        int guard=0, chunk_ok=0, delivered_elsewhere=0;
         for(;;){
             if(fd<0){
+                /* 2026-10-06: the stall rule rings this chunk at the first
+                 * eviction, so on a redial an idle worker may already have
+                 * delivered it (run 36: 680 ms, against this worker's 15-30 s
+                 * of dial + handshake + fetch on a fresh peer). Staged, or
+                 * committed: release it and claim the next. One access()
+                 * per dial. */
+                if(dlc_stage_exists(lo) || hi <= next_claim[DLC_CTL_COMMIT_TIP]){ delivered_elsewhere=1; break; }
                 int ok=0;
                 /* ONE linear scan per attempt (dlc_pick_peer): the
                  * highest-EMA unclaimed/unbanned peer when the parent has
@@ -6405,7 +6743,7 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                  * rotation. Losing a CAS race simply re-asks -- the peer the
                  * other worker won is now claimed and drops out of the scan. */
                 for(int q=0;q<nlive && !ok;q++){
-                    int idx=dlc_pick_peer(nlive, slot, ema, claimed, banned, mystat->pool_median_bps*DLC_ROTATE_FRACTION);
+                    int idx=dlc_pick_peer(nlive, slot, g_dlc_core ? NULL : ema, claimed, banned, mystat->pool_median_bps*DLC_ROTATE_FRACTION);   /* Core mode: no speed ranking, the (shuffled) rotation */
                     if(idx<0) break;
                     const char* cand=live[idx];
                     int cp2=0; unsigned ip=0; if(!dlc_parse_peer(cand, &ip, &cp2)) continue;
@@ -6420,10 +6758,13 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                       cp2 = cpc; }
                     if(peer_known_no_witness(cand)){ if(ema[idx]<=0.0) ema[idx]=1.0; claimed[idx]=0; slot=(idx+1)%nlive; continue; }   /* no witness bit: skip before the socket; and no longer "untried" to the picker */
                     dial_gate_wait();
+                    DLC_PHASE(DLC_PH_CONNECT);
                     int fdc=tcp_connect_ip(ip,(unsigned short)htons((unsigned short)cp2));
                     if(fdc<0){ if(ema[idx]<=0.0) ema[idx]=1.0; claimed[idx]=0; continue; }   /* tried, unreachable: the picker must not offer it as untried again */
                     dlc_wire_dial();                  /* the handshake's bytes belong to this connection, published once it succeeds */
-                    struct timeval tv; tv.tv_sec=20; tv.tv_usec=0; setsockopt(fdc,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
+                    /* Core mode: Core has no per-read timeout on a download
+                     * peer; its inactivity bound is 20 minutes (TIMEOUT_INTERVAL) */
+                    struct timeval tv; tv.tv_sec=g_dlc_core ? 1200 : 20; tv.tv_usec=0; setsockopt(fdc,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
                     /* 2026-09-06: a getdata is small and is the ONLY thing
                      * standing between this worker and the peer's reply, so
                      * Nagle can only delay it -- and p2p_write sends a message
@@ -6432,8 +6773,19 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                      * loopback fixture: ~45 ms per getdata without, ~5 ms
                      * with the peer ACKing immediately. */
                     { int one=1; setsockopt(fdc,IPPROTO_TCP,TCP_NODELAY,&one,sizeof one); }
-                    if(node_handshake(fdc)==1 && peer_has_witness(cand)){
+                    /* 2026-10-05: the parent's eviction (SIGUSR1) must END a
+                     * socket wait, not just set a flag: with no fd armed the
+                     * handler did nothing to a handshake read, and a peer
+                     * trickling its version bytes reset SO_RCVTIMEO on every
+                     * byte. Same arming as the relay legs (mux_budget_alarm
+                     * shuts the socket down; the read returns EOF). */
+                    DLC_PHASE(DLC_PH_HANDSHAKE);
+                    mux_budget_fd=fdc;
+                    int hs=node_handshake(fdc);
+                    mux_budget_fd=-1;
+                    if(hs==1 && peer_has_witness(cand)){
                         fd=fdc; ok=1; held=idx; slot=(idx+1)%nlive;
+                        ibd_pipeline_drop_carry();   /* a new socket may reuse an old fd number: nothing carried applies to it */
                         dlc_wire_adopt(fdc);    /* getpeerinfo's bytes are this connection's, handshake included */
                         mystat->held_idx=idx;   /* so the parent can ban THIS peer on early-kill */
                         strncpy((char*)mystat->peer,cand,63);
@@ -6486,10 +6838,24 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
             struct sigaction sa, old; memset(&sa,0,sizeof sa);
             sa.sa_handler=mux_budget_alarm; sigemptyset(&sa.sa_mask);
             sigaction(SIGALRM,&sa,&old);   /* SIGUSR1 already registered for this worker's whole life, above */
+            /* 2026-10-05: a drop that arrived while this worker was NOT
+             * fetching (dialing, in a handshake, reading headers) used to be
+             * reset here without a word -- the parent saw an eviction nobody
+             * answered. Say so, and count it as the worker's timeout: the
+             * peer it was meant for is already gone. */
+            if(mux_sync_budget_fired){
+                /* the phase is the one the handler saw, not this one: the
+                 * check sits after the handshake, so "the phase now" was
+                 * always "in the handshake" (run 36, 20 of 20 lines) */
+                fprintf(stderr,"[dlc w%d] the parent's %s arrived while this worker was %s, not fetching -- acknowledged late; continuing on %s for chunk [%ld,%ld]\n",
+                        w, mux_sync_budget_sig==SIGUSR1 ? "drop" : "alarm", dlc_phase_name((int)mux_budget_phase), mystat->peer, lo, hi);
+                mystat->timeouts++; mystat->kill_reason=0;
+                if(mux_sync_budget_sig==SIGUSR1) mystat->evict_acks++;
+            }
             mux_sync_budget_fired=0; mux_sync_budget_sig=0;
             ibd_pipeline_set_progress(dlc_chunk_progress, 0);   /* each arriving block re-arms this */
             ibd_pipeline_set_bytes(dlc_chunk_bytes);
-            alarm(DLC_CHUNK_BUDGET_SECS);
+            alarm((unsigned)g_dlc_budget_s);
             /* 2026-09-06: the whole chunk in ONE getdata, blocks placed by
              * hash as they arrive (daemon/ibd_pipeline.c). node_ibd_blocks_s
              * asked for one block and waited for it before asking for the
@@ -6507,14 +6873,23 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
 #endif
             /* 2026-09-08: the chunk goes to a staging file, not the archive;
              * the committer appends it in height order (see dlc_commit_chunk) */
+            DLC_PHASE(DLC_PH_STAGE_OPEN);
             char stmp[96]; int sfd=dlc_stage_open_tmp(stmp,sizeof stmp,lo);
             if(sfd<0){ fprintf(stderr,"[dlc w%d] stage: cannot create %s (%s)\n", w, stmp, strerror(errno)); close(fd); fd=-1; DLC_RELEASE(); break; }
             g_stage_fd=sfd; ibd_pipeline_set_sink(dlc_stage_sink);
-            long r=ibd_fetch_chunk_pipelined(fd, st, hst, lo, n, buf, (unsigned)sizeof buf, scratch, cap);
+            DLC_PHASE(DLC_PH_FETCH);
+            mux_budget_fd=fd;   /* 2026-10-05: the eviction and the stall alarm shut THIS socket down (see the handshake note above) */
+            long r = rolling
+                   ? ibd_fetch_chunk_rolling(fd, st, hst, lo, n, bl>=0 ? (void*)hst2 : NULL, bl, bn, DLC_CORE_INFLIGHT,
+                                             buf, (unsigned)sizeof buf, scratch, cap)
+                   : ibd_fetch_chunk_pipelined(fd, st, hst, lo, n, buf, (unsigned)sizeof buf, scratch, cap);
+            mux_budget_fd=-1;
+            if(r<0 || mux_sync_budget_fired) ibd_pipeline_drop_carry();   /* the socket is about to close */
             mystat->wait_ms += ibd_pipeline_last_wait_ms();
             mystat->wall_ms += ibd_pipeline_last_wall_ms();
             alarm(0); sigaction(SIGALRM,&old,NULL);
             close(sfd); g_stage_fd=-1;
+            DLC_PHASE(DLC_PH_PUBLISH);
             if(r>=0 && !mux_sync_budget_fired){
                 char sfin[64]; dlc_stage_path(sfin,sizeof sfin,lo);
                 if(hi <= next_claim[DLC_CTL_COMMIT_TIP]) unlink(stmp);          /* a helper delivered it first: already committed, nothing to publish */
@@ -6531,12 +6906,23 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                  * clock (SIGALRM: no block for DLC_CHUNK_BUDGET_SECS). Before
                  * 2026-09-07 both printed "dead weight", and 429 of 432 such
                  * lines in one run were the alarm, not the verdict. */
-                fprintf(stderr,"[dlc w%d] %s %s (last measured %s, completed %ld chunk(s)/%ld block(s) on this peer); dropping for a fresh peer\n",
+                fprintf(stderr,"[dlc w%d] %s %s%s (last measured %s, completed %ld chunk(s)/%ld block(s) on this peer); dropping for a fresh peer\n",
                         w, mystat->peer,
                         mux_sync_budget_sig==SIGUSR1 ? (mystat->kill_reason==1 ? "stalling the window (held its oldest missing chunk while it was full)" : "dead weight")
-                                                     : "stalled: no block for " DLC_STR(DLC_CHUNK_BUDGET_SECS) "s",
+                                                     : "stalled: no block for ",
+                        mux_sync_budget_sig==SIGUSR1 ? "" : (g_dlc_budget_s==DLC_CHUNK_BUDGET_SECS ? "120s" : "Core's block download timeout"),
                         lastbw, mystat->chunks, mystat->blocks);
+                if(mux_sync_budget_sig==SIGUSR1) mystat->evict_acks++;
                 mystat->kill_reason=0;
+                /* 2026-10-06: the signal is consumed HERE. Left set, the
+                 * next pass's pre-fetch check read it as a drop that had
+                 * arrived during the new handshake and printed a false
+                 * "acknowledged late" after every drop line in run 36 (20
+                 * of 20), counting each eviction twice. A signal landing in
+                 * the microseconds between the fetch's return and this
+                 * clear is lost, and loses nothing: the socket is closing
+                 * and the parent's second eviction rings the chunk. */
+                mux_sync_budget_fired=0; mux_sync_budget_sig=0;
                 close(fd); fd=-1; DLC_RELEASE();
                 slot=(slot+1)%(nlive>0?nlive:1);
                 if(guard>400){ fprintf(stderr,"[dlc w%d] reconnect budget [%ld,%ld]\n",w,lo,hi); break; }
@@ -6557,8 +6943,15 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                 long chunk_r1 = dlc_proc_rchar(getpid());
 #endif
                 double chunk_bps = (secs >= 2.0 && chunk_r0 >= 0 && chunk_r1 >= chunk_r0) ? (double)(chunk_r1 - chunk_r0) / secs : -1.0;
+                /* bmc.benchlog (2026-10-04): one line per completed chunk --
+                 * wall, the wait before first bytes, bytes, and the most
+                 * blocks in flight (16 under bmc.dlshape=core; the whole
+                 * chunk under bmc's own shape) */
+                dlc_benchlog_chunk(w, (const char*)mystat->peer, lo, n, ibd_pipeline_last_wall_ms(), ibd_pipeline_last_wait_ms(),
+                                   (chunk_r0 >= 0 && chunk_r1 >= chunk_r0) ? chunk_r1 - chunk_r0 : 0,
+                                   rolling ? (int)ibd_pipeline_max_inflight() : (int)n);
                 double med = mystat->pool_median_bps;
-                if(dlc_rotate_after_chunk(chunk_bps, med) && dlc_replace_allowed((int)next_claim[DLC_CTL_FREE_PEERS])){   /* 2026-09-10: no free peer, no rotation -- the window's tail judges */
+                if(!g_dlc_core && dlc_rotate_after_chunk(chunk_bps, med) && dlc_replace_allowed((int)next_claim[DLC_CTL_FREE_PEERS])){   /* Core rotates nobody for speed */   /* 2026-09-10: no free peer, no rotation -- the window's tail judges */
                     __sync_fetch_and_add(&next_claim[DLC_CTL_N_ROTATE], 1L);   /* counted on the tick line; nothing is discarded, so no line per event */
                     /* hand the verdict's number to the picker: the parent's
                      * tick-EMA lags (alpha 0.5 over 10 s ticks), and a peer
@@ -6582,13 +6975,18 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
             close(fd); fd=-1; DLC_RELEASE();
             slot=(slot+1)%(nlive>0?nlive:1);
             if(guard>400){ fprintf(stderr,"[dlc w%d] reconnect budget [%ld,%ld]\n",w,lo,hi); break; }
+            DLC_PHASE(DLC_PH_BACKOFF);
             usleep((useconds_t)(dlc_fail_backoff_ms(guard)*1000));   /* do not hammer the pool: 12 reconnects/s was run 14's stall */
         }
         close(hfd);
+        if(hfd2>=0) close(hfd2);
+        if(bl>=0) la_lo=bl;                     /* Core mode: B is ours; it is the next A, whatever happened to this one */
         if(helping) __sync_bool_compare_and_swap(&next_claim[DLC_CTL_HELPING], lo, -1L);   /* the help is over, whichever way */
         if(chunk_ok){
             total+=n; __sync_fetch_and_add(done_count,n);
             mystat->chunks++; mystat->blocks+=n; mystat->guard+=guard;
+        } else if(delivered_elsewhere){
+            fprintf(stderr,"[dlc w%d] chunk [%ld,%ld] was delivered by another worker while this one redialed (attempt %d): released\n", w, lo, hi, guard);
         } else {
             int q=dlc_retry_push(next_claim, lo);
             __sync_fetch_and_add(&next_claim[DLC_CTL_N_ABANDON], 1L);
@@ -6658,22 +7056,31 @@ static int dlc_probe_round(char pool[][DL_POOL_SLOT], int from, int ntry,
      * not cause the bug, it made it obvious: losing 23 per round is quiet,
      * losing 191 is not. */
     if(nf>0){
-        long long pr_end;
+        long long pr_end, last_ready;
         { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
-          pr_end = ts.tv_sec*1000LL + ts.tv_nsec/1000000LL + wait_ms; }
+          pr_end = ts.tv_sec*1000LL + ts.tv_nsec/1000000LL + wait_ms; last_ready = pr_end - wait_ms; }
+        int nready = 0;
         for(;;){
             long long pr_now;
             { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
               pr_now = ts.tv_sec*1000LL + ts.tv_nsec/1000000LL; }
             int left = (int)(pr_end - pr_now);
             if(left <= 0) break;
+            /* 2026-10-06 (plan B9): a connect that has not completed within
+             * DLC_PROBE_QUIET_MS of the last one that did is a dropped SYN
+             * waiting on the kernel's retransmit clock, not a slow peer;
+             * run 38's single round sat out its whole 8 s for 20 of 161.
+             * Once DLC_PROBE_QUIET_MIN have answered, the round ends after
+             * that much quiet. */
+            if(nready >= DLC_PROBE_QUIET_MIN){ int q = (int)(last_ready + DLC_PROBE_QUIET_MS - pr_now); if(q <= 0) break; if(q < left) left = q; }
             int r = poll(pol,nf,left);
-            if(r <= 0) break;
+            if(r < 0) break;
+            if(r == 0){ if(nready >= DLC_PROBE_QUIET_MIN) break; continue; }
             int pending = 0;
             for(int j=0;j<nf;j++){
                 if(pol[j].fd < 0) continue;
                 if(pol[j].revents & (POLLOUT|POLLERR|POLLHUP)){
-                    if(pol[j].revents & POLLOUT) prdy[j] = 1;
+                    if(pol[j].revents & POLLOUT){ prdy[j] = 1; nready++; last_ready = pr_now; }
                     pol[j].fd = -pol[j].fd;      /* poll() skips negative fds */
                 } else pending++;
                 pol[j].revents = 0;
@@ -6850,12 +7257,22 @@ static void dlc_stop_workers_for_reject(long h){
  * 2,000 headers after genesis -- ~162 KB from any synced peer -- timed from
  * request to reply; the pool is then sorted fastest-first, so the worker
  * slots start on the best peers instead of finding them by elimination.
- * Forked probes, 32 at a time, each under its own alarm(), writing into a
- * shared page: the same shape dlc_worker uses, and nothing the parent does
- * can hang on a silent peer. A peer that does not answer ranks last, which
- * is where a peer that does not answer belongs. */
-#define RANK_BATCH 32
-#define RANK_TIMEOUT_S 10
+ * Forked probes, each under its own alarm(), writing into a shared page:
+ * the same shape dlc_worker uses, and nothing the parent does can hang on
+ * a silent peer. A peer that does not answer ranks last, which is where a
+ * peer that does not answer belongs.
+ *
+ * 2026-10-06 (plan B9): the probes ran 32 to a batch and every batch
+ * waited for its slowest member -- with 49 of 141 peers silent, nearly
+ * every batch sat out the 10 s alarm, and run 38 spent 48.8 s ranking
+ * before the first header page was asked for (Core's first block arrived
+ * at 1:15; ours at 1:39, with 37 s of header download still to come after
+ * the ranking). Now up to RANK_CONC probes are in flight at once, each
+ * reaped as it finishes, so the ranking takes about one silent peer's
+ * timeout however many there are. A synced peer answers the 162 KB page
+ * in under 3 s at the slowest rate seen (53 KB/s), so the alarm is 6 s. */
+#define RANK_CONC 128
+#define RANK_TIMEOUT_S 6
 static void dlc_rank_by_throughput(char live[][DL_POOL_SLOT], int nlive){
     if (nlive < 2) return;
     double* rate = mmap(NULL, sizeof(double) * (size_t)nlive, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
@@ -6865,13 +7282,14 @@ static void dlc_rank_by_throughput(char live[][DL_POOL_SLOT], int nlive){
     for (int i = 0; i < nlive; i++){ rate[i] = -1.0; ann[i] = 0; }
     unsigned char stop[32]; memset(stop, 0, 32);
     struct timespec t_all0; clock_gettime(CLOCK_MONOTONIC, &t_all0);
-    for (int base = 0; base < nlive; base += RANK_BATCH){
-        int n = nlive - base; if (n > RANK_BATCH) n = RANK_BATCH;
-        pid_t kids[RANK_BATCH];
-        for (int k = 0; k < n; k++){
-            int i = base + k;
+    static pid_t     kids[DLC_MAXPOOL];
+    static long long kid_t0[DLC_MAXPOOL];
+    int launched = 0, inflight = 0, done = 0;
+    while (done < nlive){
+        while (launched < nlive && inflight < RANK_CONC){
+            int i = launched++;
             pid_t pid = fork();
-            if (pid < 0){ kids[k] = 0; continue; }
+            if (pid < 0){ kids[i] = 0; done++; continue; }
             if (pid == 0){
                 alarm(RANK_TIMEOUT_S);                          /* nothing below may outlive this */
                 int pport = 0; unsigned ip = pool_ipv4(live[i], &pport);
@@ -6899,12 +7317,19 @@ static void dlc_rank_by_throughput(char live[][DL_POOL_SLOT], int nlive){
                 if (bytes > 0 && secs > 0.0) rate[i] = (double)bytes / secs;
                 close(fd); _exit(0);
             }
-            kids[k] = pid;
+            kids[i] = pid; kid_t0[i] = dlc_now_ms(); inflight++;
         }
-        /* bounded: in the worker (SIGCHLD SIG_IGN) a blocking waitpid would
-         * also wait out every long-lived child -- see dl_reap_bounded */
-        for (int k = 0; k < n; k++) if (kids[k] > 0){ int st;
-            if (!dl_reap_bounded(kids[k], &st, (RANK_TIMEOUT_S + 2) * 1000L)) dl_kill_reap(kids[k], &st, "rank probe"); }
+        /* reap whatever has finished (WNOHANG: in the worker, SIGCHLD is
+         * SIG_IGN and a blocking waitpid would also wait out every long-lived
+         * child -- see dl_reap_bounded); a probe its alarm somehow did not
+         * end is killed two seconds past it */
+        int any = 0;
+        for (int i = 0; i < launched; i++) if (kids[i] > 0){
+            int st; pid_t r = waitpid(kids[i], &st, WNOHANG);
+            if (r == kids[i] || (r < 0 && errno != EINTR)){ kids[i] = 0; inflight--; done++; any = 1; continue; }
+            if (dlc_now_ms() - kid_t0[i] > (RANK_TIMEOUT_S + 2) * 1000L){ dl_kill_reap(kids[i], &st, "rank probe"); kids[i] = 0; inflight--; done++; any = 1; }
+        }
+        if (!any && done < nlive){ struct timespec ts = {0, 10000000L}; nanosleep(&ts, NULL); }
     }
     /* sort fastest first; a peer with no sample ranks last, ties keep order */
     static int idx[DLC_MAXPOOL]; for (int i = 0; i < nlive; i++) idx[i] = i;
@@ -7055,7 +7480,7 @@ static long leg_pass_poll(int* stored_leg, const char* srcpool[], int nsrc, int 
                 { int st; dl_kill_reap(g_pass[i].pid, &st, "pass helper"); } close(g_pass[i].fd); g_pass[i].pid = 0;
                 g_pass_crashed++;
                 leg_close_ours(i, "sync-budget", "the pass helper overran its budget and was killed");
-                mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i] = dh_now_ms() + REDIAL_BACKOFF_MS;
+                mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i] = dh_now_ms() + redial_gap_ms();
             }
             continue;
         }
@@ -7070,19 +7495,19 @@ static long leg_pass_poll(int* stored_leg, const char* srcpool[], int nsrc, int 
             if(WIFSIGNALED(st)) snprintf(d, sizeof d, "the pass helper died on signal %d without a report", WTERMSIG(st));
             else snprintf(d, sizeof d, "the pass helper ended (exit %d) without a report", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
             leg_close_ours(i, "pass-crashed", d);
-            mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i] = dh_now_ms() + REDIAL_BACKOFF_MS;
+            mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i] = dh_now_ms() + redial_gap_ms();
             continue;
         }
         if(r.budget_fired){
             char d[80]; snprintf(d, sizeof d, "the pass exceeded %us%s (where=%d)", g_pass[i].budget_s, g_pass[i].budget_s > (unsigned)DL_BUDGET_SECS ? ", the only-leg budget" : "", r.fail_code);
             leg_close_ours(i, "sync-budget", d);
-            mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i] = dh_now_ms() + REDIAL_BACKOFF_MS;
+            mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i] = dh_now_ms() + redial_gap_ms();
             continue;
         }
         inflight_release_leg(&g_inflight, i);            /* the announced block's claim, if this pass carried one */
         long n = leg_pass_finish(i, &r, blob, got);
         if(n > 0){ stored += n; if(stored_leg) *stored_leg = i; }
-        else if(mux_out_fd[i] < 0){ mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i] = dh_now_ms() + REDIAL_BACKOFF_MS; }   /* the bookkeeping closed it */
+        else if(mux_out_fd[i] < 0){ mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i] = dh_now_ms() + redial_gap_ms(); }   /* the bookkeeping closed it */
     }
     return stored;
 }
@@ -7293,15 +7718,17 @@ static void dlc_stall_tick(volatile long* ctl, volatile dlc_stat_t* stats, pid_t
                            long start_h, long end_h, long long now_ms,
                            char live[][DL_POOL_SLOT], int nlive, volatile int* banned){
     static long tail = -1; static long long since = 0; static int holder = -1;
+    static int last_w = -1; static long last_lo = -1, ringed_lo = -1;   /* the previous eviction (holder, chunk) and the chunk already ringed */
+    static long last_acks = 0;   /* the holder's evict_acks BEFORE the previous signal: moved since = it answered */
     long fh = ctl[DLC_CTL_FIRST_HOLE];
-    if(fh > end_h){ tail = -1; holder = -1; return; }
+    if(fh > end_h){ tail = -1; holder = -1; last_w = -1; last_lo = -1; return; }
     long lo = dlc_help_chunk_lo(fh, start_h);
     long anchor = dlc_window_anchor(ctl[DLC_CTL_APPLIED], fh);
     long claim = ctl[DLC_CTL_CLAIM];
     int full = claim <= end_h && !dlc_window_allows(claim, anchor, g_dlc_window);
     if(lo != tail){                                            /* the tail moved: the timeout eases (Core: on a block received) */
         if(tail >= 0) g_dlc_stall_timeout_s = dlc_stall_timeout_after(g_dlc_stall_timeout_s, 0);
-        tail = lo; holder = -1; since = now_ms;
+        tail = lo; holder = -1; since = now_ms; last_w = -1; last_lo = -1;
     }
     if(!full || dlc_stage_exists(lo)){ holder = -1; since = now_ms; return; }   /* not a stall: room to request, or the chunk is already here */
     int w = -1; for(int i = 0; i < nw; i++) if(kids[i] && stats[i].cur_lo == lo){ w = i; break; }
@@ -7310,6 +7737,7 @@ static void dlc_stall_tick(volatile long* ctl, volatile dlc_stat_t* stats, pid_t
     since = dlc_stall_clock(since, stats[w].last_block_ms);  /* ...and every block it delivers restarts it (Core) */
     if(!dlc_tail_stalled(full, (long)(now_ms - since), g_dlc_stall_timeout_s)) return;
     stats[w].kill_reason = 1;
+    long acks_before = stats[w].evict_acks;   /* read BEFORE the signal: the worker answers within a millisecond */
     kill(opid[w], SIGUSR1);
     __sync_fetch_and_add(&ctl[DLC_CTL_N_STALL], 1L);
     /* 2026-09-10 (run 20): this eviction was MEMORYLESS. dlc_pick_peer could
@@ -7324,7 +7752,8 @@ static void dlc_stall_tick(volatile long* ctl, volatile dlc_stat_t* stats, pid_t
     const char* verdict = "kept (no pool)";
     long bidx = stats[w].held_idx;
     if(banned && live && bidx >= 0 && bidx < nlive){
-        if(node_config_is_manual(live[bidx]))      verdict = "manual, kept selectable";
+        if(g_dlc_core)                             verdict = "disconnected, not banned (Core)";   /* Core: fDisconnect only, no Misbehaving */
+        else if(node_config_is_manual(live[bidx])) verdict = "manual, kept selectable";
         else if(banned[bidx])                      verdict = "already banned";
         else {
             int usable = 0; for(int q = 0; q < nlive; q++) if(!banned[q]) usable++;
@@ -7332,11 +7761,58 @@ static void dlc_stall_tick(volatile long* ctl, volatile dlc_stat_t* stats, pid_t
             else                                   verdict = "at the usable floor, kept selectable";
         }
     }
-    fprintf(stderr,"[dlc] w%d %s is stalling the window: chunk [%ld,%ld] is the oldest missing and the window (%ld above %ld) is full -- dropped after %ld s (next timeout %ld s; peer %s)\n",
+    char pb[160]; dlc_proc_brief(opid[w], pb, sizeof pb);
+    fprintf(stderr,"[dlc] w%d %s is stalling the window: chunk [%ld,%ld] is the oldest missing and the window (%ld above %ld) is full -- dropped after %ld s (next timeout %ld s; peer %s) | holder %s for %ld s, %s\n",
             w, stats[w].peer[0] ? (const char*)stats[w].peer : "(connecting)", lo, lo + g_dlc_chunk - 1, g_dlc_window, anchor,
-            (long)((now_ms - since) / 1000), dlc_stall_timeout_after(g_dlc_stall_timeout_s, 1), verdict);
+            (long)((now_ms - since) / 1000), dlc_stall_timeout_after(g_dlc_stall_timeout_s, 1), verdict,
+            dlc_phase_name(stats[w].phase), (long)((now_ms - stats[w].phase_ms) / 1000), pb);
     g_dlc_stall_timeout_s = dlc_stall_timeout_after(g_dlc_stall_timeout_s, 1);
     holder = -1; since = now_ms;
+    /* 2026-10-05: THE EVICTION IS A SIGNAL, AND A SIGNAL CAN GO UNANSWERED.
+     * Run 34 (Core's rules) lost 4 x ~20 min and run 35 lost 7 min to one
+     * shape: the holder of the tail chunk was "dropped" every timeout --
+     * 2, 4, 8, ... 64, 64, 64 s -- and never printed its drop line, never
+     * released the chunk, never moved; the nine other workers sat at the
+     * full window polling an empty retry ring, 64 chunks staged above the
+     * hole, the applier idle. Core's rule has no such gap: the staller is
+     * disconnected and its blocks are re-requested from another peer at
+     * once. So the SECOND eviction of the same holder for the same chunk --
+     * the proof the first was not acted on -- puts the chunk on the retry
+     * ring itself, once; the next idle worker fetches it within 200 ms.
+     * If the stuck worker later delivers too, the committer's "already
+     * committed" and "already staged" paths discard the duplicate.
+     *
+     * 2026-10-06 (run 36): the second eviction has two causes and the
+     * line must name the right one. The holder ANSWERED the first (its
+     * evict_acks moved) and its fresh peer stalled too -- the chunk is
+     * reassigned to the ring as well (Core re-requests at once), counted
+     * as such; or the holder did not answer -- the run-35 shape, counted
+     * as unanswered. Run 36 had one of the first and none of the second,
+     * and the log called it "did not answer" with the ack a line above.
+     *
+     * 2026-10-06 (run 36, 2 h): every one of 20 evictions was answered
+     * within a millisecond, and the window still sat 15-30 s on each --
+     * the evicted worker redials, shakes hands and fetches the chunk
+     * itself while nine workers wait at the full window with the applier
+     * at zero lag; the one chunk the ring did get was fetched by an idle
+     * worker in 680 ms. So the FIRST eviction rings the chunk, as Core
+     * re-requests a disconnected staller's blocks at once; the evicted
+     * worker releases the chunk when it finds it delivered on its redial
+     * (dlc_worker), and the second eviction keeps only its diagnosis:
+     * answered (reassigned) or not (the run-35 shape, unanswered). */
+    if(ringed_lo != lo && dlc_retry_push(ctl, lo)){
+        ringed_lo = lo;
+        __sync_fetch_and_add(&ctl[DLC_CTL_N_REASSIGNED], 1L);
+        fprintf(stderr,"[dlc] chunk [%ld,%ld] goes to the retry ring for an idle worker as well (Core: a staller's blocks are re-requested at once)\n",
+                lo, lo + g_dlc_chunk - 1);
+    }
+    if(last_w == w && last_lo == lo){
+        if(stats[w].evict_acks <= last_acks){
+            __sync_fetch_and_add(&ctl[DLC_CTL_N_UNANSWERED], 1L);
+            fprintf(stderr,"[dlc] w%d did not answer the eviction (still holds chunk [%ld,%ld]; it is on the retry ring since the first)\n",
+                    w, lo, lo + g_dlc_chunk - 1);
+        }
+    } else { last_w = w; last_lo = lo; last_acks = acks_before; }
 }
 /* the window's anchor: the connected tip + 1 when the engine is in this process */
 static void dlc_publish_applied(volatile long* ctl){
@@ -7397,6 +7873,7 @@ static long dl_catchup_run(const char* dir, int min_workers){
     if(!ab){ fprintf(stderr,"[dlc] address book unavailable\n"); return 0; }
     long disc=dl_bootstrap(ab, (const char**)g_seed_hosts, g_n_seed_hosts);
     fprintf(stderr,"[dlc] discovered +%ld peers (book now %ld)\n", disc, (long)ab2_count(ab));
+    ixw_catchup_start();                              /* 2026-10-06 (plan B4): the index writers run in a worker for the catch-up */
 
     static char pool[DLC_MAXPOOL][DL_POOL_SLOT];
     static double good_ema[DLC_MAXPOOL];
@@ -7496,7 +7973,18 @@ static long dl_catchup_run(const char* dir, int min_workers){
         }
     }
     if(nlive<=0){ fprintf(stderr,"[dlc] no live peers; skipping catch-up\n"); return 0; }
-    dlc_rank_by_throughput(live, nlive);      /* fastest first: the workers claim from the top */
+    if(g_cfg.dl_shape_core){
+        /* Core mode: no speed ranking. Core's replacement for a download
+         * peer is a random addrman pick (net.cpp:2797-2878); a shuffle of the
+         * live pool gives the workers' rotation the same no-preference order. */
+        unsigned seed = (unsigned)time(NULL) ^ (unsigned)getpid();
+        for(int i = nlive - 1; i > 0; i--){
+            int j = (int)(rand_r(&seed) % (unsigned)(i + 1));
+            char tmp[DL_POOL_SLOT]; memcpy(tmp, live[i], DL_POOL_SLOT); memcpy(live[i], live[j], DL_POOL_SLOT); memcpy(live[j], tmp, DL_POOL_SLOT);
+        }
+        fprintf(stderr, "[dlc] Core's download rules (bmc.dlshape=core): %d live peer(s) in random order, no speed ranking\n", nlive);
+    }
+    else dlc_rank_by_throughput(live, nlive);      /* fastest first: the workers claim from the top */
     /* Core's shape (2026-09-10): every live peer downloads, up to the cap
      * (bmc.catchupworkers, default 64) -- a fixed 16 against 124 live peers
      * carried 11 MB/s on a 2.5 Gbit link, the sum of 16 peers at 250-600
@@ -7518,6 +8006,12 @@ static long dl_catchup_run(const char* dir, int min_workers){
     int nw = dlc_workers_for(nlive, min_workers, end_h - start_h + 1, g_dlc_chunk);   /* a handoff's few dozen blocks do not need 64 helpers (row 3) */
     g_dlc_window = dlc_window_blocks(nw, g_dlc_chunk);
     g_dlc_stall_timeout_s = DLC_STALL_TIMEOUT_MIN_S;
+    g_dlc_core = g_cfg.dl_shape_core;
+    g_dlc_roll_below = g_cfg.dlc_roll_below;
+    g_dlc_budget_s = g_dlc_core ? dlc_core_block_timeout_s(nw) : DLC_CHUNK_BUDGET_SECS;
+    if(g_dlc_core)
+        fprintf(stderr,"[dlc] Core's download rules: %d blocks in flight per peer topped up as each lands, across chunks; stallers disconnected, never banned; no rate floor or rotation; block download timeout %ld s\n",
+                DLC_CORE_INFLIGHT, g_dlc_budget_s);
     fprintf(stderr,"[dlc] Core's shape: %d of %d live peer(s) download at once (cap %d, span %ld), %ld-block requests, window %ld blocks above the connected tip, stall timeout %ld s, cursor help at %ld staged\n",
             nw, nlive, min_workers, end_h - start_h + 1, g_dlc_chunk, g_dlc_window, g_dlc_stall_timeout_s,
             dlc_cursor_help_min_staged(g_dlc_window, g_dlc_chunk));
@@ -7568,7 +8062,7 @@ static long dl_catchup_run(const char* dir, int min_workers){
      * dedup here would misalign the indexes), so the first `ngood` pool
      * entries after the addnode block are exactly the loaded ones; every
      * other live entry stays 0 == rotation until measured. */
-    if(ngood>0){
+    if(ngood>0 && !g_dlc_core){   /* Core mode: no speed memory */
         int seed=0;
         for(int i=0;i<nlive;i++){
             for(int j=0;j<ngood;j++){
@@ -7727,12 +8221,11 @@ static long dl_catchup_run(const char* dir, int min_workers){
         {
             long cur_tip, present;
             dlc_scan_progress(&cur_tip, &present);
-            long holes = cur_tip>=0 ? (cur_tip+1-present) : 0;
             /* "holes" was the wrong word (2026-09-07): with 16 workers on
              * 40-block chunks a few hundred heights are always claimed and
              * not yet landed -- that is the download's work in progress,
              * bounded by the window, not blocks nobody will fetch. The
-             * line now says "in flight", and separately how long the
+             * line says "in flight", and separately how long the
              * OLDEST gap has been the first hole: a gap that outlives the
              * window's help timeout many times over is the one to read
              * about, and it is printed as STRANDED. */
@@ -7768,8 +8261,18 @@ static long dl_catchup_run(const char* dir, int min_workers){
                 long lag = prefix - applied; if(lag < 0) lag = 0;
                 snprintf(connbuf,sizeof connbuf," | applied=%ld lag=%ld%s", applied, lag, interleave ? "" : " (interleave off)");
             } else snprintf(connbuf,sizeof connbuf," | connect deferred (no UTXO engine in this process)");
+            /* in flight = heights the workers have CLAIMED above the stored
+             * frontier, less the chunks parked in the retry ring (claimed,
+             * held by nobody). It used to be the holes below the tip, which
+             * the in-order committer (2026-09-08) keeps at zero by
+             * construction: every run since, 33 and 34 included, printed
+             * "in flight 0" for seven hours (2026-10-05). */
+            long inflight = 0;
+            { long claimed = next_claim[DLC_CTL_CLAIM];
+              long retry = next_claim[DLC_CTL_RETRY_HEAD] - next_claim[DLC_CTL_RETRY_TAIL]; if(retry < 0) retry = 0;
+              inflight = claimed - present - retry * g_dlc_chunk; if(inflight < 0) inflight = 0; }
             fprintf(stderr,"[dlc] == elapsed %s | eta %s | overall: %ld/%ld stored (%.2f%% of real tip) | in flight %ld of window %ld through %ld (%s, %.2f%% landed)%s ==\n",
-                    elapsed, etabuf, present, end_h+1, overall_pct, holes, g_dlc_window, cur_tip, gapbuf, span_pct, connbuf);
+                    elapsed, etabuf, present, end_h+1, overall_pct, inflight, g_dlc_window, cur_tip, gapbuf, span_pct, connbuf);
         }
         /* 2026-09-08: the tick's seven dashed lines became ONE, printed at the
          * end of the tick when every number exists (recv, write, floor,
@@ -7870,7 +8373,7 @@ static long dl_catchup_run(const char* dir, int min_workers){
             }
             char flag[48]="";
             if(kids[w]!=0 && byte_rate>=0.0){
-                if(median_bps > 0.0 && dlc_replace_allowed(free_peers) && dlc_dead_weight(byte_rate, b-prev_blocks[w], floor_bps)){
+                if(!g_dlc_core && median_bps > 0.0 && dlc_replace_allowed(free_peers) && dlc_dead_weight(byte_rate, b-prev_blocks[w], floor_bps)){   /* Core has no rate floor */
                     dead_ticks[w]++;
                     if(dead_ticks[w]>=g_cfg.dead_weight_ticks){
                         long bidx = stats[w].held_idx;
@@ -7971,10 +8474,10 @@ static long dl_catchup_run(const char* dir, int min_workers){
               static int last_nowit = 0; int nw_now = peer_no_witness_count();
               if(nw_now != last_nowit){ last_nowit = nw_now;              /* only when the count changes */
                   fprintf(stderr,"[dlc] -- %d peer(s) dropped for lacking NODE_WITNESS; %llu redial(s) skipped since --\n", nw_now, peer_no_witness_skips()); } }
-            fprintf(stderr,"[dlc] -- recv %s (avg %s)%s | write %s (avg %s) | floor %.1f KB/s (median %.1f) | banned %ld/%d%s | free peers %d | staged %ld commit %ld cursorhelp %ld | stall evictions %ld (timeout %ld s) | events %ld rot %ld wait %ld help %ld fail %ld abandon (run %ld/%ld/%ld/%ld/%ld) --\n",
+            fprintf(stderr,"[dlc] -- recv %s (avg %s)%s | write %s (avg %s) | floor %.1f KB/s (median %.1f) | banned %ld/%d%s | free peers %d | staged %ld commit %ld cursorhelp %ld | stall evictions %ld (timeout %ld s, %ld unanswered, %ld reassigned) | events %ld rot %ld wait %ld help %ld fail %ld abandon (run %ld/%ld/%ld/%ld/%ld) --\n",
                     aggbuf, avgrbuf, idlepool, waggbuf, avgwbuf, floor_bps/1024.0, median_bps/1024.0, cur, nlive,
                     nbanned == cur ? "" : " (amnesty active)", free_peers, next_claim[DLC_CTL_STAGED], next_claim[DLC_CTL_N_COMMIT], next_claim[DLC_CTL_N_CURSOR_HELP],
-                    next_claim[DLC_CTL_N_STALL], g_dlc_stall_timeout_s, d_ro, d_wa, d_he, d_fa, d_ab, t_ro, t_wa, t_he, t_fa, t_ab);
+                    next_claim[DLC_CTL_N_STALL], g_dlc_stall_timeout_s, next_claim[DLC_CTL_N_UNANSWERED], next_claim[DLC_CTL_N_REASSIGNED], d_ro, d_wa, d_he, d_fa, d_ab, t_ro, t_wa, t_he, t_fa, t_ab);
         }
     }
     dlc_drain_committer(next_claim);            /* a no-op when the loop's last reap already drained it */
@@ -7989,6 +8492,7 @@ static long dl_catchup_run(const char* dir, int min_workers){
         long done = utxo_live_catchup_bounded(store_buf, g_dlc_connect_budget_ms, 1);
         if(done > 0){ conn_total += done; dl_new_block_choke(); }
     }
+    ixw_catchup_stop("the download is over: the tip's blocks are indexed inline");   /* drains the ring first; the writers re-read their state */
     if(interleave) fprintf(stderr,"[dlc] connected %ld block(s) during the download; connected tip %ld (the rotation drains the rest)\n",
                            conn_total, utxo_live_applied_height());
     long total=*done_count;
@@ -8108,6 +8612,9 @@ static int txsub_worker_ready(void){
     return 1;
 }
 
+static int txsub_package_accept(const unsigned char* const* txs, const unsigned long* lens,
+                                const unsigned char* txids, const unsigned long long* vsz, int n,
+                                char* msg, unsigned long mcap);   /* Core AcceptPackage, below */
 /* ==== submitpackage: validate a package, then commit it =====================
  * Core's shape, reduced to what this node can honestly do.
  *
@@ -8176,6 +8683,7 @@ static int txsub_package(char* msg, unsigned long mcap){
       if (p != end){ snprintf(msg, mcap, "package-contains-unparseable-transaction"); return 0; } }
 
     st->pkg_replaced_n = 0;
+    st->pkg_msg_full[0] = 0;
     const int test_only = st->tx_submit_test ? 1 : 0;
     const char* why = "";
     static unsigned long long vsz[RPC_PKG_MAX];
@@ -8185,10 +8693,14 @@ static int txsub_package(char* msg, unsigned long mcap){
          * package was rejected as a whole. */
         for (int i = 0; i < n; i++){
             st->pkg_result[i] = 0;
-            snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "package-not-validated");
+            snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "package-not-validated"); st->pkg_detail[i][0] = 0;
         }
         return 0;
     }
+
+    /* 2026-10-01: a real submission follows Core's AcceptPackage
+     * (txsub_package_accept); what follows is testmempoolaccept's dry run */
+    if (!test_only) return txsub_package_accept(txs, lens, txids, vsz, n, msg, mcap);
 
     /* ---- pass 1: dry run with the overlay, to learn the real fees -------- */
     unsigned long long tot_fee = 0, tot_vsize = 0;
@@ -8211,12 +8723,12 @@ static int txsub_package(char* msg, unsigned long mcap){
          * ran, and such a member never joins the total below. */
         st->pkg_vsize[i] = avs ? avs : vsz[i];
         if (rc == 1){
-            st->pkg_result[i] = 1; st->pkg_reason[i][0] = 0;
+            st->pkg_result[i] = 1; st->pkg_reason[i][0] = 0; st->pkg_detail[i][0] = 0;
             tot_fee += fee; tot_vsize += st->pkg_vsize[i];
         } else {
             int fee_only = txacc_fee_reconsiderable(r);
             st->pkg_result[i] = 0;
-            snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "%s", r);
+            snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "%s", r); snprintf((char*)st->pkg_detail[i], sizeof st->pkg_detail[i], "%s", tx_accept_last_detail());
             if (fee_only){ tot_fee += fee; tot_vsize += st->pkg_vsize[i]; }
             else {
                 all_ok = 0;      /* not something a package can rescue */
@@ -8232,6 +8744,25 @@ static int txsub_package(char* msg, unsigned long mcap){
     txacc_package_overlay(NULL, NULL, NULL, 0);
     mpol_package_context(NULL, NULL, NULL, 0);
 
+    /* testmempoolaccept on an array (2026-10-01): Core v31.1 validates it with
+     * PackageTestAccept -- package_feerates=false, allow_replacement=false --
+     * through AcceptMultipleTransactions: each member on its OWN feerate, in
+     * order, and the first failure ends the evaluation, later members getting
+     * no verdict at all (the RPC prints only their txid and wtxid). This ran a
+     * second pass under the package fee context, so a parent below the relay
+     * floor that a child paid for read allowed:true where Core says false. A
+     * TRUC violation stays a package-level answer, below. */
+    if (test_only && !truc_violation){
+        mpol_package_fee_context(0, 0);
+        st->pkg_eff_fee = 0; st->pkg_eff_vsize = 0;       /* per-member effective feerates (the RPC) */
+        int first_fail = -1;
+        for (int i = 0; i < n; i++) if (st->pkg_result[i] != 1){ first_fail = i; break; }
+        if (first_fail < 0){ snprintf(msg, mcap, "success"); return 1; }
+        for (int k = first_fail + 1; k < n; k++){ st->pkg_result[k] = -1; st->pkg_reason[k][0] = 0; st->pkg_detail[k][0] = 0; }   /* not evaluated */
+        snprintf(msg, mcap, "transaction failed");
+        return 0;
+    }
+
     if (!all_ok){
         mpol_package_fee_context(0, 0);
         st->pkg_eff_fee = tot_fee; st->pkg_eff_vsize = tot_vsize;
@@ -8239,7 +8770,7 @@ static int txsub_package(char* msg, unsigned long mcap){
             snprintf(msg, mcap, "TRUC-violation");
             for (int i = 0; i < n; i++){
                 st->pkg_result[i] = 0;
-                snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "package-not-validated");
+                snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "package-not-validated"); st->pkg_detail[i][0] = 0;
             }
             return 0;
         }
@@ -8267,10 +8798,10 @@ static int txsub_package(char* msg, unsigned long mcap){
             long rc = tx_accept_test_reason(txsub_pool(), txids + i*32, txs[i], lens[i],
                                             r, sizeof r, &fee, NULL);
             if (rc == 1){
-                st->pkg_result[i] = 1; st->pkg_reason[i][0] = 0; st->pkg_fee[i] = fee;
+                st->pkg_result[i] = 1; st->pkg_reason[i][0] = 0; st->pkg_detail[i][0] = 0; st->pkg_fee[i] = fee;
             } else {
                 st->pkg_result[i] = 0;
-                snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "%s", r);
+                snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "%s", r); snprintf((char*)st->pkg_detail[i], sizeof st->pkg_detail[i], "%s", tx_accept_last_detail());
                 all_pass = 0;
             }
         }
@@ -8281,51 +8812,170 @@ static int txsub_package(char* msg, unsigned long mcap){
         return all_pass;
     }
 
-    /* ---- pass 2: commit, with the package feerate in effect -------------- */
+    /* not reached: a real submission returned through txsub_package_accept */
+    return 0;
+}
+
+/* submitpackage, the real submission (2026-10-01): Core v31.1
+ * MemPoolAccept::AcceptPackage. Until now every member was committed under
+ * the PACKAGE's feerate, so a parent that pays its own way also paid for its
+ * child (Core: its fees "should only be used once"), and a parent that had to
+ * REPLACE something could never do it with its child's help -- there was no
+ * package RBF. Core's algorithm, step for step:
+ *   1. each member alone, in order: already in the mempool -> valid as it
+ *      is; valid alone -> committed now, its fee used once; refused for a
+ *      fee reason or a missing input (its parent is a fee-refused member) ->
+ *      kept for step 2; refused for anything else -> the package has failed
+ *      ("transaction failed"), and the remaining members are still tried
+ *      alone, as Core does;
+ *   2. the kept members, two or more, as a package (AcceptMultipleTransactions):
+ *      prechecks with the package in view, the aggregate fee floor, package
+ *      RBF when a member conflicts, then the commit -- with the package
+ *      feerate and, for a replacement, the package's fee and vsize in force.
+ *      One kept member is the step-1 verdict again (Core re-runs it alone).
+ * Per-member results: 1 valid alone (own feerate), 2 valid in the package
+ * evaluation (package feerate over those members), 3 already in the mempool
+ * (no effective feerate, as Core reports MEMPOOL_ENTRY). */
+static int txsub_package_accept(const unsigned char* const* txs, const unsigned long* lens,
+                                const unsigned char* txids, const unsigned long long* vsz, int n,
+                                char* msg, unsigned long mcap){
+    extern void mpol_package_fee_context(unsigned long long, unsigned long long);
+    extern void mpol_package_context(const unsigned char* const*, const unsigned long*, const unsigned char*, int);
+    extern void mpol_package_rbf_context(int);
+    extern void txacc_package_overlay(const unsigned char* const*, const unsigned long*, const unsigned char*, int);
+    extern long tx_accept_test_reason(void*, const unsigned char*, const unsigned char*, unsigned long, char*,
+                                      unsigned long, unsigned long long*, unsigned long long*);
+    extern int  txacc_fee_reconsiderable(const char* reason);
+    extern int  txacc_entry_fee_vsize(const unsigned char txid[32], unsigned long long*, unsigned long long*);
+    extern int  txacc_package_floor_check(unsigned long long, unsigned long long, char*, unsigned long);
+    extern int  txacc_package_rbf_check(const unsigned char* const*, const unsigned long*, const unsigned char*, int,
+                                        unsigned long long, unsigned long long, unsigned long long, unsigned long long,
+                                        char*, unsigned long);
+    extern int  mpol_last_replaced(unsigned char* out, int cap);
+    node_status_t* st = g_node_status;
+    st->pkg_eff_fee = 0; st->pkg_eff_vsize = 0;
+    /* a package-level message: in full in pkg_msg_full (the RPC prefers it), and
+     * as much as fits in the caller's buffer */
+    #define TXSUB_PKG_MSG(text) do{ snprintf((char*)st->pkg_msg_full, sizeof st->pkg_msg_full, "%s", (text)); \
+        size_t l_ = strlen((const char*)st->pkg_msg_full); if (l_ >= mcap) l_ = mcap - 1; \
+        memcpy(msg, (const char*)st->pkg_msg_full, l_); msg[l_] = 0; }while(0)
+    /* fold whatever the member just committed displaced into the union */
+    #define TXSUB_NOTE_REPLACED() do{ \
+        unsigned char rep_[RPC_PKG_REPLACED_MAX][32]; \
+        int nrep_ = mpol_last_replaced((unsigned char*)rep_, RPC_PKG_REPLACED_MAX); \
+        for (int k_ = 0; k_ < nrep_; k_++){ int dup_ = 0; \
+            for (int q_ = 0; q_ < st->pkg_replaced_n; q_++) \
+                if (!memcmp((const void*)st->pkg_replaced[q_], rep_[k_], 32)){ dup_ = 1; break; } \
+            if (dup_) continue; \
+            if (st->pkg_replaced_n >= RPC_PKG_REPLACED_MAX) break; \
+            memcpy((void*)st->pkg_replaced[st->pkg_replaced_n++], rep_[k_], 32); } }while(0)
+
+    /* ---- 1. each member alone ------------------------------------------- */
+    int eval[RPC_PKG_MAX]; int n_eval = 0, quit_early = 0;
+    for (int i = 0; i < n; i++){
+        unsigned long ml = 0; unsigned long long fee = 0, avs = 0;
+        st->pkg_fee[i] = 0; st->pkg_vsize[i] = vsz[i]; st->pkg_reason[i][0] = 0; st->pkg_detail[i][0] = 0;
+        if (mpool_get(txsub_pool(), txids + i*32, &ml)){
+            txacc_entry_fee_vsize(txids + i*32, &fee, &avs);
+            st->pkg_result[i] = 3; st->pkg_fee[i] = fee; if (avs) st->pkg_vsize[i] = avs;
+            continue;
+        }
+        char r[128]; r[0] = 0; int relayed = 0;
+        long rc = tx_accept_test_reason(txsub_pool(), txids + i*32, txs[i], lens[i], r, sizeof r, &fee, &avs);
+        st->pkg_fee[i] = fee; if (avs) st->pkg_vsize[i] = avs;
+        if (rc == 1) rc = txsub_accept_and_relay(txsub_pool(), txs[i], lens[i], mux_out_fd, mux_n_out, r, sizeof r, &relayed);
+        if (rc == 1){
+            st->pkg_result[i] = 1;
+            walletnotify_tx(txs[i], (long)lens[i]);
+            TXSUB_NOTE_REPLACED();
+            continue;
+        }
+        st->pkg_result[i] = 0;
+        snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "%s", r); snprintf((char*)st->pkg_detail[i], sizeof st->pkg_detail[i], "%s", tx_accept_last_detail());
+        if (n == 1 || !(txacc_fee_reconsiderable(r) || rc == -25)) quit_early = 1;   /* not something a package can change */
+        else eval[n_eval++] = i;
+    }
+    if (quit_early || n_eval == 1){ snprintf(msg, mcap, "transaction failed"); return 0; }
+    if (n_eval == 0){ snprintf(msg, mcap, "success"); return 1; }
+
+    /* ---- 2. the kept members as a package -------------------------------- */
+    static const unsigned char* etx[RPC_PKG_MAX];
+    static unsigned long elen[RPC_PKG_MAX];
+    static unsigned char eid[RPC_PKG_MAX*32];
+    unsigned long long efee[RPC_PKG_MAX], evs[RPC_PKG_MAX];
+    for (int k = 0; k < n_eval; k++){ etx[k] = txs[eval[k]]; elen[k] = lens[eval[k]]; memcpy(eid + k*32, txids + eval[k]*32, 32); }
+    /* prechecks with the package in view: the overlay lets a member resolve
+     * an earlier member; a fee-only verdict is what the package may change */
+    unsigned long long tot_fee = 0, tot_vsize = 0;
+    int bad = -1, truc = 0; char badr[128]; badr[0] = 0; char badd[512]; badd[0] = 0;
+    mpol_package_context(etx, elen, eid, n_eval);
+    txacc_package_overlay(etx, elen, eid, n_eval);
+    for (int k = 0; k < n_eval; k++){
+        char r[128]; r[0] = 0; unsigned long long fee = 0, avs = 0;
+        long rc = tx_accept_test_reason(txsub_pool(), eid + k*32, etx[k], elen[k], r, sizeof r, &fee, &avs);
+        efee[k] = fee; evs[k] = avs ? avs : vsz[eval[k]];
+        if (rc == 1 || txacc_fee_reconsiderable(r)){ tot_fee += fee; tot_vsize += evs[k]; continue; }
+        if (!strcmp(r, "TRUC-violation")) truc = 1;
+        bad = k; snprintf(badr, sizeof badr, "%s", r); snprintf(badd, sizeof badd, "%s", tx_accept_last_detail()); break;
+    }
+    txacc_package_overlay(NULL, NULL, NULL, 0);
+    mpol_package_context(NULL, NULL, NULL, 0);
+    if (truc){ snprintf(msg, mcap, "TRUC-violation"); return 0; }      /* package-level; members keep their step-1 verdicts */
+    if (bad >= 0){
+        snprintf((char*)st->pkg_reason[eval[bad]], sizeof st->pkg_reason[0], "%s", badr);
+        snprintf((char*)st->pkg_detail[eval[bad]], sizeof st->pkg_detail[0], "%s", badd);
+        snprintf(msg, mcap, "transaction failed"); return 0; }
+    /* the aggregate fee floor (CheckFeeRate over the package) -- attributed
+     * to the last member, as Core's FeeFailure result is */
+    { char why[160];
+      if (!txacc_package_floor_check(tot_fee, tot_vsize, why, sizeof why)){
+          /* why is Core's ToString ("min relay fee not met, 14 < 15"): the
+           * reason is the part before ", ", the debug message the rest */
+          char* sep = strstr(why, ", ");
+          if (sep){ *sep = 0;
+                    snprintf((char*)st->pkg_detail[eval[n_eval-1]], sizeof st->pkg_detail[0], "%s", sep + 2); }
+          else st->pkg_detail[eval[n_eval-1]][0] = 0;
+          size_t l_ = strlen(why); if (l_ >= sizeof st->pkg_reason[0]) l_ = sizeof st->pkg_reason[0] - 1;
+          memcpy((char*)st->pkg_reason[eval[n_eval-1]], why, l_); st->pkg_reason[eval[n_eval-1]][l_] = 0;
+          snprintf(msg, mcap, "transaction failed"); return 0; } }
+    /* package RBF (PackageRBFChecks) when a member conflicts */
+    int rbf = -1;
+    { char why[320];
+      rbf = txacc_package_rbf_check(etx, elen, eid, n_eval, tot_fee, tot_vsize, efee[0], evs[0], why, sizeof why);
+      if (rbf == 0){ TXSUB_PKG_MSG(why); return 0; } }
+    /* commit (SubmitPackage) under the package feerate and, for a
+     * replacement, the package's fee and vsize */
     int committed = 1;
     mpol_package_fee_context(tot_fee, tot_vsize);
-    mpol_package_context(txs, lens, txids, n);
-    txacc_package_overlay(txs, lens, txids, n);
-    for (int i = 0; i < n; i++){
-        char r[128]; r[0] = 0; int relayed = 0;
-        int rc = txsub_accept_and_relay(txsub_pool(), txs[i], lens[i],
-                                        mux_out_fd, mux_n_out, r, sizeof r, &relayed);
+    mpol_package_context(etx, elen, eid, n_eval);
+    txacc_package_overlay(etx, elen, eid, n_eval);
+    if (rbf == 1) mpol_package_rbf_context(1);
+    for (int k = 0; k < n_eval; k++){
+        int i = eval[k]; char r[128]; r[0] = 0; int relayed = 0;
+        int rc = txsub_accept_and_relay(txsub_pool(), etx[k], elen[k], mux_out_fd, mux_n_out, r, sizeof r, &relayed);
         if (rc == 1){
-            st->pkg_result[i] = 1; st->pkg_reason[i][0] = 0;
-            walletnotify_tx(txs[i], (long)lens[i]);
-            /* whatever THIS member displaced by RBF, folded into the
-             * package-wide union Core reports at the top level. Read
-             * immediately: the next member's accept overwrites it. */
-            extern int mpol_last_replaced(unsigned char* out, int cap);
-            unsigned char rep[RPC_PKG_REPLACED_MAX][32];
-            int nrep = mpol_last_replaced((unsigned char*)rep, RPC_PKG_REPLACED_MAX);
-            for (int k = 0; k < nrep; k++){
-                int dup = 0;
-                for (int q = 0; q < st->pkg_replaced_n; q++)
-                    if (!memcmp((const void*)st->pkg_replaced[q], rep[k], 32)){ dup = 1; break; }
-                if (dup) continue;
-                if (st->pkg_replaced_n >= RPC_PKG_REPLACED_MAX) break;
-                memcpy((void*)st->pkg_replaced[st->pkg_replaced_n++], rep[k], 32);
-            }
-        }
-        else {
+            st->pkg_result[i] = 2; st->pkg_reason[i][0] = 0; st->pkg_detail[i][0] = 0; st->pkg_fee[i] = efee[k]; st->pkg_vsize[i] = evs[k];
+            walletnotify_tx(etx[k], (long)elen[k]);
+            TXSUB_NOTE_REPLACED();
+        } else {
             st->pkg_result[i] = 0;
-            snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "%s", r);
+            snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "%s", r); snprintf((char*)st->pkg_detail[i], sizeof st->pkg_detail[i], "%s", tx_accept_last_detail());
             committed = 0;
         }
     }
-    /* ALWAYS cleared: a fee context left set would relax the floor for
-     * ordinary single-transaction traffic, and an overlay left set would let
-     * an unrelated transaction resolve against a package member. */
+    /* ALWAYS cleared: a context left set would relax the floors (or the RBF
+     * rules) for ordinary single-transaction traffic */
+    mpol_package_rbf_context(0);
     txacc_package_overlay(NULL, NULL, NULL, 0);
     mpol_package_context(NULL, NULL, NULL, 0);
     mpol_package_fee_context(0, 0);
-
+    #undef TXSUB_NOTE_REPLACED
+    #undef TXSUB_PKG_MSG
     st->pkg_eff_fee = tot_fee; st->pkg_eff_vsize = tot_vsize;
     snprintf(msg, mcap, "%s", committed ? "success" : "transaction failed");
     if (committed)
-        fprintf(stderr, "[dl] submitpackage: %d tx accepted, package fee %llu sat over %llu vB\n",
-                n, (unsigned long long)tot_fee, (unsigned long long)tot_vsize);
+        fprintf(stderr, "[dl] submitpackage: %d tx accepted as a package%s, package fee %llu sat over %llu vB\n",
+                n_eval, rbf == 1 ? " (package RBF)" : "", tot_fee, tot_vsize);
     return committed;
 }
 
@@ -8497,12 +9147,138 @@ static int dl_announce_allowed(unsigned long tip_time, long long now, long maxti
  * tip block per inv would be an 8 MB read per message; this is a load. */
 static int g_dl_in_ibd = 1;
 static int dl_in_ibd_cached(void){ return g_dl_in_ibd; }
+/* Core's IBD latch (2026-10-01): UpdateIBDStatus sets m_cached_is_ibd false
+ * the first time the tip is recent and never back. Every writer of
+ * g_dl_in_ibd passes its tip-age answer through here; the latch is published
+ * for getblockchaininfo (node_status ibd_left). */
+static int g_dl_ibd_left = 0;
+static int dl_ibd_latch(int tip_is_old){
+    if(!tip_is_old && !g_dl_ibd_left){
+        g_dl_ibd_left = 1;
+        if(g_node_status) g_node_status->ibd_left = 1;
+        fprintf(stderr,"[dl] leaving initial block download (latching to false, as Core does)\n");
+    }
+    if(g_dl_ibd_left && g_node_status) g_node_status->ibd_left = 1;   /* republished: no boot-order dependence on the zeroed block */
+    return g_dl_ibd_left ? 0 : tip_is_old;
+}
 /* the Core rule again, for the history repair: the tip is older than maxtipage */
 static int dl_tip_is_ibd(void){
     static unsigned char hb[8u<<20]; long tip = *(int*)(store_buf+24); if (tip < 0) return 1;
     if (store_read_at(store_buf, (unsigned long)tip, hb, (long)sizeof hb) < 80) return 1;
     unsigned long tip_time = (unsigned long)hb[68] | ((unsigned long)hb[69]<<8) | ((unsigned long)hb[70]<<16) | ((unsigned long)hb[71]<<24);
     return !dl_announce_allowed(tip_time, (long long)time(NULL), g_cfg.maxtipage > 0 ? g_cfg.maxtipage : 86400);
+}
+/* bmc.benchlog's clock (2026-10-04): CLOCK_MONOTONIC in ns with the key on,
+ * 0 with it off -- so the index timing in the choke point below reads no
+ * clock on a node that does not print it. */
+static unsigned long long bl_ns(void){
+    if (!g_cfg.benchlog) return 0;
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (unsigned long long)t.tv_sec * 1000000000ULL + (unsigned long long)t.tv_nsec;
+}
+/* ---- the finish line (2026-10-04, worklog/2026-10-04-logged-ibd-runs-plan.md
+ * part 3) ------------------------------------------------------------------
+ * ONE line, once per process, the first time the node is ready to serve RPC
+ * with every enabled index at the tip: IBD over (the latch), the UTXO set at
+ * the archive tip, the txid index covering it (runs + tail), the filter index
+ * holding its filter, and the coinstats history complete -- which on a fresh
+ * sync means the post-IBD history-base rebuild (38 m 47 s in run 31) has
+ * finished and verified, so the line marks the END of that, not the end of
+ * the download. Disabled indexes are named as skipped. Not gated by
+ * bmc.benchlog: a benchmark's finish must not depend on a debug switch, and
+ * it is one line per run. Evaluated every rotation of the worker loop (a few
+ * loads and compares) until it prints; the coinstats repair is only
+ * re-examined once a heartbeat (csi_hist_repair_tick), so that one condition
+ * is seen up to DL_HEARTBEAT_MS late -- the same latency its own
+ * "[coinstats] repair: history base rebuilt" line has. */
+static long long g_proc_start_ms = 0;   /* main()'s first statement; forks inherit it */
+static void dl_ready_check(int utxo_ok){
+    static int said = 0;
+    if (said) return;
+    extern int csi_hist_repair_state(void); extern long csi_height(void); extern int csi_worker_pid(void);
+    extern long bfi_count(void);
+    benchlog_ready_t r; memset(&r, 0, sizeof r);
+    r.ibd_over = g_dl_ibd_left;
+    r.tip = (long)*(int*)(store_buf+24);
+    r.utxo_on = utxo_ok;              r.utxo_applied = utxo_ok ? utxo_live_applied_height() : -1;
+    /* 2026-10-06: while the index worker runs, its published watermarks (this
+     * process's writer state is stale since the fork) */
+    r.txindex_on = g_cfg.txindex;     r.txindex_covered = g_cfg.txindex ? (ixw_on() ? (long)g_node_status->ixw_covered : txit_covered()) : -1;
+    r.bfilter_on = g_cfg.blockfilterindex; r.bfilter_count = g_cfg.blockfilterindex ? (ixw_on() ? (long)g_node_status->ixw_bfi_count : bfi_count()) : -1;
+    r.coinstats_on = g_cfg.coinstatsindex;
+    if (g_cfg.coinstatsindex){
+        r.coinstats_hist_ok = csi_hist_repair_state() == 1;   /* CSI_REPAIR_OK (coinstats_index.c) */
+        /* the fold's watermark: the worker's published height when it folds
+         * (this process's own copy is stale after the fork), else in-process */
+        r.coinstats_height = (csi_worker_pid() > 0 && g_node_status) ? (long)g_node_status->csi_folded_height : csi_height();
+    }
+    { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+      r.secs = (double)(t.tv_sec * 1000LL + t.tv_nsec / 1000000 - g_proc_start_ms) / 1000.0; }
+    char line[320];
+    if (!benchlog_ready_eval(&r, line, sizeof line)) return;
+    said = 1;
+    fprintf(stderr, "%s\n", line);
+}
+/* ---- the index worker's hooks and lifetime (2026-10-06, plan B4) ---------
+ * The four index writers ran here, in the applying process, serial with
+ * the apply: 693 thread-seconds over the chain in run 37. For the catch-up
+ * they run in a forked worker (daemon/index_worker.c) fed from the choke
+ * point below; at the tip (one block at a time) they run inline as before.
+ * The worker reads the block from the archive itself; this process keeps
+ * reading it too, for ZMQ, the mempool and the notify hooks. */
+_Static_assert(IXW_NS_N >= BL_IX_N, "the worker's timing slots hold every index column");
+extern long bfi_count(void);
+static long ixw_h_read(long h, unsigned char* buf, long cap){ return store_read_at(store_buf, (unsigned long)h, buf, cap); }
+static void ixw_h_reload(void){ store_reload(store_buf); }
+static void ixw_h_on_block(long h, const unsigned char* blk, long blen, unsigned long long ns[IXW_NS_N]){
+    unsigned long long t0 = bl_ns(), t1;
+    txit_on_block(store_buf, h, blk, blen);
+    t1 = bl_ns(); ns[BL_IX_TXINDEX] = t1 - t0; t0 = t1;
+    tsp_on_block(store_buf, h, blk, blen);
+    t1 = bl_ns(); ns[BL_IX_TXOSPENDER] = t1 - t0; t0 = t1;
+    if (g_cfg.blockfilterindex) bfi_on_block(store_buf, h, blk, (unsigned long)blen);
+    t1 = bl_ns(); ns[BL_IX_BFILTER] = t1 - t0; t0 = t1;
+    axt_on_block(store_buf, h, blk, blen);
+    t1 = bl_ns(); ns[BL_IX_ADDR] = t1 - t0;
+}
+static void ixw_h_adv(int kind, long to){
+    if (kind == IXW_K_ADV_TXI) txit_runs_advanced(to);
+    else if (kind == IXW_K_ADV_TSP) tsp_runs_advanced(to);
+    else if (kind == IXW_K_ADV_AH) axt_runs_advanced(to);
+}
+static long ixw_h_covered(void){ return txit_covered(); }
+static long ixw_h_bfi(void){ return bfi_count(); }
+static void ixw_h_log(long h, const unsigned long long ns[IXW_NS_N]){
+    if (!g_cfg.benchlog) return;
+    char bline[256]; benchlog_fmt_index(bline, sizeof bline, h, ns);
+    fprintf(stderr, "%s\n", bline);
+}
+static long ixw_applied_for_axt(void){ return ixw_current_height(); }   /* the address tail's applied-height seam: the height being indexed IS applied */
+static void ixw_h_in_child(void){ axt_set_applied_height(ixw_applied_for_axt); }
+static void ixw_catchup_start(void){
+    if (!g_node_status) return;                      /* the boot catch-up has no status block: inline, as before */
+    if (!(g_cfg.txindex || g_cfg.blockfilterindex || g_cfg.txospenderindex || g_cfg.addrindex)) return;
+    ixw_hooks_t hk; memset(&hk, 0, sizeof hk);
+    hk.read_block = ixw_h_read; hk.reload = ixw_h_reload; hk.on_block = ixw_h_on_block; hk.runs_advanced = ixw_h_adv;
+    hk.covered = ixw_h_covered; hk.bfi_count = ixw_h_bfi; hk.log_index = ixw_h_log; hk.in_child = ixw_h_in_child;
+    hk.block_cap = RPC_BLKSUBMIT_MAX;
+    ixw_start(g_node_status, &hk);
+}
+/* the worker is gone (stopped or dead): this process's writer state has
+ * been stale since the fork (watermarks, and the tail fds the worker may
+ * have rotated) -- re-read it from the files */
+static void ixw_reboot_writers(void){
+    extern void txit_close(void); extern void tsp_close(void); extern void axt_close(void); extern void bfi_close(void);
+    if (g_cfg.txindex){ txit_close(); txit_boot(store_buf); }
+    if (g_cfg.txospenderindex){ tsp_close(); tsp_boot(store_buf); }
+    if (g_cfg.addrindex){ axt_close(); axt_boot(store_buf); }
+    if (g_cfg.blockfilterindex) bfi_close();     /* its next on_block reopens from the files */
+}
+static void ixw_catchup_stop(const char* why){
+    if (ixw_pid() <= 0) return;
+    fprintf(stderr, "[ixw] stopping the index worker: %s\n", why);
+    ixw_stop();
+    ixw_reboot_writers();
 }
 static void dl_new_block_choke(void){
     int now_tip = (int)node_public_tip(store_buf);
@@ -8517,6 +9293,7 @@ static void dl_new_block_choke(void){
         if(store_read_at(store_buf, (unsigned long)now_tip, thb, (long)sizeof thb) >= 80){
             unsigned long tip_time = (unsigned long)thb[68] | ((unsigned long)thb[69]<<8) | ((unsigned long)thb[70]<<16) | ((unsigned long)thb[71]<<24);
             in_ibd = !dl_announce_allowed(tip_time, (long long)time(NULL), g_cfg.maxtipage > 0 ? g_cfg.maxtipage : 86400);
+            in_ibd = dl_ibd_latch(in_ibd);                          /* latched, as Core's m_cached_is_ibd */
             g_dl_in_ibd = in_ibd;                                   /* 2026-09-29: the tx relay reads this */
             if(in_ibd){ if(!ibd_said){ ibd_said = 1; fprintf(stderr,"[dl] per-block lines and tip announcements are off while the tip is older than maxtipage (initial block download; Core relays no blocks in IBD) -- they resume at the tip\n"); } }
             else {
@@ -8567,16 +9344,38 @@ static void dl_new_block_choke(void){
                  * getrawtransaction-by-txid keeps up with the tip
                  * (idempotent by height -- a replayed height is a
                  * no-op) */
+                /* bmc.benchlog (2026-10-04, plan part 2): each index's share
+                 * of this block, outside the UTXO apply timer. bl_ns() reads
+                 * no clock with the key off, so the default costs a branch. */
+                unsigned long long bix[BL_IX_N] = {0}, bt0, bt1;
+                /* 2026-10-06 (plan B4): the four writers run in the index
+                 * worker during the catch-up -- this pushes the height and
+                 * moves on; the worker prints the [bench] index line. A
+                 * worker found dead here is stopped (the writers re-read
+                 * their state from the files) and the block is indexed
+                 * inline, as every block is at the tip. */
+                int via_worker = 0;
+                if (ixw_on()){
+                    if (ixw_push(IXW_K_BLOCK, zh)) via_worker = 1;
+                    else ixw_catchup_stop("the index worker died -- indexing inline from here");
+                }
+                dl_index_trail_tick(g_utxo_live_on ? utxo_live_applied_height() : -1);   /* the trailing builders' tick is in no column */
+                if (!via_worker){
+                bt0 = bl_ns();
                 txit_on_block(store_buf, zh, zb, bl);
-                dl_index_trail_tick(g_utxo_live_on ? utxo_live_applied_height() : -1);
+                bt1 = bl_ns(); bix[BL_IX_TXINDEX] = bt1 - bt0; bt0 = bt1;
                 tsp_on_block(store_buf, zh, zb, bl);
+                bt1 = bl_ns(); bix[BL_IX_TXOSPENDER] = bt1 - bt0; bt0 = bt1;
                 /* filter index tail: adopt/append (cheap probe when
                  * the backfill has not closed in yet) */
                 if (g_cfg.blockfilterindex)
                     bfi_on_block(store_buf, zh, zb, (unsigned long)bl);
+                bt1 = bl_ns(); bix[BL_IX_BFILTER] = bt1 - bt0; bt0 = bt1;
                 /* address index (extension): ADDs from the block,
                  * DELs/TOUCHes from its undo records */
                 axt_on_block(store_buf, zh, zb, bl);
+                bt1 = bl_ns(); bix[BL_IX_ADDR] = bt1 - bt0;
+                }
                 /* -blocknotify: after the indexes have taken the
                  * block, so a hook that queries us sees it. */
                 if (g_cfg.blocknotify[0]){
@@ -8618,22 +9417,29 @@ static void dl_new_block_choke(void){
                       unsigned char cbh[32]; sha256d(cbh, zb, 80);
                       mempool_seq_block(cbh, 'C');
                   } }
-                if (!zmqpub_active()) continue;
-                /* Publish what this block staged (the sequence topic's 'R's
-                 * and 'C') now, not at the end of a catch-up burst: a burst
-                 * of thousands of blocks would otherwise lap the ring. */
-                zmqn_drain();
-                /* The block HASH is sha256d over the 80-byte
-                 * header, REVERSED: Core's notifier flips the bytes
-                 * (data[31-i] = hash.begin()[i]) so the hashblock
-                 * topic carries the DISPLAY-order hash getblockhash
-                 * prints. Verified against real archived blocks by
-                 * tests/zmq_realblock_check. */
-                unsigned char bh[32], bhr[32];
-                sha256d(bh, zb, 80);
-                for (int zi = 0; zi < 32; zi++) bhr[zi] = bh[31 - zi];
-                zmqpub_notify("hashblock", bhr, 32);
-                zmqpub_notify("rawblock", zb, (unsigned long)bl);
+                if (zmqpub_active()){   /* was `continue` when inactive; a block so the [bench] line below still prints (2026-10-04) */
+                    bt0 = bl_ns();
+                    /* Publish what this block staged (the sequence topic's 'R's
+                     * and 'C') now, not at the end of a catch-up burst: a burst
+                     * of thousands of blocks would otherwise lap the ring. */
+                    zmqn_drain();
+                    /* The block HASH is sha256d over the 80-byte
+                     * header, REVERSED: Core's notifier flips the bytes
+                     * (data[31-i] = hash.begin()[i]) so the hashblock
+                     * topic carries the DISPLAY-order hash getblockhash
+                     * prints. Verified against real archived blocks by
+                     * tests/zmq_realblock_check. */
+                    unsigned char bh[32], bhr[32];
+                    sha256d(bh, zb, 80);
+                    for (int zi = 0; zi < 32; zi++) bhr[zi] = bh[31 - zi];
+                    zmqpub_notify("hashblock", bhr, 32);
+                    zmqpub_notify("rawblock", zb, (unsigned long)bl);
+                    bix[BL_IX_ZMQ] = bl_ns() - bt0;
+                }
+                if (g_cfg.benchlog && !via_worker){
+                    char bline[256]; benchlog_fmt_index(bline, sizeof bline, zh, bix);
+                    fprintf(stderr, "%s\n", bline);
+                }
             }
         }
     }
@@ -8685,6 +9491,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
      * which happened on every stop/restart until 2026-08-22 and once landed
      * between a block's WAL writes and its checkpoint (height 318148). */
     utxo_live_set_shutdown_flag(&g_shutdown_requested);
+    { extern void utxo_live_set_apply_cap(long); utxo_live_set_apply_cap(g_cfg.stopatheight); }   /* -stopatheight: connect nothing above it */
     { extern void rpc_node_set_shutdown_flag(const volatile sig_atomic_t*);
       rpc_node_set_shutdown_flag(&g_shutdown_requested); }   /* the mempool reload must yield to SIGTERM */
     /* 2026-09-10: the dial memory was created by the parallel downloader only,
@@ -9280,11 +10087,12 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             strncpy(mux_out_host[mux_n_out], srcpool[i], 127);
             mux_out_fd[mux_n_out]=cfd[i]; leg_note_installed(mux_n_out); mux_out_kind[mux_n_out] = host_is_block_only(srcpool[i]) ? LEG_BLOCK_ONLY : LEG_FULL;   /* CC-4 */ mux_out_cmpct[mux_n_out] = 0;
             mux_out_wants_v2[mux_n_out]=(unsigned char)g_peer_wants_addrv2;
+            txrelay_fd_set_wtxid(cfd[i], (int)g_peer_wtxidrelay);   /* BIP339 (2026-10-03) */
             mux_out_peer[mux_n_out]=i;
             anchor_locator(mux_out_loc[mux_n_out]);
             mux_out_nextretry[mux_n_out]=0;
             { char pv[256]; format_peer_version_info(pv, sizeof pv);
-              fprintf(stderr,"[dl] outbound %d = %s (fd %d) %s addrv2=%d\n", mux_n_out, srcpool[i], cfd[i], pv, (int)mux_out_wants_v2[mux_n_out]); }
+              fprintf(stderr,"[dl] outbound %d = %s (fd %d) %s addrv2=%d wtxid=%d\n", mux_n_out, srcpool[i], cfd[i], pv, (int)mux_out_wants_v2[mux_n_out], (int)g_peer_wtxidrelay); }
             rpc_fill_peer_slot(mux_n_out, srcpool[i]);   /* publish peer to getpeerinfo */
             rpc_note_peer_socket(mux_n_out, cfd[i]);
             mux_n_out++;
@@ -9512,6 +10320,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 txsub_last_seq = g_node_status->tx_submit_seq;
                 __atomic_thread_fence(__ATOMIC_ACQUIRE);   /* ARM64 (2026-09-25): the command's fields after its seq -- the RPC side fenced before publishing; a stale tx_submit_private/_test or ctl_op/arg would act on the previous request */
             int result; char reason[128]; reason[0]=0;
+            { extern void tx_accept_clear_detail(void); tx_accept_clear_detail(); }   /* no stale detail on a path that never validates */
             if(g_node_status->tx_submit_pkg_n > 0){
                 result = txsub_package(reason, sizeof reason);
             }
@@ -9565,6 +10374,23 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     result = txsub_accept_and_relay(txsub_pool(),
                                  (const unsigned char*)g_node_status->tx_submit_buf, tlen,
                                  mux_out_fd, mux_n_out, reason, sizeof reason, &relayed);
+                    /* Core BroadcastTransaction (2026-10-01): a txid already in
+                     * the mempool is not an error -- Core skips the submission,
+                     * reannounces the mempool's copy and returns the txid. This
+                     * answered -27 "txn-already-in-mempool", so a transaction
+                     * that reached us by relay a moment before the client sent
+                     * it read as a failure (feeest_core_diff, once relay from
+                     * Core started working). */
+                    if(result == -27 && strstr(reason, "already-in-mempool")){
+                        extern int tx_txid(unsigned char* out, const unsigned char* tx, unsigned long txlen, unsigned char* scratch, unsigned long scratchcap);
+                        extern void txrelay_announce_own(const unsigned char txid[32]);
+                        static unsigned char ascratch[2000*81 + 8]; unsigned char tid[32]; unsigned long ml = 0;
+                        if(tx_txid(tid, (const unsigned char*)g_node_status->tx_submit_buf, tlen, ascratch, sizeof ascratch) &&
+                           mpool_get(txsub_pool(), tid, &ml)){
+                            txrelay_announce_own(tid);
+                            result = 1; reason[0] = 0;
+                        }
+                    }
                     /* every mempool.dat reload streams through this channel:
                      * 4,470 lines in two minutes after deploy j. One line per
                      * 5 s; the count rides along. */
@@ -9581,6 +10407,11 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 }
             } else { result=-4; snprintf(reason,sizeof reason,"mempool init failed"); }
             snprintf((char*)g_node_status->tx_submit_reason, sizeof g_node_status->tx_submit_reason, "%s", reason);
+            /* Core's debug message beside the reason (2026-10-03): the RPC
+             * prints "reason, detail" where Core prints ToString() */
+            { extern const char* tx_accept_last_detail(void);
+              snprintf((char*)g_node_status->tx_submit_detail, sizeof g_node_status->tx_submit_detail, "%s",
+                       result == 1 ? "" : tx_accept_last_detail()); }
             g_node_status->tx_submit_result = result;
             __sync_synchronize();
             g_node_status->tx_submit_ack = txsub_last_seq;
@@ -9934,7 +10765,14 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             }
             if(mux_out_fd[i]<0){
                 /* dead slot: re-dial (rate-limited), same logic as serve_mux */
-                if(now_ms>=mux_out_nextretry[i]){ mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i]=now_ms+REDIAL_BACKOFF_MS; }
+                /* 2026-10-01: under connect= the slot comes back on Core's
+                 * schedule -- ThreadOpenConnections retries each -connect peer
+                 * every <= 5.5 s -- not the 30 s pool rotation: a Core peer
+                 * that restarted was redialled once while it was still down,
+                 * then left for 30 s (the regtest bumpfee run missed a block
+                 * by it). The dial gate's CONNECT_RETRY_FLOOR_MS holds the
+                 * same floor; this stamp no longer sits on top of it. */
+                if(now_ms>=mux_out_nextretry[i]){ mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i]=now_ms+redial_gap_ms(); }
                 continue;
             }
             /* Cheap liveness check BEFORE syncing: a peer that cleanly closed
@@ -9955,7 +10793,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
              * dial. 2026-09-17: one implementation, shared with the sweep. */
             if(leg_check_gone(i)){
                 mux_next_peer(i, srcpool, nsrc, out_port);
-                mux_out_nextretry[i]=now_ms+REDIAL_BACKOFF_MS;
+                mux_out_nextretry[i]=now_ms+redial_gap_ms();
                 continue;
             }
             /* ---- transaction relay (receive side) -------------------------
@@ -9991,7 +10829,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                      * was disconnected and the slot re-dialled immediately,
                      * over and over. dh_now_ms() is the monotonic clock every
                      * other timestamp here uses. */
-                    mux_out_nextretry[i] = dh_now_ms() + REDIAL_BACKOFF_MS;
+                    mux_out_nextretry[i] = dh_now_ms() + redial_gap_ms();
                     continue;
                 }
                 { extern void txrelay_publish_orphans(void); txrelay_publish_orphans(); }
@@ -10023,6 +10861,11 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             if(mux_out_fd[i]>=0 && mux_out_kind[i] == LEG_BLOCK_ONLY){ extern long txrelay_poll_block_only_leg(int); (void)txrelay_poll_block_only_leg(mux_out_fd[i]); }   /* 2026-09-10: block announcements from block-relay-only legs too */
             if(g_stored_now) stored_break = 1;
             if(apply_first) continue;        /* see APPLY FIRST above */
+            /* -stopatheight (2026-10-01): dlc_span clamps the catch-up, but a
+             * leg pass fetches whatever the peer announces -- the node stored
+             * 9 blocks past the height while the parent noticed. Core stops
+             * fetching too: it shuts down from the tip notification. */
+            if(g_cfg.stopatheight > 0 && *(int*)(store_buf+24) >= g_cfg.stopatheight) continue;
             if(!leg_pass_gate(i, announced_now, now_ms)) continue;   /* 30 s spacing; the relay deferral (never for an announced leg) */
             /* 2026-09-10 (row 1): the pass runs in a helper under its budget;
              * the report comes back through leg_pass_poll on a later rotation.
@@ -10320,6 +11163,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
          * This is the shape Core has for free: libzmq services subscribers on
          * its own I/O thread and Core's hot paths never touch them. */
         if (zmqpub_active()) zmqn_drain();
+        dl_ready_check(utxo_live_ok);   /* the [ready] finish line, once (2026-10-04) */
         if(now_ms >= next_heartbeat_ms){
             int live_peers=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) live_peers++;
             char upbuf[UPTIME_BUF];
@@ -10339,7 +11183,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
              * is closed, or the tx-accept path never came up, say so in the
              * heartbeat line, with the count of announcements dropped. */
             char relaybuf[64]; relaybuf[0]=0;
-            { int ib = dl_tip_is_ibd();
+            { int ib = dl_ibd_latch(dl_tip_is_ibd());
               if(ib != g_dl_in_ibd){
                   fprintf(stderr, ib ? "[dl] tx announcements are dropped from here: the tip is older than maxtipage (initial block download)\n"
                                      : "[dl] tx announcements are taken again: the tip is within maxtipage (the flag had stood at 'in IBD' since boot or the last stale tip)\n");
@@ -10405,8 +11249,13 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         { dh_result_t dr; int dfd; char dhost[128];
           while(dh_poll(&dr, &dfd, dhost, sizeof dhost)){
               if(dr.ok && dfd >= 0){ if(!dh_install_leg(dhost, dfd, &dr)) fprintf(stderr, "[dial] %s: background dial landed but the leg was not installed\n", dhost); }
-              else { long bo = g_dialmem ? dialmem_note_failure(g_dialmem, dhost, strstr(dr.why, "handshake") ? DM_REFUSED : DM_CONNECT_FAIL, dialmem_now()) : 0;
-                     fprintf(stderr, "[dial] %s: background dial failed: %s (not dialled again for %ld min)\n", dhost, dr.why[0] ? dr.why : "?", bo / 60); }
+              else { if(host_is_block_only(dhost) && !bo_host_is_leg(dhost)) bo_forget(dhost);   /* 2026-10-01: a failed block-only dial frees its registry slot */
+                     long bo = g_dialmem ? dialmem_note_failure(g_dialmem, dhost, strstr(dr.why, "handshake") ? DM_REFUSED : DM_CONNECT_FAIL, dialmem_now()) : 0;
+                     char dip[128]; ctl_ip_only(dhost, dip, sizeof dip);
+                     int mk = node_config_manual_kind(dip);   /* manual peers are exempt from the dial memory (the dial gate) */
+                     if(mk) fprintf(stderr, "[dial] %s: background dial failed: %s (a %s peer: redialled within %.1f s, as Core does)\n", dhost, dr.why[0] ? dr.why : "?",
+                                    mk == 2 ? "connect=" : "addnode=", (mk == 2 ? CONNECT_RETRY_FLOOR_MS : ADDNODE_RETRY_FLOOR_MS) / 1000.0);
+                     else fprintf(stderr, "[dial] %s: background dial failed: %s (not dialled again for %ld min)\n", dhost, dr.why[0] ? dr.why : "?", bo / 60); }
           } }
         /* reserved slots: at least ONE leg per reachable anonymity network,
          * dialled in the background, on top of the clearnet legs (Core keeps
@@ -10414,7 +11263,11 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         /* CC-4: keep bo_want() block-relay-only legs on clearnet, dialled in the
          * background like the anonymity-network reserved legs below. The host is
          * registered as block-only BEFORE the dial so the version carries fRelay=0. */
-        if((rot % 8)==0 && legs_block_only() < bo_want() && mux_n_out < MUX_MAX_OUT && dh_extra_allowed()){
+        /* 2026-10-01: count the REGISTRY (live block-only legs + dials in
+         * flight), not the live legs: four dials went out in 50 s at boot while
+         * none had landed, and the three that landed made 3 block-only legs */
+        if((rot % 8)==0) bo_prune();
+        if((rot % 8)==0 && g_bo_n < bo_want() && mux_n_out < MUX_MAX_OUT && dh_extra_allowed()){
             static int bo_cursor = 0;                       /* 2026-09-10: rotate through the pool; a refused host is not first again */
             for(int step = 0; step < nsrc; step++){
                 int ci = (bo_cursor + step) % (nsrc > 0 ? nsrc : 1);
@@ -10427,7 +11280,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 bo_add(srcpool[ci]);
                 if(!host_is_block_only(srcpool[ci])) continue;   /* the registry is full: an unregistered dial would come up fRelay=1 */
                 bo_cursor = (ci + 1) % (nsrc > 0 ? nsrc : 1);
-                fprintf(stderr, "[dial] %s: dialing as block-relay-only (%d of %d)\n", srcpool[ci], legs_block_only() + 1, bo_want());
+                fprintf(stderr, "[dial] %s: dialing as block-relay-only (%d of %d, %d live)\n", srcpool[ci], g_bo_n, bo_want(), legs_block_only());
                 dh_start_slot(srcpool[ci], out_port, DH_SLOT_EXTRA);
                 break;
             }
@@ -10465,6 +11318,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             for(int ci=0; ci<nsrc && mux_n_out - legs_anon() - legs_block_only() < MUX_WANT_OUT() + stale_extra && mux_n_out<MUX_MAX_OUT; ci++){
                 if(topup_filled >= 1 || topup_fail >= 4) break;
                 if(leg_is_anon_net(leg_net_of(srcpool[ci]))) continue;   /* the helper owns those */
+                if(host_is_block_only(srcpool[ci])) continue;   /* 2026-10-01: a block-only host (leg or dial in flight) is not a full-relay candidate */
                 int already=0;
                 for(int k=0;k<mux_n_out;k++) if(!strcmp(mux_out_host[k],srcpool[ci])){ already=1; break; }
                 if(already) continue;
@@ -10496,11 +11350,12 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     strncpy(mux_out_host[mux_n_out], host, 127);
                     mux_out_fd[mux_n_out] = nfd; txrelay_leg_reset(nfd); leg_note_installed(mux_n_out); mux_out_kind[mux_n_out] = host_is_block_only(host) ? LEG_BLOCK_ONLY : LEG_FULL;
                     mux_out_wants_v2[mux_n_out] = (unsigned char)g_peer_wants_addrv2;
+                    txrelay_fd_set_wtxid(nfd, (int)g_peer_wtxidrelay);   /* BIP339 (2026-10-03) */
                     mux_out_peer[mux_n_out] = 0;
                     anchor_locator(mux_out_loc[mux_n_out]);
                     mux_out_nextretry[mux_n_out] = 0;
                     { char pv[256]; format_peer_version_info(pv, sizeof pv);
-                      fprintf(stderr,"[dl] filled outbound %d = %s (fd %d) %s addrv2=%d [manual: addnode]\n", mux_n_out, host, nfd, pv, (int)mux_out_wants_v2[mux_n_out]); }
+                      fprintf(stderr,"[dl] filled outbound %d = %s (fd %d) %s addrv2=%d wtxid=%d [manual: addnode]\n", mux_n_out, host, nfd, pv, (int)mux_out_wants_v2[mux_n_out], (int)g_peer_wtxidrelay); }
                     rpc_fill_peer_slot(mux_n_out, host);
                     rpc_note_peer_socket(mux_n_out, nfd);
                     mux_n_out++;
@@ -11258,9 +12113,10 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
          * sync-fail streak and ping clock were whatever the slot held before. */
         mux_out_fd[mux_n_out]=fd; txrelay_leg_reset(fd); leg_note_installed(mux_n_out); mux_out_kind[mux_n_out] = host_is_block_only(peers[i]) ? LEG_BLOCK_ONLY : LEG_FULL;   /* CC-4 */ mux_out_cmpct[mux_n_out] = 0;
         mux_out_wants_v2[mux_n_out]=(unsigned char)g_peer_wants_addrv2;
+        txrelay_fd_set_wtxid(fd, (int)g_peer_wtxidrelay);   /* BIP339 (2026-10-03) */
         mux_out_peer[mux_n_out]=i;
         anchor_locator(mux_out_loc[mux_n_out]);
-        fprintf(stderr,"[mux] outbound %d = %s (fd %d) addrv2=%d\n", mux_n_out, peers[i], fd, (int)mux_out_wants_v2[mux_n_out]);
+        fprintf(stderr,"[mux] outbound %d = %s (fd %d) addrv2=%d wtxid=%d\n", mux_n_out, peers[i], fd, (int)mux_out_wants_v2[mux_n_out], (int)g_peer_wtxidrelay);
         mux_n_out++;
     }
     fprintf(stderr, "serving on port %d (%d outbound peer(s))...\n", port, mux_n_out);
@@ -11310,6 +12166,18 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
             { extern int mp_quiesce(long) __attribute__((weak)); if (mp_quiesce) mp_quiesce(5000); }
             parent_stop_and_wait(60);
             _exit(1);
+        }
+        /* Core -stopatheight (2026-10-01): once the connected tip reaches the
+         * height, shut down cleanly -- KernelNotifications::blockTip requests
+         * the shutdown at index.nHeight >= m_stop_at_height. We only clamped
+         * the download span, so the node reached the height and then sat
+         * there serving; a benchmark or a test waiting for the exit waited
+         * forever. raise(SIGTERM) is the path `stop` takes. */
+        if(g_cfg.stopatheight > 0 && !g_shutdown_requested && g_node_status &&
+           stopatheight_reached(g_node_status->tip_height, g_cfg.stopatheight)){
+            fprintf(stderr,"[serve] stopatheight=%ld reached (connected tip %lld): shutting down, as Core does\n",
+                    g_cfg.stopatheight, (long long)g_node_status->tip_height);
+            raise(SIGTERM);
         }
         if(g_shutdown_requested){
             fprintf(stderr,"[serve] shutting down (signal %d): tip=%d outbound_legs=%d\n",
@@ -11475,7 +12343,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                 }
                 close(c); c = -1;
             }
-            if(c>=0) serve_idx_topup();
+            if(c>=0){ serve_reorg_check(); serve_idx_topup(); }   /* a reorg first: children fork with a fresh index */
             if(c>=0 && upload_note_and_check(0)){
                 /* over -maxuploadtarget for this 24h window -- unless the
                  * peer has the `download` permission (Core: served regardless) */
@@ -11577,6 +12445,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                       if(n >= sizeof g_cur_peer_ip) n = sizeof g_cur_peer_ip - 1;
                       memcpy(g_cur_peer_ip, peerdesc, n); g_cur_peer_ip[n] = 0; }
                     g_serve_violation_hook = serve_violation_report;
+                    { extern long serve_public_tip(const void*); (void)serve_public_tip(store_buf); }   /* follow the archive first: our version must not say the boot height (2026-10-04) */
                     version_tell_the_truth();
                     int hok = node_accept_handshake(c);
                     if(hok==1) peer_inbound_deadline(c);      /* NET-3: handshake done -> the 20-minute idle bound */
@@ -11637,7 +12506,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
         long long now_ms = dh_now_ms();
         for(int i=0;i<mux_n_out;i++){
             if(mux_out_fd[i]<0){                          /* dead slot: re-dial (rate-limited) */
-                if(now_ms >= mux_out_nextretry[i]){ mux_next_peer(i, peers, pool_len, out_port); mux_out_nextretry[i]=now_ms+REDIAL_BACKOFF_MS; }
+                if(now_ms >= mux_out_nextretry[i]){ mux_next_peer(i, peers, pool_len, out_port); mux_out_nextretry[i]=now_ms+redial_gap_ms(); }
                 continue;
             }
             short ev = pfds[poll_idx].revents;
@@ -11649,12 +12518,15 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                 char unread[200]; leg_drain_unread(mux_out_fd[i], unread, sizeof unread);
                 leg_close_theirs(i, how, unread);
                 mux_next_peer(i, peers, pool_len, out_port);
-                mux_out_nextretry[i]=now_ms+REDIAL_BACKOFF_MS;
+                mux_out_nextretry[i]=now_ms+redial_gap_ms();
                 poll_idx++;
                 continue;
             }
             bool due=(rot % mux_n_out)==(long long)i;     /* periodic */
             if(ev & POLLIN) due=true;                     /* data */
+            /* data poll cannot see: a v2 message already decrypted (2026-10-04) */
+            { extern int bmc_v2_has_message(int) __attribute__((weak));
+              if(bmc_v2_has_message && bmc_v2_has_message(mux_out_fd[i])) due=true; }
             /* Bounded: each leg's node_sync must not starve inbound accepts.
              * do_outbound_sync_bounded caps the wall-clock and re-dials the
              * leg if it exceeds the budget, so the loop always returns to
@@ -11805,6 +12677,12 @@ static int datadir_lock_acquire(const char* effdir){
 }
 
 int main(int argc, char** argv){
+    { struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0); g_proc_start_ms = t0.tv_sec * 1000LL + t0.tv_nsec / 1000000; }   /* the [ready] line's clock */
+    /* a fatal signal writes the crashing thread's stack to the log (text-
+     * segment addresses only -- no core file, LimitCORE=0 stays: the seed);
+     * forked workers inherit it (2026-10-03, after a crash loop left only
+     * the kernel's one line) */
+    crash_trace_install();
     signal(SIGPIPE, SIG_IGN);   /* broken peer connections must not kill the node */
     /* counting reaper instead of SIG_IGN: we must know how many inbound
      * children are live to enforce MAX_INBOUND (see the budget above). */
@@ -12202,7 +13080,7 @@ int main(int argc, char** argv){
     { extern int par_script_threads(void);              /* 2026-09-29: said at boot, as Core says "Script verification uses N additional threads" */
       fprintf(stderr,"[boot] script verification: %d thread(s) including the caller (par=%d; Core's cap is 15 workers + the caller)\n", par_script_threads(), g_cfg.par); }
     if(store_init(store_buf)!=1){ fprintf(stderr,"store_init failed\n"); return 1; }
-    { extern int (*txrelay_in_ibd_hook)(void); txrelay_in_ibd_hook = dl_in_ibd_cached; g_dl_in_ibd = dl_tip_is_ibd(); }   /* 2026-09-29: Core takes no tx announcements in IBD */
+    { extern int (*txrelay_in_ibd_hook)(void); txrelay_in_ibd_hook = dl_in_ibd_cached; g_dl_in_ibd = dl_ibd_latch(dl_tip_is_ibd()); }   /* 2026-09-29: Core takes no tx announcements in IBD */
     /* Before ANY append can happen, in the parent -- so the serve loop's
      * tip appends and the boot catch-up are covered as well as the download.
      * Children inherit it across fork. */
@@ -12751,6 +13629,8 @@ int main(int argc, char** argv){
                  g_node_status->tip_height = ph < stt ? ph : stt; }
                { extern void serve_set_connected_tip_ptr(const volatile long long*);
                  serve_set_connected_tip_ptr(&g_node_status->connected_tip); }
+               { extern void rpc_chain_set_ibd_left_ptr(const volatile int*);
+                 rpc_chain_set_ibd_left_ptr(&g_node_status->ibd_left); }   /* Core's latched IBD state */
                g_node_status->start_time = (long long)time(NULL);
                /* MUST be set explicitly: the status block is zeroed shared
                 * memory, and net_active == 0 means "networking disabled" --

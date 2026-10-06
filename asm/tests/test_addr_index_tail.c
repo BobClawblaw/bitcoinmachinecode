@@ -111,6 +111,30 @@ static int big_cb(void* ctx, int op, const unsigned char txid[32], unsigned vout
     return 1;
 }
 
+/* 2026-10-04: axt_read_events is one caller at a time. The Esplora facade
+ * calls it from per-connection threads without the RPC lock while
+ * getaddressbalance calls it under that lock; its mapping is shared and
+ * replaced every block. Thread A's callback starts thread B on its first
+ * record and waits 200 ms inside the scan, so B is guaranteed to try to
+ * enter while A is in it. */
+#include <pthread.h>
+extern long g_axt_inside, g_axt_inside_max;
+static int race_started;
+static pthread_t race_b;
+static int race_noop(void* c, int op, const unsigned char* t, unsigned v, unsigned long long val, unsigned h){
+    (void)c; (void)op; (void)t; (void)v; (void)val; (void)h; return 1; }
+static void* race_b_main(void* a){
+    (void)a; unsigned char k[32]; memset(k, 0x5a, 32);
+    axt_read_events(AXF_P2WPKH, k, 0, race_noop, NULL);
+    return 0;
+}
+static int race_cb(void* c, int op, const unsigned char* t, unsigned v, unsigned long long val, unsigned h){
+    (void)op; (void)t; (void)v; (void)val; (void)h;
+    long* n = (long*)c; (*n)++;
+    if (!race_started){ race_started = 1; pthread_create(&race_b, 0, race_b_main, 0); usleep(200000); }
+    return 1;
+}
+
 int main(void){
     tt_isolate();
 
@@ -331,6 +355,27 @@ int main(void){
       ck("axt_read_events does not fail on a journal past 2 GB", nt >= 0);
       ck("the record past 2 GB is found (the whole journal is scanned)",
          got.n == 1 && got.sum == 4242);
+      unlink(AXF_TAIL_FILE); }
+
+    printf("\n== one reader at a time: a second caller waits for the first (2026-10-04) ==\n");
+    { unlink(AXF_TAIL_FILE);
+      unsigned char k[32]; memset(k, 0x5a, 32);
+      int fd = open(AXF_TAIL_FILE, O_RDWR | O_CREAT | O_TRUNC, 0644);
+      unsigned char rec[AXF_TAIL_REC]; memset(rec, 0, sizeof rec);
+      rec[0] = AXF_OP_ADD; rec[1] = AXF_P2WPKH; memcpy(rec + 2, k, 32);
+      unsigned long long v = 1; unsigned vout = 0, ht = 5;
+      memcpy(rec + 66, &vout, 4); memcpy(rec + 70, &v, 8); memcpy(rec + 78, &ht, 4);
+      int w = 1; for (int i = 0; i < 64 && fd >= 0; i++) if (write(fd, rec, sizeof rec) != (ssize_t)sizeof rec) w = 0;
+      if (fd >= 0) close(fd);
+      ck("journal of 64 matching records written", fd >= 0 && w);
+      g_axt_inside = 0; g_axt_inside_max = 0; race_started = 0;
+      long n = 0;
+      long got = axt_read_events(AXF_P2WPKH, k, 0, race_cb, &n);
+      if (race_started) pthread_join(race_b, 0);
+      printf("      callers inside at once, at most: %ld\n", g_axt_inside_max);
+      ck("the first reader saw all 64 records", got == 64 && n == 64);
+      ck("the second caller never ran inside the first's scan (its munmap would pull the mapping from under it)",
+         race_started && g_axt_inside_max == 1);
       unlink(AXF_TAIL_FILE); }
 
     printf("\n%s (%d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);

@@ -8,8 +8,9 @@
 # The clock is the daemon's own log: the time from launch to the first
 # "[utxo_live] catchup progress: height=" line at or past each 50,000 mark.
 # No RPC is sent to an arm (never poll a benchmark node). An arm is stopped
-# by its pid once the apply reaches STOP; -stopatheight only clamps the
-# download span here and the node keeps running (Core shuts down).
+# by its pid once the apply reaches STOP; since 2026-10-01 -stopatheight also
+# shuts the node down there itself, as Core does, so an exit is read from the
+# log (the final height) before it is called early.
 #
 #   BASE=/srv/nvme8tb/bench/ab-chunk SRCREF=<commit> ARMS="a40:40 b16:16" \
 #     setsid nohup bash validation/ab_dlcchunk.sh > /dev/null 2>&1 < /dev/null &
@@ -39,7 +40,9 @@ say "BUILD ok commit=$COMMIT"
 [ -f RESULTS ] || echo "# arm chunk commit start_utc marks(height=elapsed_s...) stop_s" > RESULTS
 
 for spec in $ARMS; do
-    arm=${spec%%:*}; chunk=${spec##*:}
+    # name:chunk[:key=value[,key=value...]] -- the optional third field is
+    # extra bitcoin.conf lines for the arm (2026-10-06: bmc.dlcrollbelow)
+    arm=${spec%%:*}; rest=${spec#*:}; chunk=${rest%%:*}; extra=""; [ "$rest" != "$chunk" ] && extra=$(echo "${rest#*:}" | tr ',' '\n')
     D="$BASE/$arm"
     if [ -e "$D" ]; then say "SKIP $arm: $D exists (a fresh sync needs a fresh datadir; move it aside)"; continue; fi
     mkdir -p "$D/data"
@@ -61,21 +64,25 @@ zmqpubhashtx=tcp://127.0.0.1:$ZMQPORT
 zmqpubrawtx=tcp://127.0.0.1:$ZMQPORT
 stopatheight=$STOP
 bmc.dlcchunk=$chunk
+$extra
 CONF
     LOG="$D/data/main/debug.log"
     T0=$(date +%s)
     setsid nohup "$BASE/src/asm/daemon/bmcbitcoind" serve "$D/data" > "$D/console.log" 2>&1 < /dev/null &
     pid=$!; echo "$pid" > "$D/daemon.pid"
-    say "ARM $arm chunk=$chunk pid=$pid epoch=$T0"
+    say "ARM $arm chunk=$chunk extra=[$(echo "$extra" | tr '\n' ' ')] pid=$pid epoch=$T0"
     : > "$D/marks"; next=50000; reached=0
     while :; do
         sleep 5
         now=$(date +%s)
-        if ! kill -0 "$pid" 2>/dev/null; then say "ARM $arm: daemon exited before $STOP"; break; fi
+        alive=1; kill -0 "$pid" 2>/dev/null || alive=0
         if [ $((now - T0)) -ge "$ARM_TIMEOUT_S" ]; then say "ARM $arm: timeout at ${ARM_TIMEOUT_S}s"; break; fi
-        [ -f "$LOG" ] || continue
-        h=$(grep -a -o 'catchup progress: height=[0-9]*' "$LOG" | tail -1 | grep -o '[0-9]*$')
+        h=0; [ -f "$LOG" ] && h=$(grep -a -o 'catchup progress: height=[0-9]*' "$LOG" | tail -1 | grep -o '[0-9]*$')
         h=${h:-0}
+        # progress lines are periodic: the daemon's own stop line is the proof
+        [ -f "$LOG" ] && grep -aq "stopatheight=$STOP reached" "$LOG" && h=$STOP
+        # the node exits at STOP by itself now; earlier than that is a failure
+        if [ "$alive" = 0 ] && [ "$h" -lt "$STOP" ]; then say "ARM $arm: daemon exited before $STOP (log height $h)"; break; fi
         while [ "$h" -ge "$next" ] && [ "$next" -le "$STOP" ]; do
             echo "$next=$((now - T0))" >> "$D/marks"; say "ARM $arm: $next at $((now - T0)) s (log height $h)"; next=$((next + 50000))
         done

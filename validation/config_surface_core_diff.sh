@@ -4,7 +4,9 @@
 #   run 1 (defaults):  initialblockdownload false after mining; the 1 sat/vB tx
 #                      is in both templates; version 0x20000000; no UA comment
 #   run 2 (options):   uacomment in subversion; addresstype=legacy addresses;
-#                      maxtipage=1 -> IBD true; blockmintxfee=0.001 -> template
+#                      maxtipage=1 -> IBD as Core has it (v31.1 latches IBD false
+#                      once the tip is recent, so a fresh block before the check
+#                      leaves it false on both); blockmintxfee=0.001 -> template
 #                      empty; blockversion override; rpcwhitelist 403;
 #                      rpccookieperms=group -> 0640; logtimestamps=0
 set -u
@@ -58,6 +60,10 @@ ${2:-}
 EOC
 cat > "$BMC_DIR/bitcoin.conf" <<EOC
 chain=regtest
+printtoconsole=1
+# network-specific keys (port, rpcport, connect, onion, bind) apply on regtest only
+# inside [regtest] -- Core's rule, and this node's since 2026-09-04 (DMN-4)
+[regtest]
 port=$BMC_P2P
 rpcport=$BMC_RPC
 rpcuser=e2e
@@ -131,7 +137,10 @@ logtimestamps=0" "wallet=e2ecore"
 start_all
 sleep 3
 C_IBD=$(core getblockchaininfo | jget "d['initialblockdownload']"); B_IBD=$(bmc getblockchaininfo | jget "d['result']['initialblockdownload']")
-[ "$C_IBD" = "$B_IBD" ] && [ "$C_IBD" = True ] && ok "maxtipage=1: initialblockdownload core=$C_IBD bmc=$B_IBD" || fail "maxtipage=1: initialblockdownload core=$C_IBD bmc=$B_IBD"
+# 2026-10-01: equality with Core, not a fixed True. Core v31.1 caches IBD
+# (m_cached_is_ibd, UpdateIBDStatus) and latches it false the first time the tip
+# is recent; it never re-evaluates. Against v31.1 both nodes report False here.
+[ "$C_IBD" = "$B_IBD" ] && ok "maxtipage=1: initialblockdownload core=$C_IBD bmc=$B_IBD" || fail "maxtipage=1: initialblockdownload core=$C_IBD bmc=$B_IBD"
 C_UA=$(core getnetworkinfo | jget "d['subversion']"); B_UA=$(bmc getnetworkinfo | jget "d['result']['subversion']")
 case "$C_UA" in *"(cfgdiff)/") C_OK=1;; *) C_OK=0;; esac; case "$B_UA" in *"(cfgdiff)/") B_OK=1;; *) B_OK=0;; esac
 [ $C_OK = 1 ] && [ $B_OK = 1 ] && ok "uacomment: core=$C_UA bmc=$B_UA" || fail "uacomment: core=$C_UA bmc=$B_UA"

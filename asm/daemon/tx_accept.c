@@ -677,6 +677,18 @@ const char* txacc_witness_standard(void* mp_area, const u8* tx, unsigned long tx
     }
     return 0;
 }
+#include "../script_error_text.h"   /* Core's ScriptErrorString, generated from v31.1 */
+extern void sha256d(unsigned char out[32], const void* data, unsigned long len);
+/* Core's debug message for the last refusal on this thread (2026-10-03):
+ * the reason buffers stay the bare token every classifier compares; this rides
+ * beside them and the RPC layer prints "reason, detail" as Core's
+ * TxValidationState::ToString does. Empty when Core has none. */
+static __thread char g_txacc_detail[512];
+const char* tx_accept_last_detail(void){ return g_txacc_detail; }
+void tx_accept_clear_detail(void){ g_txacc_detail[0] = 0; }
+extern const char* mpool_policy_detail(void* pol);
+extern __thread long g_txv_immature_depth;          /* daemon/tx_verify.c */
+
 /* the pre-script policy gate; returns NULL ok / reason. Also parks the sigop
  * cost for the policy layer's bytespersigop-adjusted feerate. */
 static const char* txacc_prechecks(void* mp_area, const u8* tx, unsigned long txlen){
@@ -684,7 +696,8 @@ static const char* txacc_prechecks(void* mp_area, const u8* tx, unsigned long tx
     long lc = txacc_legacy_sigops(tx, txlen);
     if (lc > 2500) return "bad-txns-legacy-sigops";              /* MAX_TX_LEGACY_SIGOPS, Core v30 */
     long sc = txacc_sigop_cost(mp_area, tx, txlen);
-    if (sc > 16000) return "bad-txns-too-many-sigops";           /* MAX_STANDARD_TX_SIGOPS_COST */
+    if (sc > 16000){ snprintf(g_txacc_detail, sizeof g_txacc_detail, "%ld", sc);   /* Core: strprintf("%d", nSigOpsCost) */
+                     return "bad-txns-too-many-sigops"; }       /* MAX_STANDARD_TX_SIGOPS_COST */
     /* MEM-23: Core gates IsWitnessStandard on require_standard
      * (validation.cpp:909, `tx.HasWitness() && require_standard && ...`).
      * This ran it unconditionally, so -acceptnonstdtxn did not actually
@@ -714,6 +727,43 @@ static int txacc_script_verify(void* mp_area, const u8* tx, unsigned long txlen,
                           mp_area, &r) == 1)
         return 1;
     *rout = r ? r : "script verification failed";
+    /* Core's script-failure reason (2026-10-03): "mempool-script-verify-flag-
+     * failed (<ScriptErrorString>)" -- "block-..." when standard flags were
+     * not in force (-acceptnonstdtxn, as Core's GetBlockScriptFlags branch) --
+     * with the debug message "input N of <txid> (wtxid <wtxid>), spending
+     * <prevtxid>:<n>" (CScriptCheck). The verifier's descriptive text stays in
+     * the block-connection log. */
+    { extern int tx_verify_last_script_error(long*);
+      extern int tx_verify_input_prevout(long, u8*, unsigned int*);
+      extern int txv_get_mempool_standard(void);
+      extern int tx_txid(u8* out, const u8* tx, unsigned long txlen, u8* scratch, unsigned long scratchcap);
+      long fin = -1; int se = tx_verify_last_script_error(&fin);
+      if (se > 0 && fin >= 0){
+          static __thread char rb[128];
+          snprintf(rb, sizeof rb, "%s-script-verify-flag-failed (%s)",
+                   txv_get_mempool_standard() ? "mempool" : "block", script_error_string(se));
+          *rout = rb;
+          static u8 scratch[2000*81 + 8];
+          u8 tid[32], wid[32], pt[32]; unsigned int pv = 0;
+          if (tx_txid(tid, tx, txlen, scratch, sizeof scratch) == 1 && tx_verify_input_prevout(fin, pt, &pv)){
+              sha256d(wid, tx, (unsigned long)txlen);
+              char a[65], b[65], c[65];
+              static const char* H = "0123456789abcdef";
+              for (int k = 0; k < 32; k++){ a[2*k] = H[tid[31-k] >> 4]; a[2*k+1] = H[tid[31-k] & 15];
+                                            b[2*k] = H[wid[31-k] >> 4]; b[2*k+1] = H[wid[31-k] & 15];
+                                            c[2*k] = H[pt[31-k] >> 4];  c[2*k+1] = H[pt[31-k] & 15]; }
+              a[64] = b[64] = c[64] = 0;
+              snprintf(g_txacc_detail, sizeof g_txacc_detail, "input %ld of %s (wtxid %s), spending %s:%u", fin, a, b, c, pv);
+          }
+      } }
+    /* Core's mempool names (2026-10-01): the verifier is shared with block
+     * connection, whose log keeps the descriptive text; admission answers
+     * with Core's reason strings (Consensus::CheckTxInputs). submitpackage's
+     * per-member errors are compared with Core's word for word. */
+    if (r && !strcmp(r, "input references a missing/already-spent UTXO")) *rout = "bad-txns-inputs-missingorspent";
+    else if (r && !strcmp(r, "immature coinbase spend (100-block rule)")){
+        *rout = "bad-txns-premature-spend-of-coinbase";
+        snprintf(g_txacc_detail, sizeof g_txacc_detail, "tried to spend coinbase at depth %ld", g_txv_immature_depth); }
     return 0;
 }
 
@@ -917,7 +967,7 @@ long tx_accept_validate(void* mp_area, const u8 txid[32], const u8* tx, unsigned
     {
         const char* r = 0;
         if (!txacc_script_verify(mp_area, tx, txlen, &r)){
-            if (r && strstr(r, "missing/already-spent")) g_alog.rej_missing++;
+            if (r && !strcmp(r, "bad-txns-inputs-missingorspent")) g_alog.rej_missing++;   /* txacc_script_verify's Core name */
             else {
                 g_alog.rej_invalid++;
                 snprintf(g_alog.last_invalid, sizeof g_alog.last_invalid, "%s", r ? r : "?");
@@ -927,6 +977,7 @@ long tx_accept_validate(void* mp_area, const u8 txid[32], const u8* tx, unsigned
     }
     mp_lock_at(__func__);
     long padd = mpool_policy_add(g_pol, g_pol_state, mp_area, tx, txlen, txid, placeholder_utxo);
+    if (padd != 1) snprintf(g_txacc_detail, sizeof g_txacc_detail, "%s", mpool_policy_detail(g_pol));   /* under the lock */
     if (padd == 1) txacc_fee_note(txid);           /* fee estimation, under the same lock */
     mp_unlock();
     if (padd != 1){
@@ -972,9 +1023,56 @@ long txacc_snapshot_count(void){
     return (g_ready && g_table) ? utxo_count(g_table) : -1;
 }
 
+/* Core v31.1 TX_RECONSIDERABLE (2026-10-01: the RBF fee verdicts added).
+ * The fee floors, AND ReplacementChecks' "insufficient fee" (PaysForRBF) and
+ * "replacement-failed" (the feerate diagram) -- "Result may change in a
+ * package context", as Core says: a parent that cannot replace alone may
+ * replace with its child (package RBF). Missing from this list, a replacing
+ * parent ended submitpackage before the package was ever evaluated. */
 int txacc_fee_reconsiderable(const char* reason){
     return reason && (!strcmp(reason, "min relay fee not met") ||
-                      !strcmp(reason, "mempool min fee not met"));
+                      !strcmp(reason, "mempool min fee not met") ||
+                      !strcmp(reason, "insufficient fee") ||
+                      !strcmp(reason, "insufficient fee (including sibling eviction)") ||   /* Core's sibling-eviction name, also reconsiderable */
+                      !strcmp(reason, "replacement-failed"));
+}
+/* the aggregate fee floor and an entry's fee/vsize, under the pool lock (submitpackage) */
+int txacc_package_floor_check(unsigned long long fee, unsigned long long vsize, char* why, unsigned long wcap){
+    extern int mpol_package_floor_check(void*, void*, uint64_t, uint64_t, char*, unsigned long);
+    if (why && wcap) why[0] = 0;
+    if (!g_ready || !g_pol_ready) return 1;
+    mp_lock_at(__func__);
+    int r = mpol_package_floor_check(g_pol, g_pol_state, fee, vsize, why, wcap);
+    mp_unlock();
+    return r;
+}
+int txacc_entry_fee_vsize(const u8 txid[32], unsigned long long* fee, unsigned long long* vsize){
+    extern int mpol_entry_fee_vsize(void*, const unsigned char*, uint64_t*, uint64_t*);
+    if (!g_ready || !g_pol_ready) return 0;
+    uint64_t f = 0, v = 0;
+    mp_lock_at(__func__);
+    int r = mpol_entry_fee_vsize(g_pol_state, txid, &f, &v);
+    mp_unlock();
+    if (fee) *fee = f;
+    if (vsize) *vsize = v;
+    return r;
+}
+/* submitpackage's package RBF (Core PackageRBFChecks), under the pool lock.
+ * -1 nothing to replace, 1 go ahead, 0 refused with Core's package_msg. */
+int txacc_package_rbf_check(const u8* const* txs, const unsigned long* lens, const u8* txids, int n,
+                            unsigned long long pkg_fee, unsigned long long pkg_vsize,
+                            unsigned long long parent_fee, unsigned long long parent_vsize,
+                            char* why, unsigned long wcap){
+    extern int mpol_package_rbf_check(void*, void*, const unsigned char* const*, const unsigned long*,
+                                      const unsigned char*, int, uint64_t, uint64_t, uint64_t, uint64_t,
+                                      char*, unsigned long);
+    if (why && wcap) why[0] = 0;
+    if (!g_ready || !g_pol_ready) return -1;
+    mp_lock_at(__func__);
+    int r = mpol_package_rbf_check(g_pol, g_pol_state, txs, lens, txids, n,
+                                   pkg_fee, pkg_vsize, parent_fee, parent_vsize, why, wcap);
+    mp_unlock();
+    return r;
 }
 
 /* tx_accept_validate_p2p: the RELAY path's entry. Same verdict classes as
@@ -1004,7 +1102,7 @@ long tx_accept_validate_p2p(void* mp_area, const u8 txid[32], const u8* tx,
     {
         const char* r = 0;
         if (!txacc_script_verify(mp_area, tx, txlen, &r)){
-            if (r && strstr(r, "missing/already-spent")){ g_alog.rej_missing++; return -25; }
+            if (r && !strcmp(r, "bad-txns-inputs-missingorspent")){ g_alog.rej_missing++; return -25; }   /* the orphan class */
             g_alog.rej_invalid++;
             snprintf(g_alog.last_invalid, sizeof g_alog.last_invalid, "%s", r ? r : "?");
             /* MEM-10: a script failure is FINAL -- no descendant makes an
@@ -1019,6 +1117,7 @@ long tx_accept_validate_p2p(void* mp_area, const u8 txid[32], const u8* tx,
     }
     mp_lock_at(__func__);
     long padd = mpool_policy_add(g_pol, g_pol_state, mp_area, tx, txlen, txid, placeholder_utxo);
+    if (padd != 1) snprintf(g_txacc_detail, sizeof g_txacc_detail, "%s", mpool_policy_detail(g_pol));   /* under the lock */
     if (padd == 1) txacc_fee_note(txid);           /* fee estimation, under the same lock */
     mp_unlock();
     if (padd != 1){
@@ -1047,13 +1146,55 @@ long tx_accept_validate_p2p(void* mp_area, const u8 txid[32], const u8* tx,
  * -25 missing inputs, -26 policy/consensus reject, -27 already known. The
  * reason string is copied into `reason` (best-effort; empty on accept). Shares
  * the same g_pol/g_pol_state/g_ready state as tx_accept_validate. */
+/* Core's stage order for the RPC admission paths (2026-10-03): PreChecks
+ * (inputs: missing, coinbase maturity -- then fees, belowout, RBF, TRUC) run
+ * BEFORE the script checks, so a transaction failing more than one stage is
+ * refused for the earlier one. These paths verified scripts first: a
+ * script-invalid zero-fee transaction answered with its script failure
+ * where Core says "min relay fee not met". The inputs stage here, the
+ * policy test after it; the caller verifies scripts last. Returns 0 to
+ * continue, or the RPC code with reason (and g_txacc_detail) set. The p2p
+ * paths keep scripts first: one policy pass per relayed transaction. */
+static long txacc_rpc_inputs(void* mp_area, const u8* tx, unsigned long txlen, char* reason, unsigned long rcap){
+    extern int tx_verify_mempool_inputs(const u8*, u64, long, txv_resolve_fn, void*, const char**);
+    long nh = g_next_height > 0 ? g_next_height : (1L << 30);
+    const char* r = 0;
+    if (tx_verify_mempool_inputs(tx, (u64)txlen, nh, (txv_resolve_fn)txacc_resolve_verify, mp_area, &r) == 1) return 0;
+    if (r && !strcmp(r, "input references a missing/already-spent UTXO")){
+        if (reason && rcap){ snprintf(reason, rcap, "bad-txns-inputs-missingorspent"); }
+        return -25; }
+    if (r && !strcmp(r, "immature coinbase spend (100-block rule)")){
+        snprintf(g_txacc_detail, sizeof g_txacc_detail, "tried to spend coinbase at depth %ld", g_txv_immature_depth);
+        if (reason && rcap){ snprintf(reason, rcap, "bad-txns-premature-spend-of-coinbase"); }
+        return -26; }
+    if (reason && rcap) snprintf(reason, rcap, "%s", r ? r : "TX decode failed");
+    return -26;
+}
+
 long tx_accept_validate_reason(void* mp_area, const u8 txid[32], const u8* tx,
                                unsigned long txlen, char* reason, unsigned long rcap){
     if (reason && rcap) reason[0] = 0;
+    g_txacc_detail[0] = 0;
     if (!g_ready || !g_pol_ready){ if (reason && rcap) snprintf(reason, rcap, "mempool not initialized"); return -4; }
     void* placeholder_utxo = (void*)1;
     { const char* pre = txacc_prechecks(mp_area, tx, txlen);
       if (pre){ if (reason && rcap) snprintf(reason, rcap, "%s", pre); return -26; } }
+    /* Core's order (2026-10-03): inputs, then the policy (as a test, the
+     * commit stays after the scripts), then the scripts */
+    { long ri = txacc_rpc_inputs(mp_area, tx, txlen, reason, rcap); if (ri) return ri; }
+    { extern long mpool_policy_test(void*, void*, void*, const unsigned char*, unsigned long,
+                                    const unsigned char*, void*, unsigned long long*, unsigned long long*);
+      mp_lock_at(__func__);
+      long pt = mpool_policy_test(g_pol, g_pol_state, mp_area, tx, txlen, txid, placeholder_utxo, NULL, NULL);
+      if (pt != 1) snprintf(g_txacc_detail, sizeof g_txacc_detail, "%s", mpool_policy_detail(g_pol));
+      mp_unlock();
+      if (pt != 1){
+          const char* r = mpool_policy_reason(g_pol);
+          if (reason && rcap) snprintf(reason, rcap, "%s", r ? r : "policy rejected");
+          if (r && strstr(r, "already")) return -27;
+          if (r && (strstr(r, "missing") || strstr(r, "inputs-spent"))) return -25;
+          return -26;
+      } }
     {
         const char* r = 0;
         if (!txacc_script_verify(mp_area, tx, txlen, &r)){
@@ -1076,6 +1217,7 @@ long tx_accept_validate_reason(void* mp_area, const u8 txid[32], const u8* tx,
     }
     mp_lock_at(__func__);
     long padd = mpool_policy_add(g_pol, g_pol_state, mp_area, tx, txlen, txid, placeholder_utxo);
+    if (padd != 1) snprintf(g_txacc_detail, sizeof g_txacc_detail, "%s", mpool_policy_detail(g_pol));   /* under the lock */
     if (padd == 1) txacc_fee_note(txid);           /* fee estimation, under the same lock */
     mp_unlock();
     if (padd != 1){
@@ -1114,6 +1256,7 @@ long tx_accept_test_reason(void* mp_area, const u8 txid[32], const u8* tx,
                                   const unsigned char*, void*, unsigned long long*,
                                   unsigned long long*);
     if (reason && rcap) reason[0] = 0;
+    g_txacc_detail[0] = 0;
     if (fee_out) *fee_out = 0;
     /* The SIGOP-ADJUSTED vsize, for callers aggregating a package feerate.
      * Zero unless the policy layer was reached; a member rejected before it
@@ -1123,17 +1266,12 @@ long tx_accept_test_reason(void* mp_area, const u8 txid[32], const u8* tx,
     void* placeholder_utxo = (void*)1;
     { const char* pre = txacc_prechecks(mp_area, tx, txlen);
       if (pre){ if (reason && rcap) snprintf(reason, rcap, "%s", pre); return -26; } }
-    {
-        const char* r = 0;
-        if (!txacc_script_verify(mp_area, tx, txlen, &r)){
-            if (reason && rcap) snprintf(reason, rcap, "%s", r ? r : "mandatory-script-verify-flag-failed");
-            if (r && (strstr(r, "missing") || strstr(r, "inputs-spent"))) return -25;
-            return -26;
-        }
-    }
+    /* Core's order (2026-10-03): inputs, policy, then scripts */
+    { long ri = txacc_rpc_inputs(mp_area, tx, txlen, reason, rcap); if (ri) return ri; }
     mp_lock_at(__func__);
     long pt = mpool_policy_test(g_pol, g_pol_state, mp_area, tx, txlen, txid,
                                 placeholder_utxo, fee_out, vsize_out);
+    if (pt != 1) snprintf(g_txacc_detail, sizeof g_txacc_detail, "%s", mpool_policy_detail(g_pol));   /* under the lock */
     mp_unlock();
     if (pt != 1){
         const char* r = mpool_policy_reason(g_pol);
@@ -1141,6 +1279,14 @@ long tx_accept_test_reason(void* mp_area, const u8 txid[32], const u8* tx,
         if (r && strstr(r, "already")) return -27;
         if (r && (strstr(r, "missing") || strstr(r, "inputs-spent"))) return -25;
         return -26;
+    }
+    {
+        const char* r = 0;
+        if (!txacc_script_verify(mp_area, tx, txlen, &r)){
+            if (reason && rcap) snprintf(reason, rcap, "%s", r ? r : "mandatory-script-verify-flag-failed");
+            if (r && (strstr(r, "missing") || strstr(r, "inputs-spent"))) return -25;
+            return -26;
+        }
     }
     return 1;
 }

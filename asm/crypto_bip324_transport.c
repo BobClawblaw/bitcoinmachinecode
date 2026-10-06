@@ -312,6 +312,21 @@ int bip324_t_next_message(bip324_transport_t* t, const char** type,
     return 1;
 }
 
+/* Is a complete message already decrypted, or decryptable from bytes already
+ * fed, without touching the socket? (2026-10-03) A recv() takes up to 64 KB,
+ * so one read can carry several messages; next_message hands them out one at
+ * a time, and a caller that polls the SOCKET before each read never sees the
+ * rest -- poll reports nothing while they sit here. The serve loop's
+ * txann_wait did exactly that: a v2 peer's getheaders that arrived with its
+ * verack waited for the peer's next packet (a ping, up to 2 min). 1 = ready
+ * (or a protocol violation the read will report), 0 = needs more bytes. */
+int bip324_t_has_message(bip324_transport_t* t){
+    if (t->msg_ready) return 1;
+    if (t->recv_state == BIP324_RECV_V1 || !t->keys_ready) return 0;
+    if (!advance(t)) return 1;                   /* let the read surface the violation */
+    return t->msg_ready ? 1 : 0;
+}
+
 int bip324_t_send_message(bip324_transport_t* t, const char* type,
                           const unsigned char* payload, unsigned long plen){
     if (!t->keys_ready || !t->sent_version) return 0;

@@ -116,6 +116,7 @@ s_p:         .zero 8
 s_addrsent:  .zero 1        /* getaddr answered once per conn (Core: m_getaddr_recvd) */
 s_abound:    .zero 8        /* getaddr loop bound in MEMORY (was clobbered in rdx) */
 s_n:         .zero 8
+s_wtxtid:    .zero 32                 /* BIP339: the txid a getdata(MSG_WTX) resolved to */
 s_served:    .zero 8
 s_tip:       .zero 8
 s_from:      .zero 8
@@ -966,6 +967,8 @@ _node_serve_loop:
 	and  w10, w10, #0x3fffffff
 	cmp  w10, #1
 	b.eq .gd_tx
+	cmp  w10, #5                      /* MSG_WTX (BIP339): this peer negotiated wtxid relay */
+	b.eq .gd_wtx
 	cmp  w10, #4
 	b.eq .gd_cmpct
 	cmp  w10, #2
@@ -1129,6 +1132,28 @@ _node_serve_loop:
 	add  x11, x11, #1
 	str  x11, [x10]
 	b    .gd_next
+
+.gd_wtx:
+	/* BIP339 (bitcoin_serve.asm 2026-10-03): the hash is a wtxid -- ours,
+	 * from an MSG_WTX inv txann_tick sent this peer. The pool indexes txids
+	 * only, so txann's map gives the txid back; then the pool, served in the
+	 * WITNESS form (MSG_WTX always means the full serialization). Unknown ->
+	 * notfound. */
+	str  x9, [sp, #0]
+	add  x0, x9, #4
+	LOADADDR x1, s_wtxtid
+	bl   _txann_txid_for_wtxid
+	ldr  x9, [sp, #0]
+	cbz  w0, .gd_miss
+	LOADADDR x0, mp_cur
+	ldr  x0, [x0]
+	LOADADDR x1, s_wtxtid
+	LOADADDR x2, s_n
+	bl   _mpool_get
+	ldr  x9, [sp, #0]
+	cbz  x0, .gd_miss
+	mov  x3, x0                        /* tx bytes ptr (mpool blob) */
+	b    .gdtx_have
 
 .gd_tx:
 	str  x9, [sp, #0]

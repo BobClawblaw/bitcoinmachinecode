@@ -495,6 +495,18 @@ _point_scalar_mul_win_ct:
     str   x9, [sp, #\dst + \off]
     .endr
 .endm
+/* point_scalar_mul_glvj_ct(out[12], xy[8], k[4]): main's second
+ * constant-time k*P (2026-10-02, x86 secp256k1_point_ct.asm: libsecp256k1's
+ * ecmult_const, Jacobian, 15.9 us against 24.9). Same contract as the routine
+ * below -- k < n, Jacobian out, canonical infinity (1, 1, 0) -- so until the
+ * Jacobian body is ported it IS the routine below: constant time, the same
+ * point, the old speed. test_pointmul_ct_variants checks it against the
+ * ladder; test_pointj_add_ge_ct (its add, pointj_add_ge_ct) is N/A here. */
+    .p2align 2
+    .globl _point_scalar_mul_glvj_ct
+_point_scalar_mul_glvj_ct:
+    b     _point_scalar_mul_glv_ct
+
     .p2align 2
     .globl _point_scalar_mul_glv_ct
 _point_scalar_mul_glv_ct:

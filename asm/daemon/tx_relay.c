@@ -16,10 +16,12 @@
  * STRIPPED serialization -- the exact bug shape that silently stripped the
  * whole segwit-era block archive (incident #10) -- and a stripped segwit
  * transaction fails signature validation, so every segwit tx would be
- * fetched, rejected, and re-fetched forever. Peers announce with type 1
- * (we do not negotiate BIP339 wtxidrelay, so announcements are txid-based);
- * the REQUEST flags the witness bit, exactly as the block fetch asks for
- * MSG_WITNESS_BLOCK.
+ * fetched, rejected, and re-fetched forever. Peers that did not negotiate
+ * BIP339 announce with type 1, and the REQUEST flags the witness bit, exactly
+ * as the block fetch asks for MSG_WITNESS_BLOCK; a peer that negotiated
+ * wtxidrelay announces MSG_WTX and is asked with MSG_WTX (2026-10-03: we send
+ * wtxidrelay again, and announce to such a peer by wtxid -- txrelay_announce,
+ * txann.c's map -- because Core drops MSG_TX invs from it).
  *
  * WHAT THIS DOES NOT DO, deliberately, stated rather than implied:
  *   - block-type inv entries are ignored here exactly as the sync drains
@@ -87,6 +89,12 @@ extern long tx_accept_test_reason(void* mp, const u8* txid, const u8* tx, unsign
                                   char* reason, unsigned long rcap, unsigned long long* fee,
                                   unsigned long long* vsize_out);
 extern int  txacc_fee_reconsiderable(const char* reason);
+extern int  txacc_package_floor_check(unsigned long long fee, unsigned long long vsize, char* why, unsigned long wcap);
+extern int  txacc_package_rbf_check(const u8* const* txs, const unsigned long* lens, const u8* txids, int n,
+                                    unsigned long long pkg_fee, unsigned long long pkg_vsize,
+                                    unsigned long long parent_fee, unsigned long long parent_vsize,
+                                    char* why, unsigned long wcap);
+extern void mpol_package_rbf_context(int on);
 
 extern long strip_witness(const unsigned char* tx, long long txlen,
                           unsigned char* out, long cap);   /* MEM-24 */
@@ -511,6 +519,24 @@ static void txr_ann_add(const u8 txid[32], int src_fd){
     txr_ann_n++;
 }
 
+/* BIP339 (2026-10-03): did the peer on this fd negotiate wtxidrelay? Set by
+ * main.c at every leg install from the handshake's g_peer_wtxidrelay (and the
+ * dial helper's copy of it). A wtxid peer is announced to by MSG_WTX -- Core
+ * drops our MSG_TX invs from it -- and its getdata(MSG_WTX) is served through
+ * txann's wtxid map (txann.c, the same map the inbound children use). */
+#define TXR_WTX_FDS 65536
+static unsigned char txr_fd_wtxid[TXR_WTX_FDS];
+void txrelay_fd_set_wtxid(int fd, int on){ if (fd >= 0 && fd < TXR_WTX_FDS) txr_fd_wtxid[fd] = on ? 1 : 0; }
+int  txrelay_fd_wtxid(int fd){ return (fd >= 0 && fd < TXR_WTX_FDS) ? txr_fd_wtxid[fd] : 0; }
+extern int txann_wtxid_of(const u8 txid[32], u8 wtxid_out[32]) __attribute__((weak));
+/* a whole v2 message already decrypted from an earlier recv: poll() cannot
+ * see it, so a poll-gated read loop must ask first (daemon/v2transport.c;
+ * the inbound serve loop's txann_wait got this 2026-10-03, these outbound
+ * loops 2026-10-04) */
+extern int bmc_v2_has_message(int fd) __attribute__((weak));
+static int txr_v2_buffered(int fd){ return bmc_v2_has_message && bmc_v2_has_message(fd); }
+extern int txann_txid_for_wtxid(const u8 wtxid[32], u8 txid_out[32]) __attribute__((weak));
+
 /* A transaction WE originated: no source leg to hold back from, so it is
  * announced on every one. Called by daemon/tx_submit.c, which reaches it
  * through a weak stub so the socketpair unit test links without this TU. */
@@ -605,10 +631,16 @@ long txrelay_announce(const int* fds, int nfds){
         if (sl < 0 || !txr_leg_pend_n[sl]) continue;
         if (now < txr_leg_next[sl]) continue;             /* this leg's turn has not come */
         unsigned n = 0;
+        int wtx = txrelay_fd_wtxid(fds[f]);
         for (int i = 0; i < txr_leg_pend_n[sl]; i++){
             u8* e = inv + 1 + n*36;
-            e[0] = 1; e[1] = 0; e[2] = 0; e[3] = 0;       /* MSG_TX */
-            memcpy(e + 4, txr_leg_pend[sl][i], 32);
+            if (wtx){                                     /* BIP339: MSG_WTX by wtxid */
+                if (!txann_wtxid_of || !txann_wtxid_of(txr_leg_pend[sl][i], e + 4)) continue;   /* left the pool */
+                e[0] = 5; e[1] = 0; e[2] = 0; e[3] = 0;
+            } else {
+                e[0] = 1; e[1] = 0; e[2] = 0; e[3] = 0;   /* MSG_TX */
+                memcpy(e + 4, txr_leg_pend[sl][i], 32);
+            }
             n++;
         }
         if (n){ inv[0] = (u8)n; p2p_write(fds[f], "inv", 3, inv, 1 + n*36); }
@@ -757,19 +789,21 @@ static int txr_submit_1p1c(void* mp, const u8* parent, unsigned long plen,
     u8 txids[64];
     unsigned long long vsz[2];
     const char* why = "";
+    int rbf = -1;
 
     if (!mpol_package_well_formed(txs, lens, 2, txids, vsz, &why)) return 0;
 
     /* pass 1: dry run under the overlay, to learn the real fees. The overlay
      * is what lets the child resolve its prevout against a parent that is
      * not in the mempool yet. */
-    unsigned long long tot_fee = 0, tot_vsize = 0;
+    unsigned long long tot_fee = 0, tot_vsize = 0, pfee = 0, pvs = 0;
     int all_ok = 1;
     mpol_package_context(txs, lens, txids, 2);
     txacc_package_overlay(txs, lens, txids, 2);
     for (int i = 0; i < 2; i++){
         char r[128]; r[0] = 0; unsigned long long fee = 0, avs = 0;
         long rc = tx_accept_test_reason(mp, txids + i*32, txs[i], lens[i], r, sizeof r, &fee, &avs);
+        if (i == 0){ pfee = fee; pvs = avs ? avs : vsz[0]; }   /* the parent's own feerate, for package RBF */
         /* the SIGOP-ADJUSTED vsize, as Core's package feerate uses: vsz[] is
          * the structural walker's figure and cannot count sigops (they need
          * the UTXO view), so it only stands in when the policy layer was
@@ -781,16 +815,28 @@ static int txr_submit_1p1c(void* mp, const u8* parent, unsigned long plen,
     mpol_package_context(NULL, NULL, NULL, 0);
     if (!all_ok) return 0;
 
+    /* 2026-10-02: the aggregate floor, then package RBF -- Core's 1p1c goes
+     * through the same AcceptPackage as submitpackage, so a parent that must
+     * REPLACE a mempool transaction can do it with its child's fee
+     * (PackageRBFChecks). Without this the commit priced the parent's
+     * replacement on its own fee and refused it. */
+    { char why[320];
+      if (!txacc_package_floor_check(tot_fee, tot_vsize, why, sizeof why)) return 0;
+      rbf = txacc_package_rbf_check(txs, lens, txids, 2, tot_fee, tot_vsize, pfee, pvs, why, sizeof why);
+      if (rbf == 0) return 0; }
+
     /* pass 2: commit with the package feerate in effect */
     int committed = 1;
     mpol_package_fee_context(tot_fee, tot_vsize);
     mpol_package_context(txs, lens, txids, 2);
     txacc_package_overlay(txs, lens, txids, 2);
+    if (rbf == 1) mpol_package_rbf_context(1);
     for (int i = 0; i < 2; i++)
         if (tx_accept_validate_p2p(mp, txids + i*32, txs[i], lens[i]) != 1) committed = 0;
     /* ALWAYS cleared, on every path: a fee context left set would relax the
      * floor for ordinary single-transaction relay, and an overlay left set
      * would let an unrelated transaction resolve against a package member. */
+    mpol_package_rbf_context(0);
     txacc_package_overlay(NULL, NULL, NULL, 0);
     mpol_package_context(NULL, NULL, NULL, 0);
     mpol_package_fee_context(0, 0);
@@ -1313,8 +1359,10 @@ int txrelay_classify_missing(const unsigned char* tx, unsigned long len){
 long txrelay_poll_block_only_leg(int fd){
     char cmd[12]; unsigned plen; long seen = 0;
     for (int msgs = 0; msgs < TXR_MAX_MSGS; msgs++){
-        struct pollfd pf = { fd, POLLIN, 0 };
-        if (poll(&pf, 1, 0) <= 0 || !(pf.revents & POLLIN)) break;
+        if (!txr_v2_buffered(fd)){
+            struct pollfd pf = { fd, POLLIN, 0 };
+            if (poll(&pf, 1, 0) <= 0 || !(pf.revents & POLLIN)) break;
+        }
         if (p2p_read(fd, cmd, txr_pl, sizeof txr_pl, &plen) != 1) break;
         seen++;
         /* getpeerinfo bytesrecv_per_msg: the command is in hand here, and the
@@ -1464,12 +1512,14 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
             if (left <= 0) break;
             wait = (int)left;
         }
-        int wk = txrelay_wake_fd >= 0 && txrelay_wake_pid == (int)getpid();
-        struct pollfd pf[2] = { { fd, POLLIN, 0 }, { txrelay_wake_fd, POLLIN, 0 } };
-        int pr = poll(pf, wk ? 2 : 1, wait);
-        if (pr <= 0) break;
-        if (wk && (pf[1].revents & POLLIN) && !(pf[0].revents & POLLIN)) break;   /* a query cuts the WAIT short; buffered leg messages are still read (bounded by TXR_MAX_MSGS) */
-        if (!(pf[0].revents & POLLIN)) break;
+        if (!txr_v2_buffered(fd)){
+            int wk = txrelay_wake_fd >= 0 && txrelay_wake_pid == (int)getpid();
+            struct pollfd pf[2] = { { fd, POLLIN, 0 }, { txrelay_wake_fd, POLLIN, 0 } };
+            int pr = poll(pf, wk ? 2 : 1, wait);
+            if (pr <= 0) break;
+            if (wk && (pf[1].revents & POLLIN) && !(pf[0].revents & POLLIN)) break;   /* a query cuts the WAIT short; buffered leg messages are still read (bounded by TXR_MAX_MSGS) */
+            if (!(pf[0].revents & POLLIN)) break;
+        }
         if (p2p_read(fd, cmd, pl, TXR_PAYLOAD_CAP, &plen) != 1) break;
         /* getpeerinfo bytesrecv_per_msg: the command is in hand here, and the
          * asm read path has two exits whose frames are not worth disturbing. */
@@ -1584,9 +1634,13 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
                 if (e + 36 > pl + plen) break;
                 unsigned type = (unsigned)e[0] | (unsigned)e[1]<<8 |
                                 (unsigned)e[2]<<16 | (unsigned)e[3]<<24;
-                if (type != TXR_MSG_TX && type != TXR_MSG_WITNESS_TX) continue;
+                if (type != TXR_MSG_TX && type != TXR_MSG_WITNESS_TX && type != TXR_MSG_WTX) continue;
                 unsigned long got_len = 0;
-                const u8* bytes = mpool_get(mp, e + 4, &got_len);
+                const u8* bytes = 0;
+                if (type == TXR_MSG_WTX){                 /* BIP339: the wtxid we announced -> txid -> pool */
+                    u8 tid[32];
+                    if (txann_txid_for_wtxid && txann_txid_for_wtxid(e + 4, tid)) bytes = mpool_get(mp, tid, &got_len);
+                } else bytes = mpool_get(mp, e + 4, &got_len);
                 if (bytes && got_len){
                     /* MEM-24 (audit 2026-09-03): a bare MSG_TX (witness bit
                      * CLEAR) asks for the NON-WITNESS serialization. Core
