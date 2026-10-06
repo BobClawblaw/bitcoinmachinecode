@@ -2209,6 +2209,92 @@ static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx,
     return o;
 }
 
+/* ---- 2026-10-06: the relatives' snapshot ------------------------------------
+ * Verbose getmempoolancestors / getmempooldescendants render up to 63 entries
+ * with mpe_entry_obj. Without the bulk tables every one of them asked the
+ * registry per txid -- its own node, then each ancestor's and descendant's for
+ * the size sums, then each cluster member's for the chunk -- and each such
+ * mpool_policy_entry_info call rebuilds the registry's children index, O(pool).
+ * All of it, and the JSON, ran under the pool lock: set x cluster x pool.
+ *
+ * Instead, under the lock: walk the transaction's connected component (the
+ * only nodes any of those lookups can reach) once, one entry_info per node,
+ * and copy each pool-present node's inputs into the same per-call tables the
+ * bulk getrawmempool path fills (g_mpe_vs / g_mpe_inf / g_mpe_chunk). Then
+ * the caller releases the lock and renders in snapshot mode. A component
+ * larger than MPE_REL_CAP, or an allocation that fails, returns 0 and the
+ * caller keeps the old all-under-the-lock path (the answer is the same; the
+ * cap only bounds the walk -- the cluster limit is 64, so it is not reached
+ * on a policy-respecting pool). Caller holds the pool lock. */
+#define MPE_REL_CAP 256
+static int mpe_snapshot_component(const unsigned char seed[32]){
+    if (!g_mph.polstate || !g_mph.pol_entry_info || !g_mph.get) return 0;
+    unsigned char (*ids)[32] = (unsigned char (*)[32])malloc((size_t)MPE_REL_CAP * 32);
+    mp_entry_info* inf = (mp_entry_info*)malloc((size_t)MPE_REL_CAP * sizeof *inf);
+    mpe_vs_t* vs = (mpe_vs_t*)malloc((size_t)MPE_REL_CAP * sizeof *vs);
+    if (!ids || !inf || !vs){ free(ids); free(inf); free(vs); return 0; }
+    /* breadth-first over depends + spentby; ids[] is the queue and the seen set */
+    int nq = 0, ni = 0;
+    memcpy(ids[nq++], seed, 32);
+    for (int h = 0; h < nq; h++){
+        if (g_mph.pol_entry_info(g_mph.polstate, ids[h], &inf[ni]) != 1) continue;
+        mp_entry_info* e = &inf[ni];
+        if (h != ni) memcpy(ids[ni], ids[h], 32);    /* compact: ids[0..ni) pair with inf[] */
+        ni++;
+        for (int side = 0; side < 2; side++){
+            int ne = side ? e->n_spentby : e->n_depends;
+            unsigned char (*ed)[32] = side ? e->spentby : e->depends;
+            for (int j = 0; j < ne; j++){
+                int seen = 0;
+                for (int q = 0; q < nq && !seen; q++) seen = !memcmp(ids[q], ed[j], 32);
+                if (seen) continue;
+                if (nq >= MPE_REL_CAP){ free(ids); free(inf); free(vs); return 0; }
+                memcpy(ids[nq++], ed[j], 32);
+            }
+        }
+    }
+    /* the queue entries past ni were compacted over; the registry nodes are
+     * ids[0..ni) with inf[0..ni). Now the pool's side of each. */
+    unsigned long nv = 0;
+    for (int i = 0; i < ni; i++){
+        unsigned long len = 0;
+        const unsigned char* tx = g_mph.get(g_mph.mp, ids[i], &len);
+        if (!tx) continue;                               /* stale registry node: not rendered, not summed */
+        mpe_vs_t* v = &vs[nv];
+        memcpy(v->id, ids[i], 32);
+        v->w = mp_tx_weight(tx, len);
+        v->rbf = (unsigned char)mp_tx_signals_rbf(tx, len);
+        v->vs = (v->w + 3) / 4;
+        v->inf = -1;
+        if (g_mph.sha256d) g_mph.sha256d(v->wtxid, tx, len); else memcpy(v->wtxid, ids[i], 32);
+        v->tm = g_mph.time_of ? g_mph.time_of(ids[i]) : 0;
+        v->pri = pri_delta_of(ids[i]);
+        v->ord = nv;
+        nv++;
+    }
+    mpe_chunk_t* ch = (mpe_chunk_t*)calloc(nv ? nv : 1, sizeof *ch);
+    if (!ch){ free(ids); free(inf); free(vs); return 0; }
+    g_mpe_vs = vs; g_mpe_vs_n = nv;
+    g_mpe_inf = inf; g_mpe_inf_id = ids; g_mpe_inf_n = ni;
+    g_mpe_chunk = ch;
+    return 1;
+}
+/* after the lock: sort the snapshot and pair each pool entry with its node */
+static void mpe_snapshot_index(void){
+    qsort(g_mpe_vs, g_mpe_vs_n, sizeof *g_mpe_vs, mpe_vs_cmp);
+    for (long q = 0; q < g_mpe_inf_n; q++){
+        long k = mpe_vs_find(g_mpe_inf_id[q]);
+        if (k >= 0){ g_mpe_vs[k].inf = q;
+                     g_mpe_vs[k].vs = mpe_adj_vsize(g_mpe_vs[k].w, g_mpe_inf[q].sigop_cost); }
+    }
+}
+static void mpe_tables_free(void){
+    g_mpe_snap = 0;
+    free(g_mpe_chunk); g_mpe_chunk = 0;
+    free(g_mpe_vs); g_mpe_vs = 0; g_mpe_vs_n = 0;
+    free(g_mpe_inf); free(g_mpe_inf_id); g_mpe_inf = 0; g_mpe_inf_id = 0; g_mpe_inf_n = 0;
+}
+
 /* getmempoolancestors / getmempooldescendants (Core rpc/mempool.cpp): the
  * tx's transitive in-mempool ancestors (txs it depends on) or descendants
  * (txs depending on it), EXCLUDING the tx itself -- verified live on the
@@ -2249,6 +2335,25 @@ static int cmd_mpe_relatives(const rj_val* params, rj_val** res, long* ec, const
     if (g_mph.polstate && g_mph.pol_entry_info)
         have_inf = (int)g_mph.pol_entry_info(g_mph.polstate, txid, &inf);
     rj_val* out = verbose ? rj_obj() : rj_arr();
+    /* 2026-10-06: verbose renders from a snapshot of the component, after
+     * the lock (mpe_snapshot_component); non-verbose is a list of txids and
+     * stays as it was */
+    if (have_inf && verbose && g_grm_snapshot && mpe_snapshot_component(txid)){
+        mpu();
+        g_mpe_snap = 1;
+        mpe_snapshot_index();
+        int n = want_desc ? inf.n_desc : inf.n_anc;
+        unsigned char (*set)[32] = want_desc ? inf.desc : inf.anc;
+        for (int i=0;i<n;i++){
+            if (!memcmp(set[i], txid, 32)) continue;         /* EXCLUDING self */
+            if (mpe_vs_find(set[i]) < 0) continue;           /* stale registry entry */
+            char h2[65]; mpe_hex(h2, set[i]);
+            rj_obj_set(out, h2, mpe_entry_obj(set[i], NULL, 0));
+        }
+        mpe_tables_free();
+        *res = out;
+        return 1;
+    }
     if (have_inf){
         int n = want_desc ? inf.n_desc : inf.n_anc;
         unsigned char (*set)[32] = want_desc ? inf.desc : inf.anc;

@@ -17,7 +17,11 @@
  *     call, and its answer is byte-identical to the old all-under-the-lock
  *     build (rpc_node_set_grm_snapshot(0)) -- with arrival times, wtxids and
  *     prioritisetransaction deltas in play, the three inputs the snapshot
- *     carries that the pool used to supply mid-build.
+ *     carries that the pool used to supply mid-build;
+ *   - (2026-10-06) the same for verbose getmempoolancestors /
+ *     getmempooldescendants, which now snapshot the transaction's connected
+ *     component under the lock and render after it: byte-identical answers
+ *     on chain heads, middles, tails and a singleton, a shorter hold.
  *
  * The call's wall time is printed, not asserted (the number to compare is
  * before/after on the same box, see docs/PARITY_RPC_FIELDS.md). The lock hold
@@ -252,6 +256,46 @@ int main(int argc, char** argv){
              hold[1], hold[0]);
     ck(what, hold[1] < hold[0] * 0.5);
     free(body[0]); free(body[1]);
+
+    /* ---- verbose ancestors / descendants: old path vs the component snapshot ---- */
+    if (n > 40){
+        const int pick[6] = { 0, 1, 12, 24, 25 * 7 + 13, n - 1 };
+        const char* meth[2] = { "getmempoolancestors", "getmempooldescendants" };
+        int same = 1, calls = 0, nonempty = 0;
+        double rhold[2] = { 0, 0 };
+        long tk0 = g_takes, rl0 = g_releases;
+        for (int q = 0; q < 6; q++) for (int d = 0; d < 2; d++){
+            char pa[160]; snprintf(pa, sizeof pa, "[\"%s\", true]", all->members[pick[q]].key);
+            char* rb[2] = { NULL, NULL }; long rl[2] = { 0, 0 };
+            for (int mode = 0; mode < 2; mode++){
+                rpc_node_set_grm_snapshot(mode);
+                rj_val* pp = rj_parse(pa, strlen(pa)); rj_val* r = NULL;
+                g_hold_max = 0;
+                rpc_node_dispatch(meth[d], pp, &r, &ec, &em);
+                if (g_hold_max > rhold[mode]) rhold[mode] = g_hold_max;
+                if (mode == 1 && r && r->nmembers) nonempty++;
+                rb[mode] = r ? rj_write_alloc(r, 0, &rl[mode]) : NULL;
+                rj_free(r); rj_free(pp);
+            }
+            calls++;
+            if (!rb[0] || !rb[1] || rl[0] != rl[1] || memcmp(rb[0], rb[1], (size_t)rl[0])){
+                if (same) printf("  (first relatives disagreement: %s on member %d)\n", meth[d], pick[q]);
+                same = 0;
+            }
+            free(rb[0]); free(rb[1]);
+        }
+        rpc_node_set_grm_snapshot(1);
+        printf("  verbose ancestors/descendants, longest pool-lock hold over %d calls: %.2f ms building "
+               "under the lock, %.2f ms copying under it\n", calls, rhold[0], rhold[1]);
+        snprintf(what, sizeof what, "verbose ancestors/descendants are byte-identical on both paths (%d calls, %d non-empty)",
+                 calls, nonempty);
+        ck(what, same && nonempty >= 6);
+        snprintf(what, sizeof what, "...with every take released (%ld takes, %ld releases)",
+                 g_takes - tk0, g_releases - rl0);
+        ck(what, g_takes - tk0 == g_releases - rl0 && g_takes > tk0);
+        snprintf(what, sizeof what, "...and a shorter longest hold (%.2f ms against %.2f ms)", rhold[1], rhold[0]);
+        ck(what, rhold[1] < rhold[0]);
+    }
 
     rj_free(all);
     rpc_node_set_mempool(NULL);

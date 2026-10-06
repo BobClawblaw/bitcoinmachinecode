@@ -2482,6 +2482,22 @@ release cannot pass as a short hold. A call whose tables did not build
 (no one-pass graph, an allocation failure) keeps the old under-the-lock
 shape, because it still needs the per-txid lookups.
 
+*Same evening:* verbose `getmempoolancestors` / `getmempooldescendants`
+had a worse shape under the lock than the dump. With no bulk tables each
+rendered member asked the registry per txid -- its own node, each
+ancestor's and descendant's for the size sums, each cluster member's for
+the chunk -- and every `mpool_policy_entry_info` rebuilds the registry's
+children index, O(pool): set x cluster x pool scans, plus the JSON, all
+inside `mpl()`. Now `mpe_snapshot_component` walks the transaction's
+connected component once under the lock (one entry_info per node, the only
+nodes any of those lookups can reach), copies each pool-present node's
+inputs into the same per-call tables, and the render runs after `mpu()` in
+snapshot mode. A component above 256 nodes (the cluster limit is 64) or a
+failed allocation keeps the old path. `test_rpc_chunk_scale`: on chain
+heads, middles, tails and a singleton, both directions, the answers are
+byte-identical to the old path's and the longest hold went 85.3 ms ->
+1.6 ms. Non-verbose forms and single `getmempoolentry` are unchanged.
+
 ### The wallet has no reorg awareness (WAL-13)
 
 `wallet_scan.c`'s on-disk record is `u32 height | txid | vout | value`
