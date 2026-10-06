@@ -43,6 +43,7 @@ node_config_t g_cfg = {
     .maxpool               = 2048,
     .dlc_chunk_blocks      = 16,
     .dl_shape_core         = 0,
+    .dlc_roll_below        = 0,
     .addr_max_per_response = 256,
     .addr_max_per_netgroup = 16,
     .utxo_bulk_slots_log2  = 22,
@@ -282,6 +283,7 @@ static void set_defaults(void){
     g_cfg.maxpool               = 2048;
     g_cfg.dlc_chunk_blocks      = 16;
     g_cfg.dl_shape_core         = 0;
+    g_cfg.dlc_roll_below        = 0;
     g_cfg.addr_max_per_response = 256;
     g_cfg.addr_max_per_netgroup = 16;
     g_cfg.proxyrandomize        = 1;     /* Core DEFAULT_PROXYRANDOMIZE */
@@ -1116,6 +1118,7 @@ long node_config_load(const char* path){
          * keeps 16 in flight per peer, refilled as each lands; ours is one
          * getdata per chunk. 4..64: the staging buffer is sized for 64. */
         else if(!strcmp(key,"bmc.dlcchunk"))          { t=clamp_int(IV,4,64,key,&bad);     if(t>=0){g_cfg.dlc_chunk_blocks=t;applied++;} }
+        else if(!strcmp(key,"bmc.dlcrollbelow"))      { t=clamp_int(IV,0,100000000,key,&bad); if(t>=0){g_cfg.dlc_roll_below=t;applied++;} }   /* plan B9 (2026-10-06) */
         /* 2026-10-04: the download's SHAPE. "bmc" (the default) is this
          * node's own: whole-chunk requests, peers ranked by a header sample
          * and picked by speed, slow peers rotated, dead weight and stallers
@@ -1365,9 +1368,9 @@ void node_config_log(void){
             g_cfg.max_connections, outbound, g_cfg.max_outbound,
             g_cfg.max_block_relay_only, g_cfg.max_feeler,
             g_cfg.max_connections-outbound, g_cfg.feeler_interval_ms/1000);
-    fprintf(stderr,"[config] peers: min_bps=%.0f ticks=%d min_usable=%d pool=%d dlc_chunk=%d dlshape=%s\n",
+    fprintf(stderr,"[config] peers: min_bps=%.0f ticks=%d min_usable=%d pool=%d dlc_chunk=%d dlshape=%s dlcrollbelow=%ld\n",
             g_cfg.dead_weight_bps, g_cfg.dead_weight_ticks,
-            g_cfg.min_usable_peers, g_cfg.maxpool, g_cfg.dlc_chunk_blocks, g_cfg.dl_shape_core ? "core" : "bmc");
+            g_cfg.min_usable_peers, g_cfg.maxpool, g_cfg.dlc_chunk_blocks, g_cfg.dl_shape_core ? "core" : "bmc", g_cfg.dlc_roll_below);
     fprintf(stderr,"[config] addr : max_per_response=%d max_per_netgroup=%d\n",
             g_cfg.addr_max_per_response, g_cfg.addr_max_per_netgroup);
     fprintf(stderr,"[config] utxo : dbcache=%dMB -> bulk_slots=2^%d bulk_blob=%dMB bulk_gap=%ld compact_at=%d\n",

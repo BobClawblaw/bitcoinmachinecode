@@ -41,11 +41,7 @@ static rj_val* call(const rpc_wallet* w, const char* method, rj_val* params, lon
 }
 static rj_val* P1s1n(const char* s, long n){ rj_val* a = rj_arr(); rj_arr_push(a, rj_str(s)); rj_arr_push(a, rj_numf("%ld", n)); return a; }
 static rj_val* P1s1b(const char* s, int b){ rj_val* a = rj_arr(); rj_arr_push(a, rj_str(s)); rj_arr_push(a, rj_bool(b)); return a; }
-static void obj_del(rj_val* o, const char* k){
-    for (size_t i = 0; o && o->typ == RJ_OBJ && i < o->nmembers; i++) if (!strcmp(o->members[i].key, k)){
-        rj_free(o->members[i].val); free(o->members[i].key);
-        memmove(&o->members[i], &o->members[i + 1], (o->nmembers - i - 1) * sizeof o->members[0]); o->nmembers--; return; }
-}
+static void obj_del(rj_val* o, const char* k){ rj_obj_del(o, k); }   /* 2026-10-06: arena-aware (rpc_json.c) */
 
 /* ---- the reply ---------------------------------------------------------------- */
 typedef struct { char** out; size_t* outlen; int* status; const char** ctype; } resp_t;

@@ -5006,6 +5006,12 @@ static long g_dlc_chunk = 16;
  * node_config.c and ibd_fetch_chunk_rolling. Set once per pass before any
  * worker forks, like g_dlc_chunk. */
 static int  g_dlc_core = 0;
+/* bmc.dlcrollbelow (plan B9, 2026-10-06): below this height a ranked worker
+ * fetches with Core's rolling 16-in-flight pipeline across its chunk and
+ * its lookahead claim -- tiny early blocks are round-trip bound and the
+ * one-request-per-chunk shape pays an idle round trip per 16 blocks. The
+ * ranking, rotation, floor and eviction rules stay bmc's. 0 = never. */
+static long g_dlc_roll_below = 0;
 #define DLC_CORE_INFLIGHT 16      /* Core: MAX_BLOCKS_IN_TRANSIT_PER_PEER (net_processing.cpp:130) */
 static long g_dlc_pool_idle_pct = -1;   /* pool-wide share of worker wall-clock blocked in the socket read (2026-09-11); -1 until a chunk completes */
 /* Draw from the WHOLE address book, not a 512 slice of it. Measured
@@ -6583,7 +6589,8 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
          * a lookahead, so B is always above A and the stall rule, which keys
          * on the chunk a worker is completing, still sees the oldest one. */
         long bl=-1, bn=0; int hfd2=-1;
-        if(g_dlc_core){
+        int rolling = g_dlc_core || lo < g_dlc_roll_below;   /* plan B9: the early chain rolls under bmc's rules too */
+        if(rolling){
             long peek=next_claim[DLC_CTL_CLAIM], fh=next_claim[DLC_CTL_FIRST_HOLE];
             long anchor=dlc_window_anchor(next_claim[DLC_CTL_APPLIED], fh);
             if(peek<=end_h && dlc_window_allows(peek, anchor, g_dlc_window)){
@@ -6761,7 +6768,7 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
             g_stage_fd=sfd; ibd_pipeline_set_sink(dlc_stage_sink);
             DLC_PHASE(DLC_PH_FETCH);
             mux_budget_fd=fd;   /* 2026-10-05: the eviction and the stall alarm shut THIS socket down (see the handshake note above) */
-            long r = g_dlc_core
+            long r = rolling
                    ? ibd_fetch_chunk_rolling(fd, st, hst, lo, n, bl>=0 ? (void*)hst2 : NULL, bl, bn, DLC_CORE_INFLIGHT,
                                              buf, (unsigned)sizeof buf, scratch, cap)
                    : ibd_fetch_chunk_pipelined(fd, st, hst, lo, n, buf, (unsigned)sizeof buf, scratch, cap);
@@ -6831,7 +6838,7 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                  * chunk under bmc's own shape) */
                 dlc_benchlog_chunk(w, (const char*)mystat->peer, lo, n, ibd_pipeline_last_wall_ms(), ibd_pipeline_last_wait_ms(),
                                    (chunk_r0 >= 0 && chunk_r1 >= chunk_r0) ? chunk_r1 - chunk_r0 : 0,
-                                   g_dlc_core ? (int)ibd_pipeline_max_inflight() : (int)n);
+                                   rolling ? (int)ibd_pipeline_max_inflight() : (int)n);
                 double med = mystat->pool_median_bps;
                 if(!g_dlc_core && dlc_rotate_after_chunk(chunk_bps, med) && dlc_replace_allowed((int)next_claim[DLC_CTL_FREE_PEERS])){   /* Core rotates nobody for speed */   /* 2026-09-10: no free peer, no rotation -- the window's tail judges */
                     __sync_fetch_and_add(&next_claim[DLC_CTL_N_ROTATE], 1L);   /* counted on the tick line; nothing is discarded, so no line per event */
@@ -6938,22 +6945,31 @@ static int dlc_probe_round(char pool[][DL_POOL_SLOT], int from, int ntry,
      * not cause the bug, it made it obvious: losing 23 per round is quiet,
      * losing 191 is not. */
     if(nf>0){
-        long long pr_end;
+        long long pr_end, last_ready;
         { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
-          pr_end = ts.tv_sec*1000LL + ts.tv_nsec/1000000LL + wait_ms; }
+          pr_end = ts.tv_sec*1000LL + ts.tv_nsec/1000000LL + wait_ms; last_ready = pr_end - wait_ms; }
+        int nready = 0;
         for(;;){
             long long pr_now;
             { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
               pr_now = ts.tv_sec*1000LL + ts.tv_nsec/1000000LL; }
             int left = (int)(pr_end - pr_now);
             if(left <= 0) break;
+            /* 2026-10-06 (plan B9): a connect that has not completed within
+             * DLC_PROBE_QUIET_MS of the last one that did is a dropped SYN
+             * waiting on the kernel's retransmit clock, not a slow peer;
+             * run 38's single round sat out its whole 8 s for 20 of 161.
+             * Once DLC_PROBE_QUIET_MIN have answered, the round ends after
+             * that much quiet. */
+            if(nready >= DLC_PROBE_QUIET_MIN){ int q = (int)(last_ready + DLC_PROBE_QUIET_MS - pr_now); if(q <= 0) break; if(q < left) left = q; }
             int r = poll(pol,nf,left);
-            if(r <= 0) break;
+            if(r < 0) break;
+            if(r == 0){ if(nready >= DLC_PROBE_QUIET_MIN) break; continue; }
             int pending = 0;
             for(int j=0;j<nf;j++){
                 if(pol[j].fd < 0) continue;
                 if(pol[j].revents & (POLLOUT|POLLERR|POLLHUP)){
-                    if(pol[j].revents & POLLOUT) prdy[j] = 1;
+                    if(pol[j].revents & POLLOUT){ prdy[j] = 1; nready++; last_ready = pr_now; }
                     pol[j].fd = -pol[j].fd;      /* poll() skips negative fds */
                 } else pending++;
                 pol[j].revents = 0;
@@ -7130,12 +7146,22 @@ static void dlc_stop_workers_for_reject(long h){
  * 2,000 headers after genesis -- ~162 KB from any synced peer -- timed from
  * request to reply; the pool is then sorted fastest-first, so the worker
  * slots start on the best peers instead of finding them by elimination.
- * Forked probes, 32 at a time, each under its own alarm(), writing into a
- * shared page: the same shape dlc_worker uses, and nothing the parent does
- * can hang on a silent peer. A peer that does not answer ranks last, which
- * is where a peer that does not answer belongs. */
-#define RANK_BATCH 32
-#define RANK_TIMEOUT_S 10
+ * Forked probes, each under its own alarm(), writing into a shared page:
+ * the same shape dlc_worker uses, and nothing the parent does can hang on
+ * a silent peer. A peer that does not answer ranks last, which is where a
+ * peer that does not answer belongs.
+ *
+ * 2026-10-06 (plan B9): the probes ran 32 to a batch and every batch
+ * waited for its slowest member -- with 49 of 141 peers silent, nearly
+ * every batch sat out the 10 s alarm, and run 38 spent 48.8 s ranking
+ * before the first header page was asked for (Core's first block arrived
+ * at 1:15; ours at 1:39, with 37 s of header download still to come after
+ * the ranking). Now up to RANK_CONC probes are in flight at once, each
+ * reaped as it finishes, so the ranking takes about one silent peer's
+ * timeout however many there are. A synced peer answers the 162 KB page
+ * in under 3 s at the slowest rate seen (53 KB/s), so the alarm is 6 s. */
+#define RANK_CONC 128
+#define RANK_TIMEOUT_S 6
 static void dlc_rank_by_throughput(char live[][DL_POOL_SLOT], int nlive){
     if (nlive < 2) return;
     double* rate = mmap(NULL, sizeof(double) * (size_t)nlive, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
@@ -7145,13 +7171,14 @@ static void dlc_rank_by_throughput(char live[][DL_POOL_SLOT], int nlive){
     for (int i = 0; i < nlive; i++){ rate[i] = -1.0; ann[i] = 0; }
     unsigned char stop[32]; memset(stop, 0, 32);
     struct timespec t_all0; clock_gettime(CLOCK_MONOTONIC, &t_all0);
-    for (int base = 0; base < nlive; base += RANK_BATCH){
-        int n = nlive - base; if (n > RANK_BATCH) n = RANK_BATCH;
-        pid_t kids[RANK_BATCH];
-        for (int k = 0; k < n; k++){
-            int i = base + k;
+    static pid_t     kids[DLC_MAXPOOL];
+    static long long kid_t0[DLC_MAXPOOL];
+    int launched = 0, inflight = 0, done = 0;
+    while (done < nlive){
+        while (launched < nlive && inflight < RANK_CONC){
+            int i = launched++;
             pid_t pid = fork();
-            if (pid < 0){ kids[k] = 0; continue; }
+            if (pid < 0){ kids[i] = 0; done++; continue; }
             if (pid == 0){
                 alarm(RANK_TIMEOUT_S);                          /* nothing below may outlive this */
                 int pport = 0; unsigned ip = pool_ipv4(live[i], &pport);
@@ -7179,12 +7206,19 @@ static void dlc_rank_by_throughput(char live[][DL_POOL_SLOT], int nlive){
                 if (bytes > 0 && secs > 0.0) rate[i] = (double)bytes / secs;
                 close(fd); _exit(0);
             }
-            kids[k] = pid;
+            kids[i] = pid; kid_t0[i] = dlc_now_ms(); inflight++;
         }
-        /* bounded: in the worker (SIGCHLD SIG_IGN) a blocking waitpid would
-         * also wait out every long-lived child -- see dl_reap_bounded */
-        for (int k = 0; k < n; k++) if (kids[k] > 0){ int st;
-            if (!dl_reap_bounded(kids[k], &st, (RANK_TIMEOUT_S + 2) * 1000L)) dl_kill_reap(kids[k], &st, "rank probe"); }
+        /* reap whatever has finished (WNOHANG: in the worker, SIGCHLD is
+         * SIG_IGN and a blocking waitpid would also wait out every long-lived
+         * child -- see dl_reap_bounded); a probe its alarm somehow did not
+         * end is killed two seconds past it */
+        int any = 0;
+        for (int i = 0; i < launched; i++) if (kids[i] > 0){
+            int st; pid_t r = waitpid(kids[i], &st, WNOHANG);
+            if (r == kids[i] || (r < 0 && errno != EINTR)){ kids[i] = 0; inflight--; done++; any = 1; continue; }
+            if (dlc_now_ms() - kid_t0[i] > (RANK_TIMEOUT_S + 2) * 1000L){ dl_kill_reap(kids[i], &st, "rank probe"); kids[i] = 0; inflight--; done++; any = 1; }
+        }
+        if (!any && done < nlive){ struct timespec ts = {0, 10000000L}; nanosleep(&ts, NULL); }
     }
     /* sort fastest first; a peer with no sample ranks last, ties keep order */
     static int idx[DLC_MAXPOOL]; for (int i = 0; i < nlive; i++) idx[i] = i;
@@ -7836,6 +7870,7 @@ static long dl_catchup_run(const char* dir, int min_workers){
     g_dlc_window = dlc_window_blocks(nw, g_dlc_chunk);
     g_dlc_stall_timeout_s = DLC_STALL_TIMEOUT_MIN_S;
     g_dlc_core = g_cfg.dl_shape_core;
+    g_dlc_roll_below = g_cfg.dlc_roll_below;
     g_dlc_budget_s = g_dlc_core ? dlc_core_block_timeout_s(nw) : DLC_CHUNK_BUDGET_SECS;
     if(g_dlc_core)
         fprintf(stderr,"[dlc] Core's download rules: %d blocks in flight per peer topped up as each lands, across chunks; stallers disconnected, never banned; no rate floor or rotation; block download timeout %ld s\n",

@@ -643,7 +643,29 @@ static rj_val* exec_one(rj_val* req, int* status, int* is_notification) {
  * Rendering needs the lock; writing to a socket does not. Separating them
  * takes network I/O out of the critical section entirely, and the serial
  * execution contract is untouched. */
+/* 2026-10-06 (plan A5): one JSON arena per request on the thread that
+ * renders it -- the parsed request, the result tree and the reply wrapper
+ * are bump-allocated and released together after the body is written
+ * (rj_write_alloc's output buffer stays a plain malloc: send_response frees
+ * it). getblock verbosity 2 on a full block built ~400,000 values through
+ * malloc and freed them one by one: a third of its render time. */
+static char* render_request_inner(const char* body, size_t blen, size_t* outlen);
+static long g_last_render_arena_bytes = -1;   /* test seam: the arena's size when the last reply was written (-1 = no arena) */
 static char* render_request(const char* body, size_t blen, size_t* outlen) {
+    rj_arena_begin();
+    char* r = render_request_inner(body, blen, outlen);
+    g_last_render_arena_bytes = rj_arena_bytes();
+    rj_arena_end();
+    return r;
+}
+/* test seam: render one body in this process and report the arena's size */
+long rpc_render_probe(const char* body, unsigned long blen, char** out, unsigned long* outlen){
+    size_t n = 0; char* r = render_request(body, (size_t)blen, &n);
+    if (out) *out = r; else free(r);
+    if (outlen) *outlen = n;
+    return g_last_render_arena_bytes;
+}
+static char* render_request_inner(const char* body, size_t blen, size_t* outlen) {
     *outlen = 0;
     rj_val* req = rj_parse(body, blen);
     int status = HTTP_OK;

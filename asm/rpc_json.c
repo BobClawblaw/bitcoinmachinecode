@@ -12,19 +12,151 @@
 #include <stdarg.h>
 #include <stdint.h>
 
+/* ---------------- the request arena (2026-10-06, plan A5) ----------------
+ *
+ * getblock verbosity 2 on a full mainnet block builds ~400,000 values --
+ * 3,573 transactions, every field its own rj_val plus its own string --
+ * and a third of the render time was malloc/free (perf on block 969,000:
+ * malloc_consolidate 14%, unlink_chunk 7%, _int_malloc/_int_free 9%, 36 ms
+ * build+write+free of which ~13 ms allocator). Core's UniValue pays the
+ * same shape in C++ allocations; the fix here is the classic one: every
+ * value a request builds lives in a per-thread bump arena and is released
+ * in one step when the response has been written.
+ *
+ * Contract: rj_arena_begin() on a thread routes every rj_* allocation
+ * (values, strings, keys, item/member arrays, the parser's output) to that
+ * thread's arena until the matching rj_arena_end(), which frees the arena
+ * whole. rj_free of an arena-owned value is a no-op (the walk still runs,
+ * so a foreign child -- built before the arena began -- is freed as
+ * before). Nested begin/end pairs share one arena (released at the
+ * outermost end). Nothing built under an arena may outlive its end: the
+ * server begins one per request on its execution thread and ends it after
+ * the body is written (render_request), and no RPC handler keeps rj_val
+ * trees across requests (grep'd 2026-10-06: none). Code that never calls
+ * rj_arena_begin -- the REST facade's own threads, the tests, the CLI --
+ * sees malloc exactly as before. */
+typedef struct rj_chunk { struct rj_chunk* next; size_t cap, used; unsigned char* base; } rj_chunk;
+typedef struct { rj_chunk* head; rj_chunk* cur; size_t total; size_t chunks; int depth; } rj_arena;
+static __thread rj_arena* t_arena;
+#define RJ_ARENA_CHUNK (256u << 10)
+#define RJ_ARENA_ALIGN 16u
+static size_t arena_round(size_t n){ return (n + (RJ_ARENA_ALIGN - 1)) & ~(size_t)(RJ_ARENA_ALIGN - 1); }
+static rj_chunk* arena_chunk_new(size_t cap){
+    rj_chunk* c = malloc(sizeof *c + cap);
+    if (!c) abort();
+    c->next = NULL; c->cap = cap; c->used = 0; c->base = (unsigned char*)(c + 1);
+    return c;
+}
+static void* arena_alloc(size_t n){
+    rj_arena* a = t_arena;
+    n = arena_round(n ? n : 1);
+    rj_chunk* c = a->cur;
+    if (!c || c->used + n > c->cap){
+        size_t cap = c ? c->cap * 2 : RJ_ARENA_CHUNK;
+        if (cap > (64u << 20)) cap = 64u << 20;
+        if (cap < n) cap = n;
+        rj_chunk* nc = arena_chunk_new(cap);
+        if (c) c->next = nc; else a->head = nc;
+        a->cur = c = nc; a->chunks++;
+    }
+    void* p = c->base + c->used; c->used += n; a->total += n;
+    return p;
+}
+static int arena_owns(const void* p){
+    if (!t_arena) return 0;
+    const unsigned char* q = p;
+    for (rj_chunk* c = t_arena->head; c; c = c->next) if (q >= c->base && q < c->base + c->cap) return 1;
+    return 0;
+}
+void rj_arena_begin(void){
+    if (t_arena){ t_arena->depth++; return; }
+    rj_arena* a = malloc(sizeof *a); if (!a) abort();
+    memset(a, 0, sizeof *a); a->depth = 1; t_arena = a;
+}
+void rj_arena_end(void){
+    rj_arena* a = t_arena;
+    if (!a) return;
+    if (--a->depth > 0) return;
+    for (rj_chunk* c = a->head; c;){ rj_chunk* n = c->next; free(c); c = n; }
+    free(a); t_arena = NULL;
+}
+int  rj_arena_active(void){ return t_arena != NULL; }
+long rj_arena_bytes(void){ return t_arena ? (long)t_arena->total : -1; }
+int  rj_arena_owns(const void* p){ return arena_owns(p); }
+
 /* ---------------- allocation helpers ---------------- */
-static void* xmalloc(size_t n) { void* p = malloc(n ? n : 1); if (!p) abort(); return p; }
+static void* xmalloc(size_t n) { if (t_arena) return arena_alloc(n); void* p = malloc(n ? n : 1); if (!p) abort(); return p; }
+/* xfree: a pointer the arena owns is released with the arena, not here */
+static void xfree(void* p) { if (!p) return; if (t_arena && arena_owns(p)) return; free(p); }
+/* xrealloc: the caller knows the old size (the containers keep their
+ * capacity), so an arena block grows in place when it is the arena's last
+ * allocation and is copied otherwise; a foreign block (malloc'd before the
+ * arena began) is copied in and freed. */
+static void* xrealloc(void* p, size_t old_bytes, size_t new_bytes) {
+    if (!t_arena){ void* q = realloc(p, new_bytes); if (!q) abort(); return q; }
+    if (p && arena_owns(p)){
+        rj_chunk* c = t_arena->cur;
+        size_t ro = arena_round(old_bytes), rn = arena_round(new_bytes);
+        if (c && (unsigned char*)p + ro == c->base + c->used && c->used - ro + rn <= c->cap){
+            c->used += rn - ro; t_arena->total += rn - ro; return p;   /* the last allocation: extend in place */
+        }
+        void* q = arena_alloc(new_bytes);
+        memcpy(q, p, old_bytes < new_bytes ? old_bytes : new_bytes);
+        return q;
+    }
+    void* q = arena_alloc(new_bytes);
+    if (p){ memcpy(q, p, old_bytes < new_bytes ? old_bytes : new_bytes); free(p); }
+    return q;
+}
 static char* xstrdup(const char* s) { size_t n = strlen(s) + 1; char* p = xmalloc(n); memcpy(p, s, n); return p; }
 static char* xstrndup(const char* s, size_t n) { char* p = xmalloc(n + 1); memcpy(p, s, n); p[n] = 0; return p; }
 
 rj_val* rj_null(void) { rj_val* v = xmalloc(sizeof(*v)); memset(v, 0, sizeof(*v)); v->typ = RJ_NULL; return v; }
 rj_val* rj_bool(int b) { rj_val* v = xmalloc(sizeof(*v)); memset(v, 0, sizeof(*v)); v->typ = RJ_BOOL; v->str = xstrdup(b ? "1" : "0"); return v; }
 rj_val* rj_num(const char* s) { rj_val* v = xmalloc(sizeof(*v)); memset(v, 0, sizeof(*v)); v->typ = RJ_NUM; v->str = xstrdup(s); return v; }
+/* the integer formats rj_numf is called with (grep 2026-10-06: %lld %ld %d
+ * %u %llu %lu %zu are 340 of 400 call sites) are formatted by hand; anything
+ * else goes through vsnprintf as before. Same digits, same sign, no
+ * padding, so the text is what printf would print. */
+static char* fmt_u64(char* end, unsigned long long v){ *--end = 0; do { *--end = (char)('0' + v % 10); v /= 10; } while (v); return end; }
+static char* fmt_i64(char* end, long long v){
+    unsigned long long u = v < 0 ? 0ULL - (unsigned long long)v : (unsigned long long)v;
+    char* s = fmt_u64(end, u); if (v < 0) *--s = '-'; return s;
+}
 rj_val* rj_numf(const char* fmt, ...) {
-    char buf[64]; va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof buf, fmt, ap); va_end(ap);
-    return rj_num(buf);
+    char buf[64]; va_list ap; va_start(ap, fmt);
+    const char* s = NULL;
+    if (fmt[0] == '%'){
+        const char* f = fmt + 1;
+        if      (!strcmp(f, "lld")) s = fmt_i64(buf + sizeof buf, va_arg(ap, long long));
+        else if (!strcmp(f, "ld"))  s = fmt_i64(buf + sizeof buf, va_arg(ap, long));
+        else if (!strcmp(f, "d"))   s = fmt_i64(buf + sizeof buf, va_arg(ap, int));
+        else if (!strcmp(f, "u"))   s = fmt_u64(buf + sizeof buf, va_arg(ap, unsigned));
+        else if (!strcmp(f, "llu")) s = fmt_u64(buf + sizeof buf, va_arg(ap, unsigned long long));
+        else if (!strcmp(f, "lu"))  s = fmt_u64(buf + sizeof buf, va_arg(ap, unsigned long));
+        else if (!strcmp(f, "zu"))  s = fmt_u64(buf + sizeof buf, va_arg(ap, size_t));
+    }
+    if (!s){ vsnprintf(buf, sizeof buf, fmt, ap); s = buf; }
+    va_end(ap);
+    return rj_num(s);
 }
 rj_val* rj_str(const char* s) { rj_val* v = xmalloc(sizeof(*v)); memset(v, 0, sizeof(*v)); v->typ = RJ_STR; v->str = xstrdup(s ? s : ""); return v; }
+/* a lowercase-hex string value written straight into the value (2026-10-06:
+ * the callers hex-encoded into a malloc'd buffer, rj_str copied it, the
+ * buffer was freed -- three passes and two allocations per script,
+ * witness item and transaction of a getblock v2 render) */
+static const char RJ_HEX2[512] =
+    "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f"
+    "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f"
+    "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf"
+    "c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff";
+rj_val* rj_hex(const unsigned char* b, size_t n) {
+    rj_val* v = xmalloc(sizeof(*v)); memset(v, 0, sizeof(*v)); v->typ = RJ_STR;
+    char* h = xmalloc(n * 2 + 1);
+    for (size_t i = 0; i < n; i++) memcpy(h + i * 2, RJ_HEX2 + b[i] * 2, 2);
+    h[n * 2] = 0; v->str = h;
+    return v;
+}
 rj_val* rj_strf(const char* fmt, ...) {
     char buf[512]; va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof buf, fmt, ap); va_end(ap);
     return rj_str(buf);
@@ -34,8 +166,7 @@ static void rj_arr_reserve(rj_val* a, size_t n) {
     if (a->cap_items >= n) return;
     size_t nc = a->cap_items ? a->cap_items : 8;
     while (nc < n) nc *= 2;
-    a->items = realloc(a->items, nc * sizeof(rj_val*));
-    if (!a->items) abort();
+    a->items = xrealloc(a->items, a->cap_items * sizeof(rj_val*), nc * sizeof(rj_val*));
     a->cap_items = nc;
 }
 rj_val* rj_arr(void) { rj_val* v = xmalloc(sizeof(*v)); memset(v, 0, sizeof(*v)); v->typ = RJ_ARR; return v; }
@@ -48,8 +179,7 @@ static void rj_obj_reserve(rj_val* o, size_t n) {
     if (o->cap_members >= n) return;
     size_t nc = o->cap_members ? o->cap_members : 8;
     while (nc < n) nc *= 2;
-    o->members = realloc(o->members, nc * sizeof(rj_member));
-    if (!o->members) abort();
+    o->members = xrealloc(o->members, o->cap_members * sizeof(rj_member), nc * sizeof(rj_member));
     o->cap_members = nc;
 }
 rj_val* rj_obj(void) { rj_val* v = xmalloc(sizeof(*v)); memset(v, 0, sizeof(*v)); v->typ = RJ_OBJ; return v; }
@@ -98,10 +228,47 @@ rj_val* rj_obj_get(const rj_val* o, const char* key) {
         if (!strcmp(o->members[i].key, key)) return o->members[i].val;
     return NULL;
 }
+/* 2026-10-06: the two member operations callers used to do by hand with
+ * free() on the key and the member array -- under the request arena those
+ * frees abort (the memory is the arena's), so they live here, arena-aware. */
+int rj_obj_del(rj_val* o, const char* key) {
+    if (!o || o->typ != RJ_OBJ) return 0;
+    for (size_t i = 0; i < o->nmembers; i++) if (!strcmp(o->members[i].key, key)) {
+        xfree(o->members[i].key); rj_free(o->members[i].val);
+        memmove(&o->members[i], &o->members[i + 1], (o->nmembers - i - 1) * sizeof o->members[0]);
+        o->nmembers--;
+        return 1;
+    }
+    return 0;
+}
+void rj_obj_splice(rj_val* dst, rj_val* src) {
+    if (!src) return;
+    if (src->typ == RJ_OBJ) {
+        for (size_t k = 0; k < src->nmembers; k++) { rj_obj_set(dst, src->members[k].key, src->members[k].val); src->members[k].val = NULL; }
+    }
+    rj_free(src);   /* the keys and the member array; the values are NULL now */
+}
 
 /* ---------------- escapeStringBN (Core-exact) ---------------- */
+/* the bytes the escaper rewrites: the seven named escapes, every control
+ * byte and 0x7f. Everything else is copied through in spans (2026-10-06:
+ * the byte-at-a-time loop with a capacity check per byte was 11% of a
+ * getblock v2 render -- 10 MB of hex and base58 that never needs escaping). */
+static const unsigned char rj_esc_needed[256] = {
+    [0]=1,[1]=1,[2]=1,[3]=1,[4]=1,[5]=1,[6]=1,[7]=1,[8]=1,[9]=1,[10]=1,[11]=1,[12]=1,[13]=1,[14]=1,[15]=1,
+    [16]=1,[17]=1,[18]=1,[19]=1,[20]=1,[21]=1,[22]=1,[23]=1,[24]=1,[25]=1,[26]=1,[27]=1,[28]=1,[29]=1,[30]=1,[31]=1,
+    ['"']=1, ['\\']=1, [0x7f]=1 };
 static void rj_append_escaped(char** out, size_t* cap, size_t* len, const char* in) {
     for (const unsigned char* p = (const unsigned char*)in; *p; p++) {
+        if (!rj_esc_needed[*p]) {
+            const unsigned char* q = p + 1;
+            while (*q && !rj_esc_needed[*q]) q++;
+            size_t n = (size_t)(q - p);
+            if (*len + n + 1 >= *cap) { while (*len + n + 1 >= *cap) *cap = (*cap ? *cap * 2 : 64); *out = realloc(*out, *cap); if (!*out) abort(); }
+            memcpy(*out + *len, p, n); *len += n;
+            p = q - 1;   /* the loop's p++ lands on q */
+            continue;
+        }
         char c = (char)*p;
         const char* esc = NULL;
         switch (c) {
@@ -260,12 +427,16 @@ char* rj_write_alloc(const rj_val* v, int pretty, long* len_out) {
 
 void rj_free(rj_val* v) {
     if (!v) return;
+    /* an arena value's children are arena values (everything a request
+     * builds is built after its arena began; no handler keeps a tree across
+     * requests), so there is nothing to walk: the arena's end releases it */
+    if (t_arena && arena_owns(v)) return;
     if (v->typ == RJ_ARR) for (size_t i = 0; i < v->nitems; i++) rj_free(v->items[i]);
-    if (v->typ == RJ_OBJ) for (size_t i = 0; i < v->nmembers; i++) { free(v->members[i].key); rj_free(v->members[i].val); }
-    free(v->items);
-    free(v->members);
-    free(v->str);
-    free(v);
+    if (v->typ == RJ_OBJ) for (size_t i = 0; i < v->nmembers; i++) { xfree(v->members[i].key); rj_free(v->members[i].val); }
+    xfree(v->items);
+    xfree(v->members);
+    xfree(v->str);
+    xfree(v);
 }
 
 /* ---------------- parser ---------------- */
@@ -352,7 +523,7 @@ static rj_val* p_string(pctx* c) {
     char* s = NULL;
     if (p_string_core(c, &s)) return NULL;
     rj_val* v = rj_str(s);
-    free(s);
+    xfree(s);
     return v;
 }
 
@@ -398,7 +569,7 @@ static rj_val* p_number(pctx* c) {
      * parsing the single character "1" leaks 2 bytes. */
     char* txt = xstrndup(start, (size_t)(c->p - start));
     rj_val* v = rj_num(txt);
-    free(txt);
+    xfree(txt);
     return v;
 }
 
@@ -423,14 +594,14 @@ static rj_val* p_val(pctx* c) {
             p_ws(c);
             if (c->p >= c->end || *c->p != '"') { c->err = 1; rj_free(o); return NULL; }
             char* key = NULL; p_string_core(c, &key);
-            if (c->err) { free(key); rj_free(o); return NULL; }
+            if (c->err) { xfree(key); rj_free(o); return NULL; }
             p_ws(c);
-            if (c->p >= c->end || *c->p != ':') { free(key); c->err = 1; rj_free(o); return NULL; }
+            if (c->p >= c->end || *c->p != ':') { xfree(key); c->err = 1; rj_free(o); return NULL; }
             c->p++;
             rj_val* v = p_val(c);
-            if (c->err) { free(key); rj_free(o); return NULL; }
+            if (c->err) { xfree(key); rj_free(o); return NULL; }
             rj_obj_set(o, key, v);
-            free(key);
+            xfree(key);
             p_ws(c);
             if (c->p >= c->end) { c->err = 1; rj_free(o); return NULL; }
             if (*c->p == ',') { c->p++; continue; }

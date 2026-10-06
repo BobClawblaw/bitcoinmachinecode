@@ -63,6 +63,12 @@ static inline int dlc_chain_falls_short(long chain_tip, long announced){
 #define DLC_BLOCK_DOWNLOAD_WINDOW 1024L    /* Core: BLOCK_DOWNLOAD_WINDOW, above the connected tip (2026-09-29) */
 #define DLC_STALL_TIMEOUT_MIN_S 2L         /* BLOCK_STALLING_TIMEOUT_DEFAULT */
 #define DLC_STALL_TIMEOUT_MAX_S 64L        /* BLOCK_STALLING_TIMEOUT_MAX */
+/* the liveness probe's early end (2026-10-06, plan B9): once this many
+ * connects have completed, a round ends after this much quiet -- a connect
+ * still pending that long after the last completion is a dropped SYN on
+ * the kernel's retransmit clock (1 s, 3 s, 7 s), not a slow peer */
+#define DLC_PROBE_QUIET_MIN 10
+#define DLC_PROBE_QUIET_MS  2000LL
 /* every live peer downloads, up to the operator's cap and the arrays' 64 --
  * and no more than the span has chunks (2026-09-10, row 3: a reorg handoff
  * of forty blocks forked 64 helpers for one chunk) */

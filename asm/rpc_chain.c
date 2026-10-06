@@ -259,8 +259,16 @@ static long public_tip_cap(long stored){
 
 /* ---- small helpers ---- */
 static const char HEXD[] = "0123456789abcdef";
+/* two digits per byte from one 512-byte table (2026-10-06: getblock v2 hex-
+ * encodes the block once per transaction plus every script and witness item,
+ * 3.3 MB of output on a full block; the per-nibble loop was 4% of its render) */
+static const char HEX2[512] =
+    "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f"
+    "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f"
+    "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf"
+    "c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff";
 static void hex_of(char* out, const u8* b, size_t n){
-    for (size_t i = 0; i < n; i++){ out[i*2] = HEXD[b[i]>>4]; out[i*2+1] = HEXD[b[i]&15]; }
+    for (size_t i = 0; i < n; i++) memcpy(out + i*2, HEX2 + b[i]*2, 2);
     out[n*2] = 0;
 }
 static void hex_rev(char* out, const u8* b, size_t n){ /* display order of a wire hash */
@@ -899,7 +907,7 @@ static rj_val* script_pubkey_json_x(const u8* s, size_t n, int want_desc){
     rj_obj_set(o, "asm", rj_str(a ? a : "")); free(a);
     if (want_desc){ char* di = desc_inner_of(s, n); char* dc = desc_with_checksum(di);
                     if (dc){ rj_obj_set(o, "desc", rj_str(dc)); free(dc); } free(di); }
-    char* h = malloc(n*2 + 1); if (h){ hex_of(h, s, n); rj_obj_set(o, "hex", rj_str(h)); free(h); }
+    rj_obj_set(o, "hex", rj_hex(s, n));
     const char* type = script_type(s, n);
     if (strcmp(type, "pubkey") != 0){
         char addr[128]; addr[0] = 0;
@@ -917,7 +925,7 @@ rj_val* rpc_chain_script_json_noaddr(const unsigned char* sc, unsigned long n){
     rj_val* o = rj_obj();
     char* a = script_asm(sc, n, 0); rj_obj_set(o, "asm", rj_str(a ? a : "")); free(a);
     /* no "desc": Core's decodepsbt calls the ScriptToUniv overload without a provider for these */
-    char* h = malloc(n*2 + 1); if (h){ hex_of(h, sc, n); rj_obj_set(o, "hex", rj_str(h)); free(h); }
+    rj_obj_set(o, "hex", rj_hex(sc, n));
     rj_obj_set(o, "type", rj_str(script_type(sc, n)));
     return o;
 }
@@ -1030,8 +1038,11 @@ static rj_val* tx_to_json_pv(const u8* tx, const txw_t* w, long long in_total,
                              const undo_prevout_t* prevouts, long nprevouts){
     rj_val* o = rj_obj();
     u8 txid[32], wtxid[32]; char hx[65];
-    u8* scratch = malloc(w->len ? w->len : 1);
-    if (scratch){ tx_txid(txid, tx, w->len, scratch, w->len); free(scratch); } else memset(txid, 0, 32);
+    /* 2026-10-06: a per-thread scratch for the stripped copy, grown as
+     * needed -- a malloc per transaction went to mmap above 128 KB */
+    static __thread u8* scratch; static __thread size_t scratch_cap;
+    if (scratch_cap < w->len){ size_t nc = w->len < (256u << 10) ? (256u << 10) : w->len; u8* ns = realloc(scratch, nc); if (ns){ scratch = ns; scratch_cap = nc; } }
+    if (scratch && scratch_cap >= w->len){ tx_txid(txid, tx, w->len, scratch, w->len); } else memset(txid, 0, 32);
     if (w->segwit) sha256d(wtxid, tx, w->len); else memcpy(wtxid, txid, 32);
     hex_rev(hx, txid, 32);  rj_obj_set(o, "txid", rj_str(hx));
     hex_rev(hx, wtxid, 32); rj_obj_set(o, "hash", rj_str(hx));
@@ -1055,13 +1066,13 @@ static rj_val* tx_to_json_pv(const u8* tx, const txw_t* w, long long in_total,
         static const u8 zero32[32] = {0};
         if (i == 0 && vout == 0xffffffffu && memcmp(prev, zero32, 32) == 0) coinbase = 1;
         if (coinbase){
-            char* h = malloc(sl*2 + 1); if (h){ hex_of(h, ss, sl); rj_obj_set(in, "coinbase", rj_str(h)); free(h); }
+            rj_obj_set(in, "coinbase", rj_hex(ss, sl));
         } else {
             hex_rev(hx, prev, 32); rj_obj_set(in, "txid", rj_str(hx));
             rj_obj_set(in, "vout", rj_numf("%u", vout));
             rj_val* sso = rj_obj();
             char* a = script_asm(ss, sl, 1); rj_obj_set(sso, "asm", rj_str(a ? a : "")); free(a);
-            char* h = malloc(sl*2 + 1); if (h){ hex_of(h, ss, sl); rj_obj_set(sso, "hex", rj_str(h)); free(h); }
+            rj_obj_set(sso, "hex", rj_hex(ss, sl));
             rj_obj_set(in, "scriptSig", sso);
         }
         if (wp){
@@ -1070,7 +1081,7 @@ static rj_val* tx_to_json_pv(const u8* tx, const txw_t* w, long long in_total,
                 rj_val* arr = rj_arr();
                 for (u64 j = 0; j < ni; j++){
                     u64 il = read_varint(wp, tx + w->len, &c); wp += c;
-                    char* h = malloc(il*2 + 1); if (h){ hex_of(h, wp, il); rj_arr_push(arr, rj_str(h)); free(h); }
+                    rj_arr_push(arr, rj_hex(wp, il));
                     wp += il;
                 }
                 rj_obj_set(in, "txinwitness", arr);
@@ -1113,7 +1124,7 @@ static rj_val* tx_to_json_pv(const u8* tx, const txw_t* w, long long in_total,
      * means "not available" (coinbase, or undo file pruned/absent). */
     if (in_total >= 0 && (u64)in_total >= out_total)
         rj_obj_set(o, "fee", amount_json((u64)in_total - out_total));
-    char* h = malloc(w->len*2 + 1); if (h){ hex_of(h, tx, w->len); rj_obj_set(o, "hex", rj_str(h)); free(h); }
+    rj_obj_set(o, "hex", rj_hex(tx, w->len));
     return o;
 }
 /* The pre-RPX-2 shape: no prevouts. Every existing caller keeps it. */
@@ -1843,8 +1854,7 @@ static int cmd_getblock(const rj_val* params, rj_val** res, long* ec, const char
     if (len < 0){ *ec = -1; *em = "Block not found on disk"; return 0; }
     const u8* blk = CUR_BB; const u8* end = blk + len;
     if (verbosity <= 0){
-        char* hx = malloc((size_t)len*2 + 1); if (!hx){ *ec = -7; *em = "out of memory"; return 0; }
-        hex_of(hx, blk, (size_t)len); *res = rj_str(hx); free(hx); return 1;
+        *res = rj_hex(blk, (size_t)len); return 1;   /* 2026-10-06: encoded in place */
     }
     rj_val* o;
     if (!header_json(h, tip, &o, ec, em)) return 0;
@@ -2520,11 +2530,7 @@ int rpc_chain_tx_blockhash(const char* txid_disp, char out_disp[65]){
 static const char GENESIS_CB_TXID[] = "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b";
 long g_txi_fast_hits;   /* test seam: getrawtransaction answers served from the record's range (2026-10-06) */
 /* splice TxToUniv's members into our object to keep Core's order */
-static void grt_splice(rj_val* o, rj_val* t){
-    for (size_t k = 0; k < t->nmembers; k++){ rj_obj_set(o, t->members[k].key, t->members[k].val); t->members[k].val = NULL; }
-    for (size_t k = 0; k < t->nmembers; k++) free(t->members[k].key);
-    free(t->members); t->nmembers = 0; t->members = NULL; rj_free(t);
-}
+static void grt_splice(rj_val* o, rj_val* t){ rj_obj_splice(o, t); }   /* 2026-10-06: arena-aware (rpc_json.c) */
 static int cmd_getrawtransaction(const rj_val* params, rj_val** res, long* ec, const char** em){
     long tip = refresh();
     const char* txs = rpc_param_str(params, 0, ec, em); if (!txs) return 0;
@@ -2698,8 +2704,7 @@ static int cmd_getrawtransaction(const rj_val* params, rj_val** res, long* ec, c
         tx_txid(txid, p, w.len, scratch, w.len); free(scratch);
         if (memcmp(txid, want, 32) == 0){
             if (verbosity <= 0){
-                char* hx = malloc(w.len*2 + 1); if (!hx){ *ec = -7; *em = "out of memory"; return 0; }
-                hex_of(hx, p, w.len); *res = rj_str(hx); free(hx); return 1;
+                *res = rj_hex(p, w.len); return 1;   /* 2026-10-06: encoded in place */
             }
             rj_val* o = rj_obj();
             /* Core: "only present with explicit blockhash argument". It used
@@ -5359,13 +5364,7 @@ int rpc_chain_decode_rawtx(const u8* tx, long txlen, rj_val** result, long* ec, 
     if (!o){ *ec = -7; *em = "out of memory"; return 0; }
     /* tx_to_json emits "hex" for getblock/getrawtransaction; decoderawtransaction
      * and decodepsbt's tx do NOT include it. Strip it. */
-    for (size_t i = 0; i < o->nmembers; i++){
-        if (!strcmp(o->members[i].key, "hex")){
-            free(o->members[i].key); rj_free(o->members[i].val);
-            for (size_t j = i + 1; j < o->nmembers; j++) o->members[j-1] = o->members[j];
-            o->nmembers--; break;
-        }
-    }
+    rj_obj_del(o, "hex");   /* 2026-10-06: arena-aware (rpc_json.c) */
     *result = o;
     return 1;
 }
