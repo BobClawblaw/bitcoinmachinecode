@@ -73,10 +73,16 @@ int benchlog_mem_line(char* out, size_t cap, const char* tag);
  * dependency. */
 #include <sys/syscall.h>
 #include <unistd.h>
-static inline void benchlog_mem_name_region(const void* p, size_t len, const char* name){
-    unsigned long a = (unsigned long)p, e = a + len, pg = 4096;
+static __attribute__((unused, access(none, 1))) void benchlog_mem_name_region(const void* p, size_t len, const char* name){
+    /* access(none, 1): the pointer is only cast to an address, never read
+     * through. Without it gcc 13 -O2 infers a read through the const pointer
+     * and reports a caller that names a fresh malloc'd block as "'<unknown>'
+     * may be used uninitialized"; under -Werror that fails the daemon link. */
+    const unsigned long pg = 4096;
+    unsigned long a, e;
     if (!p || !len || !name) return;
-    a = (a + pg - 1) & ~(pg - 1); e &= ~(pg - 1);
+    a = ((unsigned long)p + pg - 1) & ~(pg - 1);
+    e = ((unsigned long)p + len) & ~(pg - 1);
     if (e <= a) return;
     (void)syscall(SYS_prctl, 0x53564d41L /* PR_SET_VMA */, 0L /* PR_SET_VMA_ANON_NAME */, a, e - a, name);
 }
