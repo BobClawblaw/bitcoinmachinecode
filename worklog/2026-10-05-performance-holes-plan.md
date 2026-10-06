@@ -173,6 +173,38 @@ printed); the eviction line now answers this on the first recurrence.
 Run 35 was stopped at 21:00Z (72%) for the re-run; its logs are in
 `bench/run35/` (debug.log copied out of the datadir).
 
+Run 36 (the re-run, on the fix) at 2 h: 20 evictions, every one acted on
+within a millisecond, no apply gap over 45 s, the ring path exercised once
+(w2 fetched the ringed chunk in 680 ms). Two accounting defects in the fix
+itself, read off that log and corrected on
+`fix/2026-10-05-eviction-ack-accounting` (not in run 36's binary; neither
+touches the run's timing): (1) the parent cannot see the worker's ack, so
+"did not answer" was printed on a second eviction whose first WAS answered
+(the holder's fresh peer stalled too) — the worker now counts its acks in
+`evict_acks`, the parent reads it before and after its signal, and the
+second eviction is "reassigned" (answered) or "unanswered" (the run-35
+shape), both on the status line; (2) the drop path never cleared the fired
+flag, so the next pass's pre-fetch check printed a false "acknowledged late
+... in the handshake" after every drop line (20 of 20) and counted each
+eviction twice — the flag is consumed with the drop line, and the late-ack
+line names the phase the handler saw, not the phase at the check.
+And one behaviour change from the same log: the five 30 s pauses the stall
+watcher dumped were each the window full on one evicted holder redialing,
+shaking hands and refetching its chunk itself (15–30 s) while nine workers
+waited and the applier sat at zero lag; the one chunk that reached the
+ring was fetched by an idle worker in 680 ms. So (3) the FIRST eviction
+rings the chunk (Core re-requests a disconnected staller's blocks at
+once), counted as "reassigned" on the status line; the evicted worker
+releases the chunk when its redial finds it staged or committed (one
+`access()` per dial; "delivered by another worker" line); the second
+eviction keeps only its diagnosis (unanswered when the acks did not move).
+Expected on run 37: ~20 × 15–25 s = 5–8 min less applier idle.
+Test: the rewritten eviction block in `test_dialhelper` (ring at the first
+eviction, unanswered vs answered second, no double ring; revert-checked on
+the parent side; the worker side has no unit seam — run 37's log is the
+check: a "delivered by another worker" line after each drop line, and no
+late-ack line beside one).
+
 ## Part C — later, not for the first release
 - UTXO on disk 12.8 GB vs Core's 10.6: run encoding (compressed scripts and
   varint amounts as Core's `CTxOutCompressor`). Space, not speed.
