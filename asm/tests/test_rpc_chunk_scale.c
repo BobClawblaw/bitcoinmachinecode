@@ -21,13 +21,21 @@
  *   - (2026-10-06) the same for verbose getmempoolancestors /
  *     getmempooldescendants, which now snapshot the transaction's connected
  *     component under the lock and render after it: byte-identical answers
- *     on chain heads, middles, tails and a singleton, a shorter hold.
+ *     on chain heads, middles, tails and a singleton, a shorter hold;
+ *   - (2026-10-06) the tables are sized by the pool's LIVE count, not its slot
+ *     capacity: with a quarter of the entries gone from the pool but still in
+ *     the registry -- more stale nodes than the first buffer's headroom -- the
+ *     graph call is retried at capacity and the snapshot path still answers,
+ *     byte-identical, with the short hold. Run with a production-shaped slot
+ *     table: ./tests/test_rpc_chunk_scale 68000 1048576.
  *
  * The call's wall time is printed, not asserted (the number to compare is
  * before/after on the same box, see docs/PARITY_RPC_FIELDS.md). The lock hold
  * is asserted only relative to the old path's, on the same pool.
  *
- * Usage: ./tests/test_rpc_chunk_scale [entries]   (default 32000)
+ * Usage: ./tests/test_rpc_chunk_scale [entries] [slots]   (default 32000, and
+ *        a slot table of the next power of two >= 2 x entries; production's is
+ *        1,048,576 slots at maxmempool=300MB, ~15x a 68k pool)
  */
 #include "../rpc_node.h"
 #include "../rpc_json.h"
@@ -36,6 +44,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/resource.h>
 
 /* confirmed prevouts: every outpoint the policy cannot find in its own outreg
  * resolves to a 100000-sat P2WPKH (the same stub as test_rpc_node.c) */
@@ -52,6 +61,7 @@ long mempool_resolve_confirmed_utxo(void* u, const unsigned char* txid, unsigned
 extern void   mpool_init(void*, unsigned long, void*, unsigned long);
 extern unsigned long mpool_struct_size(unsigned long);
 extern long   mpool_count(void*);
+extern long   mpool_del(void* mp, const unsigned char txid[32]);
 extern const unsigned char* mpool_get(void*, const unsigned char*, unsigned long*);
 extern void   mpool_policy_init(void*, unsigned long long, unsigned, unsigned, unsigned, unsigned, unsigned);
 extern unsigned long mpool_policy_state_size(unsigned long);
@@ -81,6 +91,11 @@ static void t_sha256d(unsigned char* out, const void* p, unsigned long n){
     for (int i = 0; i < 32; i++){ h ^= (unsigned long long)i; h *= 1099511628211ULL; out[i] = (unsigned char)(h >> 29); }
 }
 
+/* a count hook that under-reports by 4x, so the walk outgrows the first
+ * vsize buffer and must grow it (the live count is only an estimate to the
+ * call: the walk is what is authoritative) */
+static long t_count_low(void* mp){ return mpool_count(mp) / 4; }
+
 static unsigned long mk_tx1(unsigned char* t, const unsigned char prev[32],
                             unsigned long long val, unsigned tag){
     unsigned long n = 0;
@@ -100,6 +115,7 @@ int main(int argc, char** argv){
     unsigned chains = (want * 31 / 32) / DEPTH;    /* ~97% of entries in chains */
     unsigned singles = want - chains * DEPTH;
     unsigned long slots = 1; while (slots < (unsigned long)want * 2) slots <<= 1;
+    if (argc > 2){ unsigned long s2 = strtoul(argv[2], 0, 10); while (slots < s2) slots <<= 1; }
 
     void* pool = calloc(1, mpool_struct_size(slots));
     unsigned long blobcap = (unsigned long)want * 96 + 4096;
@@ -149,6 +165,22 @@ int main(int argc, char** argv){
     rpc_node_set_mempool(&h);
 
     long ec = 0; const char* em = NULL;
+    /* the first verbose call's peak-memory growth: the per-call tables are
+     * the only large allocations it makes (ru_maxrss is bytes on Darwin,
+     * KB on Linux) */
+    { struct rusage ru0, ru1; getrusage(RUSAGE_SELF, &ru0);
+      rj_val* pv = rj_parse("[true]", 6); rj_val* r = NULL;
+      g_hold_max = 0;
+      rpc_node_dispatch("getrawmempool", pv, &r, &ec, &em);
+      getrusage(RUSAGE_SELF, &ru1);
+#ifdef __APPLE__
+      double mb = (double)(ru1.ru_maxrss - ru0.ru_maxrss) / 1048576.0;
+#else
+      double mb = (double)(ru1.ru_maxrss - ru0.ru_maxrss) / 1024.0;
+#endif
+      printf("  first verbose call: %lu-slot table, pool-lock hold %.1f ms, peak RSS +%.0f MB\n",
+             slots, g_hold_max, mb);
+      rj_free(r); rj_free(pv); }
     double best = 1e18; rj_val* all = NULL; unsigned long builds = 0;
     for (int rep = 0; rep < 3; rep++){
         if (all) rj_free(all);
@@ -295,6 +327,65 @@ int main(int argc, char** argv){
         ck(what, g_takes - tk0 == g_releases - rl0 && g_takes > tk0);
         snprintf(what, sizeof what, "...and a shorter longest hold (%.2f ms against %.2f ms)", rhold[1], rhold[0]);
         ck(what, rhold[1] < rhold[0]);
+    }
+
+    /* ---- stale registry nodes beyond the first buffer: the retry ----
+     * every fourth entry leaves the structural pool only (the registry keeps
+     * it, as it does for a moment after an eviction): live drops by a
+     * quarter, the registry does not, so the live-count buffer is too small
+     * for the one-pass graph and the call must retry at capacity -- or fall
+     * back to the slow under-the-lock path, which the hold check catches */
+    if (n > 40){
+        unsigned dropped = 0;
+        for (int m = 0; m < n; m += 4){
+            unsigned char id2[32]; const char* k = all->members[m].key;
+            for (int b = 0; b < 32; b++){ unsigned v; sscanf(k + 2 * b, "%2x", &v); id2[31 - b] = (unsigned char)v; }
+            if (mpool_del(pool, id2) == 1) dropped++;
+        }
+        char* sb[2] = { NULL, NULL }; long sl[2] = { 0, 0 }; double sh[2] = { 0, 0 };
+        long tk0 = g_takes, rl0 = g_releases;
+        for (int mode = 0; mode < 2; mode++){
+            rpc_node_set_grm_snapshot(mode);
+            sh[mode] = 1e18;
+            for (int rep = 0; rep < 3; rep++){
+                rj_val* pv = rj_parse("[true]", 6); rj_val* r = NULL;
+                g_hold_max = 0;
+                rpc_node_dispatch("getrawmempool", pv, &r, &ec, &em);
+                if (g_hold_max < sh[mode]) sh[mode] = g_hold_max;
+                if (rep == 0 && r){ free(sb[mode]); sb[mode] = rj_write_alloc(r, 0, &sl[mode]); }
+                rj_free(r); rj_free(pv);
+            }
+        }
+        rpc_node_set_grm_snapshot(1);
+        printf("  %u entries dropped from the pool, kept in the registry (live %ld): hold %.1f ms "
+               "under-the-lock build, %.1f ms snapshot\n", dropped, mpool_count(pool), sh[0], sh[1]);
+        ck("with stale registry nodes the snapshot answer is still byte-identical",
+           sb[0] && sb[1] && sl[0] == sl[1] && !memcmp(sb[0], sb[1], (size_t)sl[0]));
+        snprintf(what, sizeof what, "...and it took the snapshot path (hold %.1f ms against %.1f ms): the graph was retried at capacity",
+                 sh[1], sh[0]);
+        ck(what, dropped > (unsigned)n / 8 && sh[1] < sh[0] * 0.5);
+        ck("...with every take released", g_takes - tk0 == g_releases - rl0);
+        free(sb[0]); free(sb[1]);
+
+        /* the count under-reports: the vsize buffer must grow mid-walk */
+        h.count = t_count_low; rpc_node_set_mempool(&h);
+        char* gb[2] = { NULL, NULL }; long gl[2] = { 0, 0 }; double gh[2] = { 0, 0 };
+        for (int mode = 0; mode < 2; mode++){
+            rpc_node_set_grm_snapshot(mode);
+            rj_val* pv = rj_parse("[true]", 6); rj_val* r = NULL;
+            g_hold_max = 0;
+            rpc_node_dispatch("getrawmempool", pv, &r, &ec, &em);
+            gh[mode] = g_hold_max;
+            gb[mode] = r ? rj_write_alloc(r, 0, &gl[mode]) : NULL;
+            rj_free(r); rj_free(pv);
+        }
+        rpc_node_set_grm_snapshot(1);
+        h.count = mpool_count; rpc_node_set_mempool(&h);
+        snprintf(what, sizeof what, "with the live count under-reported 4x the buffer grows: same answer, snapshot hold "
+                 "(%.1f ms against %.1f ms)", gh[1], gh[0]);
+        ck(what, gb[0] && gb[1] && gl[0] == gl[1] && !memcmp(gb[0], gb[1], (size_t)gl[0])
+                 && gh[1] < gh[0] * 0.5);
+        free(gb[0]); free(gb[1]);
     }
 
     rj_free(all);

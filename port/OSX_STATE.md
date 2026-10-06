@@ -4,6 +4,13 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-10-06 (night, 2) — verbose `getrawmempool`'s tables sized by the live count, not the slot capacity (shared C)
+
+The finding of the "later" section, fixed. `cmd_getrawmempool` sized `g_mpe_vs` and `g_mpe_inf` by `mp_slot_count` (mask + 1, 1,048,576 at `maxmempool=300MB`), and `g_mpe_inf`'s element is an ~8.3 KB `mp_entry_info`: ~8.7 GB asked of malloc per verbose call, under the lock, every 20 s. Now both start at the live count (`g_mph.count`) plus an eighth plus 64; the vsize table grows to capacity if the walk outruns it, and `pol_entry_info_all` is retried at capacity if it refuses the smaller buffer (it answers -1 when the registry has more nodes than `max` — stale nodes after a pool removal).
+- **Measured** (`test_rpc_chunk_scale` now takes an optional slot count; `68000 1048576` is production's shape): snapshot hold 55.8 → 32.1 ms (best of 3), close to the 29.3 ms the same pool gets in a 262k-slot table; the rest is the walk of 1M slots. Peak RSS per call unchanged at ~+794 MB: it is the 8.3 KB record per registry node, which only a compact graph format would cut (not done).
+- **Tests:** two new sections — a quarter of the entries dropped from the pool but kept in the registry (live 24,000: the retry must fire; snapshot hold 11.7 ms against 121.2, byte-identical), and a count hook under-reporting 4× (the buffer must grow; 12.4 against 131.4 ms, byte-identical). Without the retry or the grow, each falls to the per-entry path: **a ~45 s hold** on the test pool, which the checks catch.
+- **Full suite:** 424 PASS, 11 SKIP, 14 N/A, 0 FAIL. Note item 24 and FEATURE_GAPS.md RPC-12 updated.
+
 ## 2026-10-06 (later) — verbose `getmempoolancestors` / `getmempooldescendants` render outside the pool lock too (shared C)
 
 The bulk `getmempoolentry` paths. Without bulk tables each rendered member asked the registry per txid (its node, every ancestor's and descendant's for the size sums, every cluster member's for the chunk), and each `mpool_policy_entry_info` rebuilds the registry's children index, O(pool) — set × cluster × pool scans plus the JSON, all under `mpl()`. Now `mpe_snapshot_component` walks the transaction's connected component once under the lock (one entry_info per node; cap 256 nodes, the cluster limit being 64), copies each pool-present node's inputs into the per-call tables, and the render runs after `mpu()` in snapshot mode (`mpe_snapshot_index`, `mpe_tables_free`). Over the cap or on an allocation failure the old path answers. Non-verbose forms and single `getmempoolentry` unchanged.

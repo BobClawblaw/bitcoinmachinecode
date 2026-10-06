@@ -2498,6 +2498,19 @@ heads, middles, tails and a singleton, both directions, the answers are
 byte-identical to the old path's and the longest hold went 85.3 ms ->
 1.6 ms. Non-verbose forms and single `getmempoolentry` are unchanged.
 
+*Night:* the same call's per-call tables were sized by the slot table's
+CAPACITY (`mp_slot_count` = mask + 1, 1,048,576 at `maxmempool=300MB`),
+and `g_mpe_inf`'s element is a ~8.3 KB `mp_entry_info`: ~8.7 GB asked of
+malloc per verbose call, under the lock. Now they are sized by the pool's
+live count plus an eighth; the vsize table grows if the walk outruns it
+and the one-pass graph is retried at capacity if the registry holds more
+nodes than the buffer (stale nodes after a pool removal) -- without that
+retry the call falls to the per-entry path, a ~45 s hold on the test pool.
+`test_rpc_chunk_scale 68000 1048576` (production's slot table): snapshot
+hold 55.8 -> 32.1 ms. Peak RSS per call is unchanged (~+790 MB): it is
+the 8.3 KB record per registry node that `pol_entry_info_all` writes, and
+only a compact graph format would shrink it.
+
 ### The wallet has no reorg awareness (WAL-13)
 
 `wallet_scan.c`'s on-disk record is `u32 height | txid | vout | value`

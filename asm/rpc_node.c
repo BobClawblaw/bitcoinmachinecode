@@ -1848,12 +1848,29 @@ static int cmd_getrawmempool(const rj_val* params, rj_val** res, long* ec, const
          * searches instead of a pool lookup plus a full parse per set member.
          * If the allocation fails the cache stays null and every entry takes
          * the slower direct path -- correct either way, just slower. */
+        /* 2026-10-06: the tables are sized by the LIVE count, not by n. n is
+         * the slot table's capacity (mask + 1: 1,048,576 at maxmempool=300MB,
+         * ~15x a 68k pool), and g_mpe_inf's element is a ~8.3 KB
+         * mp_entry_info, so sizing by n asked malloc for ~8.7 GB per verbose
+         * call -- under the pool lock, every 20 s under BlockYard's poll.
+         * The live count plus an eighth is the first try; the vsize table
+         * grows to n if the walk ever outruns it, and the graph call is
+         * retried at n if it refuses the smaller buffer (the registry can
+         * hold a few nodes the pool has already dropped). */
+        unsigned long live = g_mph.count ? (unsigned long)g_mph.count(g_mph.mp) : n;
+        unsigned long cap = live + live / 8 + 64;
+        if (cap > n) cap = n;
         if (verbose && n){
-            g_mpe_vs = (mpe_vs_t*)malloc((size_t)n * sizeof *g_mpe_vs);
+            g_mpe_vs = (mpe_vs_t*)malloc((size_t)cap * sizeof *g_mpe_vs);
             g_mpe_vs_n = 0;
             if (g_mpe_vs){
                 for (unsigned long i=0;i<n;i++){ mp_ent e2;
                     if (mp_slot(g_mph.mp,i,&e2) != 1) continue;
+                    if (g_mpe_vs_n == cap){
+                        mpe_vs_t* g2 = cap < n ? (mpe_vs_t*)realloc(g_mpe_vs, (size_t)n * sizeof *g_mpe_vs) : 0;
+                        if (!g2){ free(g_mpe_vs); g_mpe_vs = 0; g_mpe_vs_n = 0; break; }
+                        g_mpe_vs = g2; cap = n;
+                    }
                     mpe_vs_t* v = &g_mpe_vs[g_mpe_vs_n];
                     memcpy(v->id, e2.txid, 32);
                     { unsigned char rbf = 0;
@@ -1873,12 +1890,17 @@ static int cmd_getrawmempool(const rj_val* params, rj_val** res, long* ec, const
                 }
                 /* the whole graph in one pass; -1 means fall back per entry */
                 g_mpe_inf_n = -1;
-                if (g_mph.polstate && g_mph.pol_entry_info_all){
-                    g_mpe_inf = (mp_entry_info*)malloc((size_t)n * sizeof *g_mpe_inf);
-                    g_mpe_inf_id = (unsigned char (*)[32])malloc((size_t)n * 32);
-                    if (g_mpe_inf && g_mpe_inf_id)
-                        g_mpe_inf_n = g_mph.pol_entry_info_all(g_mph.polstate, g_mpe_inf, g_mpe_inf_id, (unsigned)n);
-                    if (g_mpe_inf_n < 0){ free(g_mpe_inf); free(g_mpe_inf_id); g_mpe_inf=0; g_mpe_inf_id=0; }
+                if (g_mpe_vs && g_mph.polstate && g_mph.pol_entry_info_all){
+                    unsigned long icap = live + live / 8 + 64;
+                    if (icap > n) icap = n;
+                    for (int attempt = 0; attempt < 2 && g_mpe_inf_n < 0; attempt++){
+                        if (attempt){ if (icap >= n) break; icap = n; }
+                        g_mpe_inf = (mp_entry_info*)malloc((size_t)icap * sizeof *g_mpe_inf);
+                        g_mpe_inf_id = (unsigned char (*)[32])malloc((size_t)icap * 32);
+                        if (g_mpe_inf && g_mpe_inf_id)
+                            g_mpe_inf_n = g_mph.pol_entry_info_all(g_mph.polstate, g_mpe_inf, g_mpe_inf_id, (unsigned)icap);
+                        if (g_mpe_inf_n < 0){ free(g_mpe_inf); free(g_mpe_inf_id); g_mpe_inf=0; g_mpe_inf_id=0; }
+                    }
                 }
             }
         }
