@@ -7093,6 +7093,7 @@ static void dlc_scan_progress(long* out_tip, long* out_present){
  * tests (tests/test_dlc_interleave, which includes this TU) set them. */
 #define DLC_CONNECT_BUDGET_MS 8000L   /* one connect pass: the scope's ~8 s */
 #define DLC_IDLE_MS           2000L   /* nothing connectable: the scope's ~2 s */
+#define DLC_CW_PER_PASS      65536L   /* chainwork records appended per pass (B8, 2026-10-06): the committer's last few seconds, still in the page cache */
 #define DLC_STATUS_MS        10000L   /* the peer-status table's cadence (was the loop's nanosleep) */
 #define DLC_CONNECT_RETRY_MS 30000L   /* after a connect FAILURE (not a hole): keep downloading, retry later */
 static int  g_dlc_interleave        = 1;                     /* test seam: 0 = the pre-step-1 loop */
@@ -8016,6 +8017,7 @@ static long dl_catchup_run(const char* dir, int min_workers){
     int interleave = g_dlc_interleave && g_utxo_live_on;
     g_dlc_kids = kids; g_dlc_nw = nw;
     long conn_total = 0;                       /* blocks connected by this call's passes */
+    long cw_total = 0;                         /* chainwork records appended by this call's passes (B8) */
     long long last_status_ms = dlc_now_ms(), connect_retry_ms = 0;
     int alive=nw;
     int dlc_table_this_tick = 1;
@@ -8046,6 +8048,24 @@ static long dl_catchup_run(const char* dir, int min_workers){
                         utxo_live_applied_height()+1, utxo_live_fail_kind_name(utxo_live_last_fail_kind()), DLC_CONNECT_RETRY_MS/1000);
                 connect_retry_ms = dlc_now_ms() + DLC_CONNECT_RETRY_MS;
             }
+        }
+        /* B8 (2026-10-06): chainwork.dat kept in step with the archive DURING
+         * the download. Nothing appended a record while the helpers stored
+         * 970k blocks, so the first rotation after the download walked every
+         * height with an 80-byte pread into blk files long out of the page
+         * cache: run 38 sat 66 s at queue depth 1 (3.3 GB read, CPU idle)
+         * between "[dl] parallel downloader wrote" and the final drain, three
+         * quarters of its IBD_END-to-ready tail. Here, a pass at a time, the
+         * heights are the ones the committer wrote seconds ago and the reads
+         * hit the cache. Bounded so a pass never blocks on a cold file; the
+         * rotation's unbounded sync still owns whatever is left. Gated on
+         * g_reorg_ok: only the worker opens chainwork.dat (the boot parent's
+         * dl_catchup has none to keep). */
+        if(g_reorg_ok){
+            store_reload(store_buf);                      /* the committer's tip, whether or not a connect pass ran */
+            long cw = reorg_chainwork_sync(store_buf, DLC_CW_PER_PASS);
+            if(cw < 0) fprintf(stderr,"[chainwork] sync failed mid-download -- fork choice is DEGRADED until the rotation's sync recovers\n");
+            else cw_total += cw;
         }
         if(done <= 0){
             long ms = interleave ? g_dlc_idle_ms : 10000L;   /* the pre-step-1 loop: sleep 10 s, print */
@@ -8357,6 +8377,15 @@ static long dl_catchup_run(const char* dir, int min_workers){
     if(interleave && !g_shutdown_requested){
         long done = utxo_live_catchup_bounded(store_buf, g_dlc_connect_budget_ms, 1);
         if(done > 0){ conn_total += done; dl_new_block_choke(); }
+    }
+    /* B8: the last chunks' records, so the download gate leaves chainwork.dat
+     * at the archive tip and the rotation's sync has nothing cold to read */
+    if(g_reorg_ok && !g_shutdown_requested){
+        store_reload(store_buf);
+        long cw = reorg_chainwork_sync(store_buf, 0);
+        if(cw < 0) fprintf(stderr,"[chainwork] sync failed at the download gate -- fork choice is DEGRADED until the rotation's sync recovers\n");
+        else cw_total += cw;
+        fprintf(stderr,"[dlc] chainwork in step with the archive at the download gate: %ld record(s) appended during the download\n", cw_total);
     }
     ixw_catchup_stop("the download is over: the tip's blocks are indexed inline");   /* drains the ring first; the writers re-read their state */
     if(interleave) fprintf(stderr,"[dlc] connected %ld block(s) during the download; connected tip %ld (the rotation drains the rest)\n",

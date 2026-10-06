@@ -263,6 +263,10 @@ static void echo_lines_with(const char* text, const char* needle, int max){
     }
 }
 
+/* B8 (2026-10-06): chainwork.dat's record count -- one 16-byte cumulative
+ * record per stored height when the download kept it in step */
+static long cw_records(void){ struct stat st; return stat("chainwork.dat", &st) == 0 ? (long)(st.st_size / 16) : -1; }
+
 /* one full download against the three peers; returns dl_catchup's result */
 static long run_download(const char* tag, int interleave, long* out_gate_applied, char** out_log){
     tt_subdir(tag);
@@ -270,6 +274,8 @@ static long run_download(const char* tag, int interleave, long* out_gate_applied
     ck("store_init", store_init(store_buf), 1);
     ck("utxo_live_init", utxo_live_init("."), 1);
     g_utxo_live_on = 1;                         /* the worker's mirror of utxo_live_ok */
+    ck("reorg_chainwork_open", reorg_chainwork_open(store_buf), 1);
+    g_reorg_ok = 1;                             /* the worker's flag: dl_catchup keeps chainwork.dat in step (B8) */
     g_dl_last_seen_tip = (int)node_public_tip(store_buf);
     g_dlc_interleave = interleave;
     g_dlc_connect_budget_ms = 500; g_dlc_idle_ms = 30;   /* the scope's 8 s / 2 s, scaled to a seconds-long download */
@@ -314,6 +320,11 @@ int main(void){
         echo_lines_with(log, "confirmed-live", 1); echo_lines_with(log, "[dlc] headers", 1); echo_lines_with(log, "[dlc] span", 1);
         echo_lines_with(log, "[dlc]   w", 3); echo_lines_with(log, "done: blocks", 3);
         ck("dl_catchup wrote every block", got, NB);
+        /* B8 (2026-10-06): the download keeps chainwork.dat in step, so the
+         * rotation's sync after the gate has nothing cold to read (run 38
+         * paid 66 s of queue-depth-1 preads for 970k records there) */
+        ck("chainwork.dat in step with the archive at the gate (one record per stored height)", cw_records(), NB);
+        ckm("...and the gate line says so", strstr(log, "chainwork in step with the archive at the download gate") != NULL);
         long present_gate = 0; { int fd = open("index.dat", O_RDONLY); present_gate = count_present(fd); close(fd); }
         ck("archive complete at the gate", present_gate, NB);
         /* 2026-09-08: three workers, one committer -- the archive's (file, offset)
@@ -382,6 +393,7 @@ int main(void){
         long gate_applied; char* log;
         long got = run_download("off", 0, &gate_applied, &log);
         ck("dl_catchup wrote every block", got, NB);
+        ck("chainwork.dat in step with the archive at the gate, interleave or not (B8)", cw_records(), NB);
         ck("connected tip at the gate is still the starting value (-1)", gate_applied, -1);
         long ns = g_ns, moved = 0;
         for(long i=0;i<ns;i++) if(g_s[i].applied != -1) moved++;
