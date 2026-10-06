@@ -406,7 +406,16 @@ int main(void){
                 long h; double ms, mb; unsigned long long ops, runs, live; unsigned run; int used = 0;
                 int k = sscanf(f, "[bench] flush at block %ld: %lf ms, %llu ops, run %u %lf MB, runs %llu, live %llu%n",
                                &h, &ms, &ops, &run, &mb, &runs, &live, &used);
-                if (k != 7 || f[used] != 0 || h < 0 || h >= NBLOCKS || ops == 0 || mb <= 0.0 || runs == 0){ bad_flush++; printf("     bad flush line: %s\n", f); }
+                /* B3 (2026-10-06): an async flush appends what the writer did;
+                 * the suffix must parse whole and its run cannot have been
+                 * frozen after the block it lands at */
+                int sfx_ok = 1;
+                if (k == 7 && f[used] != 0){
+                    double wsec; long fh; unsigned long fw, fi; int u2 = 0;
+                    int k2 = sscanf(f + used, " (async: writer %lf s, frozen at block %ld, waits %lu, inline %lu)%n", &wsec, &fh, &fw, &fi, &u2);
+                    sfx_ok = k2 == 4 && f[used + u2] == 0 && wsec >= 0.0 && fh >= 0 && fh <= h;
+                }
+                if (k != 7 || !sfx_ok || h < 0 || h >= NBLOCKS || ops == 0 || mb <= 0.0 || runs == 0){ bad_flush++; printf("     bad flush line: %s\n", f); }
                 nflush++;
             }
             if (!e) break;

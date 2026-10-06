@@ -9667,8 +9667,11 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
              * rows exist from block 0, so a fresh sync ends with the
              * history base built, not with a walk and a rebuild. */
             extern int csi_worker_start(void);
-            if (!csi_boot(ah))
+            extern void utxo_live_flush_wait(void);
+            if (!csi_boot(ah)){
+                utxo_live_flush_wait();        /* plan B3: the walk reads the memtable and the runs; a frozen set must be in a run first */
                 csi_seed_from_walk(utxo_live_lst(), utxo_live_table(), ah);
+            }
             csi_worker_start();
         }
     }

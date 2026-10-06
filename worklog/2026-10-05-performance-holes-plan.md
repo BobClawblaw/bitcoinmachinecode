@@ -110,6 +110,17 @@ put ≤ 1.5 µs/input → ~3k s off the chain.
   batch must not widen the torn window those tests pin.
 
 ### B3. Memtable flush off the applier (medium)
+
+**BUILT 10-06 (branch perf/2026-10-06-b3-async-flush; gate and run 40 pending):**
+not a second memtable -- the applier copies the live table + blob prefix
+into a private copy and forks a writer that builds the run from it
+(`utxo_lsm_freeze` / `utxo_lsm_build_run`, `bmc.asyncflush`, default on);
+reads consult live → frozen → runs; the WAL is retired by a `utxo.idx`
+checkpoint offset + a punched hole, never truncated. Two reload defects
+fixed on the way (tombstone pass from byte 0; the idx not emptied by an
+inline flush). Design as built: worklog/2026-10-05-b3-b4-design.md, last
+section. Expected: the per-block `flush` stage becomes the copy
+(~0.3-0.6 s × ~109) and the applier drops ~1,200 thread-seconds.
 A flush (113 × 12 s) sorts the memtable and writes a run inline in a put.
 Make it double-buffered: freeze the full memtable, start a new one, a flush
 thread sorts and writes the frozen one and publishes the manifest (the
