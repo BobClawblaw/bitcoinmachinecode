@@ -297,6 +297,14 @@ obj_del, grt_splice, the decoderawtransaction strip) moved into
 ms. Core's UniValue pays the same allocation shape; the arena is the
 classic answer. Measure after the deploy: the 32-client median and the
 single call against Core in the same minute.
+**DONE 10-06 (#392, deploy-20261006c 11:59Z, thirteen saved responses
+byte-identical):** 12:02Z pair, two waves each: median 441 / 483 vs Core
+449 / 459 (parity: the FIFO median is 8 × the service time on both), p90
+487 / 521 vs 641 / 586, wave 3,187 / 3,224 vs 4,473 / 4,436 ms; single
+call 58 vs 87 (was 73). v1 at 32 clients 9 vs 19; v3 single 84 vs 126;
+getrawmempool 114 vs 484 on pools of the same size (26.8k vs 25.5k).
+What is left in the render (perf under the arena): the descriptor
+checksum 9%, bech32 7%, sha256 5% -- Core pays the same three.
 ### B8. The 100 s tail after IBD end has a 62 s pause — DIAGNOSED 10-06
 Run 37's sampler and stall watcher over 04:55:36–04:56:38: the catch-up's
 applier (the dlc child) finished; the serve process took the remaining 694
@@ -339,9 +347,30 @@ timeout; the liveness round ends after 2 s of quiet once 10 connects have
 completed (`DLC_PROBE_QUIET_MIN/MS`, dlc_rules.h). Expected on run 39:
 boot → block 1 ≈ 55–60 s against Core's 75. Verify in the log: the
 "ranked ... in N s" line and the liveness line's timing.
-Part 2 (not built): the rolling 16-in-flight fetch under the ranked rules
-below a height threshold -- needs an A/B to 300,000 (two arms × ~16 min of
-quiet box) before a default is chosen.
+**Measured 10-06 12:03Z on the A/B's control arm (main 01d235f6, a fresh
+sync):** liveness 135 live in 2.3 s (was 8.0), ranking 7.0 s (was 48.8;
+87 of 135 answered, best 1393 KB/s), headers 36 s, block 1 at 50.5 s
+after boot (run 38: 99 s; Core #6: 75 s).
+Part 2 (`bmc.dlcrollbelow`, PR #392, default 0 = off): the rolling
+16-in-flight fetch under the ranked rules below a height threshold.
+**A/B'd 10-06 12:02–13:07Z** (validation/ab_dlcchunk.sh, main 01d235f6,
+four fresh syncs to 300,000 one after another, chunk 16, production
+running beside them as on every run; /srv/nvme8tb/bench/ab-roll):
+
+| arm | 50k | 100k | 150k | 200k | 250k | 300k |
+|---|---|---|---|---|---|---|
+| ctl16a (off) | 165 | 256 | 371 | 501 | 716 | 941 |
+| roll16a (rollbelow=300000) | 195 | 295 | 410 | 550 | 801 | 1066 |
+| roll16b (rollbelow=300000) | 165 | 255 | 370 | 490 | 715 | 941 |
+| ctl16b (off) | 170 | 260 | 375 | 495 | 715 | 900 |
+
+The rolling arm is a 13% loss or a tie, never a win; the two control arms
+agree within 4%. **Decision: the default stays 0; part 2 is closed.** The
+knob stays for the dlshape=core comparison. What the control arms also
+say: with part 1 the first 200,000 blocks are at Core's pace (100,000 at
+4:16/4:20 against Core #6's 4:12; 200,000 at 8:21/8:15 against 8:15; run
+38 had 5:08 and 9:03) -- the ~50 s Core had on the early chain was the
+probe minute, not the request shape. Run 39 confirms on a full sync.
 ### M1. Memory: name the 26 GB
 Anonymous memory held 26.4 GB through the sync with dbcache=8192 (peak 35.2
 GB in a compaction). A per-subsystem `[mem]` line under benchlog at the MEM
