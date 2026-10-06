@@ -40,7 +40,9 @@ say "BUILD ok commit=$COMMIT"
 [ -f RESULTS ] || echo "# arm chunk commit start_utc marks(height=elapsed_s...) stop_s" > RESULTS
 
 for spec in $ARMS; do
-    arm=${spec%%:*}; chunk=${spec##*:}
+    # name:chunk[:key=value[,key=value...]] -- the optional third field is
+    # extra bitcoin.conf lines for the arm (2026-10-06: bmc.dlcrollbelow)
+    arm=${spec%%:*}; rest=${spec#*:}; chunk=${rest%%:*}; extra=""; [ "$rest" != "$chunk" ] && extra=$(echo "${rest#*:}" | tr ',' '\n')
     D="$BASE/$arm"
     if [ -e "$D" ]; then say "SKIP $arm: $D exists (a fresh sync needs a fresh datadir; move it aside)"; continue; fi
     mkdir -p "$D/data"
@@ -62,12 +64,13 @@ zmqpubhashtx=tcp://127.0.0.1:$ZMQPORT
 zmqpubrawtx=tcp://127.0.0.1:$ZMQPORT
 stopatheight=$STOP
 bmc.dlcchunk=$chunk
+$extra
 CONF
     LOG="$D/data/main/debug.log"
     T0=$(date +%s)
     setsid nohup "$BASE/src/asm/daemon/bmcbitcoind" serve "$D/data" > "$D/console.log" 2>&1 < /dev/null &
     pid=$!; echo "$pid" > "$D/daemon.pid"
-    say "ARM $arm chunk=$chunk pid=$pid epoch=$T0"
+    say "ARM $arm chunk=$chunk extra=[$(echo "$extra" | tr '\n' ' ')] pid=$pid epoch=$T0"
     : > "$D/marks"; next=50000; reached=0
     while :; do
         sleep 5

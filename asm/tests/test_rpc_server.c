@@ -780,6 +780,27 @@ int main(void) {
     kill(srv, SIGTERM);
     waitpid(srv, NULL, 0);
 
+    /* ============ the request arena (2026-10-06, plan A5) ============
+     * render_request builds the parsed request, the result and the reply
+     * wrapper in one JSON arena and releases it after the body is written.
+     * The seam reports the arena's size when the reply was written: with
+     * the begin removed it is -1. The body is a method with no chain
+     * behind it in this process, so the reply is an error object -- still
+     * rendered under the arena. */
+    {   extern long rpc_render_probe(const char* body, unsigned long blen, char** out, unsigned long* outlen);
+        extern int rj_arena_active(void);
+        const char* body = "{\"jsonrpc\":\"1.0\",\"id\":\"a\",\"method\":\"getblockcount\",\"params\":[]}";
+        char* out = NULL; unsigned long n = 0;
+        long bytes = rpc_render_probe(body, strlen(body), &out, &n);
+        ck("A5 a reply is rendered under a JSON arena (its size is reported)", bytes > 0);
+        ck("A5 ...the arena is released after the body is written", !rj_arena_active());
+        ck("A5 ...and the body is a JSON-RPC reply", out && n > 0 && has_substr(out, "\"result\"") && has_substr(out, "\"error\""));
+        free(out);
+        rpc_render_probe(body, strlen(body), &out, &n);
+        ck("A5 a second render starts a fresh arena (released again)", !rj_arena_active() && out != NULL);
+        free(out);
+    }
+
     printf("\n%s (%d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);
     return fails ? 1 : 0;
 }

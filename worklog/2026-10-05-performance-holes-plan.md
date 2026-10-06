@@ -273,6 +273,30 @@ gone from the lock log.
 The reader lane is narrower than Core's thread pool. Widen the per-thread
 lane (more concurrent readers) once A7's rwlock pattern exists; measure the
 32-client median.
+
+**Measured 10-06 (after run 38), before building anything:** both nodes
+answer from a 4-thread pool (`rpcthreads` default on both; the oracle's
+conf sets none), bmc's listener took no overflow during a 32-client wave
+(`nstat TcpExtListenOverflows` unchanged), and the latency distribution is
+the FIFO model's: median 600, p90 664 = 32/4 × the 75 ms single call.
+Core: median 491, p90 669, single 100 ms. So the lane is not narrower --
+the per-call cost under load is the lever, and it is CPU. perf on a
+micro-benchmark of the render (block 969,000, 3,573 tx, 6.8 MB of JSON
+without the per-tx hex): malloc/free 35% (malloc_consolidate 14%,
+unlink_chunk 7%, _int_malloc/_int_free 9%), the byte-at-a-time string
+escaper 11%, the descriptor checksum 7%, bech32 5%, hex_of 4%, printf 2.5%.
+Fix (branch perf/2026-10-06-a5-json-arena): a per-request bump arena for
+every rj_val the server builds (begun in `render_request`, released after
+the body is written; rj_free of an arena value is a no-op), a span-copying
+escaper, a hand integer formatter for the seven integer formats, `rj_hex`
+(hex encoded straight into the value instead of malloc + copy + free), a
+per-thread txid scratch (a malloc per transaction went to mmap above 128
+KB), and the three places that freed JSON internals by hand (rest.c's
+obj_del, grt_splice, the decoderawtransaction strip) moved into
+`rj_obj_del`/`rj_obj_splice`. Micro-benchmark: build+write+free 37 → 26
+ms. Core's UniValue pays the same allocation shape; the arena is the
+classic answer. Measure after the deploy: the 32-client median and the
+single call against Core in the same minute.
 ### B8. The 100 s tail after IBD end has a 62 s pause — DIAGNOSED 10-06
 Run 37's sampler and stall watcher over 04:55:36–04:56:38: the catch-up's
 applier (the dlc child) finished; the serve process took the remaining 694
@@ -296,6 +320,28 @@ trip, Core pipelines per block. A per-peer in-flight pipeline across chunk
 boundaries on the early chain (what `dlshape=core` already does) under the
 ranked rules until blocks reach ~100 KB. Measure: the 100,000 and 200,000
 milestones.
+
+**Read from run 38's log 10-06, before building anything:** of the 99 s
+from boot to block 1 (Core: 75), 49 s were the peer RANKING (`ranked 141
+live peer(s) by a 2000-header sample in 48.8s`: probes 32 to a batch, each
+batch waiting for its slowest member, 49 of 141 silent → nearly every batch
+sat out the 10 s alarm), 8 s the liveness round (its full timeout, waiting
+on 20 dropped SYNs), 37 s the header download from the best peer at 2.0
+MB/s (held pages stored once the chain crosses minimumchainwork -- no
+redownload, which is where Core spends its own 75 s: presync + redownload),
+3 s to the first block. So the early-chain chunk shape is at most the
+remaining ~30 s of the 100,000 gap (3:29 vs Core's 2:57 for the blocks
+themselves); the pre-block minute was the probe.
+Part 1 (branch perf/2026-10-06-a5-json-arena, with A5): the ranking
+probes run up to 128 at once and are reaped as they finish (alarm 6 s: the
+slowest answering peer took 3 s), so the ranking takes one silent peer's
+timeout; the liveness round ends after 2 s of quiet once 10 connects have
+completed (`DLC_PROBE_QUIET_MIN/MS`, dlc_rules.h). Expected on run 39:
+boot → block 1 ≈ 55–60 s against Core's 75. Verify in the log: the
+"ranked ... in N s" line and the liveness line's timing.
+Part 2 (not built): the rolling 16-in-flight fetch under the ranked rules
+below a height threshold -- needs an A/B to 300,000 (two arms × ~16 min of
+quiet box) before a default is chosen.
 ### M1. Memory: name the 26 GB
 Anonymous memory held 26.4 GB through the sync with dbcache=8192 (peak 35.2
 GB in a compaction). A per-subsystem `[mem]` line under benchlog at the MEM
