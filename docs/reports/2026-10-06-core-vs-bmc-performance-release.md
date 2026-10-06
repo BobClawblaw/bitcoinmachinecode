@@ -214,6 +214,22 @@ Since `deploy-20261006b` the serve process also holds the txindex tail's
 hash table: 4 bytes a slot at ≤ 3/4 load, 128–256 MB over the fold cycle
 (not in run 37's figures).
 
+**Correction (10-06 15:30Z, read on run 39's /proc):** the anonymous
+figures in this paragraph are inflated by the sampler's arithmetic, not
+by the node. It summed smaps_rollup's `Anonymous` over the tree, and that
+field counts the download worker's inherited copy-on-write pages once in
+every forked child: run 39's 13 children each reported 1,479 MB of which
+1,476 MB were the worker's own pages (`Shared_Dirty`). By proportional
+share (`Pss_Anon`) the tree's anonymous memory two hours into run 39 was
+~10 GB (the worker 8.3 GB: flush scratch, tombstone list and hash, the
+inherited block hash index; the parent 0.16 GB; 0.11 GB per child), the
+"compaction peak" one more copy of that set in the compaction child, and
+the post-ready 44.9/53.6 GB the same fork arithmetic on the downshift's
+compaction. Core is one process and never had the inflation. The sampler
+sums `Pss_Anon` from run 40 on, and the node prints a `[mem]` line by
+mapping at both marks (plan M1); run 40 and Core rerun #7 give this row
+two honest sides. The PSS figures were always right.
+
 Memory, bmc run 38, proc sampler every 5 s over every process of the
 daemon's tree: anonymous (heap) memory held 27.9 GB steadily through the
 sync (mean 27.5 GB; run 37: 26.4 GB), PSS peaked at 66.9 GB (09:30Z; run

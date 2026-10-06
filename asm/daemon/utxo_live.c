@@ -48,6 +48,7 @@
 #include "utxo_walk.h"
 #include "seqlocks.h"
 #include "log_ts.h"
+#include "benchlog.h"      /* benchlog_mem_name_region (M1, 2026-10-06) */
 
 extern long store_reload(void* st);
 extern long store_read_at(void* st, u64 height, void* buf, u64 cap);
@@ -3349,6 +3350,15 @@ int utxo_live_init(const char* dir){
     { int sw = lsm_manifest_sweep_orphans(&g_utxo_lst);
       if (sw > 0) fprintf(stderr, "[utxo_live] init: swept %d orphan file(s) the manifest does not name\n", sw);
       else if (sw < 0) fprintf(stderr, "[utxo_live] init: orphan sweep skipped -- manifest file and memory disagree\n"); }
+    /* M1 (2026-10-06): the worker's anonymous memory by purpose, for
+     * /proc/PID/maps, smaps and the [mem] line. The memtable's table and
+     * blob are file maps (utxo_lsm_table.map, utxo_lsm_blob.map) and name
+     * themselves; the tombstone hash is the asm's own mmap, allocated by
+     * utxo_lsm_init/reload (eagerly, so it exists here). */
+    benchlog_mem_name_region(g_utxo_lst.tomb_buf, g_utxo_lst.tomb_cap * 36, "utxo-tombstones");
+    benchlog_mem_name_region(g_utxo_lst.scratch_buf, g_utxo_lst.scratch_cap, "utxo-flush-scratch");
+    benchlog_mem_name_region(g_utxo_lst.manifest_buf, g_utxo_lst.manifest_cap * 16, "utxo-manifest");
+    if (g_utxo_lst.tomb_hash_buf) benchlog_mem_name_region(g_utxo_lst.tomb_hash_buf, (g_utxo_lst.tomb_hash_mask + 1) * 8, "utxo-tomb-hash");
     fprintf(stderr, "[utxo_live] init dir=%s slots=2^%d %s applied_height=%ld manifest_n=%lu live=%ld\n",
             dir, g_bulk_mode ? g_cfg.utxo_bulk_slots_log2 : UTXO_LIVE_SLOTS_LOG2,
             have_prior_state ? "reload" : "fresh",

@@ -371,11 +371,43 @@ say: with part 1 the first 200,000 blocks are at Core's pace (100,000 at
 4:16/4:20 against Core #6's 4:12; 200,000 at 8:21/8:15 against 8:15; run
 38 had 5:08 and 9:03) -- the ~50 s Core had on the early chain was the
 probe minute, not the request shape. Run 39 confirms on a full sync.
-### M1. Memory: name the 26 GB
+### M1. Memory: name the 26 GB — BUILT 10-06 (branch perf/2026-10-06-m1-mem-naming; gate pending)
 Anonymous memory held 26.4 GB through the sync with dbcache=8192 (peak 35.2
 GB in a compaction). A per-subsystem `[mem]` line under benchlog at the MEM
 marks (memtable, header tree, download window, index builders, RPC caches),
 and the Core rerun WITH the sampler so the row has two sides.
+
+**Read on run 39 (10-06 15:20Z, two hours in), before building:** the 26 GB
+was the sampler's arithmetic, not the node's memory. `proc_sampler.sh`
+summed smaps_rollup's `Anonymous` across the tree, and that field counts
+a forked child's inherited copy-on-write pages once PER CHILD: the
+download worker's 13 children (10 dlc helpers, the committer, the index
+worker, the coinstats worker) each reported 1,479 MB "Anonymous" of
+which 1,476 MB was `Shared_Dirty` (the worker's pages) and 113 MB their
+own share (`Pss_Anon`). The tree's real anonymous footprint by `Pss_Anon`
+was ~10 GB: the worker 8.3 GB (the flush scratch 6.1 GB virtual, the
+tombstone list 1.1 GB, the tombstone hash 0.5 GB, the inherited block
+hash index 0.4 GB), the serve parent 0.16 GB, the children 0.11 GB each.
+The 35.2 GB "compaction peak" was one more copy of the worker's set (the
+compaction child), and "anon rose to 44.9 GB after ready" the same fork
+arithmetic on the downshift's compaction. Core is one process, so its
+figure never had the inflation; the memory rows before run 40 compare an
+inflated bmc number with Core's.
+Built: (1) the sampler sums `Pss_Anon` (header comment says why; the
+`pss` column was always right); (2) `benchlog_mem_line` reads
+/proc/self/smaps and prints this process's Pss by mapping, largest first,
+at the two marks under bmc.benchlog — `[mem] at IBD end: pss N MB (anon
+A, file F, shmem S) | utxo-flush-scratch N | utxo_lsm_blob.map N | ... |
+other N`; (3) the big anonymous regions are named with prctl
+PR_SET_VMA_ANON_NAME (kernel 5.17+; a no-op elsewhere) at their
+allocation: utxo-tombstones, utxo-flush-scratch, utxo-manifest,
+utxo-tomb-hash (the asm's mmap, named from C after init), block-hash-index
+(main.c, inherited by every fork), txdv-table/-blob/-tombstones/-flush-scratch
+(tx_accept's boot snapshot), dlc-stage (the committer), dlc-side/dlc-hold
+(each helper's pipeline buffers). The file maps (utxo_lsm_table.map,
+utxo_lsm_blob.map, the runs, the archive) already carry their names.
+test_benchlog maps 48 MB, names it bl_probe and expects it in the line by
+name and size. B3's frozen copy gets "utxo-frozen" once the branches meet.
 
 Order (A7, A8 and B4 done 10-06): B3 (the applier target) → B8 → A5 →
 B9 → M1 alongside the Core rerun.
