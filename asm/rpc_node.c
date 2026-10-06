@@ -1050,7 +1050,8 @@ long rpc_node_mempool_many(const unsigned char (*txid_wire)[32], long n, rpc_mp_
  * daemon/reorg.c uses): +0 n, +8 mask, +16 blob, then MPOOL_SLOT_BYTES slots
  * at +40 -- [+0 len][+8 txid[32]][+40 blob_off][+48 wtxid[32]], len==~0
  * marking empty. */
-typedef struct { const unsigned char* txid; const unsigned char* tx; unsigned long len; } mp_ent;
+typedef struct { const unsigned char* txid; const unsigned char* tx; unsigned long len;
+                 const unsigned char* wtxid;   /* the slot's cached sha256d of tx (mpool_put) */ } mp_ent;
 static long mp_slot(void* mp, unsigned long i, mp_ent* e){
     unsigned char* m = (unsigned char*)mp;
     unsigned long long mask; memcpy(&mask, m+8, 8);
@@ -1061,6 +1062,7 @@ static long mp_slot(void* mp, unsigned long i, mp_ent* e){
     unsigned char* blob; memcpy(&blob, m+16, 8);
     unsigned long long off; memcpy(&off, s+MPOOL_SLOT_OFF, 8);
     e->txid = s+8; e->tx = blob+off; e->len = (unsigned long)len;
+    e->wtxid = s+MPOOL_SLOT_WTXID;
     return 1;
 }
 static unsigned long mp_slot_count(void* mp){
@@ -1880,8 +1882,15 @@ static int cmd_getrawmempool(const rj_val* params, rj_val** res, long* ec, const
                     v->inf = -1;
                     /* the snapshot's per-entry inputs, in the builder's order
                      * of preference (wtxid degrades to the txid without a
-                     * hash hook, as mpe_entry_obj does) */
-                    if (g_mph.sha256d) g_mph.sha256d(v->wtxid, e2.tx, e2.len);
+                     * hash hook, as mpe_entry_obj does). 2026-10-06: the
+                     * wtxid is the SLOT'S CACHED one, not a fresh sha256d:
+                     * mpool_put computes it once over the bytes as stored,
+                     * mpool_del's shift moves it with the record, compaction
+                     * moves only blob_off, and every writer holds the lock
+                     * we hold -- so it is sha256d(e2.tx) without re-hashing
+                     * ~25 MB of transactions under the lock on every poll.
+                     * (The hook stays the switch for the degraded case.) */
+                    if (g_mph.sha256d) memcpy(v->wtxid, e2.wtxid, 32);
                     else memcpy(v->wtxid, e2.txid, 32);
                     v->tm = g_mph.time_of ? g_mph.time_of(e2.txid) : 0;
                     v->pri = pri_delta_of(e2.txid);

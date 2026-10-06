@@ -4,6 +4,13 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-10-06 (night, 3) — the verbose `getrawmempool` copy reads the slot's cached wtxid instead of re-hashing (shared C)
+
+The snapshot fill ran `g_mph.sha256d` over every pool transaction under the lock (~25 MB at a 68k pool). The pool already keeps that hash: `mpool_put` writes `sha256d(bytes as stored)` into the slot (`MPOOL_SLOT_WTXID`, +48) before the txid, `mpool_del`'s backward shift moves it with the record, compaction rewrites only `blob_off`, and every writer holds the lock the fill holds. `mp_ent` now carries the slot's wtxid pointer and the fill copies it (with no hash hook the reply still degrades to the txid, as before). Single `getmempoolentry`, the old path and the relatives' component snapshot (≤256 txs, no slot index) still hash.
+- **Measured:** hold at production shape (`68000 1048576`) 32.1 → 25.7 ms; on the 32k pool 13.0 → 9.5 ms.
+- **Test:** `test_rpc_chunk_scale`'s hook is now the real `sha256d` (a fake one would make the paths disagree by construction), and its 1,000 singletons carry a witness (`mk_tx1w`), so wtxid ≠ txid for them and the byte comparison checks the slot cache against a fresh hash. Copying the txid instead fails four checks. `test_mempool_wtxid` and `test_cmpct_recv` (the cache's other readers) pass.
+- **Full suite:** 424 PASS, 11 SKIP, 14 N/A, 0 FAIL. FEATURE_GAPS.md RPC-12 and note item 24 updated.
+
 ## 2026-10-06 (night, 2) — verbose `getrawmempool`'s tables sized by the live count, not the slot capacity (shared C)
 
 The finding of the "later" section, fixed. `cmd_getrawmempool` sized `g_mpe_vs` and `g_mpe_inf` by `mp_slot_count` (mask + 1, 1,048,576 at `maxmempool=300MB`), and `g_mpe_inf`'s element is an ~8.3 KB `mp_entry_info`: ~8.7 GB asked of malloc per verbose call, under the lock, every 20 s. Now both start at the live count (`g_mph.count`) plus an eighth plus 64; the vsize table grows to capacity if the walk outruns it, and `pol_entry_info_all` is retried at capacity if it refuses the smaller buffer (it answers -1 when the registry has more nodes than `max` — stale nodes after a pool removal).

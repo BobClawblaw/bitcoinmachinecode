@@ -82,14 +82,18 @@ static double now_ms(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &
 static double g_lock_at, g_hold_max; static long g_takes, g_releases;
 static void t_lock(void){ g_lock_at = now_ms(); g_takes++; }
 static void t_unlock(void){ double h = now_ms() - g_lock_at; if (h > g_hold_max) g_hold_max = h; g_releases++; }
-/* an arrival time and a "wtxid" that differ per entry, so a snapshot that
- * paired them with the wrong txid would show in the byte comparison */
+/* an arrival time that differs per entry, so a snapshot that paired it with
+ * the wrong txid would show in the byte comparison */
 static long t_time_of(const unsigned char* txid){ return 1700000000L + txid[0] * 257L + txid[1]; }
-static void t_sha256d(unsigned char* out, const void* p, unsigned long n){
-    const unsigned char* b = (const unsigned char*)p; unsigned long long h = 1469598103934665603ULL;
-    for (unsigned long i = 0; i < n; i++){ h ^= b[i]; h *= 1099511628211ULL; }
-    for (int i = 0; i < 32; i++){ h ^= (unsigned long long)i; h *= 1099511628211ULL; out[i] = (unsigned char)(h >> 29); }
-}
+/* the REAL sha256d, as daemon/main.c installs it (2026-10-06): the bulk
+ * snapshot reads the pool slot's cached wtxid, which mpool_put computed with
+ * this function, while the old path hashes through the hook -- so the byte
+ * comparison checks the cache against a fresh hash. A fake hook here would
+ * make the two paths disagree by construction. Every wtxid differs from its
+ * txid only for witness transactions, so the singletons carry a witness
+ * (mk_tx1w) and a check below counts entries whose wtxid != txid. */
+extern void sha256d(unsigned char* out, const void* msg, unsigned long len);
+static void t_sha256d(unsigned char* out, const void* p, unsigned long n){ sha256d(out, p, n); }
 
 /* a count hook that under-reports by 4x, so the walk outgrows the first
  * vsize buffer and must grow it (the live count is only an estimate to the
@@ -106,6 +110,21 @@ static unsigned long mk_tx1(unsigned char* t, const unsigned char prev[32],
     t[n++]=22; t[n++]=0x00; t[n++]=0x14;
     for (int i=0;i<20;i++) t[n++]=(unsigned char)(tag >> (8*(i%4)));
     t[n++]=0;t[n++]=0;t[n++]=0;t[n++]=0;
+    return n;
+}
+
+/* mk_tx1 with a segwit marker and a two-item witness (a 71-byte "signature"
+ * and a 33-byte "pubkey", the P2WPKH shape the stub prevout has): the txid is
+ * unchanged by the witness, the wtxid is not */
+static unsigned long mk_tx1w(unsigned char* t, const unsigned char prev[32],
+                             unsigned long long val, unsigned tag){
+    unsigned char b[128]; unsigned long l = mk_tx1(b, prev, val, tag), n = 0;
+    memcpy(t, b, 4); n = 4; t[n++] = 0x00; t[n++] = 0x01;      /* version, marker, flag */
+    memcpy(t + n, b + 4, l - 8); n += l - 8;                     /* inputs and outputs */
+    t[n++] = 2;
+    t[n++] = 71; for (int i = 0; i < 71; i++) t[n++] = (unsigned char)(0x30 + ((tag + i) & 0x3f));
+    t[n++] = 33; t[n++] = 0x02; for (int i = 0; i < 32; i++) t[n++] = (unsigned char)(tag >> (i % 4) * 8);
+    memcpy(t + n, b + l - 4, 4); n += 4;                         /* locktime */
     return n;
 }
 
@@ -127,7 +146,7 @@ int main(int argc, char** argv){
     mpool_policy_init(polcfg, 1000, 25, 101000, 25, 101000, 1);
     mpool_policy_state_init(polstate, want + 64);
 
-    unsigned char tx[128], id[32], prev[32];
+    unsigned char tx[256], id[32], prev[32];
     static unsigned char scratch[4096];
     unsigned tag = 1, added = 0, refused = 0;
     double t0 = now_ms();
@@ -146,7 +165,7 @@ int main(int argc, char** argv){
     }
     for (unsigned s = 0; s < singles; s++){
         memset(prev, 0, 32); prev[0] = 0x5e; memcpy(prev + 1, &s, sizeof s);
-        unsigned long l = mk_tx1(tx, prev, 100000 - 200 - (s % 40) * 50, tag++);
+        unsigned long l = mk_tx1w(tx, prev, 100000 - 200 - (s % 40) * 50, tag++);
         tx_txid(id, tx, l, scratch, sizeof scratch);
         if (mpool_policy_add(polcfg, polstate, pool, tx, l, id, (void*)1) == 1) added++;
         else refused++;
@@ -282,6 +301,18 @@ int main(int argc, char** argv){
       ck(what, n <= 40 || moved == 3); }
     printf("  pool-lock hold, best of 3: %.1f ms building under the lock (call %.1f ms), "
            "%.1f ms copying under it (call %.1f ms)\n", hold[0], wall[0], hold[1], wall[1]);
+    { /* the witness singletons: their wtxid (the slot's cache, on the
+       * snapshot path) is not their txid */
+      int differ = 0;
+      rj_val* pv = rj_parse("[true]", 6); rj_val* r = NULL;
+      rpc_node_dispatch("getrawmempool", pv, &r, &ec, &em);
+      for (int m = 0; r && m < (int)r->nmembers; m++){
+          rj_val* w = rj_obj_get(r->members[m].val, "wtxid");
+          if (w && strcmp(w->str, r->members[m].key)) differ++;
+      }
+      rj_free(r); rj_free(pv);
+      snprintf(what, sizeof what, "the witness singletons report a wtxid that is not their txid (%d of %u)", differ, singles);
+      ck(what, differ > 0 && (unsigned)differ == singles); }
     ck("the snapshot answer is byte-identical to the all-under-the-lock answer",
        body[0] && body[1] && blen[0] == blen[1] && !memcmp(body[0], body[1], (size_t)blen[0]));
     snprintf(what, sizeof what, "the pool lock is held for under half the old hold (%.1f ms against %.1f ms)",

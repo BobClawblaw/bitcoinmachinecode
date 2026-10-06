@@ -2511,6 +2511,16 @@ hold 55.8 -> 32.1 ms. Peak RSS per call is unchanged (~+790 MB): it is
 the 8.3 KB record per registry node that `pol_entry_info_all` writes, and
 only a compact graph format would shrink it.
 
+The copy no longer hashes either: the snapshot's wtxid is the pool slot's
+cached one (`MPOOL_SLOT_WTXID`, computed once by `mpool_put` over the
+bytes as stored, moved with the record by `mpool_del`, untouched by
+compaction, and read here under the lock every writer holds) rather than
+a fresh `sha256d` over every transaction -- ~25 MB of hashing per poll at
+a 68k pool. Hold at production shape 32.1 -> 25.7 ms; the test's
+singletons now carry a witness, so the comparison against the old path
+(which still hashes through the hook) checks the cache against a fresh
+hash, and copying the txid instead fails four checks.
+
 ### The wallet has no reorg awareness (WAL-13)
 
 `wallet_scan.c`'s on-disk record is `u32 height | txid | vout | value`
