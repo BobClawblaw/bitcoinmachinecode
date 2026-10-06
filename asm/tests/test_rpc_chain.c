@@ -1845,6 +1845,34 @@ int main(void){
           rj_free(r);
       }
       rpc_chain_set_chainparams("main", 210000, 0, 0, 0x1d00ffffu, 0); }
+    /* 2026-10-06: the BIP9 state walk is cached per period boundary (Core's
+     * VersionBitsCache). On production the walk re-read ~10k headers from
+     * genesis on every call and held the exclusive lock 2 s. testdummy with
+     * a 2-block period crosses boundaries at 1 and 3 on this fixture: the
+     * first call walks (reads headers), the second at the same tip reads
+     * none for the walk and answers the same, a reset walks again. */
+    { extern long g_b9_walk_reads; extern void rpc_chain_b9_test_dummy(long, long); extern void rpc_chain_b9_cache_reset(void);
+      rpc_chain_set_chainparams("regtest", 210000, 0, 0, 0x1d00ffffu, 0);
+      rpc_chain_b9_test_dummy(2, 1);
+      g_b9_walk_reads = 0;
+      rj_val* a = call("getdeploymentinfo", "[]", &ec, &em);
+      long r1 = g_b9_walk_reads;
+      rj_val* b = call("getdeploymentinfo", "[]", &ec, &em);
+      long r2 = g_b9_walk_reads - r1;
+      rj_val* da = a ? rj_obj_get(rj_obj_get(a, "deployments"), "testdummy") : NULL;
+      rj_val* db = b ? rj_obj_get(rj_obj_get(b, "deployments"), "testdummy") : NULL;
+      long la = 0, lb = 0; char* sa = da ? rj_write_alloc(da, 0, &la) : NULL; char* sb = db ? rj_write_alloc(db, 0, &lb) : NULL;
+      ck("bip9 cache: the first walk reads headers (period 2: boundaries 1 and 3)", r1 > 0);
+      ck("bip9 cache: the second call at the same tip reads NO header for the walk (cached boundaries, verified by the boundary's hash)", r2 == 0);
+      ck("bip9 cache: testdummy's object is the same from the cache as from the walk", sa && sb && la == lb && !memcmp(sa, sb, (size_t)la));
+      ck("bip9 cache: testdummy crossed its first boundary (started, since 2)", db && rj_obj_get(db, "bip9") && S(rj_obj_get(db, "bip9"), "status") && !strcmp(S(rj_obj_get(db, "bip9"), "status"), "started")
+                                                                              && !strcmp(S(rj_obj_get(db, "bip9"), "since"), "2"));
+      rpc_chain_b9_cache_reset(); g_b9_walk_reads = 0;
+      rj_val* c = call("getdeploymentinfo", "[]", &ec, &em);
+      ck("bip9 cache: after a reset the walk reads again, as many as the first time", g_b9_walk_reads == r1);
+      free(sa); free(sb); rj_free(a); rj_free(b); rj_free(c);
+      rpc_chain_b9_test_dummy(0, 0);
+      rpc_chain_set_chainparams("main", 210000, 0, 0, 0x1d00ffffu, 0); }
     expect_err("getdeploymentinfo on an unknown hash -> -5", "getdeploymentinfo",
                "[\"00000000000000000000000000000000000000000000000000000000deadbeef\"]",
                -5, "Block not found");
@@ -2108,6 +2136,37 @@ int main(void){
       }
       ck("every fixture tx resolves by txid alone", all);
       ck("...and byte-identically to the blockhash path (one render path)", same);
+    /* 2026-10-06: by txid (the index), verbosity 0 and 1 are served from
+     * the record's byte range -- two small reads, not the block and a
+     * walk of every transaction before this one (14 ms vs Core's 4 on
+     * mainnet; 382 ms at 32 clients). The answer must be the block
+     * path's, member for member, with in_active_chain the only
+     * difference (Core: only with an explicit blockhash). */
+    { extern long g_txi_fast_hits;
+      char q0[200], q1[320];
+      snprintf(q0, sizeof q0, "[\"%s\", 0]", g_tx1_txid);
+      long f0 = g_txi_fast_hits; long ec0 = 0; const char* em0 = NULL;
+      rj_val* fa = call("getrawtransaction", q0, &ec0, &em0);
+      { char want[1100]; tohex(want, g_tx1, g_tx1_len); ck_str("grt v0 by txid: the raw hex", fa && fa->typ == RJ_STR ? fa->str : NULL, want); }
+      ck("grt v0 by txid took the record-range path (test seam counts it)", g_txi_fast_hits == f0 + 1);
+      rj_free(fa);
+      snprintf(q0, sizeof q0, "[\"%s\", 1]", g_tx2_txid);
+      snprintf(q1, sizeof q1, "[\"%s\", 1, \"%s\"]", g_tx2_txid, g_hash[3]);
+      f0 = g_txi_fast_hits;
+      rj_val* fb = call("getrawtransaction", q0, &ec0, &em0);
+      ck("grt v1 by txid took the record-range path", g_txi_fast_hits == f0 + 1);
+      rj_val* bb = call("getrawtransaction", q1, &ec0, &em0);
+      int same = fb && bb && fb->typ == RJ_OBJ && bb->typ == RJ_OBJ && bb->nmembers == fb->nmembers + 1
+                 && !strcmp(bb->members[0].key, "in_active_chain") && !rj_obj_get(fb, "in_active_chain");
+      for (size_t k = 0; same && k < fb->nmembers; k++){
+          if (strcmp(fb->members[k].key, bb->members[k + 1].key)){ same = 0; break; }
+          long la = 0, lb = 0;
+          char* a = rj_write_alloc(fb->members[k].val, 0, &la); char* b = rj_write_alloc(bb->members[k + 1].val, 0, &lb);
+          if (!a || !b || la != lb || memcmp(a, b, (size_t)la)) same = 0;
+          free(a); free(b);
+      }
+      ck("grt v1 by txid == the block path's object minus in_active_chain, member for member (blockhash, confirmations, time, blocktime included)", same);
+      rj_free(fb); rj_free(bb); }
       /* 2026-10-01: rpc_chain_tx_blockhash, the facade batch's index-only
        * lookup (getrawtransaction would consult the mempool first) */
       { extern int rpc_chain_tx_blockhash(const char*, char[65]);
