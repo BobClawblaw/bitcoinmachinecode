@@ -48,10 +48,13 @@ beside the bmc run; Core's rerun had none (its CPU time is systemd's
 
 Milestones and segment walls: `docs/reports/2026-10-06-run38-vs-core6-stage-report.md`
 (validation/ibd_stage_report.py; run 37's is beside it). Core is ahead
-for the first 200,000 blocks (by 56 s at 100,000 and 48 s at 200,000):
-tiny blocks, where the wall is round trips, not bytes, and bmc's chunked
-requests pay one more round trip per 16 blocks than Core's per-block
-pipeline. From 300,000 on bmc is ahead in every segment, by 2.2–2.9×.
+for the first 200,000 blocks in run 38 (by 56 s at 100,000 and 48 s at
+200,000), and the gap is the probe minute before block 1 (below), not the
+request shape: the #392 build's two fresh syncs of the same afternoon
+reached 100,000 at 4:16 and 4:20 and 200,000 at 8:21 and 8:15 against
+Core's 4:12 and 8:15, while a rolling per-block pipeline below 300,000
+(`bmc.dlcrollbelow`, two arms against those two controls) was 13% slower
+or tied. From 300,000 on bmc is ahead in every segment, by 2.2–2.9×.
 
 Download, run 38: 60,639 chunks, 774 GB, 25 distinct peers; per-chunk wait
 p50 0.06 s, p90 0.08 s; 2 stall evictions over the run, both answered by
@@ -63,6 +66,17 @@ peers the download is no longer the bound. Run 38 took 33 minutes off run
 index writes off the applier, and the applier's own UTXO columns fell with
 them (less contention in the applying process: get 4,650 → 4,096 s, put
 5,687 → 4,994 s).
+
+The header phase, from run 38's log: of the 99 s between boot and block 1,
+48.8 s were the peer ranking (141 live peers probed 32 to a batch, each
+batch waiting out its silent members' 10 s alarm), 8 s the liveness
+round's full timeout, 37 s the header download from the best peer at 2.0
+MB/s (the held pages are stored once the chain crosses minimumchainwork;
+Core's own 75 s is its presync plus a redownload). PR #392 runs the
+probes concurrently and ends the liveness round after two quiet seconds;
+a fresh sync of that build (12:03Z, the early-chain A/B's control arm)
+reached block 1 in 50.5 s: liveness 2.3 s, ranking 7.0 s, headers 36 s.
+Run 39 carries it through the whole chain.
 
 ## 2. Where the applier's time goes (thread-seconds over the whole chain)
 
@@ -117,18 +131,21 @@ the 06:10Z mempool rows are not comparable (production's pool was
 refilling after the restart: 2,252 tx against Core's 21,133) and keep the
 05:20Z column. Both nodes live on the same box, both at the tip, loopback.
 
-| method | Core (10-05) | bmc before | Core (10-06 05:20Z) | bmc after the lanes | Core (06:10Z) | bmc final |
-|---|---|---|---|---|---|---|
-| getblockcount | 5 | 5 | 5 | 4 | 5 | 5 |
-| getblockhash | 5 | 5 | 5 | 4 | 5 | 4 |
-| getmempoolinfo | 5 | 177 | 5 | 5 | — | (05:20Z) 5 |
-| getrawmempool | 687 | 249 | 496 | 216 (pool 2.7× Core's) | — | (05:20Z) 216 |
-| getblock (verbosity 2) | 494 | 704 | 498 | 597 (wave 4,107 ms vs Core's 4,829) | 451 | 607 (wave 3,932 vs 4,589) |
-| getrawtransaction (verbosity 1), tail tx | 6 | 6 | 5 | **382** | 5 | **5** (single client 3 vs 3) |
-| getrawtransaction (verbosity 1), tx in a sorted run (block 950,000) | — | — | 5 | 5 | 5 | 6 |
-| getdeploymentinfo | — | — | 5 | (2,000 single; exclusive hold) | 5 | 5 (single 4 vs 4) |
-| getpeerinfo | 7 | 5 | 6 | 5 | 6 | 5 |
-| exec-lock waits ≥ 2 s per day under BlockYard + mempool.space | n/a | ~10 | n/a | 0 since 17:46Z 10-05 | n/a | 0 |
+| method | Core (10-05) | bmc before | Core (10-06 05:20Z) | bmc after the lanes | Core (06:10Z) | bmc after #387/#388 | Core (12:02Z) | bmc final (#392, the JSON arena) |
+|---|---|---|---|---|---|---|---|---|
+| getblockcount | 5 | 5 | 5 | 4 | 5 | 5 | — | — |
+| getblockhash | 5 | 5 | 5 | 4 | 5 | 4 | — | — |
+| getmempoolinfo | 5 | 177 | 5 | 5 | — | (05:20Z) 5 | — | — |
+| getrawmempool | 687 | 249 | 496 | 216 (pool 2.7× Core's) | — | (05:20Z) 216 | 484 (pool 25,508) | **114** (pool 26,757) |
+| getblock (verbosity 2) | 494 | 704 | 498 | 597 (wave 4,107 ms vs Core's 4,829) | 451 | 607 (wave 3,932 vs 4,589) | 449 / 459 (two waves; p90 641 / 586; wave 4,473 / 4,436) | **441 / 483** (p90 487 / 521; wave 3,187 / 3,224) |
+| getblock (verbosity 2), single client | 88 | 75 | — | — | — | 73 | 87 | **58** |
+| getblock (verbosity 1), 32 clients | — | — | — | — | — | — | 19 | **9** |
+| getblock (verbosity 3), single client | 140 | 102 | — | — | — | — | 126 | **84** |
+| getrawtransaction (verbosity 1), tail tx | 6 | 6 | 5 | **382** | 5 | **5** (single client 3 vs 3) | 5 | 5 |
+| getrawtransaction (verbosity 1), tx in a sorted run (block 950,000) | — | — | 5 | 5 | 5 | 6 | — | — |
+| getdeploymentinfo | — | — | 5 | (2,000 single; exclusive hold) | 5 | 5 (single 4 vs 4) | 5 | 5 |
+| getpeerinfo | 7 | 5 | 6 | 5 | 6 | 5 | — | — |
+| exec-lock waits ≥ 2 s per day under BlockYard + mempool.space | n/a | ~10 | n/a | 0 since 17:46Z 10-05 | n/a | 0 | n/a | 0 |
 
 What the 05:20Z column found, and what fixed it the same morning:
 
@@ -154,12 +171,28 @@ What the 05:20Z column found, and what fixed it the same morning:
   hash (Core's VersionBitsCache); a lookup verifies the highest cached
   boundary is still in the chain with one index read. First call after a
   restart 1.6 s (the walk, once), then 4 ms.
-- **getblock verbosity 2** at 32 clients remains mixed: bmc's wave finishes
-  14–15% sooner but the median call is 20–35% slower: the reader lane
-  serves fewer calls at once than Core's thread pool, so throughput is
-  higher and latency is worse. Single-client bmc is ahead at every
-  verbosity (v1 5 vs 8, v2 73 vs 91, v3 102 vs 140 ms). Lane width is plan
-  item A5.
+- **getblock verbosity 2** at 32 clients was mixed through the 06:10Z
+  column: bmc's wave finished 14–15% sooner but the median call was 20–35%
+  slower. Measured before building anything (plan A5): both nodes answer
+  from a 4-thread pool (`rpcthreads` default on both), bmc's listener took
+  no overflow during a wave, and bmc's latencies were the FIFO model's
+  (p90 = median + 10% = 32/4 × the single call) -- the lane was not
+  narrower than Core's pool; the per-call cost was the lever. perf on a
+  micro-benchmark of the render (3,573 transactions, 6.8 MB of JSON): a
+  third of the time in malloc/free of the ~400,000 JSON values, 11% in the
+  byte-at-a-time string escaper, 4% in hex encoding. PR #392 (production
+  `deploy-20261006c`, 11:59Z, every saved response byte-identical to the
+  previous build): one JSON arena per request, released whole after the
+  body is written; a span-copying escaper; hex encoded straight into the
+  value; a per-thread txid scratch. Micro-benchmark 37 → 26 ms; the
+  single call 73 → 58 ms (Core 87). At 32 clients the 12:02Z pair: median
+  441 / 483 against Core's 449 / 459 over two waves each (parity -- the
+  FIFO median is 8 × the service time on both), p90 487 / 521 against 641
+  / 586, wave 3,187 / 3,224 ms against 4,473 / 4,436 (28% sooner). Every
+  other getblock row is bmc's: v1 at 32 clients 9 vs 19, v3 single 84 vs
+  126.
+- **getrawmempool** at 32 clients, re-measured 12:02Z on pools of the same
+  size for the first time (26,757 vs 25,508 transactions): 114 vs 484 ms.
 
 ## 4. Modules (from docs/reports/2026-09-28-the-module-benchmarks-gaps-closed.md)
 
@@ -206,14 +239,14 @@ next Core rerun carries the sampler.
 | every milestone from 300,000 up | **bmc, 2.2–2.9×** | §1 |
 | CPU time for the sync | **bmc, 1.8×** less | 7 h 48 m vs 13 h 50 m |
 | download: applier time spent waiting | **bmc, 11×** less | 2,193 s vs 24,587 s |
-| headers → first block | Core | 1:39 vs 1:15 (was 5:06, then 1:58) |
-| the first 200,000 blocks | Core, by ~50 s | round-trip bound; §1 |
+| headers → first block | **bmc** since PR #392 (run 38 itself: Core) | 0:50 vs 1:15 on a fresh sync of the #392 build (12:03Z, the A/B's control arm: liveness 2.3 s, ranking 7.0 s, headers 36 s); run 38 was 1:39 (ranking 48.8 s) |
+| the first 200,000 blocks | parity since PR #392 (run 38 itself: Core, by ~50 s) | the #392 build's two fresh syncs (12:02Z, 12:52Z): 100,000 at 4:16 / 4:20, 200,000 at 8:21 / 8:15 against Core's 4:12 and 8:15; the ~50 s was the probe minute (§1). A rolling per-block request shape (`bmc.dlcrollbelow`) was A/B'd on the same afternoon and lost (13%) or tied; it stays off |
 | apply path per block (thread-seconds) | **bmc, by 4%** | 13,363 vs 13,909 (run 37: Core by 5%; run 34: by 23%) |
 | index writes, on the applier | parity (both off it) | 0.2 s vs 5 s; the worker's 688 s runs beside the applier as Core's callback threads do |
 | RPC: getblockcount, getblockhash, getmempoolinfo, getpeerinfo | parity | 4–5 ms both |
-| RPC: getrawmempool, 32 clients | **bmc, 2.3×**, on a pool 2.7× larger | 216 vs 496 ms |
-| RPC: getblock v2, 32 clients | mixed: wave 15% faster, median 20% slower | §3 |
-| RPC: getblock, single client, every verbosity | **bmc** | §3 |
+| RPC: getrawmempool, 32 clients | **bmc, 4.2×** on pools of the same size (12:02Z) | 114 vs 484 ms (26.8k vs 25.5k tx) |
+| RPC: getblock v2, 32 clients | parity on the median, **bmc** on p90 and the wave (was: median 20% slower) | 441/483 vs 449/459; p90 487/521 vs 641/586; wave 28% sooner; §3 |
+| RPC: getblock, single client, every verbosity | **bmc, 1.5×** | v2 58 vs 87, v3 84 vs 126 ms; v1 at 32 clients 9 vs 19 |
 | RPC: getrawtransaction (tail or run) | parity | 5 vs 5 ms at 32 clients; 3 vs 3 single (was 382 vs 5 at 05:20Z) |
 | RPC: getdeploymentinfo | parity | 5 vs 5 ms; the 2 s exclusive holds are gone |
 | RPC lock-ups under BlockYard + mempool.space | **bmc** (was ~10/day) | 0 waits ≥ 2 s since the deploy |
@@ -225,13 +258,23 @@ next Core rerun carries the sampler.
 | correctness | identical | muhash at 970,133 |
 
 Not yet beaten, with the fix named: the first 200,000 blocks and the
-header phase (per-block requests on the early chain; plan B9), getblock
-v2's median at 32 clients (lane width; plan A5). The apply path per block
-moved from Core's column to bmc's with run 38 (the index worker, PR #390);
-the flush (plan B3) is the remaining column off Core's shape in §2. The
-memory row needs the Core rerun with the sampler before it can be claimed
-either way. The two RPC losses the 05:20Z rows found were fixed and
-deployed the same morning (§3).
+header phase. Run 38's log puts 49 of the 99 s before block 1 in the peer
+ranking (probes 32 to a batch, each batch waiting out its silent members'
+10 s alarm) and 8 s in the liveness round's full timeout; PR #392 makes
+both end on their own clocks (expected boot → block 1 ≈ 60 s against
+Core's 75; measured 0:50 on the two fresh syncs of 12:02Z and 12:52Z),
+and those same two syncs put the first 200,000 blocks at Core's pace
+(100,000 at 4:16 / 4:20, 200,000 at 8:21 / 8:15 against 4:12 and 8:15).
+The early-chain request shape (plan B9 part 2, `bmc.dlcrollbelow`, a
+rolling per-block pipeline below a height) was A/B'd against the chunked
+default on four fresh syncs to 300,000 and lost: 1066 s and 941 s against
+the controls' 941 s and 900 s. It stays off. getblock v2's median
+at 32 clients moved from a 20% loss to parity with PR #392 (the JSON
+arena; p90 and the wave are bmc's). The apply path per block moved from
+Core's column to bmc's with run 38 (the index worker, PR #390); the flush
+(plan B3) is the remaining column off Core's shape in §2. The memory row
+needs the Core rerun with the sampler before it can be claimed either
+way.
 
 ## 7. What changed between run 34 and run 38
 
@@ -294,6 +337,17 @@ misreporting. Neither is in the tables.
   trailed the applier by ~20 blocks the whole run and stopped within 1 s
   of the download's end; the stage report counts its lines in their own
   column (`ixw`). Ready 4:50:52 → 4:17:09; applier 14,602 → 13,363 s.
+- **The JSON arena and the peer probes** (PR #392, `6e8cc448`, production
+  `deploy-20261006c` at 11:59Z, verified byte-identical on thirteen saved
+  responses): every JSON value a request builds lives in one per-thread
+  arena released after the body is written (a third of a getblock v2
+  render had been malloc/free), the string escaper copies spans, hex is
+  encoded straight into the value; getblock v2 single 73 → 58 ms, the
+  32-client median to parity (§3). The download's peer ranking runs its
+  probes concurrently and the liveness round ends after two quiet seconds:
+  run 38 had spent 57 of its first 99 s there (§6). The same PR's
+  `bmc.dlcrollbelow` (a rolling per-block pipeline on the early chain) was
+  A/B'd the same afternoon and lost; the default stays off.
 - **Not done, stated:** the double-buffered memtable flush (B3) — the
   flush row in §2 is unchanged from run 34, as predicted — and the 60–70 s
   pause after IBD end while the serve process faults the memtable in (B8,
