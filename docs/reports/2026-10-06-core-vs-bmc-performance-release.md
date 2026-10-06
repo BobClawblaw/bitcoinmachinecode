@@ -93,48 +93,59 @@ and printed "other = −5,289 s" on the first render of run 37; fixed in
 ## 3. RPC, 32 simultaneous clients × 5 calls, median ms (validation/rpc_concurrency_bench.sh)
 
 Measured 2026-10-05 before the lane work (bmc pool 71,348 tx, Core pool
-29,961 tx), and 2026-10-06 05:20Z after it (bmc pool 64,793 tx, Core pool
-24,074 tx; Core re-measured the same minute). Fixed-work rows use block
-969,000 (`00000000000000000000fb6c31229d2253cd7161c9cb72cf03d2e3d847e9a22a`)
-and its second transaction (`75fbbbf4…1d70`). Both nodes live on the same
-box, both at the tip, loopback.
+29,961 tx); 2026-10-06 05:20Z after it (bmc pool 64,793 tx, Core pool
+24,074 tx); and 2026-10-06 06:10Z after the two fixes that row found
+(PRs #387 and #388, production `deploy-20261006b`). Core is re-measured in
+the same minute as each bmc column. Fixed-work rows use block 969,000
+(`00000000000000000000fb6c31229d2253cd7161c9cb72cf03d2e3d847e9a22a`) and
+its second transaction (`75fbbbf4…1d70`, in the txindex's unsorted tail);
+the 06:10Z mempool rows are not comparable (production's pool was
+refilling after the restart: 2,252 tx against Core's 21,133) and keep the
+05:20Z column. Both nodes live on the same box, both at the tip, loopback.
 
-| method | Core (10-05) | bmc before | Core (10-06) | bmc after |
-|---|---|---|---|---|
-| getblockcount | 5 | 5 | 5 | 4 |
-| getblockhash | 5 | 5 | 5 | 4 |
-| getmempoolinfo | 5 | 177 | 5 | 5 |
-| getrawmempool | 687 | 249 | 496 | 216 (pool 2.7× Core's) |
-| getblock (verbosity 2) | 494 | 704 | 498 | 597 (wave wall 4,107 ms vs Core's 4,829) |
-| getrawtransaction (verbosity 1) | 6 | 6 | 5 | **382** |
-| getpeerinfo | 7 | 5 | 6 | 5 |
-| exec-lock waits ≥ 2 s per day under BlockYard + mempool.space | n/a | ~10 | n/a | 0 since the deploy (17:46Z 10-05) |
+| method | Core (10-05) | bmc before | Core (10-06 05:20Z) | bmc after the lanes | Core (06:10Z) | bmc final |
+|---|---|---|---|---|---|---|
+| getblockcount | 5 | 5 | 5 | 4 | 5 | 5 |
+| getblockhash | 5 | 5 | 5 | 4 | 5 | 4 |
+| getmempoolinfo | 5 | 177 | 5 | 5 | — | (05:20Z) 5 |
+| getrawmempool | 687 | 249 | 496 | 216 (pool 2.7× Core's) | — | (05:20Z) 216 |
+| getblock (verbosity 2) | 494 | 704 | 498 | 597 (wave 4,107 ms vs Core's 4,829) | 451 | 607 (wave 3,932 vs 4,589) |
+| getrawtransaction (verbosity 1), tail tx | 6 | 6 | 5 | **382** | 5 | **5** (single client 3 vs 3) |
+| getrawtransaction (verbosity 1), tx in a sorted run (block 950,000) | — | — | 5 | 5 | 5 | 6 |
+| getdeploymentinfo | — | — | 5 | (2,000 single; exclusive hold) | 5 | 5 (single 4 vs 4) |
+| getpeerinfo | 7 | 5 | 6 | 5 | 6 | 5 |
+| exec-lock waits ≥ 2 s per day under BlockYard + mempool.space | n/a | ~10 | n/a | 0 since 17:46Z 10-05 | n/a | 0 |
 
-Two rows need words:
+What the 05:20Z column found, and what fixed it the same morning:
 
-- **getrawtransaction** is a loss, and the 10-05 "6 vs 6" row did not show
-  it (the transaction it used is not recorded; today's row is pinned
-  above). Single-client the call costs 14 ms on bmc against Core's 4 ms at
-  every verbosity (0: 14 vs 4; 1: 14 vs 2; 2: 25 vs 7); at 32 clients bmc
-  serialises to 382 ms while Core stays at 5. Cause, by design and
-  documented in `rpc_chain.c` ("the txindex lane"): one reader at a time
-  inside the lane (its verify path shares static 4 MB buffers), and a
-  lookup reads the whole block to extract one transaction where Core
-  reads the transaction at its file offset. The lane removed the convoy
-  it was built for (the exec-lock row); it did not make the call fast.
-  Fix: per-thread lane buffers under a reader-writer lock (concurrency),
-  and the transaction's byte offset in the txindex record (the 14 ms).
-- **getblock verbosity 2** at 32 clients: bmc's wave finishes 15% sooner
-  (4,107 ms vs 4,829 ms) but the median call is 20% slower (597 vs 498):
-  the reader lane serves fewer calls at once than Core's thread pool, so
-  throughput is higher and latency is worse. Single-client bmc is ahead at
-  every verbosity (v1 5 vs 8, v2 73 vs 91, v3 102 vs 140 ms).
-
-The 7 exclusive holds over 2 s since the deploy were all `getdeploymentinfo`
-(2.0–2.1 s each, 1–2 callers queued behind each): it re-walks the BIP9 state
-from genesis on every call (~10k header reads) where Core caches it per
-period. No caller waited ≥ 2 s. Fix in the plan: Core's per-period cache,
-served from the reader lane.
+- **getrawtransaction** was a loss the 10-05 "6 vs 6" row had hidden (its
+  transaction was never recorded). Pinned: 14 ms single-client against
+  Core's 4, and 382 ms at 32 clients against 5. Three causes, in
+  `rpc_chain.c`: the txindex lane's verify read the WHOLE block into a
+  static 4 MB buffer to compare one txid (and that buffer was why the lane
+  admitted one reader at a time); the handler then read the block again
+  and walked every transaction before the one asked for; and for a
+  transaction in the index's unsorted tail -- every block since the last
+  fold, up to 20,000 of them, 564 MB on production -- the lookup scanned
+  the tail from the start. PR #387: the verify and verbosity 0/1 read the
+  transaction at the record's byte range (as Core reads it at its file
+  position), the txid recomputed and compared. PR #388: the tail gets an
+  in-memory hash table of record numbers (4 bytes a slot, ≤ 256 MB at the
+  fold's worst point), built as the tail grows. Result: 3 ms single, 5 ms
+  at 32 clients, tail or run -- Core's numbers.
+- **getdeploymentinfo** was the one remaining exclusive-lock holder over
+  2 s on production (seven a day, 2.0–2.1 s each, 1–2 callers queued): the
+  BIP9 walk re-read ~10k headers from genesis on every call. PR #387 caches
+  the decided state at every period boundary with the boundary block's
+  hash (Core's VersionBitsCache); a lookup verifies the highest cached
+  boundary is still in the chain with one index read. First call after a
+  restart 1.6 s (the walk, once), then 4 ms.
+- **getblock verbosity 2** at 32 clients remains mixed: bmc's wave finishes
+  14–15% sooner but the median call is 20–35% slower: the reader lane
+  serves fewer calls at once than Core's thread pool, so throughput is
+  higher and latency is worse. Single-client bmc is ahead at every
+  verbosity (v1 5 vs 8, v2 73 vs 91, v3 102 vs 140 ms). Lane width is plan
+  item A5.
 
 ## 4. Modules (from docs/reports/2026-09-28-the-module-benchmarks-gaps-closed.md)
 
@@ -151,6 +162,10 @@ ahead of Core; signature verification at parity with libsecp256k1.
 | block filters | 13 GB | 13 GB |
 | undo | 101 GB (rev files) | 2.5× larger (carries spent scripts; feeds the address history) — 2026-10-05 measurement |
 | coinstats history | — | 0.9 GB |
+
+Since `deploy-20261006b` the serve process also holds the txindex tail's
+hash table: 4 bytes a slot at ≤ 3/4 load, 128–256 MB over the fold cycle
+(not in run 37's figures).
 
 Memory, bmc run 37, proc sampler every 5 s over every process of the
 daemon's tree: anonymous (heap) memory held 26.4 GB steadily through the
@@ -177,7 +192,8 @@ next Core rerun carries the sampler.
 | RPC: getrawmempool, 32 clients | **bmc, 2.3×**, on a pool 2.7× larger | 216 vs 496 ms |
 | RPC: getblock v2, 32 clients | mixed: wave 15% faster, median 20% slower | §3 |
 | RPC: getblock, single client, every verbosity | **bmc** | §3 |
-| RPC: getrawtransaction | **Core** | 382 vs 5 ms at 32 clients; 14 vs 4 single |
+| RPC: getrawtransaction (tail or run) | parity | 5 vs 5 ms at 32 clients; 3 vs 3 single (was 382 vs 5 at 05:20Z) |
+| RPC: getdeploymentinfo | parity | 5 vs 5 ms; the 2 s exclusive holds are gone |
 | RPC lock-ups under BlockYard + mempool.space | **bmc** (was ~10/day) | 0 waits ≥ 2 s since the deploy |
 | modules (archive read, MuHash, hashes, AEAD, sigs) | **bmc or parity** | §4 |
 | txindex on disk | **bmc, 2.5× smaller** | 28 vs 70 GB |
@@ -186,12 +202,13 @@ next Core rerun carries the sampler.
 | peak memory | not comparable yet | Core unmeasured |
 | correctness | identical | muhash at 970,133 |
 
-Not yet beaten, with the fix named: getrawtransaction (the lane's single
-reader and whole-block read; §3), the apply path per block (B3 async flush,
-B4 async index work; §2), the first 200,000 blocks and the header phase
-(per-block requests on the early chain; a later item), getblock v2's median
-at 32 clients (lane width). The memory row needs the Core rerun with the
-sampler before it can be claimed either way.
+Not yet beaten, with the fix named: the apply path per block (B3 async
+flush, B4 async index work; §2), the first 200,000 blocks and the header
+phase (per-block requests on the early chain; plan B9), getblock v2's
+median at 32 clients (lane width; plan A5). The memory row needs the Core
+rerun with the sampler before it can be claimed either way. The two RPC
+losses the 05:20Z rows found were fixed and deployed the same morning
+(§3).
 
 ## 7. What changed between run 34 and run 37
 
@@ -236,6 +253,11 @@ misreporting. Neither is in the tables.
   (Core's semantics: a disconnected staller's blocks are re-requested at
   once) and the evicted worker releases a chunk its redial finds delivered.
   Run 37: 7 evictions, 7 reassigned, 0 unanswered, 3 released on redial.
+- **After run 37, from its RPC rows** (PRs #387 and #388, production
+  `deploy-20261006a`/`b`, both verified on the next block with zero
+  restarts): getrawtransaction by the record's byte range and the tail's
+  hash index; the BIP9 walk cached per period boundary. §3 carries the
+  before/after.
 - **Not done, stated:** the double-buffered memtable flush (B3) and the
   async index work (B4) — the flush and inline-index rows in §2 are
   unchanged from run 34, as predicted.
