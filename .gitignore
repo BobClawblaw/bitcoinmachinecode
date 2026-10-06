@@ -461,3 +461,7 @@ asm/daemon/bmc_utxo_probe_one
 
 # ---- gate log audits (scripts/gate_log_audit.py writes one per gate log) ----
 asm/gate-*.audit
+
+# 2026-10-06: tool binaries and gate build logs
+asm/daemon/bmc_utxo_snapshot_diff
+asm/gate-*.build
