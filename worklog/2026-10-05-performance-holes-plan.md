@@ -147,6 +147,33 @@ sets `g_cfg.async_flush = 0` and pins the inline path, which is still shipped
 (bmc.asyncflush=0, build_utxo, the tools); the shipped-object arm keeps the
 default (dfc41338 on the branch).
 
+**Run 40 (10-06/07, main b194dd01, the full sync with the fix):** 112
+freezes of 0.47–0.68 s each on the applier (p50 680 ms; the first one
+11.9 s at block 228,769, gen 0: the copy's pages faulted in on first
+touch — a touch pass or MAP_POPULATE at init would take that off the
+first flush), 97 s in all; the writer's run build 13.6 s median (0.3–25.5
+s), 1,545 s in the forked child, 187 GB of runs; every adopt line `waits
+0, inline 0`; no WARNING. The flush column 1,357 → 131 s. The applier
+total still rose, 14,060 → 14,650 s: put 5,661 → 7,135 s (ins 1,845 →
+2,621, undo 2,463 → 3,079), the third rise in a row for the same put code
+(run 38: 4,994). Not the writer: per 1,000 inputs the insert cost 0.77 ms
+in the blocks applied while a writer child was alive (the 30 s after each
+freeze, blocks 300,000+) and 0.74 ms in the rest. The tree's CPU rose by
+the writer's 1,545 s and little else (28,535 → 30,218 s), so the extra
+1,475 s of put was waited for, not computed. See B11. B3 itself: done.
+
+**Production, steady state (10-07 01:16Z, found by the other session on
+deploy-20261006d):** the writer is reaped only by `fz_poll`, and `fz_poll`
+runs only per applied block (utxo_live.c, the per-block call in catch-up
+and the post-catch-up call), both firing right after the fork, before the
+writer has exited. At the tip the writer (3.9 MB run, written in ms) sat
+as a zombie for the whole block interval; the adopt, the WAL hole-punch
+and the frozen copy's release lag by one block (10 min to 1 h+). Safe (a
+crash replays the WAL, the hook waits before the next freeze, shutdown
+reaps) but not the shape intended: poll from the idle heartbeat or on
+SIGCHLD (the compaction child's `compact_poll` has the same shape). Small;
+after Core #7, with B10.
+
 ### B4. Index work off the applier (medium)
 `idx` 1,194 s is the Phase 0.5 index build inside `apply_block_inner`;
 txindex 329 s + bfilter 375 s + csi 460 s are the choke-point writers. Core
@@ -375,6 +402,17 @@ drained block (17:45:18.5); the tail was 97 s from IBD end to ready (drain 23
 s, downshift flush, latch, index gaps). The test's two record assertions fail
 with both sync sites disabled (revert check 18:00Z).
 
+**Run 40 (with the fix):** the gate line `[dlc] chainwork in step with
+the archive at the download gate: 970229 record(s) appended during the
+download` at 01:15:01.9, `parallel downloader wrote` at 01:15:02.787, the
+first drained block line at 01:15:03.336: 0.55 s against run 39's 65 s.
+The drain of the remaining 629 blocks took 23 s (to 01:15:26). The tail
+to ready was still 99 s: at 01:15:40 the rotation probed the pool again
+(161 live peers, 1 round), ranked it by a 2,000-header sample in 22.3 s,
+and fetched the 37 blocks that had arrived during the sync (01:16:03 →
+01:16:28); ready at 01:16:41. The ~62 s of re-probe and re-rank for 37
+blocks is a new item (B10). B8: done.
+
 ### B9. The first 200,000 blocks: Core ahead by ~70 s
 Round-trip bound on tiny blocks: bmc asks for 16-block chunks per round
 trip, Core pipelines per block. A per-peer in-flight pipeline across chunk
@@ -438,6 +476,16 @@ Not isolated: the applier's own columns rose by 700 s in the same run (memtable
 insert and undo capture) with PR #392 touching neither. Run 40 is the next
 data point; if the churn repeats, rank by a second, staggered sample.
 
+**Run 40:** boot to block 1 in 46.5 s (liveness 4.0 s, ranking 8.6 s,
+headers 33.3 s); 100,000 at 4:16, 200,000 at 8:12 (Core 4:12 / 8:15). The
+churn repeated: 70 distinct chunk peers (run 39: 81, run 38: 25), chunk
+wait sum 6,790 s (5,160; 3,591), chunk wall p50 0.80 s (0.94; 0.39) — and
+this time with no bans at all (`banned 0/161` at the end against 22/135),
+so the churn is the ranking's, not the eviction's. Part 1 (rank by a
+second, staggered sample so each peer's rate is its own and not a share
+of the uplink) stays open; A/B to 300,000 after Core #7, the distinct
+peer count and the wait sum are the metrics.
+
 ### M1. Memory: name the 26 GB — BUILT 10-06 (branch perf/2026-10-06-m1-mem-naming; gate pending)
 Anonymous memory held 26.4 GB through the sync with dbcache=8192 (peak 35.2
 GB in a compaction). A per-subsystem `[mem]` line under benchlog at the MEM
@@ -484,6 +532,16 @@ Run 38 (B4, 10-06 11:00Z): ready **4:17:09** (exit met), applier 13,363 s
 (Core 13,909; target 12,000 still open: the flush, B3), getrawtransaction
 5 ms, no exclusive hold ≥ 2 s on production.
 
+**Run 40:** `[mem] at IBD end: pss 40667 MB (anon 2716, file 37880,
+shmem 70)` with the mapped runs named (utxo_run_000096.dat 12,807 MB,
+seven generation runs of 1.6–1.7 GB, utxo_lsm_blob.map 1,619 MB); `[mem]
+at ready: pss 42074 MB (anon 3660, file 38256, shmem 157)`. The sampler
+(Pss_Anon): 9.6–11.4 GB anonymous through the sync, peak 22.1 GB during a
+compaction at 21:47Z, PSS peak 67.9 GB in the same minute; the RSS peak
+of 245 GB at 01:15:55Z is the top-up round's 27 forked probes each
+counting the worker's pages (the Pss columns are the honest ones). M1:
+done; the Core side comes from rerun #7's sampler.
+
 ### B4 — built 2026-10-06 (branch perf/2026-10-06-b4-index-worker)
 `daemon/index_worker.{c,h}`: the applier pushes (BLOCK h) onto a 1,024-slot
 ring in the shared status block after each connected block; a forked
@@ -517,3 +575,67 @@ started/stopped lines printed without a timestamp (`log_ts.h` after
 `<stdio.h>`); `validation/ibd_stage_report.py` brackets the index lines
 between the worker's started/stopped lines into an `ixw` column (off the
 wall) with a selftest check and a mutant (3 FAIL).
+
+## 2026-10-07 — run 40 against the targets, and the next holes
+
+Run 40 (main b194dd01, B3 + B8 + M1; 20:34Z → 01:16Z): PASS 970,267,
+ready 4:42:41, 2.3× Core; the applier 14,650 s against Core's 13,909 (5%
+behind) with the flush off it; details above under B3, B8, B9 and M1 and
+in `docs/reports/2026-10-06-core-vs-bmc-performance-release.md` (§1, §2,
+§5, §6, §7) and `docs/reports/2026-10-07-run40-vs-core6-stage-report.md`.
+The box during the run, for the record: production bmcbitcoind
+(deploy-20261006d), mempool-backend (restarted 21:33:41Z with a 16 GB
+heap by the other session, heavy for 78 s at ~block 508,000), BlockYard,
+a vLLM server holding 30 GB of GPU memory with 4.5 GB of its host memory
+in swap, the 8 GB swap file full the whole time, 85 GB of page cache.
+None of it is ours to stop; Core rerun #7 (started 01:24:50Z, with the
+sampler) runs on the same box in the same state, which is what makes the
+pair comparable.
+
+### B10. The top-up round after the download re-probes and re-ranks the whole pool (run 40: ~62 of the 99 s tail)
+
+The parallel download ends at the archive tip the gate knew (970,229);
+the blocks that arrived during the 4.7 h sync (37) are fetched by the
+rotation's next pass, which first runs the full liveness probe (161
+peers) and the 2,000-header ranking (22.3 s) as if the pool were unknown.
+Fix: when the pool was ranked within the last few minutes and the top-up
+is under a window's worth of blocks, reuse the ranking (or let the
+download gate extend itself to the current header tip before it closes).
+Small. Measure: the tail from `parallel downloader wrote` to `[ready]`,
+99 s → ~40 s.
+
+### B11. The memtable's backing: file-backed shared mappings, and a put column that moves 2,141 s between runs of the same code
+
+Evidence: put 4,994 / 5,661 / 7,135 s over runs 38 / 39 / 40 (ins 1,377 /
+1,845 / 2,621; undo 2,242 / 2,463 / 3,079) with no change to the put path
+between them; the per-input cost the same with and without a writer child
+alive (run 40); the tree's CPU flat apart from the writer, so the time is
+waited, not computed; and the table and blob are `mmap(MAP_SHARED)` on
+`utxo_lsm_table.map` / `utxo_lsm_blob.map` (utxo_live.c, `mmap_file`),
+2^25 slots and 6 GB of blob in bulk mode: every insert dirties a file
+page the kernel writes back, and under page-cache pressure (85 GB of
+cache, the swap full, the mapped runs competing) a reclaimed page is
+re-faulted from the file on the next touch. The writer side appears never
+to read the files back: the boot and every inbound child rebuild their
+view by `utxo_lsm_reload`, a WAL replay from the checkpoint (the header
+comment of utxo_live.c) — to be confirmed in the asm before anything
+changes. A within-run check was tried and is not usable: put.ins per
+input rises with height on its own (more outputs per input late in the
+chain), so only the same blocks across runs compare.
+
+Change: back the live table and blob with anonymous private memory
+(`MAP_PRIVATE|MAP_ANONYMOUS`, `madvise(MADV_HUGEPAGE)`: the box's THP
+mode is `madvise`, and the frozen copy already asks for it), the WAL as
+the sole durability, `utxo_lsm_reload` unchanged. The tools that map the
+files (build_utxo, utxo_probe_one, utxo_dump_keys, utxo_repair_del,
+utxo_setinfo's size probe) keep the file path or read the WAL;
+archive_verify's file list loses two entries. Risk: a crash loses nothing
+the WAL does not hold, if the files were indeed never read back; the
+reload path must be shown to rebuild a full generation (test: kill -9
+mid-generation, reboot, compare the walk to the oracle; the async-flush
+test's crash phase covers the adopt window).
+
+Measure: A/B to 300,000 after Core #7 (two arms in the same hour, the
+box quiet): put.ins and put.undo per 1,000 inputs at the same heights;
+then a full run. Target: put at or under run 38's 4,994 s, which puts the
+applier at ~12,500 s against Core's 13,909.
