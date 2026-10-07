@@ -2448,6 +2448,18 @@ pool, so none of them waits on the worker there (`getblocktemplate` does,
 under the exclusive lock, and stays so: a miner's call, not a poller's).
 The block lane with a private buffer remains the next step for `getblock`.
 
+**Update 2026-10-07.** That step was taken on 2026-10-05 (#383, the lanes
+batch). `getblock` runs in a per-thread reader lane (class NOLOCK: a private
+store handle and an 8 MB block buffer). A txindex lane under one mutex that
+`irs_refresh` also takes serves `getrawtransaction` and the facade batch's
+parent lookups. The facade now takes only the lock class its method needs, where
+it used to take the exclusive lock for every dispatch. Production's exec-lock
+waits of 2 s or more went from about 10 a day to 0. The lane's per-thread state
+was not released at thread exit, and the facade's thread per connection turned
+that into a descriptor leak. Production RPC stopped accepting for 2 h 17 m on
+2026-10-07 at 1,023/1,024 descriptors. The release at thread exit is #402
+(`devlog/INCIDENT_2026-10-07_reader_lane_fd_leak.md`).
+
 ### The wallet has no reorg awareness (WAL-13)
 
 `wallet_scan.c`'s on-disk record is `u32 height | txid | vout | value`

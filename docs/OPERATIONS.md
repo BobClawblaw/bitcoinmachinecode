@@ -430,6 +430,13 @@ deliberately not vendored into this repository (operator decision,
 - SIGTERM is honoured (the parent forwards it to the download worker);
   `TimeoutStopSec` is the wait before systemd SIGKILLs.
 - `Restart=on-failure`, `RestartSec=10`, at most 5 starts per 600 s.
+- No `LimitNOFILE` is set, so the process gets the default soft limit of 1,024
+  descriptors (`Max open files` in `/proc/<pid>/limits`). A healthy production
+  process holds about 66. The Core oracle's unit sets 65,536. On 2026-10-07 a
+  leak used all 1,024 and RPC stopped accepting for 2 h 17 m
+  (`devlog/INCIDENT_2026-10-07_reader_lane_fd_leak.md`). Raising the limit is an
+  open decision. It would only buy time against a leak, so keep the descriptor
+  check below either way.
 
 ```sh
 sudo systemctl daemon-reload
@@ -516,18 +523,41 @@ ln -sfn bmcbitcoind.deploy-<previous> daemon/bmcbitcoind.live
 sudo systemctl restart bmcbitcoind
 ```
 
-A deploy is verified only when all three hold:
+Not every earlier snapshot is a safe rollback target (as of 2026-10-07):
+
+- **Nothing before `deploy-20261006d`.** B3's async flush (#396, first live in
+  06d) retires the UTXO WAL's flushed generations: it records the first live
+  byte in `utxo.idx` and punches a hole over the bytes before it. Earlier builds
+  replay the WAL from byte 0 and would drop tombstones from a datadir that 06d
+  or later has written. That includes `deploy-20261006c`, the snapshot
+  immediately before. Do not roll back past 06d without working out the
+  datadir first.
+- **`deploy-20261006d` leaks three descriptors per Esplora facade request**
+  (the getblock reader lane, fixed by #402, as does every build from
+  `deploy-20261005a`). It is the only rollback target for `deploy-20261007a`.
+  It runs, but RPC stops accepting within hours to a day under mempool.space,
+  so use it only as a bridge and watch the descriptor count.
+
+The current production snapshot and its predecessors, with what each one
+carried, are in `devlog/DEPLOYMENT_HISTORY.md`.
+
+A deploy is verified only when all four hold:
 
 1. a NEW block arrives and is applied: its hash equals the oracle's, and the
    heartbeat shows `tip == stored`;
 2. at least 10 minutes in, `systemctl show -p NRestarts,ActiveState
    bmcbitcoind` still reads `0` / `active`;
-3. the RPC clients (mempool.space, the facade) have reconnected meanwhile.
+3. the RPC clients (mempool.space, the facade) have reconnected meanwhile;
+4. the descriptor count stays flat across that client traffic:
+   `ls /proc/$(systemctl show -p MainPID --value bmcbitcoind)/fd | wc -l`
+   (about 66 on `deploy-20261007a`), well under `Max open files`.
 
-The second and third are not optional. On 2026-10-02 a build applied its
-first block correctly, then crash-looped ~40 s after every start once
+The second, third and fourth are not optional. On 2026-10-02 a build applied
+its first block correctly, then crash-looped ~40 s after every start once
 mempool.space re-synced through the facade, until systemd gave up. One good
-block proves only the apply path.
+block proves only the apply path. On 2026-10-07 a build that had passed the
+first three for two days ran out of descriptors: every facade request leaked
+three, and only a count taken over time shows that.
 
 ## The Core oracle
 
@@ -602,10 +632,11 @@ Two lines every 10 s (since 2026-09-08; before that the tick was eight lines):
 - `eta` is `DD:HH:MM:SS` at the last ten minutes' block rate; blocks grow
   toward the tip, so on the tail it reads optimistic. `--:--:--:--` until a
   rate exists.
-- `in flight N of window W` is the claimed-not-yet-landed set: with 16
-  workers on 40-block chunks a few hundred is normal. It is bounded by the
-  window (4,096 above the first unfilled height); the archive consolidates
-  behind it.
+- `in flight N of window W` is the claimed-not-yet-landed set. With the
+  defaults since 2026-10-01 (10 workers, `bmc.catchupworkers`, on 16-block
+  chunks, `bmc.dlcchunk`) it is at most a few hundred. It is bounded by the
+  window: Core's 1,024 blocks above the connected tip (since 2026-09-29), or
+  workers × chunk if that is larger. The archive consolidates behind it.
 - `oldest gap Ns at h` is how long height `h` has been the lowest unfilled
   height. A gap that stays oldest for 60 s prints as `STRANDED: height h
   has been the oldest gap for Ns` — the one line on this subject that
@@ -624,8 +655,8 @@ Two lines every 10 s (since 2026-09-08; before that the tick was eight lines):
   retry ring after 400 attempts). Before the event counts, `staged N
   commit M` (2026-09-08): chunks waiting for the in-order committer right
   now, and chunks it has appended. `staged` above a handful for more than
-  a tick means the chunk at the first hole has not arrived; the help path
-  fetches it after 2 s.
+  a tick means the chunk at the first hole has not arrived. While the window
+  is full, the stall rule below judges whoever holds it.
 - The NODE_WITNESS drop count prints only when it changes.
 - The 16-line peer table prints every five minutes.
 - `[dl] new block` and `[dl] announced tip` are silent while the tip is
@@ -638,6 +669,20 @@ Lines that still print one per event, because each one is worth reading:
 pool-relative verdict, with the measured rate and the bar), `stalled: no
 block for 120s`, `attempt N failed after M ms: <reason>` (only the third in
 a row on one chunk and every hundredth), and `REJECT h=`.
+
+The download's other one-per-event lines (2026-10-05 to 10-07):
+
+| line | meaning |
+|---|---|
+| `[dlc] header probe: the first page from N candidate(s) in Xs: <peer> R KB/s (...), ... -- <peer> leads, the rest are fallbacks` | B5: the first header page was asked of four candidates. The fastest leads the header download. |
+| `[dlc] headers from X fell to N KB/s over its last 4 page(s), under half of Y's probed M KB/s -- switching at height H (+S stored, P page(s) held and carried); Y continues from there` | B12 (#404): the header leader slowed. The next candidate continues from H, with nothing re-downloaded. Never printed under `bmc.dlshape=core`. |
+| `[dlc] headers from X stopped answering after +N (chain at H) -- the next candidate takes over` | the leader went silent. What it served is rolled back and the next candidate starts over. |
+| `[dlc] wN <peer> is stalling the window: chunk [lo,hi] is the oldest missing and the window (W above A) is full -- dropped after N s (next timeout T s; peer <verdict>) \| holder <phase> for N s, ...` | Core's stall rule. The verdict is `disconnected, a first stall (banned on a second)` or `BANNED for the run (its second stall)` (B13), `disconnected, not banned (Core)` under `bmc.dlshape=core`, or one of the guards: `manual, kept selectable`, `at the usable floor, kept selectable`, `already banned`. |
+| `[dlc] chunk [lo,hi] goes to the retry ring for an idle worker as well (Core: ...)` | the stalled chunk was handed to an idle worker at once, as Core re-requests a disconnected staller's blocks. |
+| `[dlc] connected N block(s) during the download; connected tip T (...); idle waits cut short N (B9)` | end of the download: blocks the applier connected while downloading, and how often the idle tick was cut short by a new tip (B9 part 2). |
+| `[dl] peers announce N but the pool's median claim was M Ns ago -- not believed (...); using K` | B10: an announced height the chain could not have reached is clamped. |
+| `[ready] ...` | the finish line: every index at the tip (`bmc.benchlog`). |
+
 
 ## Operating
 
@@ -675,6 +720,8 @@ a row on one chunk and every hundredth), and `REJECT h=`.
 | `[mempool] block <h>: removed N pool tx (confirmed/conflicted)` | a block connected |
 | `compaction of N run(s) ... started in background pid P` / `background compaction done in Xs` | UTXO maintenance |
 | `RECOVERY: rolled back N ghost block(s)`, `rolled back ghost application`, `init: swept N orphan file(s)` | healthy crash recovery at boot |
+| `[utxo_live] flush: async (...)`, `[bench] freeze ...` | B3: the memtable is frozen and a forked writer flushes it. The writer is a short-lived child that is adopted between blocks. |
+| `[rpc] accept: out of file descriptors (...) -- backing off; the RPC listener is degraded` | printed **once** per process. RPC and the facade are no longer accepting. See *Troubleshooting*. |
 | `REJECT`, `FATAL`, `DEGRADED`, `ghost-rollback FAILED`, `INCONSISTENT` | alert on these |
 
 ### RPC access
@@ -829,7 +876,8 @@ rollback. The scratch copy needs as much space as the archive.
 | `systemctl status`: `failed (Result: core-dump)`, "Start request repeated too quickly" | A crash loop: systemd stopped restarting. Roll back first (above), then `sudo systemctl reset-failed bmcbitcoind` and start. The cause is in the log's `[crash]` lines (next row). |
 | `[crash] SIGSEGV (11) at address ...` | A fatal signal (2026-10-03, `daemon/crash_trace.c`). The lines give the fault address, RIP/RSP/RBP, a backtrace, and the stack's return addresses; resolve each with `addr2line -fe asm/daemon/bmcbitcoind.deploy-<x> <addr>` (the binary is non-PIE). There is no core file, by design: `LimitCORE=0` keeps the decrypted wallet seed off disk, and the report prints addresses only. |
 | `[rpc] getmininginfo took N ms: refresh ..., networkhashps ..., ...` | One call held the exclusive RPC lock over 1 s; every other RPC waited behind it. The split names the slow step. Seen once after a restart into catch-up (149.5 s on 2026-10-03), cause still open. |
-| a second `bmcbitcoind` with the same command line | A compaction child. Check `/proc/<pid>/exe` and the parent PID before assuming a duplicate daemon; never run two daemons on one chain directory. |
+| a second `bmcbitcoind` with the same command line | A child of the running daemon: the serve worker, a compaction, the B3 flush writer (seconds per freeze), the B4 index worker or the coinstats builder. Check `/proc/<pid>/exe` and the parent PID before assuming a duplicate daemon; never run two daemons on one chain directory. A `<defunct>` flush writer that lasts longer than a block interval was the pre-#400 shape (fixed 2026-10-07). |
+| RPC and the facade time out, but `is-active` is fine and the tip advances; mempool.space stalls | Check descriptors first: `ls /proc/<pid>/fd \| wc -l` against `Max open files` in `/proc/<pid>/limits`, and grep the log for `accept: out of file descriptors`. At the limit, P2P keeps working because its sockets are already open, while accept() fails. Roll forward to a build without the leak, or restart as a stopgap. 2026-10-07: `devlog/INCIDENT_2026-10-07_reader_lane_fd_leak.md`. |
 
 ## Running more than one chain
 
@@ -872,7 +920,7 @@ Extra listeners: onion service target at chain default P2P port + 1
 |---|---|
 | `blk*.dat`, `index.dat` | block archive (framed blocks, 128 MiB rotation) and positional height index (48-byte records) |
 | `headers.dat`, `chainwork.dat` | header chain and cumulative work |
-| `utxo.dat`, `utxo_run_*.dat`, `utxo_manifest.dat`, `utxo_applied_height.dat`, `utxo_lsm_*.map` | LSM UTXO store: WAL, sorted runs, manifest, applied height, memtable maps |
+| `utxo.dat`, `utxo.idx`, `utxo_run_*.dat`, `utxo_manifest.dat`, `utxo_applied_height.dat`, `utxo_lsm_*.map` | LSM UTXO store: the WAL; its checkpoint (`utxo.idx`, the first byte of the generations not yet retired; B3, 2026-10-06; retired bytes are hole-punched); sorted runs; manifest; applied height; and the memtable files. Since B11 (2026-10-07) the memtable lives in anonymous memory, and the `.map` files are only created at their full size for the offline tools, which read their sizes. Only the table's first page (the live count) is shared through the file. `bmc.memtableanon=0` restores the file mappings. |
 | `undo_<h>.dat` | per-block undo data for the recent tail (reorg and crash rollback) |
 | `append.lock` | archive append lock |
 | `mempool.dat` | mempool saved at shutdown, reloaded after RPC start |

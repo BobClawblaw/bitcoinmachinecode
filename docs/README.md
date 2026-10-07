@@ -62,12 +62,23 @@ project, in Markdown, HTML and BBCode forms of the same text.
 | [`reports/2026-09-28-core-vs-bmc-modules.md`](reports/2026-09-28-core-vs-bmc-modules.md) ([BBCode](reports/2026-09-28-core-vs-bmc-modules.bbcode)) | The 2026-09-27 report rerun in full after the day's ports: ahead on Base58 (7.9x), MuHash (6x), ChaCha20 (2.4x), the archive, SHA-1 (1.6x); parity on signatures, SHA-512, RIPEMD-160, compact blocks; behind on the ECDH window (1.8x), filter construction (different work), 64-byte packets, long SHA-256 |
 | [`reports/2026-09-28-run30-vs-core.md`](reports/2026-09-28-run30-vs-core.md) | IBD run 30 (4 h 54 m 30 s, MuHash identical to Core at 968,987) against a Core v31.1 rerun on the same drive and the repaired link, 21 minutes apart; FINAL: Core's fourth run reached run 30's end height in 11:01:00 against 4:54:30, bmc 55% ahead (2.24×), flat from 350,000; the two Core runs that did not finish (a `mount` on `/mnt`, the link change) as history |
 | [`reports/2026-09-30-ibd-benchmarks-bmc-vs-core.md`](reports/2026-09-30-ibd-benchmarks-bmc-vs-core.md) | The state of the IBD pair at 2026-09-30: run 30 vs Core rerun #4 (4:54:30 vs 11:01:00 to the same height, bmc 2.24×), every setting on both sides, the milestones of all four Core runs, where the margin comes from (apply-bound), what is and is not clean, run 31 in progress |
+| [`reports/2026-09-11-ibd-vs-core.md`](reports/2026-09-11-ibd-vs-core.md) ([BBCode](reports/2026-09-11-ibd-vs-core.bbcode)) | the first full mainnet IBD measured against Core v31.1 (`bench-2026-09-10`); corrected 09-13: the UTXO set was right, and the "hour ahead" was one stalled Core peer |
+| [`reports/2026-09-11-run22-muhash-divergence.md`](reports/2026-09-11-run22-muhash-divergence.md) | run 22: a clean sync, and a capstone that could not read its own result (a torn read; PASS offline) |
+| [`reports/2026-09-16-run24.md`](reports/2026-09-16-run24.md) | run 24: the full index set, and the getblock defect it exposed |
+| [`reports/2026-09-17-run26-vs-core.md`](reports/2026-09-17-run26-vs-core.md) ([BBCode](reports/2026-09-17-run26-vs-core.bbcode)) | run 26: every index during the sync, chain identical to Core's; the wall-clock comparison withdrawn (Core ran on a portable SSD) |
+| [`reports/2026-09-18-run27/`](reports/2026-09-18-run27/) | run 27 vs Core v31.1 on the same device; both sides polled |
+| [`reports/2026-09-22-run29-vs-core.md`](reports/2026-09-22-run29-vs-core.md) | run 29, a repeat of run 28: 18:28:54, 5.5% ahead of the same Core |
+| [`reports/2026-10-02-run32-dlc-chunking.md`](reports/2026-10-02-run32-dlc-chunking.md) | run 32: 16-block download requests (`bmc.dlcchunk=16`) |
+| [`reports/2026-10-05-logged-ibd-pair.md`](reports/2026-10-05-logged-ibd-pair.md) | the logged pair: Core rerun #6 (10:42:05) vs run 34 on Core's download rules (7:17:39); the applier 23% slower, the win was overlap |
+| [`reports/2026-10-06-core-vs-bmc-performance-release.md`](reports/2026-10-06-core-vs-bmc-performance-release.md) | **the release report**: IBD, RPC, memory and disk against Core v31.1, updated through run 41 |
+| stage reports: [run 37](reports/2026-10-06-run37-vs-core6-stage-report.md), [38](reports/2026-10-06-run38-vs-core6-stage-report.md), [39](reports/2026-10-06-run39-vs-core6-stage-report.md) vs Core #6; [39](reports/2026-10-07-run39-vs-core7-stage-report.md), [40](reports/2026-10-07-run40-vs-core7-stage-report.md) ([vs #6](reports/2026-10-07-run40-vs-core6-stage-report.md)), [41](reports/2026-10-07-run41-vs-core7-stage-report.md) vs Core #7 | per-100k-segment and per-stage timings from both nodes' own logs (`validation/ibd_stage_report.py`) |
 
 ## Milestones
 
 [`releases/`](releases/) holds one short note per landed batch -- the
 paragraph behind each `git log --first-parent main` line. Milestones are
-also annotated tags.
+also annotated tags until 2026-09-10 (`build-attestation-2026-09-10` is the
+last); since then the notes here are the only summary layer.
 
 | | |
 |---|---|
@@ -167,6 +178,8 @@ also annotated tags.
 | [`releases/2026-09-28-the-module-benchmarks-gaps-closed.md`](releases/2026-09-28-the-module-benchmarks-gaps-closed.md) | The module benchmark's gaps closed: MuHash, ElligatorSwift, ChaCha20, SHA-1, SHA-512, Base58 (2026-09-28) |
 | [`releases/2026-09-29-core-download-shape-matched.md`](releases/2026-09-29-core-download-shape-matched.md) | The IBD download takes Core's shape: 10 download peers (the two outbound classes), a 1,024-block window, no idle legs beside the workers (2026-09-29) |
 | [`releases/2026-10-03-the-outage-and-cores-words.md`](releases/2026-10-03-the-outage-and-cores-words.md) | The 23-hour outage and its fix; inbound serving past the boot height; buffered v2 messages; wtxid relay; Core's exact rejection text (26/26) and stage order; crash backtraces without core files (2026-10-03) |
+| [`releases/2026-10-07-faster-than-core-in-every-stage-of-the-sync.md`](releases/2026-10-07-faster-than-core-in-every-stage-of-the-sync.md) | The performance release: run 41 against Core rerun #7, 3:48:22 against 9:50:04, faster in every 100k segment; memory is the category Core keeps (2026-10-07) |
+| [`releases/2026-10-07-the-descriptor-outage-and-the-header-leader.md`](releases/2026-10-07-the-descriptor-outage-and-the-header-leader.md) | The getblock reader lane closes at thread exit (production RPC down 2 h 17 m); the B3 reap test; the header leader switch (B12); a staller banned on its second stall (B13) (2026-10-07) |
 
 ## Development history
 
@@ -178,13 +191,15 @@ dead ends and the day-by-day action log, and are not tidied after the fact.
 [`history/`](history/) holds the long-form reports written from that record:
 [21 FOR 21](history/2026-09-02-21-for-21/) (2026-08-11 to 2026-09-02) and
 [The Measuring Equipment](history/2026-09-19-the-measuring-equipment/)
-(2026-09-02 to 2026-09-19), each with its source, PDF, forum edition and
-build scripts.
+(2026-09-02 to 2026-09-19), [Run 28 vs Core](history/2026-09-21-run-28-vs-core/)
+(2026-09-19 to 2026-09-21) and [The Applier](history/2026-10-07-the-applier/)
+(2026-09-21 to 2026-10-07), each with its source, its forum edition and
+build scripts, and a PDF for the long ones.
 
 | | |
 |---|---|
 | [`devlog/LOG.md`](devlog/LOG.md) | incident log: every defect found, how it was found, what it cost |
-| [`devlog/DEPLOYMENT_HISTORY.md`](devlog/DEPLOYMENT_HISTORY.md) | the deployment record: every production rollout, what it changed, what it proved |
+| [`devlog/DEPLOYMENT_HISTORY.md`](devlog/DEPLOYMENT_HISTORY.md) | the deployment record (backfilled 2026-10-07 for 09-25 to 10-07; five restarts on 09-24/25 left no snapshot and are listed in the backfill note): every production rollout, what it changed, what it proved |
 | [`devlog/README_HISTORY.md`](devlog/README_HISTORY.md) | the previous, history-laden README, kept for its incident narratives |
 | [`devlog/PLAN.md`](devlog/PLAN.md) | the build plan and its revisions |
 | [`devlog/PLAN_SCRIPT_VERIFY.md`](devlog/PLAN_SCRIPT_VERIFY.md) | script/consensus verification plan |
@@ -192,10 +207,13 @@ build scripts.
 | [`devlog/BENCHMARKS.md`](devlog/BENCHMARKS.md) | benchmark results and methodology |
 | [`devlog/ASSESSMENT.md`](devlog/ASSESSMENT.md) | periodic assessment of project state |
 | [`devlog/CHAIN_AHEAD_CENSUS.md`](devlog/CHAIN_AHEAD_CENSUS.md) | survey of what the chain actually contains |
-| [`../worklog/`](../worklog/) | one file per day: what was done, why, with evidence |
+| [`../worklog/`](../worklog/) | one file per day (plus resume notes and long-lived plans; see its README): what was done, why, with evidence |
+| [`../worklog/2026-10-05-performance-holes-plan.md`](../worklog/2026-10-05-performance-holes-plan.md) | the performance plan and the register of items A1–A8, B1–B13 and M1, with a status table |
 
 Source comments cite these documents by bare filename (`see LOG.md incident
 #20`, `PERF_SCOPE.md 4.1`); each resolves to a file under `docs/`,
 `docs/devlog/` or `docs/audits/`.
 - [Incident 2026-09-01: boot header sync accepted a genesis-first answer](devlog/INCIDENT_2026-09-01_header_sync_genesis_answer.md) — root causes, damage assessment, fixes
 - [Incident 2026-09-01: set-diff OOM took the box down; 2,596 spends resurrected by blind recoveries](devlog/INCIDENT_2026-09-01_oom_and_resurrected_spends.md) — host freeze root cause, the UTXO surplus traced to eight flush-time recoveries, repair options
+- [Incident 2026-09-16: getblock refused every block above a fixed height for the whole of IBD](devlog/INCIDENT_2026-09-16_getblock_probe_budget.md) — a probe budget in a caller-saved register, and a fold that marked unwritten records as folded
+- [Incident 2026-10-07: production RPC dead 2 h 17 m, out of file descriptors](devlog/INCIDENT_2026-10-07_reader_lane_fd_leak.md) — the getblock reader lane leaked three descriptors per Esplora facade connection

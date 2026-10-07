@@ -7,6 +7,36 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-10-07 -- where the record moved after 09-06, and the defects of 10-02 to 10-07
+
+This file stopped being updated after 2026-09-06. The defect record from then
+on is spread across these places:
+
+- `docs/releases/` (one note per batch: what broke, how it was found, the
+  test watched to fail);
+- `docs/devlog/INCIDENT_*.md` (production and benchmark incidents);
+- `docs/reports/` (benchmark and stage reports, including the corrections
+  of earlier claims);
+- the worklogs (`worklog/README.md` lists the shapes);
+- the long-form histories in `docs/history/`, which narrate them.
+
+The production-affecting defects of the last week, newest first:
+
+- **10-07, RPC dead 2 h 17 m: the getblock reader lane leaked three
+  descriptors per Esplora facade connection** (thread-local state, a facade
+  that runs a thread per connection). Fixed by #402.
+  `INCIDENT_2026-10-07_reader_lane_fd_leak.md`.
+- **10-07, the B3 flush writer sat as a zombie for one block interval at the
+  tip** (the reap ran only per applied block). Harmless; fixed by #400, test
+  #403.
+- **10-02 to 10-03, production down 23 h: a lock-free facade call raced
+  `irs_refresh`.** #368's batch route called `rpc_chain_tx_blockhash` without
+  the exec lock while the refresh zeroed the run maps. All 11 segfaults hit
+  `0x6a61e3bd8`, a NULL base plus a data-derived offset. The deploy had been
+  called verified on one good block. Fixed by #373; crash backtraces since
+  #376. `docs/releases/2026-10-03-the-outage-and-cores-words.md`.
+
+----------------------------------------------------------------------------
 ## 2026-09-06 -- the 3-hour gap to Core, decomposed and mostly removed
 
 Eight branches landed today against `audits/UTXO_INLINE_BUILD_PERF_SCOPE.md`

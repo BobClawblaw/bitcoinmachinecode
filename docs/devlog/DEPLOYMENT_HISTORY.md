@@ -1270,3 +1270,670 @@ that would have hit any fresh sync of the live build.
   - At most ~30 to 40 s of Core time, within Core's own minute-to-minute noise
     (it did 507 at 18:34 with no restart).
   - Recorded in docs/reports/2026-09-18-run27/README.md.
+
+## Backfill, 2026-09-25 to 2026-10-07: how these entries were reconstructed
+
+The entries below were written on 2026-10-07, after the fact, from the records
+that survive. Nothing in them is new measurement.
+
+- **Commit:** the `bmc_build_commit` string compiled into each
+  `asm/daemon/bmcbitcoind.deploy-*` snapshot, and its dirty flag read from the
+  compiled `rj_bool` argument. Every snapshot below is clean except
+  `deploy-20260927f`.
+- **PRs carried:** the first-parent merges between one snapshot's commit and the
+  next.
+- **Restart times:** each process's first `[config] loaded` line in
+  `logs/main/bitcoin.main.log*` and the `[serve] shutting down (signal 15)` line
+  before it. The systemd journal on this box starts at 2026-09-30 21:03Z, and it
+  agrees with the log from there on.
+- **Why and verification:** worklog/ (2026-09-27 to 2026-10-05), the
+  resume notes, docs/releases/, docs/reports/2026-10-06-core-vs-bmc-performance-release.md,
+  INCIDENT_2026-10-07_reader_lane_fd_leak.md, and the session notes. Where none
+  of them says why a deploy was made or how it was checked, the entry says
+  "not recorded".
+- **Restarts with no snapshot on disk:** 2026-09-24 21:51:39Z, 2026-09-25
+  00:05:20Z, 2026-09-25 14:10:22Z (#303, below), 2026-09-25 15:20:08Z (the
+  rollback, below) and 2026-09-25 20:29:50Z. Which binary the first two and the
+  last one ran is not recorded.
+- **Two snapshots were never started:** `deploy-20260927b` and
+  `deploy-20261003a`.
+
+## 2026-09-25 08:25Z — `deploy-20260925b`: the batches since 09-19 (PRs #288–#302)
+
+- **Why:** not recorded in a worklog. A session note from that day says the
+  day's two deploys before 14:10Z each had a next-block watch because the
+  operator asked for one. Their results are not recorded.
+- **What:** `main` at `4a5c95e2` (merge of #302), clean build. Since
+  `deploy-20260919c` it carries:
+  - #289, the catch-up-done heartbeat;
+  - #295, the Mac's shared fixes;
+  - #296, the txvb worker pool on mutex+condvar;
+  - #298, no dial without a free candidate;
+  - #299, the per-thread mapping cache made fully associative (LRU);
+  - #300 and #301: the 481,827 fixture, and dial helpers that close inherited fds;
+  - #302, getpeerinfo's `synced_headers`/`synced_blocks` from the peer's
+    best-known block;
+  - direct commits: `bmc.bootcatchup` defaults to 0, the license, and the
+    run 29 report;
+  - docs PRs #288, #290 and #292.
+
+  The gate is not recorded. Process start 08:25:49Z.
+- **Verified live:** not recorded.
+
+## 2026-09-25 15:38Z — `deploy-20260925d`: the boot fill's double close (PRs #303, #306)
+
+- **Why:** #303 (a new leg is asked for headers from pprev, as Core does) was
+  deployed at 14:10:22Z from a build that has no snapshot on disk. It was
+  checked for what it changed, peers' synced heights, and passed. But the apply
+  had stalled at 968,555: six blocks were stored and none applied (heartbeat
+  `tip=968555 stored=968561`), and RPC served a stale tip for 70 minutes.
+  - #303 made the boot fill read the store, which exposed a double `close()` on
+    a failed candidate. The second close took the store's cached blk-file fd,
+    and the next file opened reused that number. bmc_osx `132c6f7e` named it.
+  - Production was rolled back to the pre-#303 build at 15:20:08Z and caught up
+    with Core in about 80 s.
+- **What:** `main` at `593aff66` (merge of #306: each failed candidate's fd is
+  set to -1 after its close; `test_leg_close_labels` checks the rule). Carries
+  #303 as well. Clean build. Process start 15:38:41Z. The gate is not recorded.
+- **Verified live:** not recorded beyond "production has run it since 15:38"
+  (worklog/2026-09-25-note-for-osx-2.md, in git history at `0b9e27a3`).
+- **Found:** a deploy is not verified until a new block has been applied: tip
+  and hash equal to the oracle's, and heartbeat `tip == stored`. Watch for this
+  even when the deploy is about something else. This became the standing deploy
+  rule.
+- The process was stopped at 20:24:04Z and a process started at 20:29:50Z with
+  no new snapshot. That restart is not recorded.
+
+## 2026-09-26 00:04Z — `deploy-20260926a`: compact-block short-id count (PRs #305, #307–#310)
+
+- **Why:** cmpctblock_build wrote the short-id count as a single byte. Every
+  compact block served for a block of 254 or more transactions was malformed
+  (from bmc_osx 360b06e6).
+- **What:** `main` at `0704f377` (merge of #310), clean. It also carries:
+  - #305, the dial-helper ack byte;
+  - #307, the 481,827 test's Mac path;
+  - #308, the live-walk MuHash printed byte-reversed, as Core prints it
+    (`695a719c`; #321 later found this a double reversal);
+  - #309, an SCR-1d test.
+
+  Process start 00:04:41Z. The gate is not recorded.
+- **Verified live:** not recorded.
+
+## 2026-09-26 01:58Z — `deploy-20260926b`: ban-table slot claim (PRs #311–#314)
+
+- **What:** `main` at `32857aae` (merge of #314), clean. Fixes from the Mac's
+  note-for-x86-2:
+  - #314: every ban-table writer claims its slot under `mis_lock`;
+  - #312: a ban expires by CAS;
+  - #313: `mpool_get` builds its pointer from the `blob_off` it checked;
+  - #311: the mempool journal checks TAIL before copying a body.
+
+  Process start 01:58:24Z. The gate is not recorded.
+- **Why / Verified live:** not recorded beyond the PR subjects.
+
+## 2026-09-26 05:12Z — `deploy-20260926c`: banlist.json persists (PR #315)
+
+- **What:** `main` at `92d536cc`, clean. Saves to banlist.json are serialised by
+  an flock, and `setban` now persists. Process start 05:12:49Z.
+- **Why / Verified live:** not recorded beyond the PR subject.
+
+## 2026-09-26 09:57Z — `deploy-20260926d`: no strike during a local outage (PR #316)
+
+- **Why:** a host-wide network silence had closed every long-lived peer as
+  `sync-failed-3x`.
+- **What:** `main` at `1d36e282`, clean. A sync pass's failure is not a strike
+  when no leg received anything during it. Process start 09:57:51Z.
+- **Verified live:** not recorded for the deploy.
+- **Found later (09-27):** zero singleton strikes in 34 hours. A second
+  three-minute silence (09-27 12:44Z) still cost five legs their third strike in
+  its tail, and that is still open as a design question.
+
+## 2026-09-26 12:43Z — `deploy-20260926e`: reorg probe held during an outage (PR #317)
+
+- **What:** `main` at `7dacd8ab`, clean. No reorg probe starts while no leg has
+  heard anything for 20 s. Snapshot written 12:35Z, process start 12:43:17Z.
+- **Why / Verified live:** not recorded beyond the PR subject.
+
+## 2026-09-26 14:55Z — `deploy-20260926f`: the announced-block claim (PR #318)
+
+- **What:** `main` at `a3e598f9`, clean. The in-flight claim on an announced
+  block is taken when the pass starts. Before this, a skipped pick held the
+  claim for up to 600 s and every other leg was refused the block. Process start
+  14:55:14Z.
+- **Why / Verified live:** not recorded beyond the PR subject. The same commit
+  ran the assumevalid=0 full-verification sync that finished 09-27.
+
+## 2026-09-27 09:10Z — `deploy-20260927a`: safegcd scalar inverse (PR #319)
+
+- **What:** `main` at `0a28906a`, clean. `sc_inv_var` by safegcd: 3.55 →
+  0.67 µs, and ECDSA verify 21.9 → 20.7 µs. Revert-checked three ways.
+  Process start 09:10:20Z.
+- **Verified live:** 968,821 stored 2.7 s after Core (worklog/2026-09-27.md).
+
+## 2026-09-27 09:43Z — `deploy-20260927b`: `fe_pow_sqrt` + `fe_inv_var` (PR #320), never made live
+
+- **What:** `main` at `0151dd8c`, clean. BIP340 verify 25.9 → 22.4 µs. Gate
+  MAKE_EXIT=0.
+- **Never started.** The snapshot was written at 09:43:40Z, but production
+  logged no restart between 09:10 and 12:07. #320 first ran in production in
+  `deploy-20260927c`.
+
+## 2026-09-27 12:07Z — `deploy-20260927c`: the MuHash byte order (PR #321)
+
+- **Why:** the no-height `gettxoutsetinfo` MuHash was printed byte-reversed: a
+  double reversal since 09-25 (`csi_rpc_run` plus #308's `hex_rev`).
+- **What:** `main` at `781bc354`, clean. Carries #320 too. Process start
+  12:07:04Z.
+- **Verified live:** the live answer, the coinstats row and Core agree at
+  968,837 (`b0982e65…`). 968,843 was stored 0.0 s after Core.
+
+## 2026-09-27 13:05Z — `deploy-20260927d`: the Mac's shared fixes (PR #322)
+
+- **What:** `main` at `33843749`, clean. The `addr_hist` race (TSan: 22 reports
+  before, 0 after; the facade calls it from a thread per connection), the
+  passphrase flush, and related fixes. Process start 13:05:14Z.
+- **Verified live:** `/address` returned 200, and 4 concurrent `/address/txs`
+  calls returned 200. The worklog gives the same next-block line as for
+  deploy e ("968,889 stored 2.8 s after Core"). 968,889 is after this
+  process's lifetime (the tip was 968,842 at 13:05 and 968,888 at 20:43),
+  so this deploy's next-block figure is not recorded.
+
+## 2026-09-27 20:43Z — `deploy-20260927e`: the map-cache magic (PR #323)
+
+- **What:** `main` at `caa0f2da`, clean. `MAP_MAGIC` lived at st+120, which is
+  fd-cache slot 7, and now lives at the dword at st+52. This was latent in
+  production, where the block-filter builder maps the archive itself. Process
+  start 20:43:37Z.
+- **Verified live:** 968,889 stored 2.8 s after Core.
+
+## 2026-09-27 22:49Z — `deploy-20260927f`: mutated compact block (PRs #324, #325) — a dirty build
+
+- **What:** `main` at `ca255a15` (merge of #325):
+  - #325, the Mac's item 16: a mutated compact block is dropped and
+    re-fetched, never marked invalid;
+  - #324, store-CLI and `multisig_verify` fixes, which link into no runtime
+    binary.
+
+  Process start 22:49:49Z.
+- **The binary's dirty flag is set.** It is the only snapshot in this backfill
+  built from a tree with uncommitted changes. What the change was is not
+  recorded. The docs PR #326 was being prepared in the same checkout that
+  evening, which could explain it, but that is not established.
+- **Verified live:** not recorded. The worklog says production ends the day on
+  this snapshot. Production had not hit the #325 case: no `invalid.dat`, and
+  968,824 applied normally.
+
+## 2026-09-28 00:52Z — `deploy-20260928a`: MuHash safegcd inverse (PR #329)
+
+- **What:** `main` at `240c1ece`, clean. It carries:
+  - #329: `num3072_inv.c`, a port of Core's `Num3072::GetInverse`.
+    `MuHashFinalize` went from 1,861 to 27.9 µs (Core 28.0).
+  - #327: the module bench suite.
+  - Docs PRs #326 and #328.
+
+  Gated as its own PR. Process start 00:52:10Z.
+- **Verified live:** confirmed on the next block, 968,911, against Core (tip,
+  hash, ≤ 1 s lag). The MuHash digest was checked live against Core at the
+  same height.
+
+## 2026-09-28 01:39Z — `deploy-20260928b`: ElligatorSwift constant-time and unbiased (PR #330)
+
+- **What:** `main` at `11bbe4b8`, clean.
+  - A constant-time comb for k·G and a w=4 window for k·P.
+  - A Jacobi square test.
+  - The encoder now draws the branch from the hash. The fixed order had biased
+    the 64 wire bytes.
+
+  ElligatorSwift create went from 108 to 21 µs, and ECDH from 65 to 40 µs.
+  Process start 01:39:19Z.
+- **Verified live:** real BIP324 v2 handshakes observed completing. The
+  next-block figure is not recorded separately.
+
+## 2026-09-28 02:08Z — `deploy-20260928c`: ChaCha20 in AVX2 (PR #331)
+
+- **What:** `main` at `25b1a33f`, clean. `chacha20_avx2.asm`, which the MuHash
+  keystream dispatches to: 1 MB went from 1.15 to 0.30 ns/B. Process start
+  02:08:56Z.
+- **Verified live:** confirmed on 968,921. The live MuHash digest equalled
+  Core's at 968,920, and v2 handshakes completed.
+
+## 2026-09-28 02:28Z — `deploy-20260928d`: SHA-1 SHA-NI, SHA-512 unrolled, Base58 limbs (PR #332)
+
+- **What:** `main` at `21ac9750`, clean. Process start 02:28:37Z.
+- **Verified live:** confirmed on 968,922.
+
+## 2026-09-28 04:07Z — `deploy-20260928e`: GLV, the comb everywhere, SHA-256 and GCS (PRs #333, #334)
+
+- **What:** `main` at `31c65846` (merge of #334), clean. It carries:
+  - GLV for ECDH: 39.7 to 30.9 µs;
+  - the comb at every k·G caller;
+  - SHA-256 at Core's speed;
+  - the block-filter builder: 21.6 to 3.7 ms;
+  - script rows in a sighash session;
+  - #333, docs.
+
+  Process start 04:07:36Z.
+- **Verified live:** confirmed on 968,934.
+
+## 2026-09-28 11:34Z — `deploy-20260928f`: three Mac testnet4 fixes (PRs #335, #336)
+
+- **What:** `main` at `982fd78b`, clean. #336 cherry-picked three fixes from
+  bmc_osx with `-x`:
+  - the archive frame check accepts the chain's magic;
+  - a hole below the archive tip is re-fetched whatever `bmc.bootcatchup`
+    says;
+  - the reorg apply moves past the gap.
+
+  Each was revert-checked by mutation. `-Werror`, gate MAKE_EXIT=0. Process
+  start 11:34:23Z. #335 is docs.
+- **Verified live:** confirmed on 968,987.
+
+## 2026-09-28 18:35Z — `deploy-20260928g`: memtable shape sizing, the cluster claim memo (PRs #337, #338)
+
+- **What:** `main` at `99285ae3`, clean. The Mac's PR #337, landed the x86
+  way:
+  - issue #294: a third sizing rule on the store's shape, so a restart in the
+    middle of a sync no longer sizes the memtable for the steady state;
+  - issue #304: two rules about which peers are believed, so a cluster of
+    Knots peers on a rejected fork no longer starts the parallel downloader.
+
+  Revert-checked by mutation, gate MAKE_EXIT=0 with 402 markers. Process start
+  18:35:30Z. #338 is docs.
+- **Verified live:** confirmed on 969,033 at 18:39:35Z. The first boot logged
+  the new shape line.
+
+## 2026-09-28 22:44Z — `deploy-20260928h`: the reorg probe's rejection memo (PRs #339–#341)
+
+- **What:** `main` at `5dae51ae` (the Mac's PR #340, merged from their branch).
+  A leg whose probe rejected a candidate chain is not probed again for an hour
+  (`PROBE_REJECT_MEMO_S` 3600). Before this, the #304 fork was re-probed every
+  30 s.
+  - Revert-checked: with `probe_memo_active` forced to 0, 2 checks fail.
+  - Gate MAKE_EXIT=0 with 402 markers.
+  - The merged tree diffs empty against the gated cherry-pick.
+
+  Process start 22:44:32Z. #339 and #341 are docs.
+- **Verified live:** confirmed on 969,060.
+
+## 2026-09-29 02:22Z — `deploy-20260929a`: Core's download shape (PRs #342–#344)
+
+- **Why:** asked to match Core's default network settings for a fair A/B. bmc
+  had used 8 download peers to Core's 10 (8 full-relay + 2 block-relay-only), a
+  4,096-block window to Core's 1,024, and idle legs held beside the workers.
+- **What:** `main` at `0dde606d`, clean.
+  - `bmc.catchupworkers` is derived as `bmc.maxoutbound + bmc.blockrelayonly`
+    (10).
+  - The window is 1,024.
+  - Idle legs are closed by name before the parallel download and re-dialled
+    after it.
+
+  Process start 02:22:01Z. #342 and #343 are docs.
+- **Verified live:** confirmed on 969,089.
+
+## 2026-09-29 13:42Z — `deploy-20260929b`: the even comparison (PRs #345–#347)
+
+- **What:** `main` at `b27e3c18`, clean. bmc's defaults now equal Core's:
+  - dbcache 450 MiB;
+  - no transaction announcements taken during IBD;
+  - the script-thread count stated at boot.
+
+  The harness runs Core's bench protocol by default. Process start 13:42:30Z.
+  #345 and #346 are docs.
+- **Verified live:** RPC up with the tip equal to the oracle's at 969,161.
+  Confirmed on 969,162 at 14:06:25Z: hash equal, lag 0 s, tip = stored.
+- **Found later (09-30 14:05 restart):** with no announcements taken in IBD, a
+  restart took no transactions until the next block connected, 7 m 48 s that
+  time. #357 fixed it in `deploy-20260930e`.
+
+## 2026-09-30 00:16Z — `deploy-20260930a`: the exec-lock wait/hold log (PR #348)
+
+- **Why:** four times in three days, the whole RPC surface (JSON-RPC and the
+  facade) answered nothing for over 90 s within two seconds of a new block, and
+  the log could not say who held `g_exec_lock`.
+- **What:** `main` at `8d7988e9`, clean. Every take and release of the lock is
+  timed. A wait or hold of 2 s or more (`BMC_RPC_EXEC_LOG_MS`) logs one
+  `[rpc] exec lock:` line that names the method or route.
+  - `make -k test` MAKE_EXIT=0.
+  - `gate-log-check` flagged only `test_rpc_signer`'s intentional segfault, and
+    the deploy went ahead on that reading, on the operator's word.
+
+  Restart at 00:16:15Z. RPC was up at 00:16:54Z.
+- **Verified live:** `bmcgetcapabilities` build `8d7988e9`, not dirty. 5 indexes
+  synced, tip 969,229 = Core's, and peers went from 0 to 3 in the first minutes.
+  Stop saved 80,150 mempool transactions.
+- **Found:** the first named holders, at 07:21Z: `getrawmempool (excl) held
+  3467 ms` and `getmempoolinfo (shared) held 2885 ms`, at a 77,800-tx pool. These
+  led to #355.
+
+## 2026-09-30 01:13Z — `deploy-20260930b`: RPC waits on the worker without the lock (PRs #349–#351)
+
+- **What:** `main` at `49e26354`, clean. #349 means a handler that waits on the
+  worker no longer holds the execution lock, which was the shape of the 90 s
+  stalls. #350 is the signer fixture's stderr, test only. #351 is docs, with
+  one direct worklog commit. Process start 01:13:04Z.
+- **Verified live:** confirmed on 969,234.
+
+## 2026-09-30 09:42Z — `deploy-20260930c`: block lookups off the lock (PRs #352–#354)
+
+- **What:** `main` at `75563b6f`, clean. #353 moves `getblockhash` and
+  `getblockheader` into the fast lane: the pollers' per-block lookups answer
+  during any slow holder. #352 and #354 are docs. Process start 09:42:00Z.
+  The gate waited for run 31 to finish.
+- **Verified live:** confirmed on 969,289, hash equal and tip = stored. That
+  block landed during the 30 s RPC start-up, so the watch shows a start-up lag,
+  not an apply lag.
+
+## 2026-09-30 14:05Z — `deploy-20260930d`: the mempool readers cached and in their own lane (PR #355)
+
+- **What:** `main` at `9b0bb505`, clean.
+  - A per-slot parse cache (`mpc_weight`) for `getmempoolinfo` and
+    `getrawmempool`.
+  - The seven mempool readers run in a NOLOCK lane of their own.
+
+  Revert-checked both ways. Process start 14:05:05Z.
+- **Verified live:** confirmed on 969,307 at 14:12:31Z, in the same second as
+  Core, hash equal, tip = stored.
+- **Found:** this restart took no transaction announcements for 7 m 48 s,
+  until 969,307 connected. That was #347's IBD gate, fixed by #357.
+
+## 2026-09-30 22:52Z — `deploy-20260930e`: the relay gate at the heartbeat; the pool lock timed (PRs #356–#359)
+
+- **What:** `main` at `d1d332fa`, clean.
+  - #357: the relay's IBD gate is refreshed at the heartbeat (from bmc_osx
+    `f8611830`).
+  - #359: the pool lock is timed and named, and `getrawtransaction`'s mempool
+    consult moved off the execution lock (from bmc_osx `71f4369d`).
+
+  Each was gated on its own head. #359 was gated again rebased on #357:
+  MAKE_EXIT=0, `GATE LOG AUDIT OK`, 442 tests. #359's revert check: without the
+  yield, `getchaintips` waited 1,700 ms. #356 and #358 are docs. Restart
+  22:52:33Z, RPC up 22:53:23Z.
+- **Verified live:** confirmed on 969,359, applied 22:58:46Z with the oracle's
+  hash. "tx announcements are taken again" was logged at the first heartbeat
+  (22:54:42). The mempool.dat reload took 72,674 of 72,951 transactions in
+  9 m 12 s.
+- **Found:** the first pool-lock lines were a convoy, not one long holder. At
+  23:01:35, waits of about 1.2 s followed releases of 0–3 ms.
+
+## 2026-10-01 16:06Z — `deploy-20261001a`: the download chunk as a setting (PRs #360, #361)
+
+- **What:** `main` at `a19a624f`, clean. #361 adds `bmc.dlcchunk` (default 16),
+  and cursor help can fire again inside Core's 1,024 window. In an A/B to
+  300k, 16 beat 40 by 19.5% and 14.1%. #360 is docs. Process start 16:06:04Z.
+- **Verified live:** confirmed on 969,463, hash equal to the oracle's.
+- The restart overlapped the first minutes of run 32's first attempt, and that
+  attempt was later cut.
+
+## 2026-10-01 18:51Z — `deploy-20261001b`: mempool policy to Core v31.1 (PRs #362, #363)
+
+- **Why:** BlockYard's differential found 15 + 14 of 35 missing children, and
+  2 of 246 clusters differing from Core.
+- **What:** `main` at `f332e791`, clean. #363:
+  - cluster limits only (ancestor and descendant counts deprecated);
+  - `limitclustercount` capped at 64 and actually wired;
+  - v31.1 RBF: rule 5, PaysForRBF and the feerate-diagram check;
+  - optimal linearization.
+
+  #362 adds `MAIN_C_HDRS` and `make header-check`. Process start 18:51:28Z.
+- **Verified live:** confirmed on 969,480, hash equal. `getmempoolinfo` reports
+  `limitclustercount 64`, `limitclustersize 101000`, `optimal true`.
+
+## 2026-10-02 03:58Z — `deploy-20261002a`: eviction by cluster, the facade batch, the Core-parity batch (PRs #364–#369) — crash-looped, production down 23 h
+
+- **What:** `main` at `1606aa36`, clean. It carries:
+  - #366, eviction scores whole clusters;
+  - #368, the facade's `POST /internal/mempool/txs` reads under one pool-lock
+    hold per slice;
+  - #369, the 17-commit Core-parity batch: no `wtxidrelay` sent, Core's fee
+    rounding, `submitpackage` with package RBF, `stopatheight`, the IBD latch,
+    and more;
+  - #364, the one-oracle move (scripts and config).
+
+  Each was gated 442/442 with the audit OK. Restart 03:58:54Z.
+- **Reported verified, and it was not.** It applied 969,530 with the oracle's
+  hash and logged the new IBD latch. It then segfaulted at 04:02:02Z, and
+  crash-looped about 40 s after every restart, once mempool.space re-synced
+  through the facade. systemd gave up after 12 restarts at 04:28:05Z.
+  Production was down until 2026-10-03 13:16:40Z. Nobody looked until the next
+  session ran `systemctl status`.
+- **Cause:** #368's batch route called `rpc_chain_tx_blockhash` from the facade
+  thread without the execution lock, and `irs_refresh` zeroes each kept run's
+  map in place. All 11 crashes faulted at `0x6a61e3bd8`, which is NULL plus the
+  run's sparse-index offset plus the first binary-search probe. That named the
+  bug without a core dump. Fixed by #373.
+- **Found:** one good block proves only the apply path. A deploy is verified
+  only after 10+ minutes with `NRestarts=0`, once the RPC clients have
+  reconnected. Check `systemctl is-active` at the start of every session.
+
+## 2026-10-03 03:30Z — `deploy-20261003a`: ECDH by the Jacobian port (PR #371, #372), never made live
+
+- **What:** `main` at `4483e11d`, clean. #372: ECDH k·P by the Jacobian
+  `ecmult_const` port, 1.06× Core. #371 is docs.
+- **Never started.** The snapshot was written while production sat in the
+  failed state. The next process start, 10-03 13:16:40Z, ran a later build.
+
+## 2026-10-03 13:16Z — `deploy-20261003b`: the crash fix (PR #373)
+
+- **What:** the head of the #373 branch, `af04f538`, clean. Its tree is
+  identical to the merge `1af4432b`, which the resume note names for this
+  snapshot.
+  - The facade batch route's txid-index lookup takes the execution lock.
+  - `gettxspendingprevout` left the lock-free mempool lane, which had had the
+    same race since 09-30.
+
+  Snapshot written 04:12Z. Production was started on it at 13:16:40Z, ending the
+  23 h outage.
+- **Verified live:** not recorded beyond its listing as the rollback from 03c.
+- **Found:** `getmininginfo` held the exclusive exec lock from 13:17:27 to
+  13:19:57, a ~150 s RPC freeze after a restart into catch-up.
+  `chainwork.dat` was ruled out. #376 added per-step timings, and the cause is
+  still unexplained.
+
+## 2026-10-03 15:07Z — `deploy-20261003c`: wtxid relay; the serve child follows the archive; buffered v2 messages (PR #374)
+
+- **What:** `main` at `ace3a684`, clean, gated on its head (443 tests, audit OK).
+  - `wtxidrelay` is sent again, with `MSG_WTX` announcements, and both getdata
+    servers serve `MSG_WTX`.
+  - The serve process follows `index.dat`. Its tip had been frozen at the boot
+    height: the old process reported `tip=969479` at shutdown, 49 blocks stale.
+  - A decrypted v2 message no longer waits for the peer's next packet.
+
+  Restart 15:07:36Z.
+- **Verified live:** RPC up at 15:07:52, tip equal to the oracle's at 969,739,
+  and 0 restarts 12 minutes in. Every outbound leg negotiated `addrv2=1
+  wtxid=1`.
+
+## 2026-10-03 15:37Z — `deploy-20261003d`: Core's reject details (PR #375)
+
+- **What:** `main` at `4302ed6f`, clean. `sendrawtransaction`,
+  `testmempoolaccept` and `submitpackage` now give Core's `reason, debug` text
+  and decode-failure messages, and TRUC's checks run in Core's order.
+  `validation/reject_details_core_diff.sh` gave 16/16 byte for byte. Process
+  start 15:37:46Z.
+- **Verified live:** on 969,741. A clean restart: the longest exec-lock wait was
+  3 s, and the 150 s freeze did not reproduce.
+
+## 2026-10-03 16:22Z — `deploy-20261003e`: the crash handler; the chainwork tail (PR #376)
+
+- **What:** `main` at `d09d2bd3`, clean.
+  - `crash_trace.c`: a fatal signal writes the crashing stack, as text-segment
+    addresses only, and the process still dies of the signal. `LimitCORE=0`
+    stays, because the wallet seed is in memory.
+  - Chainwork lookups past the end of `chainwork.dat` read only the missing
+    headers.
+  - `getmininginfo` logs per-step timings for a call over 1 s.
+
+  Restart 16:22:58Z.
+- **Verified live:** not recorded.
+
+## 2026-10-03 16:45Z — `deploy-20261003f`: Core's script-failure reasons (PR #377)
+
+- **What:** `main` at `5ca25aee`, clean. Script failures are reported as
+  `mempool-script-verify-flag-failed (<ScriptErrorString>)`, with Core's input
+  and prevout detail. The differential gave 22/22. Process start 16:45:58Z.
+- **Verified live:** not recorded separately.
+
+## 2026-10-03 20:40Z — `deploy-20261003g`: RPC admission in Core's stage order (PR #378)
+
+- **What:** `main` at `230074a4`, clean. The RPC paths check inputs, then
+  fees/RBF/TRUC, then scripts, so a transaction failing two stages is named by
+  the stage Core names. Reject-details differential 26/26. Process start
+  20:40:37Z.
+- **Verified live:** on 969,760.
+
+## 2026-10-03 23:45Z — `deploy-20261003h`: six audit fixes (PR #379)
+
+- **What:** `main` at `f1b7d66c`, clean. Its tree equals the gated `4d0e904a`:
+  a clean gate, 444/444, with the audit, link and header checks OK. The six
+  fixes:
+  - an `axt_read_events` mutex;
+  - outbound v2 buffering;
+  - helper-dialed services and the self vote;
+  - the serve side's `reorg_gen`;
+  - the inbound version tip;
+  - the gbt reason on the stack.
+
+  4 tests revert-checked. Restart 23:45:17Z. Run 33 was restarted fresh within
+  seconds of it.
+- **Verified live:** a next-block watch was started. Its result is not recorded.
+- **Found later:** this build logged 21 `[rpc] exec lock:` lines in two days,
+  each a 2.1–2.7 s wait behind holders of 0–16 ms. That fed the 10-05 RPC lanes
+  plan.
+
+## 2026-10-05 17:46Z — `deploy-20261005a`: the RPC lanes (PRs #380–#383)
+
+- **What:** `6ed54746`, "integrate: RPC lanes (A0, A1, A2, A3, A5)", clean:
+  the head of the #383 branch. Its tree equals #383's merge `0319e1eb` except
+  for 18 lines of `docs/PERFORMANCE.md`. It carries:
+  - lanes for the txid index and for `getblock` (the reader lane, `3b807cc6`);
+  - a class-aware facade lock;
+  - O(1) `getmempoolinfo`;
+  - the undo capture taking Phase 1's prevout (B1+B2);
+  - the header phase asking four peers;
+  - #380 `bmc.dlshape=core` and the benchlog lines;
+  - #381 coinstats from genesis;
+  - #382 housekeeping.
+
+  Snapshot written 17:28Z, restart 17:46:19Z. The gate is not recorded.
+- **Verified live:** not recorded as a next-block check. Run 37's row (10-06)
+  says 0 exec-lock waits ≥ 2 s since this deploy, and `getmempoolinfo` takes
+  5 ms.
+- **Found later (10-07):** the getblock reader lane kept a store handle (3 fds)
+  and an 8 MB buffer in `__thread` storage, never released. The Esplora facade
+  runs a thread per connection, so it leaked on every facade block read.
+  Every snapshot from this one through `deploy-20261006d` carries the leak;
+  see `deploy-20261007a` and INCIDENT_2026-10-07_reader_lane_fd_leak.md.
+
+## 2026-10-06 05:41Z — `deploy-20261006a`: getrawtransaction by byte range; BIP9 cached (PRs #384–#387)
+
+- **Why:** run 37's RPC rows (A7, A8). `getrawtransaction` took 14 ms single
+  and 382 ms at 32 clients, against Core's 4 / 5. `getdeploymentinfo` held the
+  exclusive lock for 2.0–2.1 s.
+- **What:** `main` at `c2229ded`, clean. It carries:
+  - #387: `getrawtransaction` reads the record's byte range, and the BIP9 walk
+    is cached per period boundary;
+  - #384 and #385: eviction accounting;
+  - #386: docs.
+
+  Restart 05:41:43Z.
+- **Verified live:** on the next block, with zero restarts.
+  `getdeploymentinfo` took 1.6 s once after the restart, then 4 ms.
+
+## 2026-10-06 06:08Z — `deploy-20261006b`: the txindex tail hash-indexed (PR #388)
+
+- **What:** `main` at `01f9c7fa`, clean. A recent transaction now costs what a
+  run record costs. Before this, every lookup scanned the unsorted tail
+  linearly, and the tail is 564 MB on production. The serve process now holds
+  the tail's hash table, 128–256 MB over the fold cycle. Restart 06:08:55Z.
+- **Verified live:** on the next block, with zero restarts. Measured on
+  production after it: `getrawtransaction` 3 ms single and 5 ms at 32 clients
+  (Core 3 / 5).
+
+## 2026-10-06 11:59Z — `deploy-20261006c`: the JSON arena; the index worker (PRs #389–#392)
+
+- **What:** `main` at `01d235f6`, clean. It carries:
+  - #392: one JSON arena per request, a span-copying escaper, and hex encoded
+    in place. getblock v2 single went from 73 to 58 ms, and the 32-client
+    median reached parity. The peer probes also end on their own clocks
+    (B9 part 1).
+  - #390: index writes moved off the applier into a forked index worker.
+  - #389 and #391: docs.
+
+  Restart 11:59:34Z.
+- **Verified live:** thirteen saved responses byte-identical to the previous
+  build's.
+- **Not a rollback target.** Like every build before `deploy-20261006d`, it
+  replays the UTXO WAL from byte 0. It would drop tombstones from a datadir
+  that 06d or later has written, because B3 punches a hole over the retired
+  WAL bytes and `utxo.idx` holds the first live byte. It also carries the
+  reader-lane fd leak.
+
+## 2026-10-06 20:03Z — `deploy-20261006d`: B3 async flush, B8 chainwork in step, M1 memory naming (PRs #393–#396)
+
+- **What:** `main` at `b194dd01`, clean. It carries:
+  - #394 M1: named memory regions, and the `[mem]` lines;
+  - #395 B8: the chainwork records kept in step during the parallel download;
+  - #396 B3: the memtable flush freezes a private copy, and a forked writer
+    builds the run. The WAL is hole-punched below the checkpoint.
+  - #393: docs.
+
+  The gate passed in a worktree at 19:24Z: main+M1+B8+B3 plus the
+  `test_utxo_catchup_timing` fix `e53301a3`, MAKE_EXIT=0. Deployed at 20:03:56Z
+  on the operator's "run the deploy commands".
+- **Verified live:**
+  - 970,223 applied 20:05:55Z with the oracle's hash.
+  - Tip 970,225 = oracle at 20:16, and the facade answered.
+  - `NRestarts=0` 11 minutes in.
+  - mempool-backend had been failed since 10:04Z (V8 heap OOM). It came back
+    on a 16 GB heap at 21:33:41Z and was in sync by 21:34:43Z. The client-load
+    check closed at 21:49Z: production pid 3144426, `NRestarts=0`.
+- **Found:**
+  - **The getblock reader-lane fd leak,** latent since `deploy-20261005a` (the
+    lanes integration `6ed54746`, reader lane `3b807cc6`). This process ran out
+    of descriptors on 10-07 at 16:26:22Z (1,023/1,024), and RPC and the facade
+    were dead for 2 h 17 m. See `deploy-20261007a`.
+  - **The B3 tip zombie.** The writer is reaped only by `fz_poll`, which runs
+    once per applied block, right after the fork. The flush writer forked at
+    block 970,267 (pid 1959235, 2026-10-07 01:16:41Z) sat as a zombie for
+    22.5 min, until block 970,268. The adopt, the WAL hole-punch and the frozen
+    copy's release lagged one block interval. This is safe: a crash replays the
+    WAL, the hook waits before the next freeze, and shutdown reaps. Fixed in
+    #400 (the idle-rest poll), with the test in #403.
+- **Rollback:** do not roll back past 06d. Every snapshot before it replays the
+  UTXO WAL from byte 0 and would drop tombstones from a datadir that 06d or
+  later has written.
+
+## 2026-10-07 18:42Z — `deploy-20261007a`: the reader lane released at thread exit (PR #402, with #400)
+
+- **Why:** production RPC was dead from 16:26:22Z. `accept()` got EMFILE at
+  1,023/1,024 fds: the Esplora facade's thread per connection leaked 3 fds per
+  getblock lane. mempool.space stalled at 970,365. P2P sync went on, so
+  `is-active` and the tip looked healthy. The operator noticed at 18:22Z.
+- **What:** `main` at `54ffb790`, clean.
+  - #402: the reader lane closes its store handle and frees its 8 MB buffer at
+    thread exit, via a pthread-key destructor (`asm/rpc_chain.c`).
+    `test_rpc_chain` was watched to fail on the unfixed code (14 → 206
+    descriptors over 64 threads).
+  - #400: B9 part 2, the idle tick; B11, the anonymous memtable; B10, the
+    claim clamp; and B3's reap at the tip.
+  - Docs PRs #397–#399.
+
+  Built in a clean worktree at the merge commit, full gate MAKE_EXIT=0. The
+  operator chose "fix first, then deploy" over a restart on the leaking build.
+  Started 18:42:56Z (systemd `ActiveEnterTimestamp`).
+- **Verified live:**
+  - RPC answering at 18:43:46Z.
+  - New blocks 970,378 and 970,379 hash-identical to the Core v31.1 oracle's.
+  - `NRestarts=0` at 10+ minutes.
+  - fd count flat at 66–67 across facade traffic, against 1,023 before.
+  - mempool backend synced to the tip.
+  - At 20:42Z, still healthy at 970,389 with 66 fds.
+- **Rollback:** `deploy-20261006d` is the only rollback target. It leaks fds, so
+  use it only as a bridge and watch the descriptor count. Do not roll back past
+  06d: every snapshot from `deploy-20261005a` through `deploy-20261006d`
+  carries the fd leak, and every snapshot before 06d replays the UTXO WAL from
+  byte 0 and would drop tombstones from a datadir that 06d or later has
+  written. Never `deploy-20261006c`.
+- #403 (the B3 reap-at-tip test) and #404 (B12, the header leader switch)
+  landed after this deploy without a redeploy. #403 is test-only, and B12 only
+  matters for fresh syncs.

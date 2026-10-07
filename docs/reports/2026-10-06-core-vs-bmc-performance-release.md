@@ -81,7 +81,8 @@ behind run 38 (ready 4:34:48 against 4:17:09; still 2.3× Core). The
 stage reports put the difference in two places, neither of them touched
 by PR #392: the applier's own time rose from 13,363 to 14,060 s (put
 4,994 → 5,661 s, of which the memtable insert 1,377 → 1,845 s and the
-undo capture 2,242 → 2,463 s; get, verify, read and the index columns
+the spent output's delete 2,242 → 2,463 s (this read "undo capture"
+until 2026-10-07, one column off; see §2); get, verify, read and the index columns
 within 1%), and the download's per-chunk wait sum rose from 3,591 to
 5,160 s over 81 distinct peers against run 38's 25 (the pool banned 22 of
 135 by the end against 4 of 141; chunk wall p50 0.94 s against 0.39 s).
@@ -109,7 +110,8 @@ the first one 11.9 s, faulting the copy in — and a forked writer builds
 the 1.8 GB run in 13.6 s median, 1,545 s in all off the applier; zero
 waits on a writer and zero inline fallbacks over the run). The applier's
 total nonetheless rose, 14,060 → 14,650 s: the put column went 5,661 →
-7,135 s (insert 1,845 → 2,621, undo capture 2,463 → 3,079; get, verify
+7,135 s (insert 1,845 → 2,621, the spent output's delete 2,463 → 3,079,
+labelled "undo capture" until 2026-10-07; get, verify
 and the index columns within 4%), the third rise in a row for the same
 put code (run 38: 4,994 s). It is not the writer's presence: the insert
 cost per 1,000 inputs was 0.77 ms in the blocks applied while a writer
@@ -509,7 +511,7 @@ arena; p90 and the wave are bmc's). The apply path per block moved from
 Core's column to bmc's with run 38 (the index worker, PR #390) and back
 by 1% and 5% in runs 39 and 40; run 40 took the flush off the applier
 (B3: 1,357 → 131 s, zero waits) and its applier still came in 741 s
-behind Core's because the memtable insert and the undo capture rose
+behind Core's because the memtable insert and the spent output's delete rose
 again for the same code (§2). Three readings of the same put path spread
 2,141 s; the next lever is the memtable's backing (file-backed shared
 mappings; plan B11), and the claim for this row stays "parity, within
@@ -523,7 +525,7 @@ parity: 2.0× at 100,000 and 1.7× at 200,000, and the cause is a 2 s
 idle tick the download loop paid at every 1,024-block window edge
 (§1); the fix is built, pinned and in its A/B as this is written (§7).
 The apply path is Core's by 10% in run 40 (parity in run 38): the flush
-is off the applier and the memtable insert and undo capture rose for
+is off the applier and the memtable insert and the spent output's delete rose for
 the same code; the memtable's file-backed mappings are the next lever
 (plan B11). The memory row has two sides now: the heap is the same 10
 GB; the peak heap is Core's by 10 GB for a ten-second compaction; the
@@ -567,7 +569,11 @@ misreporting. Neither is in the tables.
   `rpc_chain_tx_blockhash` and `getrawtransaction` v0/v1; the facade's
   mempool batch enters it once per batch; `getblock` runs in a per-RPC-thread
   reader lane; `getmempoolinfo`'s totals are memoised on the mempool
-  sequence. Production: 0 waits ≥ 2 s since the deploy.
+  sequence. Production: 0 waits ≥ 2 s since the deploy. *(2026-10-07: the
+  reader lane was never released when its thread exited, and the facade runs
+  a thread per connection. Each facade block read leaked three descriptors
+  until production's RPC stopped accepting at 1,023/1,024 for 2 h 17 m. Fixed
+  by #402: `devlog/INCIDENT_2026-10-07_reader_lane_fd_leak.md`.)*
 - **Header sync** (`c5aecada`, PR #383): the first 2,000-header page is asked
   of four peers at once and the fastest leads (run 37: 1,155 KB/s chosen in
   0.4 s), with the others as fallbacks. Headers → first block 5:06 → 1:58.
