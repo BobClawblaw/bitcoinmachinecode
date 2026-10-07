@@ -5026,6 +5026,7 @@ static long g_dlc_pool_idle_pct = -1;   /* pool-wide share of worker wall-clock 
 #define DLC_MAXPOOL 2048
 #include "dlc_rules.h"
 static long g_live_announced[DLC_MAXPOOL];   /* each ranked live peer's start_height (aligned with live[] after the sort; 0 = unknown) */
+static long g_dl_pool_claim = 0; static long long g_dl_pool_claim_s = 0;   /* B10 (2026-10-07): the pool's median claim from the last ranking and when; see dl_plausible_claim */
 #define DLC_HDR_TRY_PEERS 8
 /* STALL budget: the longest a worker waits for the NEXT block of a chunk
  * before dropping the peer. Re-armed from the pipeline's progress hook on
@@ -7096,9 +7097,11 @@ static void dlc_scan_progress(long* out_tip, long* out_present){
 #define DLC_CW_PER_PASS      65536L   /* chainwork records appended per pass (B8, 2026-10-06): the committer's last few seconds, still in the page cache */
 #define DLC_STATUS_MS        10000L   /* the peer-status table's cadence (was the loop's nanosleep) */
 #define DLC_CONNECT_RETRY_MS 30000L   /* after a connect FAILURE (not a hole): keep downloading, retry later */
+#define DLC_IDLE_POLL_MS        20L   /* B9 part 2 (2026-10-07): while idling, how often the committer's tip is read */
 static int  g_dlc_interleave        = 1;                     /* test seam: 0 = the pre-step-1 loop */
 static long g_dlc_connect_budget_ms = DLC_CONNECT_BUDGET_MS;
 static long g_dlc_idle_ms           = DLC_IDLE_MS;
+static long g_dlc_n_idle_cut        = 0;                     /* idle waits ended early because the committer's tip moved (B9 part 2); the gate line prints it, tests read it */
 static pid_t* g_dlc_kids = NULL;   /* dl_catchup's helper pids while it runs; NULL otherwise */
 static int    g_dlc_nw   = 0;
 static void dl_new_block_choke(void);   /* the 3.1 choke point, defined with the worker below */
@@ -7237,6 +7240,7 @@ static void dlc_rank_by_throughput(char live[][DL_POOL_SLOT], int nlive){
     { static long sorted_ann[DLC_MAXPOOL]; for (int i = 0; i < nlive; i++) sorted_ann[i] = ann[idx[i]]; for (int i = 0; i < nlive; i++) g_live_announced[i] = sorted_ann[i]; for (int i = nlive; i < DLC_MAXPOOL; i++) g_live_announced[i] = 0;
       long announced = dlc_announced_height(g_live_announced, nlive); int claimed = 0; for (int i = 0; i < nlive; i++) if (g_live_announced[i] > 0) claimed++;
       fprintf(stderr, "[dlc] the pool announces height %ld (%d of %d peers claimed one; the median claim counts)\n", announced, claimed, nlive);
+      if (announced > 0){ g_dl_pool_claim = announced; g_dl_pool_claim_s = (long long)time(NULL); }   /* B10: what the far-behind trigger measures later claims against */
       munmap(ann, sizeof(long) * (size_t)nlive); }
     int answered = 0; double best = 0.0, worst_answered = 0.0;
     for (int i = 0; i < nlive; i++) if (rate[idx[i]] >= 0.0){ answered++; if (best == 0.0) best = rate[idx[i]]; worst_answered = rate[idx[i]]; }
@@ -8019,6 +8023,7 @@ static long dl_catchup_run(const char* dir, int min_workers){
     long conn_total = 0;                       /* blocks connected by this call's passes */
     long cw_total = 0;                         /* chainwork records appended by this call's passes (B8) */
     long long last_status_ms = dlc_now_ms(), connect_retry_ms = 0;
+    long idle_cut_tip = -2;                    /* the committer tip that last cut an idle wait short (B9 part 2) */
     int alive=nw;
     int dlc_table_this_tick = 1;
     while(alive>0){
@@ -8070,12 +8075,36 @@ static long dl_catchup_run(const char* dir, int min_workers){
         if(done <= 0){
             long ms = interleave ? g_dlc_idle_ms : 10000L;   /* the pre-step-1 loop: sleep 10 s, print */
             /* sleep in 200 ms steps so a worker blocked at the window gets a
-             * fresh anchor without waiting for the 10 s tick */
-            for(long slept=0; slept<ms; slept+=200){
-                if(next_claim[DLC_CTL_WANT_ANCHOR]) dlc_publish_anchor(next_claim, start_h);
-                dlc_stall_tick(next_claim, stats, kids, opid, nw, start_h, end_h, dlc_now_ms(), live, nlive, banned);
-                long step = ms-slept < 200 ? ms-slept : 200;
+             * fresh anchor without waiting for the 10 s tick.
+             *
+             * B9 part 2 (2026-10-07, run 40 against Core rerun #7): the wait
+             * ends as soon as the committer's contiguous tip is above the
+             * connected tip, i.e. there is something to connect. The window
+             * is anchored to the connected tip, and on the early chain the
+             * helpers fill a 1,024-block window of tiny blocks in ~0.3 s and
+             * then block at its edge while this loop slept the whole
+             * DLC_IDLE_MS before connecting them: every window cost one
+             * tick. Run 40's chunk completions came in bursts 2.09 s apart
+             * (p50) through the first 100,000 blocks, one burst per window,
+             * and it reached 100,000 in 4:16 against Core #7's 2:06 (Core
+             * connects on arrival, so its window never waits on a timer).
+             * The tip is read from shared memory every DLC_IDLE_POLL_MS; a
+             * given committer tip cuts the wait at most once, so a pass that
+             * connects nothing (a hole at the front, the connect-failure
+             * backoff) cannot turn this into a spin. The anchor and the stall
+             * tick keep their 200 ms cadence. */
+            for(long slept=0; slept<ms; ){
+                if(slept % 200 == 0){
+                    if(next_claim[DLC_CTL_WANT_ANCHOR]) dlc_publish_anchor(next_claim, start_h);
+                    dlc_stall_tick(next_claim, stats, kids, opid, nw, start_h, end_h, dlc_now_ms(), live, nlive, banned);
+                }
+                if(interleave && dlc_now_ms() >= connect_retry_ms){
+                    long ct = next_claim[DLC_CTL_COMMIT_TIP];
+                    if(ct > utxo_live_applied_height() && ct != idle_cut_tip){ idle_cut_tip = ct; g_dlc_n_idle_cut++; break; }
+                }
+                long step = ms-slept < DLC_IDLE_POLL_MS ? ms-slept : DLC_IDLE_POLL_MS;
                 struct timespec ts={step/1000,(step%1000)*1000000L}; nanosleep(&ts,NULL);
+                slept += step;
             }
         }
         if(g_shutdown_requested){
@@ -8388,8 +8417,8 @@ static long dl_catchup_run(const char* dir, int min_workers){
         fprintf(stderr,"[dlc] chainwork in step with the archive at the download gate: %ld record(s) appended during the download\n", cw_total);
     }
     ixw_catchup_stop("the download is over: the tip's blocks are indexed inline");   /* drains the ring first; the writers re-read their state */
-    if(interleave) fprintf(stderr,"[dlc] connected %ld block(s) during the download; connected tip %ld (the rotation drains the rest)\n",
-                           conn_total, utxo_live_applied_height());
+    if(interleave) fprintf(stderr,"[dlc] connected %ld block(s) during the download; connected tip %ld (the rotation drains the rest); idle waits cut short %ld (B9)\n",
+                           conn_total, utxo_live_applied_height(), g_dlc_n_idle_cut);
     long total=*done_count;
     /* Remember who actually produced blocks. A peer that delivered is worth
      * trying first next boot; the address book alone only records that an IP
@@ -8921,6 +8950,26 @@ static long dl_trigger_height(const long* hs, int n){
     long top = 0, second = 0;
     for(int i=0;i<n;i++){ if(hs[i] > top){ second = top; top = hs[i]; } else if(hs[i] > second) second = hs[i]; }
     return n >= 2 ? second : top;
+}
+/* 2026-10-07 (run 40, plan B10): the pool's own claim from the last parallel
+ * download's ranking (the median over the handshakes: 135 of 161 peers in
+ * run 40) and when it was taken. Right after a download the legs are fresh
+ * and a cluster's claim passes the second-highest rule unopposed: run 40's
+ * worker saw two legs claim 975,945 on a 970,229 archive four seconds after
+ * a ranking had put the pool's median at 970,265, and ran the full parallel
+ * downloader -- seeds, liveness probe, a 2,000-header ranking of 161 peers,
+ * 62 s -- for the 37 blocks that were really there. The chain grows a block
+ * every ten minutes; a claim more than DL_CLAIM_GROWTH_BLOCKS plus a block
+ * a minute (six times the real rate) above the last median is not believed.
+ * The highest claim within that bound is used instead, else the median. A
+ * fresh node with no ranking behind it keeps the second-highest rule. */
+#define DL_CLAIM_GROWTH_BLOCKS 50L
+static long dl_plausible_claim(long best, const long* hs, int n, long pool_claim, long long pool_s, long long now_s){
+    if(pool_claim <= 0 || best <= 0) return best;
+    long bound = pool_claim + DL_CLAIM_GROWTH_BLOCKS + (long)((now_s - pool_s) / 60);
+    if(best <= bound) return best;
+    long within = 0; for(int i=0;i<n;i++) if(hs[i] <= bound && hs[i] > within) within = hs[i];
+    return within > 0 ? within : pool_claim;
 }
 /* issue #304 (2026-09-28): two agreeing peers were a CLUSTER. Every claim
  * above 973,900 on a 968,5xx chain came from /Satoshi:29.4.x/Knots/ peers
@@ -10513,6 +10562,12 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     if(mux_out_fd[i]>=0 && g_node_status->peers[i].start_height > 0 && dl_claim_believed(i, nows))   /* #304: failing and remembered legs do not vote */
                         hs[nh++] = g_node_status->peers[i].start_height;
             long best = dl_trigger_height(hs, nh);
+            { long b2 = dl_plausible_claim(best, hs, nh, g_dl_pool_claim, g_dl_pool_claim_s, nows);   /* B10 (2026-10-07): a claim the chain could not have reached */
+              if(b2 != best){ static long said = -1;
+                  if(best != said){ said = best;
+                      fprintf(stderr,"[dl] peers announce %ld but the pool's median claim was %ld %llds ago -- not believed (the chain grows a block every ten minutes); using %ld\n",
+                              best, g_dl_pool_claim, (long long)(nows - g_dl_pool_claim_s), b2); }
+                  best = b2; } }
             long atip = (long)(*(int*)(store_buf+24));
             static long noop_best = -1, noop_tip = -1;
             if(g_dl_parallel_now){ g_dl_parallel_now = 0; noop_best = -1; noop_tip = -1; dl_parallel_last_s = 0; }   /* a reorg handoff: fetch now */
@@ -11100,7 +11155,10 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                   prev_drop = hf + hb; } }
             next_heartbeat_ms = now_ms + DL_HEARTBEAT_MS;
         }
-        if(!did){ usleep(200000); }   /* all idle: rest before next rotation */
+        if(!did){
+            if(g_utxo_live_on){ extern void utxo_live_bg_poll(void); utxo_live_bg_poll(); }   /* B3 at the tip (2026-10-07): adopt a finished flush writer / compaction within a rotation */
+            usleep(200000);           /* all idle: rest before next rotation */
+        }
         /* background leg-fill: gradually acquire live legs toward MUX_MAX_OUT
          * from the discovered candidate pool. Boot rarely lands all 8 at once
          * on a variable network, so keep trying to add a leg occasionally

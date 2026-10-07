@@ -267,7 +267,12 @@ static void echo_lines_with(const char* text, const char* needle, int max){
  * record per stored height when the download kept it in step */
 static long cw_records(void){ struct stat st; return stat("chainwork.dat", &st) == 0 ? (long)(st.st_size / 16) : -1; }
 
-/* one full download against the three peers; returns dl_catchup's result */
+/* one full download against the three peers; returns dl_catchup's result.
+ * t_idle_ms / t_window: the loop's idle wait and the download window for
+ * the run (the idle-tick phase below sets the REAL 2 s idle and a window
+ * smaller than the chain, so the window edge is hit several times); the
+ * wall time of the call lands in t_elapsed_ms. */
+static long t_idle_ms = 30, t_window = 0, t_elapsed_ms = 0;
 static long run_download(const char* tag, int interleave, long* out_gate_applied, char** out_log){
     tt_subdir(tag);
     memset(store_buf, 0, sizeof store_buf);
@@ -278,12 +283,15 @@ static long run_download(const char* tag, int interleave, long* out_gate_applied
     g_reorg_ok = 1;                             /* the worker's flag: dl_catchup keeps chainwork.dat in step (B8) */
     g_dl_last_seen_tip = (int)node_public_tip(store_buf);
     g_dlc_interleave = interleave;
-    g_dlc_connect_budget_ms = 500; g_dlc_idle_ms = 30;   /* the scope's 8 s / 2 s, scaled to a seconds-long download */
+    g_dlc_connect_budget_ms = 500; g_dlc_idle_ms = t_idle_ms;   /* the scope's 8 s / 2 s, scaled to a seconds-long download */
+    if(t_window) g_dlc_window = t_window;
     int ifd = open("index.dat", O_RDONLY);
     g_ns = 0; g_stop = 0;
     pthread_t th; pthread_create(&th, 0, sampler, &ifd);
     capture_begin("dlc.log");
+    long long t0 = dlc_now_ms();
     long got = dl_catchup(".", 3);
+    t_elapsed_ms = (long)(dlc_now_ms() - t0);
     *out_log = capture_end("dlc.log");
     g_stop = 1; pthread_join(th, 0); close(ifd);
     *out_gate_applied = utxo_live_applied_height();
@@ -407,6 +415,35 @@ int main(void){
         ck("connected tip == NB-1 after the drain", utxo_live_applied_height(), NB-1);
         free(log);
         utxo_live_close(); g_utxo_live_on = 0;
+    }
+
+    /* ---------------- B9 part 2 (2026-10-07): the idle wait ends when blocks land ----------------
+     * The real DLC_IDLE_MS (2 s) and a 120-block window over the 600-block
+     * chain: the helpers hit the window's edge four times after the first
+     * window. The loop as it was slept the whole 2 s at each (nothing was
+     * connectable the instant after a connect pass), ~8 s on a download
+     * that takes ~1 s -- run 40's early chain, one tick per 1,024-block
+     * window. The fixed loop reads the committer's tip every 20 ms and
+     * connects as soon as it moves. Watched to FAIL with the cut removed
+     * (the condition forced false): cut count 0, elapsed 2.2 s against
+     * 1.0 s with it -- the count is the pin, the elapsed bound a sanity
+     * check (the fake peers at 4 ms a block keep most connect passes busy,
+     * so this fixture pays fewer ticks than the real early chain did). */
+    printf("\n-- idle tick: the real 2 s idle, a 120-block window; the wait must end when blocks land\n");
+    {
+        long gate_applied; char* log;
+        t_idle_ms = DLC_IDLE_MS; t_window = 120; g_dlc_n_idle_cut = 0;
+        long got = run_download("tick", 1, &gate_applied, &log);
+        ck("dl_catchup wrote every block", got, NB);
+        ck("connected tip == NB-1 at the gate", gate_applied, NB-1);
+        printf("     elapsed %ld ms, idle waits cut short %ld (five 120-block windows; the old loop slept 2 s at each edge)\n", t_elapsed_ms, g_dlc_n_idle_cut);
+        ckm("the idle wait was cut short at least once", g_dlc_n_idle_cut >= 1);
+        ckm("the download did not pay a 2 s tick per window (elapsed < 4 s)", t_elapsed_ms < 4000);
+        const char* gl = last_line_with(log, "idle waits cut short"); print_line(gl);
+        ckm("the gate line reports the cut count", gl != NULL);
+        free(log);
+        utxo_live_close(); g_utxo_live_on = 0;
+        t_idle_ms = 30; t_window = 0;
     }
 
     for(int i=0;i<3;i++){ kill(-peers[i], SIGKILL); waitpid(peers[i], 0, 0); }
