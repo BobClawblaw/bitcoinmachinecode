@@ -2173,10 +2173,29 @@ static long g_lanes_gen;
 static __thread u8 t_rd_st[ST_SIZE]; static __thread int t_rd_ok; static __thread u8* t_rd_bb; static __thread long t_rd_gen = -1;
 typedef txi_lane_t rd_lane_t;
 long g_rd_lane_entries;    /* test seam */
+/* 2026-10-07: the lane is released when its thread exits. The facade runs a
+ * thread per connection (rpc_server.c's esp_conn_thread, Connection: close)
+ * and its block routes call getblock in-process, so every facade request
+ * that read a block opened a lane and left it behind: index.dat, the current
+ * block file and the reader's fd cache, and the 8 MB buffer. Production
+ * (deploy-20261006d) reached 1,023 descriptors at 10-07 16:26Z and the RPC
+ * listener stopped accepting. A pthread key's destructor runs in the exiting
+ * thread before its TLS is freed, so it can close the thread's own handle. */
+static pthread_key_t g_rd_key; static pthread_once_t g_rd_key_once = PTHREAD_ONCE_INIT;
+static void rd_lane_release(void* v){
+    (void)v;
+    if (t_rd_ok){ lane_handle_close(t_rd_st); t_rd_ok = 0; }
+    free(t_rd_bb); t_rd_bb = NULL;
+}
+static void rd_key_make(void){ pthread_key_create(&g_rd_key, rd_lane_release); }
 static rd_lane_t rd_lane_enter(void){
     rd_lane_t sv = { t_st, t_blockbuf, t_blockbuf_h, 0 };
     if (t_rd_gen != g_lanes_gen){ if (t_rd_ok){ lane_handle_close(t_rd_st); t_rd_ok = 0; } t_rd_gen = g_lanes_gen; }
-    if (!t_rd_bb) t_rd_bb = malloc(BLOCKBUF_CAP);
+    if (!t_rd_bb){
+        pthread_once(&g_rd_key_once, rd_key_make);
+        pthread_setspecific(g_rd_key, (void*)1);      /* non-NULL: the destructor runs at this thread's exit */
+        t_rd_bb = malloc(BLOCKBUF_CAP);
+    }
     if (!t_rd_ok){ static pthread_mutex_t open_mu = PTHREAD_MUTEX_INITIALIZER;   /* once per thread; the open is not reentrant */
         pthread_mutex_lock(&open_mu); lane_handle_open(t_rd_st, &t_rd_ok); pthread_mutex_unlock(&open_mu); }
     if (t_rd_bb && t_rd_ok){ t_st = t_rd_st; t_blockbuf = t_rd_bb; t_blockbuf_h = -1; sv.ok = 1; }

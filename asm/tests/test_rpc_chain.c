@@ -426,6 +426,21 @@ static void* race_lookups(void* a){
         }
     return NULL;
 }
+/* 2026-10-07: the facade's shape -- a thread that serves one request and exits */
+static long open_fds(void){
+    long n = 0; char p[32];
+    for (int fd = 0; fd < 4096; fd++){ snprintf(p, sizeof p, "/proc/self/fd/%d", fd); if (access(p, F_OK) == 0) n++; }
+    return n;
+}
+static volatile long g_getblock_once_ok = 0;
+static void* getblock_once(void* a){
+    (void)a; long ec; const char* em; char p[128]; snprintf(p, sizeof p, "[\"%s\", 0]", GENESIS_HASH);
+    rj_val* r = call("getblock", p, &ec, &em);
+    if (r && r->str && !strcmp(r->str, GENESIS_HEX)) __sync_fetch_and_add(&g_getblock_once_ok, 1);
+    rj_free(r);
+    return NULL;
+}
+
 int main(void){
     /* ---- -blockversion is honoured ONLY where Core honours it (2026-09-06) --
      * Core: node/miner.cpp:148 applies -blockversion under
@@ -557,6 +572,23 @@ int main(void){
     expect_err("getblockheader unknown hash", "getblockheader", "[\"0000000000000000000000000000000000000000000000000000000000000001\"]", -5, "Block not found");
     expect_err("getblockheader bad length", "getblockheader", "[\"abc\"]", -8, "parameter 1 must be of length 64 (not 3, for 'abc')");
     expect_err("getblockheader non-hex", "getblockheader", "[\"zz00000000000000000000000000000000000000000000000000000000000000\"]", -8, "parameter 1 must be hexadecimal string (not 'zz00000000000000000000000000000000000000000000000000000000000000')");
+
+    /* ---- getblock on short-lived threads (2026-10-07) ----
+     * The facade's thread per connection calls getblock in-process. Each
+     * thread's reader lane (a store handle: index.dat, the current block
+     * file, the reader's fd cache) must be closed when the thread exits:
+     * production leaked three descriptors per facade request and the RPC
+     * listener stopped accepting at 1,023 (deploy-20261006d, 10-07 16:26Z).
+     * Watched to FAIL with the lane's pthread-key destructor removed:
+     * 64 threads left 192 descriptors open. */
+    { extern long g_rd_lane_entries;
+      long e0 = g_rd_lane_entries, f0 = open_fds();
+      for (int i = 0; i < 64; i++){ pthread_t th; pthread_create(&th, NULL, getblock_once, NULL); pthread_join(th, NULL); }
+      long f1 = open_fds();
+      printf("      64 one-call threads: %ld lane entries, open descriptors %ld -> %ld\n", g_rd_lane_entries - e0, f0, f1);
+      ck("64 one-call threads each entered the reader lane", g_rd_lane_entries - e0 == 64);
+      ck("...each read the genesis block through it", g_getblock_once_ok == 64);
+      ck("...and their lanes were closed at thread exit (no descriptor left open)", f1 == f0); }
 
     /* ---- getblock ---- */
     { char p[128]; snprintf(p, sizeof p, "[\"%s\", 0]", GENESIS_HASH);
