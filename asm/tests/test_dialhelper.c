@@ -744,14 +744,30 @@ int main(void){
             ok(c[DLC_CTL_N_STALL] == 1 && WIFEXITED(st7) && WEXITSTATUS(st7) == 7 && sst[0].kill_reason == 1,
                "2 s at a full window: the holder is dropped (SIGUSR1, reason 'stalling the window'), the eviction counted");
             ok(g_dlc_stall_timeout_s == 4, "...and the timeout doubled to 4 s");
-            ok(tbanned[0] == 1,
-               "...and the staller is BANNED for the run (run 20, 2026-09-10: the eviction was memoryless and one address was handed the same chunk 14 times)");
+            ok(tbanned[0] == 0,
+               "...and a FIRST stall is not banned (B13, 2026-10-07: Core only disconnects; run 41 banned 26 fresh peers for one slow first chunk each)");
             kids[0] = 0;                                                    /* the worker is gone */
             c[DLC_CTL_FIRST_HOLE] = 140;                                     /* the tail moved on */
             dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 124000, tlive, TNLIVE, tbanned);
             ok(g_dlc_stall_timeout_s == 3, "the tail moved: the timeout eases 15% (4 s -> 3 s)");
             dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 200000, tlive, TNLIVE, tbanned);
             ok(c[DLC_CTL_N_STALL] == 1, "nobody holds the new tail (it is the retry ring's): no eviction");
+            /* B13: the same address stalls a second time (redrawn for the new
+             * tail) -- now it is banned for the run, so run 20's address, handed
+             * the same chunk 14 times, still goes on its second */
+            { sigset_t um1; sigemptyset(&um1); sigaddset(&um1, SIGUSR1); sigprocmask(SIG_BLOCK, &um1, 0);
+              pid_t hp1 = fork();
+              if (hp1 == 0){ for (;;){ sigset_t m; sigemptyset(&m); int s = 0; sigaddset(&m, SIGUSR1); sigwait(&m, &s); if (s == SIGUSR1) _exit(7); } }
+              sigprocmask(SIG_UNBLOCK, &um1, 0);
+              kids[0] = opid[0] = hp1;
+              sst[0].cur_lo = 140; sst[0].cur_hi = 179; sst[0].held_idx = 0; sst[0].kill_reason = 0;
+              c[DLC_CTL_CLAIM] = 140 + 4097;
+              dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 250000, tlive, TNLIVE, tbanned);
+              dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 250000 + g_dlc_stall_timeout_s * 1000, tlive, TNLIVE, tbanned);
+              int st1 = 0; waitpid(hp1, &st1, 0);
+              ok(c[DLC_CTL_N_STALL] == 2 && WIFEXITED(st1) && WEXITSTATUS(st1) == 7 && tbanned[0] == 1,
+                 "the SAME address stalling a second time is BANNED for the run (run 20, 2026-09-10: one address was handed the same chunk 14 times)");
+              kids[0] = 0; }
             /* the floor guard: the same rule that stops the dead-weight
              * eviction emptying the pool applies here -- a slow peer beats no
              * peer, so at the floor the staller is dropped but stays selectable */
@@ -764,6 +780,7 @@ int main(void){
               c[DLC_CTL_FIRST_HOLE] = 140; c[DLC_CTL_CLAIM] = 140 + 4097;
               g_dlc_stall_timeout_s = 2;
               int save_floor = g_cfg.min_usable_peers; g_cfg.min_usable_peers = TNLIVE;   /* every peer is needed */
+              (void)dlc_stall_strike(tlive[1]);                                           /* its first stall was earlier: this one would ban */
               dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 300000, tlive, TNLIVE, tbanned);
               dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 303000, tlive, TNLIVE, tbanned);
               int st8 = 0; waitpid(hp2, &st8, 0);

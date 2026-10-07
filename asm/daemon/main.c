@@ -7649,6 +7649,26 @@ static void legs_sweep_except(int except){
  * retry ring, which the workers idle at the window are already polling.
  * Every 200 ms from the parent's idle steps and once per connect pass. */
 static long g_dlc_stall_timeout_s = DLC_STALL_TIMEOUT_MIN_S;
+/* ---- B13 (2026-10-07): a peer is banned on its SECOND stall ----------------
+ * Run 41 banned 34 of 132 peers in 12 minutes (blocks 391k-431k, where blocks
+ * pass 1 MB): 26 of its 29 stall lines were a holder that had completed
+ * nothing on its peer -- a fresh draw took the tail chunk (16 blocks, ~16 MB)
+ * and had not finished within the 2 s timeout, which never backed off because
+ * the tail moved between stalls. Core's rule is the same 2 s, and Core only
+ * DISCONNECTS the staller. So the first stall of an address disconnects it
+ * (the chunk is ringed at once, as before) and is remembered; the second
+ * stall of the same address bans it for the run -- run 20's address, handed
+ * the same chunk 14 times, is still banned on its second. Keyed by address,
+ * not pool index, so a re-ranked pool keeps the memory. Parent-only state. */
+#define DLC_STALL_STRIKES_MAX 1024
+static char g_dlc_stall_struck[DLC_STALL_STRIKES_MAX][DL_POOL_SLOT];
+static int  g_dlc_stall_nstruck = 0;
+/* 1 if `addr` had stalled before (now its second), else records it and returns 0 */
+static int dlc_stall_strike(const char* addr){
+    for(int i = 0; i < g_dlc_stall_nstruck; i++) if(!strcmp(g_dlc_stall_struck[i], addr)) return 1;
+    if(g_dlc_stall_nstruck < DLC_STALL_STRIKES_MAX){ snprintf(g_dlc_stall_struck[g_dlc_stall_nstruck], DL_POOL_SLOT, "%s", addr); g_dlc_stall_nstruck++; }
+    return 0;
+}
 static void dlc_stall_tick(volatile long* ctl, volatile dlc_stat_t* stats, pid_t* kids, pid_t* opid, int nw,
                            long start_h, long end_h, long long now_ms,
                            char live[][DL_POOL_SLOT], int nlive, volatile int* banned){
@@ -7690,9 +7710,10 @@ static void dlc_stall_tick(volatile long* ctl, volatile dlc_stat_t* stats, pid_t
         if(g_dlc_core)                             verdict = "disconnected, not banned (Core)";   /* Core: fDisconnect only, no Misbehaving */
         else if(node_config_is_manual(live[bidx])) verdict = "manual, kept selectable";
         else if(banned[bidx])                      verdict = "already banned";
+        else if(!dlc_stall_strike(live[bidx]))     verdict = "disconnected, a first stall (banned on a second)";   /* B13: Core's disconnect */
         else {
             int usable = 0; for(int q = 0; q < nlive; q++) if(!banned[q]) usable++;
-            if(usable > g_cfg.min_usable_peers){ banned[bidx] = 1; verdict = "BANNED for the run"; }
+            if(usable > g_cfg.min_usable_peers){ banned[bidx] = 1; verdict = "BANNED for the run (its second stall)"; }
             else                                   verdict = "at the usable floor, kept selectable";
         }
     }
