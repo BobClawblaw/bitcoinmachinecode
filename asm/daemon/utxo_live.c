@@ -792,6 +792,12 @@ long utxo_live_flush_now(void){
     fz_wait();
     return g_fz_fatal ? -1 : 1;
 }
+/* TEST-ONLY (B3 at the tip, tests/test_utxo_reap_at_tip): a freeze that
+ * forks the writer and returns without waiting, as a threshold crossing
+ * does; the outstanding writer's pid (0 = none); the adopt count. */
+long utxo_live_test_freeze_nowait(void){ return g_fz_enabled ? fz_hook(&g_utxo_lst, g_utxo_table) : -1; }
+int  utxo_live_test_writer_pid(void){ return (int)g_fz_pid; }
+unsigned long utxo_live_test_fz_adopted(void){ return g_fz_count; }
 /* the shutdown path: the writer gets its seconds (its run is adopted, so the
  * next boot replays one generation less); past 30 s it is killed and the
  * generation replays from the WAL. */
