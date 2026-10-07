@@ -833,3 +833,29 @@ Noted in the release report §5/§6 with the knob (`bmc.memtableanon=0`).
 Open after run 41, in order: B13 (the stall rule's ban on a fresh
 holder), B12 (the single-peer header stream), B9 part 1 (the ranking's
 churn); none of them cost run 41 measurable time.
+
+## 2026-10-07 — B12 built (branch perf/2026-10-07-b12-header-switch)
+
+The switch arm of B12: `dlc_fetch_headers` keeps the rate of its last 4
+pages (bytes over getheaders-to-headers, the probe's own measure) and,
+once that falls under half the next candidate's probed rate, stops; the
+next candidate continues from where it stopped. Nothing is rolled back:
+stored headers stay, and the low-work hold (every mainnet page below
+~880k is held, not stored) is carried into the next fetch, whose locator
+starts at the held tail; a next candidate that does not answer from that
+tail drops the hold and is weighed from the stored tip. Forward in the
+order only (no ping-pong); the last probed candidate has no bar; if no
+one after a slow leader finishes, the slow one is let complete.
+`bmc.dlshape=core` probes nothing, so it never switches. Log line:
+`[dlc] headers from X fell to N KB/s over its last 4 page(s), under half
+of Y's probed M KB/s -- switching at height H (+S stored, P page(s) held
+and carried)`.
+
+Test: `test_dlc_header_probe`, two new cases (a leader slowed to 0.5 MB/s
+after its first page; the same with the floor armed). The runner-up's
+pages are counted at the peer: 1 probe + 4, not 7 from genesis. Watched
+to FAIL with the switch removed (8 checks), with the hold not carried
+(the runner-up served 8 pages) and with the stored pages rolled back (2).
+
+Not done: the disjoint-ranges arm (two peers in parallel). Measure on the
+next benchmark: boot to block 1 ≤ 50 s, and the `fell to` line's count.

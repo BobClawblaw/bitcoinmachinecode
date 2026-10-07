@@ -13,7 +13,17 @@
  *   - a candidate whose first page does not link to our locator is ranked
  *     last and never leads;
  *   - bmc.dlshape=core: no probe, the first live peer serves (Core's single
- *     header-sync peer).
+ *     header-sync peer);
+ *   - B12 (2026-10-07): a leader that answers its first page fast and then
+ *     slows under half the runner-up's probed rate is switched; the runner-up
+ *     continues from where it stopped -- the stored pages kept and, with the
+ *     -minimumchainwork floor armed, the held (unstored) pages carried -- and
+ *     serves only the rest of the chain, counted page by page at the peer.
+ *
+ * B12 watched to FAIL with the switch's break removed (the slow leader
+ * serves the whole chain), with the hold not carried (the runner-up refetches
+ * from genesis: 7 pages, not 4) and with the stored pages rolled back on a
+ * switch.
  *
  * Watched to FAIL with the probe call removed (the first candidate leads
  * whatever its speed), with the stall branch removed (the chain ends at the
@@ -39,8 +49,9 @@ static void ckm(const char* l, int cond){ if (cond) printf("PASS %s\n", l); else
 /* ---- the chain: mainnet genesis, then NB-1 headers at min difficulty (the
  * test TU's chain params are mainnet with the powLimit gate unarmed, the
  * footing test_dlc_interleave stands on); timestamps rise by one so the
- * header floor (> MTP) holds. 4,500 = two full pages and a short one. */
-#define NB 4500
+ * header floor (> MTP) holds. 14,000 = six full pages after genesis and a
+ * short one, enough for a switch partway. */
+#define NB 14000
 static unsigned char hdrs[NB][80];
 static unsigned char bh[NB][32];
 static const unsigned char GENESIS_HDR[80] = {
@@ -61,7 +72,8 @@ static void build_chain(void){
 }
 
 /* ---- the fake peer: handshake, then header pages off the locator ---------- */
-typedef struct { long first_delay_ms; int stall_after_pages; int bad_link; } fp_opts_t;
+typedef struct { long first_delay_ms; int stall_after_pages; int bad_link; int slow_after_pages; long slow_page_ms; } fp_opts_t;
+static volatile int* g_served;   /* MAP_SHARED: header pages each peer has sent, probe included (B12) */
 static int fp_version(int cfd){
     unsigned char v[128]; int o=0;
     put_u32(v+o,70016); o+=4; put_u64(v+o,9); o+=8; put_u64(v+o,(unsigned long long)time(NULL)); o+=8;
@@ -74,7 +86,7 @@ static int fp_version(int cfd){
     return p2p_write(cfd,"version",7,v,(unsigned)o) > 0;
 }
 static int find_hash(const unsigned char* h){ for(int k=0;k<NB;k++) if(!memcmp(bh[k],h,32)) return k; return -1; }
-static void fp_serve(int cfd, const fp_opts_t* op){
+static void fp_serve(int cfd, const fp_opts_t* op, int who){
     static unsigned char rb[1<<16]; static unsigned char out[3 + 2000*81];
     char cmd[12]; unsigned plen=0; int sent_version=0; int pages=0;
     for(;;){
@@ -88,6 +100,7 @@ static void fp_serve(int cfd, const fp_opts_t* op){
             for(unsigned k=0;k<cnt && (p+32) <= rb+plen;k++,p+=32){ idx = find_hash(p); if(idx>=0) break; }
             if(op->stall_after_pages && pages >= op->stall_after_pages){ sleep(60); return; }   /* served its pages, then silence */
             if(pages == 0 && op->first_delay_ms) usleep((useconds_t)(op->first_delay_ms * 1000));
+            if(op->slow_after_pages && pages >= op->slow_after_pages) usleep((useconds_t)(op->slow_page_ms * 1000));
             int start = idx<0 ? 0 : idx+1;
             int n = NB - start; if(n>2000) n=2000; if(n<0) n=0;
             int o;
@@ -96,13 +109,13 @@ static void fp_serve(int cfd, const fp_opts_t* op){
             for(int i=0;i<n;i++){ memcpy(out+o, hdrs[start+i], 80); out[o+80]=0; o+=81; }
             if(op->bad_link && n > 0) memset(out + (n>=253 ? 3 : 1) + 4, 0xEE, 32);   /* the first header's prev is nothing we hold */
             p2p_write(cfd,"headers",7,out,(unsigned)o);
-            pages++;
+            pages++; __sync_fetch_and_add(&g_served[who], 1);
         } else if(!strncmp(cmd,"ping",4)){
             p2p_write(cfd,"pong",4,rb,(plen>=8)?8:0);
         }
     }
 }
-static pid_t start_peer(unsigned ip_host, unsigned short* port_out, const fp_opts_t* op){
+static pid_t start_peer(unsigned ip_host, unsigned short* port_out, const fp_opts_t* op, int who){
     int ls=socket(AF_INET,SOCK_STREAM,0); int one=1; setsockopt(ls,SOL_SOCKET,SO_REUSEADDR,&one,sizeof one);
     struct sockaddr_in a; memset(&a,0,sizeof a); a.sin_family=AF_INET; a.sin_addr.s_addr=htonl(ip_host); a.sin_port=0;
     if(bind(ls,(struct sockaddr*)&a,sizeof a)!=0){ perror("bind"); return -1; }
@@ -113,7 +126,7 @@ static pid_t start_peer(unsigned ip_host, unsigned short* port_out, const fp_opt
         setpgid(0,0); signal(SIGPIPE,SIG_IGN); signal(SIGCHLD,SIG_IGN);
         for(;;){ int c=accept(ls,0,0); if(c<0) continue;
                  { int nd=1; setsockopt(c,IPPROTO_TCP,TCP_NODELAY,&nd,sizeof nd); }
-                 pid_t q=fork(); if(q==0){ close(ls); fp_serve(c,op); close(c); _exit(0); }
+                 pid_t q=fork(); if(q==0){ close(ls); fp_serve(c,op,who); close(c); _exit(0); }
                  close(c); }
     }
     close(ls);
@@ -150,7 +163,8 @@ static long run_phase(const char* tag, const fp_opts_t* ops, char peer[4][DL_POO
     tt_subdir(tag);
     memset(store_buf, 0, sizeof store_buf);
     unsigned short ports[4]; pid_t pids[4];
-    for(int i=0;i<4;i++){ pids[i] = start_peer(0x7f000001u + (unsigned)i, &ports[i], &ops[i]); if(pids[i] < 0) return -2; }
+    for(int i=0;i<4;i++) g_served[i] = 0;
+    for(int i=0;i<4;i++){ pids[i] = start_peer(0x7f000001u + (unsigned)i, &ports[i], &ops[i], i); if(pids[i] < 0) return -2; }
     static char live[4][DL_POOL_SLOT]; memset(live, 0, sizeof live);
     for(int i=0;i<4;i++){ snprintf(live[i], DL_POOL_SLOT, "127.0.0.%d:%u", i+1, (unsigned)ports[i]); memcpy(peer[i], live[i], DL_POOL_SLOT); }
     for(int i=0;i<DLC_MAXPOOL;i++) g_live_announced[i] = 0;
@@ -161,8 +175,25 @@ static long run_phase(const char* tag, const fp_opts_t* ops, char peer[4][DL_POO
     return got;
 }
 
+/* ---- an armed -minimumchainwork floor for the hold-carry case: the chain
+ * clears it at height FLOOR_H (genesis's work + 2 per min-difficulty header) */
+extern void block_work(unsigned char*, unsigned); extern void chainwork_add(unsigned char*, const unsigned char*, const unsigned char*);
+extern long chainwork_cmp(const unsigned char a[16], const unsigned char b[16]);
+extern void reorg_set_min_chain_work(const unsigned char be32[32]);
+#define FLOOR_H 10000
+static unsigned char g_floor_work[16];
+static int floor_at_h(const unsigned char work[16]){ return chainwork_cmp(work, g_floor_work) >= 0; }
+static void arm_floor(int on){
+    if(!on){ unsigned char z[32]; memset(z, 0, 32); reorg_set_min_chain_work(z); lowwork_set_floor_fn(NULL); return; }
+    unsigned char w[16]; memset(g_floor_work, 0, 16);
+    for(int i=0;i<=FLOOR_H;i++){ unsigned bits = hdrs[i][72] | (hdrs[i][73]<<8) | (hdrs[i][74]<<16) | ((unsigned)hdrs[i][75]<<24); block_work(w, bits); chainwork_add(g_floor_work, g_floor_work, w); }
+    unsigned char be[32]; memset(be, 0, 32); be[31] = 1; reorg_set_min_chain_work(be);   /* armed; the test's floor fn decides */
+    lowwork_set_floor_fn(floor_at_h);
+}
+
 int main(void){
     signal(SIGPIPE, SIG_IGN);
+    g_served = mmap(NULL, 4 * sizeof(int), PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
     setvbuf(stdout, NULL, _IONBF, 0);
     build_chain();
     printf("chain built: %d headers\n", NB);
@@ -213,6 +244,43 @@ int main(void){
       ckm("the first live peer served, Core's single pick", served_by(log, peer[0]));
       g_cfg.dl_shape_core = 0;
       free(log); }
+
+    /* B12: the leader answers its first page in 20 ms and every page after
+     * its first in 300 ms (0.5 MB/s); the runner-up's probe page took 100 ms
+     * (~1.6 MB/s), so the bar is ~0.8 MB/s. With a 2-page window the leader is
+     * judged after pages 0-1 (~1 MB/s, kept) and 1-2 (~0.5 MB/s, switched):
+     * three pages, through height 6,000, then the runner-up serves the four
+     * that remain -- plus its one probe page. */
+    g_dlc_hdr_switch_pages = 2;
+    printf("\n-- B12: the leader slows after its first page: the runner-up continues, the stored pages kept\n");
+    { fp_opts_t ops[4] = { {100,0,0,0,0}, {20,0,0,1,300}, {400,0,0,0,0}, {600,0,0,0,0} };
+      g_cfg.dl_shape_core = 0;
+      long got = run_phase("switch", ops, peer, &log);
+      print_line(line_with(log, "[dlc] header probe")); print_line(line_with(log, "fell to")); print_line(line_with(log, "[dlc] headers +"));
+      { char lead[128]; snprintf(lead, sizeof lead, "-- %s leads", peer[1]); ckm("the 20 ms peer led the probe", strstr(log, lead) != 0); }
+      ckm("the switch was named, at height 6000 with 6000 stored kept", line_with(log, "switching at height 6000 (+6000 stored, 0 page(s) held") != 0);
+      ck("the whole chain was fetched", got, NB);
+      ckm("the rest of the chain came from the runner-up, the 100 ms peer", served_by(log, peer[0]));
+      ckm("  as +7999 headers: nothing was refetched", line_with(log, "[dlc] headers +7999 from") != 0);
+      ck("the runner-up sent its probe page and the 4 after height 6000", g_served[0], 5);
+      ck("the slow leader sent its probe page and 3", g_served[1], 4);
+      ckm("no hold to drop", line_with(log, "hold is dropped") == 0);
+      free(log); }
+
+    printf("\n-- B12 with the floor armed: the switch carries the held pages\n");
+    { fp_opts_t ops[4] = { {100,0,0,0,0}, {20,0,0,1,300}, {400,0,0,0,0}, {600,0,0,0,0} };
+      g_cfg.dl_shape_core = 0; arm_floor(1);
+      long got = run_phase("carry", ops, peer, &log);
+      arm_floor(0);
+      print_line(line_with(log, "fell to")); print_line(line_with(log, "crossed -minimumchainwork")); print_line(line_with(log, "[dlc] headers +"));
+      ckm("the switch carried 3 held pages, nothing stored yet", line_with(log, "switching at height 6000 (+0 stored, 3 page(s) held and carried)") != 0);
+      ckm("the runner-up continued the hold (no drop)", line_with(log, "hold is dropped") == 0);
+      ckm("the chain crossed the floor holding 4 pages (3 carried + 1)", line_with(log, "crossed -minimumchainwork -- storing 4 held page(s)") != 0);
+      ck("the whole chain was fetched", got, NB);
+      ckm("it came from the runner-up", served_by(log, peer[0]));
+      ck("the runner-up sent its probe page and the 4 after height 6000, not 7 from genesis", g_served[0], 5);
+      free(log); }
+    g_dlc_hdr_switch_pages = DLC_HDR_SWITCH_PAGES;
 
     printf("\n%s (%d failures)\n", failures?"TESTS FAILED":"ALL TESTS PASSED", failures);
     return failures?1:0;

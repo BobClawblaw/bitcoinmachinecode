@@ -5927,13 +5927,43 @@ static int dlc_lw_get_at(void* hst, unsigned long long h, void* out){ return hst
 extern int reorg_min_chain_work_set(void);
 static long long dlc_now_ms(void); static void dlc_fmt_rate(char* buf, size_t cap, double bytes_per_sec);   /* defined below; the progress line needs them here */
 static int g_dlc_hdr_stalled = 0;   /* the last fetch ended on a read timeout AFTER pages had landed (2026-10-05): the try loop moves on */
+/* ---- B12 (2026-10-07): a leader that slows is switched, its pages kept ------
+ * The probe ranks the first page only, and the leader then served all 970k
+ * headers (78 MB): the B9 fix arm drew one that answered its first page
+ * fast and streamed at 0.5 MB/s after, 165 s for the phase against run 40's
+ * 33 s. dlc_headers sets g_dlc_hdr_switch_bps to half the NEXT candidate's
+ * probed rate (the same measure: one page's bytes over getheaders-to-headers);
+ * the fetch keeps the rate of its last g_dlc_hdr_switch_pages pages and, once
+ * that falls under the bar, stops with g_dlc_hdr_slow set. Nothing is rolled
+ * back: the stored headers stay, and the low-work hold (on mainnet every page
+ * below ~880k is held, not stored) is carried into the next candidate's fetch
+ * (g_dlc_hdr_carry), whose locator starts at the held tail. A next candidate
+ * that does not answer from that tail drops the hold and is weighed from the
+ * stored tip, as a fresh fetch is. Only forward in the order, never back, so
+ * there is no ping-pong; the last probed candidate has no bar. */
+#define DLC_HDR_SWITCH_PAGES 4
+#define DLC_HDR_SWITCH_MAXW  32
+static int    g_dlc_hdr_switch_pages = DLC_HDR_SWITCH_PAGES;   /* the window, in pages (test seam) */
+static double g_dlc_hdr_switch_bps = 0;   /* the bar for the fetch in progress, bytes/s; 0 = never switch */
+static int    g_dlc_hdr_slow = 0;         /* the last fetch stopped because its window fell under the bar */
+static double g_dlc_hdr_slow_bps = 0;     /* the window's rate when it did */
+static int    g_dlc_hdr_carry = 0;        /* the next fetch continues the previous one's low-work hold */
 static long dlc_fetch_headers(int fd, unsigned char* hst, const char* cand){
-    long have0 = hst_count(hst), added = 0; int lw_started = 0; lowwork_clear(&g_lw); g_dlc_hdr_stalled = 0;
+    long have0 = hst_count(hst), added = 0; int lw_started = 0; g_dlc_hdr_stalled = 0; g_dlc_hdr_slow = 0;
+    int carried = g_dlc_hdr_carry && g_lw.held > 0; g_dlc_hdr_carry = 0;   /* B12: a switch hands over the hold */
+    if(carried) lw_started = 1; else lowwork_clear(&g_lw);
+    int sw_n = g_dlc_hdr_switch_pages; if(sw_n < 1) sw_n = 1; if(sw_n > DLC_HDR_SWITCH_MAXW) sw_n = DLC_HDR_SWITCH_MAXW;
+    long long sw_b[DLC_HDR_SWITCH_MAXW], sw_ms[DLC_HDR_SWITCH_MAXW]; int sw_k = 0;   /* the last sw_n pages, a ring */
     long long fetch_t0 = dlc_now_ms(); unsigned long held_bytes = 0;   /* for the held-region progress line */
     static unsigned char page[DLC_HDR_PAGE * 81 + 16];
     static unsigned char msg[2 << 20];
     unsigned char stop[32]; memset(stop, 0, 32);
     for(int round = 0; round < 1000; round++){
+        if(g_dlc_hdr_switch_bps > 0 && sw_k >= sw_n){             /* B12: the window under the bar ends this peer's turn */
+            long long b = 0, ms = 0; for(int q = 0; q < sw_n; q++){ b += sw_b[q]; ms += sw_ms[q]; }
+            double bps = (double)b * 1000.0 / (double)(ms > 0 ? ms : 1);
+            if(bps < g_dlc_hdr_switch_bps){ g_dlc_hdr_slow = 1; g_dlc_hdr_slow_bps = bps; break; }
+        }
         unsigned char loc[DLC_HDR_LOCATOR_MAX * 32]; long lh[DLC_HDR_LOCATOR_MAX];
         int nl = dlc_locator_build(hst, loc, lh);
         if(nl <= 0) return -1;
@@ -5944,6 +5974,7 @@ static long dlc_fetch_headers(int fd, unsigned char* hst, const char* cand){
               memcpy(loc, th, 32); lh[0] = tht; nl++;
           } }
         long plen = p2p_getheaders(page, loc, nl, stop);
+        long long pg_t0 = dlc_now_ms();
         if(plen <= 0 || p2p_write(fd, "getheaders", 10, page, (unsigned)plen) < 0) return -1;
         /* the reply: skip anything else the peer says first (inv, ping, ...) */
         unsigned mlen = 0; char cmd[12]; int got = 0;
@@ -5954,6 +5985,7 @@ static long dlc_fetch_headers(int fd, unsigned char* hst, const char* cand){
             else if(!strncmp(cmd, "ping", 12) && mlen == 8) p2p_write(fd, "pong", 4, msg, 8);
         }
         if(!got){ if(added){ g_dlc_hdr_stalled = 1; break; } return -1; }
+        { long long pg_ms = dlc_now_ms() - pg_t0; sw_b[sw_k % sw_n] = (long long)mlen; sw_ms[sw_k % sw_n] = pg_ms > 0 ? pg_ms : 1; sw_k++; }
         dl_gate_account((long)mlen);                                  /* bmc.downloadratelimit: a header page is bytes too */
         unsigned long used; unsigned long cnt = dlc_varint(msg, mlen, &used);
         if(!used || cnt > DLC_HDR_PAGE || used + cnt * 81 > mlen) break;   /* malformed: stop here */
@@ -5965,6 +5997,13 @@ static long dlc_fetch_headers(int fd, unsigned char* hst, const char* cand){
         if(at < 0){
             fprintf(stderr,"[dlc] headers from %s do not connect to any header we hold (%lu offered) -- discarding\n", cand, cnt);
             dlc_headers_rollback(hst, have0); return -1;
+        }
+        if(carried && at != 0){
+            /* B12: the hold came from the previous candidate and this one did
+             * not answer from its tail -- it does not know that chain (or not
+             * yet). Drop the hold; this page is weighed from our stored tip. */
+            fprintf(stderr,"[dlc] headers from %s do not continue the %d held page(s) of the previous candidate -- the hold is dropped, this chain is weighed from the stored tip\n", cand, g_lw.held);
+            lowwork_clear(&g_lw); lw_started = 0; carried = 0;
         }
         long pos = lh[at] + 1;                    /* the height this page's first header would have */
         if(!dlc_headers_sane(have0, pos)){
@@ -6145,8 +6184,8 @@ static long dl_header_mirror_topup(unsigned char* store){
 #define DLC_HDR_PROBE_S 10
 typedef struct { int ok, why; long cnt, ms, bytes; } dlc_hprobe_t;   /* why: 1 no answer, 2 the page does not link, 3 the page breaks its chain or PoW */
 static const char* const dlc_hprobe_why[] = { "", "no answer", "page does not link", "page fails linkage or PoW" };
-static int dlc_headers_probe(char live[][DL_POOL_SLOT], int nlive, unsigned char* hst, int* order){
-    for(int i=0;i<nlive;i++) order[i]=i;
+static int dlc_headers_probe(char live[][DL_POOL_SLOT], int nlive, unsigned char* hst, int* order, double* order_bps){
+    for(int i=0;i<nlive;i++){ order[i]=i; order_bps[i] = -1.0; }   /* order_bps: the probed rate at each order position, -1 = none (B12's bar) */
     if(nlive < 2 || g_cfg.dl_shape_core) return 0;
     int cand[DLC_HDR_PROBE_N]; int n=0;
     for(int i=0;i<nlive && n<DLC_HDR_PROBE_N;i++){ unsigned ip; int pp; if(!dlc_parse_peer(live[i],&ip,&pp) || peer_known_no_witness(live[i])) continue; cand[n++]=i; }
@@ -6203,7 +6242,7 @@ static int dlc_headers_probe(char live[][DL_POOL_SLOT], int nlive, unsigned char
     static unsigned char probed[DLC_MAXPOOL]; memset(probed, 0, (size_t)nlive);
     for(int k=0;k<n;k++) probed[cand[k]] = 1;
     int o=0;
-    for(int k=0;k<n;k++) if(res[pk[k]].ok) order[o++] = cand[pk[k]];
+    for(int k=0;k<n;k++) if(res[pk[k]].ok){ order_bps[o] = rate[pk[k]]; order[o++] = cand[pk[k]]; }
     for(int i=0;i<nlive;i++) if(!probed[i]) order[o++] = i;
     for(int k=0;k<n;k++) if(!res[pk[k]].ok) order[o++] = cand[pk[k]];
     char line[DLC_HDR_PROBE_N * 96 + 64]; int w=0;
@@ -6242,13 +6281,28 @@ static long dlc_headers(char live[][DL_POOL_SLOT], int nlive){
     int tried=0, failed=0, whys[8]={0};
     long announced = dlc_announced_height(g_live_announced, nlive);   /* 2026-09-09: the pool's claim, from the ranking handshakes */
     int short_i = -1; long short_tip = -1;                             /* the longest chain that still fell short, in case every candidate does */
-    static int order[DLC_MAXPOOL]; dlc_headers_probe(live, nlive, hst, order);   /* 2026-10-05: the fastest first page leads */
+    static int order[DLC_MAXPOOL]; static double order_bps[DLC_MAXPOOL];
+    dlc_headers_probe(live, nlive, hst, order, order_bps);   /* 2026-10-05: the fastest first page leads */
+    g_dlc_hdr_carry = 0; int slow_i = -1;
     for(int oi=0;oi<nlive && tried<DLC_HDR_TRY_PEERS; oi++){
         int i = order[oi];
         int why=0;
+        /* B12: the bar is half the next candidate's probed rate; none without one */
+        g_dlc_hdr_switch_bps = (oi+1 < nlive && order_bps[oi+1] > 0) ? order_bps[oi+1] * 0.5 : 0;
         long added=dlc_headers_try(live[i], hst, loc, hdrbuf, sizeof hdrbuf, &why);
+        g_dlc_hdr_switch_bps = 0;
         if(added<0){ failed++; if(why>=0 && why<8) whys[why]++; continue; }
         tried++;
+        if(g_dlc_hdr_slow){
+            /* B12: slower than half the runner-up: the runner-up continues
+             * from here, nothing rolled back, the hold carried */
+            unsigned char th[32]; long held_tip = -1; int held = lowwork_tail(&g_lw, th, &held_tip) ? g_lw.held : 0;
+            long tip_now = held ? held_tip : hst_count(hst) - 1;
+            fprintf(stderr,"[dlc] headers from %s fell to %.0f KB/s over its last %d page(s), under half of %s's probed %.0f KB/s -- switching at height %ld (+%ld stored, %d page(s) held and carried); %s continues from there\n",
+                    live[i], g_dlc_hdr_slow_bps/1024.0, g_dlc_hdr_switch_pages, live[order[oi+1]], order_bps[oi+1]/1024.0, tip_now, added, held, live[order[oi+1]]);
+            g_dlc_hdr_carry = 1; slow_i = i;
+            continue;
+        }
         if(added>0 && g_dlc_hdr_stalled){
             /* the peer served pages and then stopped answering (2026-10-05):
              * before, that ended the phase on whatever had landed, and the
@@ -6280,6 +6334,16 @@ static long dlc_headers(char live[][DL_POOL_SLOT], int nlive){
         if(added>0){ fprintf(stderr,"[dlc] headers +%ld from %s (total %ld)\n", added, live[i], hst_count(hst)); return hst_count(hst); }
         if(added==0 && have>0){ fprintf(stderr,"[dlc] headers: already current per %s (total %ld)\n", live[i], hst_count(hst)); return hst_count(hst); }
     }
+    if(slow_i >= 0){
+        /* B12: switched away from, and no one after it finished: the slow
+         * peer is still the best we have -- let it complete, no bar */
+        int why=0; long added=dlc_headers_try(live[slow_i], hst, loc, hdrbuf, sizeof hdrbuf, &why);
+        if(added>=0 && !g_dlc_hdr_stalled){
+            fprintf(stderr,"[dlc] headers +%ld from %s (total %ld) -- no candidate after it finished, so the slow one completed the chain\n", added, live[slow_i], hst_count(hst));
+            g_dlc_hdr_carry = 0; return hst_count(hst);
+        }
+    }
+    g_dlc_hdr_carry = 0;
     if(short_i >= 0){
         /* every candidate fell short of the announcement: take the longest of
          * them rather than nothing (the announcement may be the liar, or every
