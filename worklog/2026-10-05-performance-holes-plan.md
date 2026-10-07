@@ -635,6 +635,37 @@ count 0 FAIL, 2,245 ms. Daemon builds -Werror. A/B to 300,000 launched
 c6884a22; validation/ab_dlcchunk.sh arms); then the full gate, PR,
 deploy, run 41.
 
+**A/B (10-07 11:50–12:11Z, validation/ab_dlcchunk.sh, fresh syncs):** the
+control arm (main bf861e5c) drew a starved pool — recv ~1 MB/s, 34 of 131
+banned in 12 minutes, 65 evictions, the stall rule's floor at work on a
+pool whose median was 122 KB/s — and was stopped by pid after its
+150,000 mark (50,000 at 165 s, 100,000 at 270 s, 150,000 at 766 s); run
+40 (the same code, a healthy pool) is the fairer control: block 1 at 46.5
+s, 100,000 at 256 s, 200,000 at 492 s. The fix arm (c6884a22, to
+200,000): 50,000 at 215 s, 100,000 at 235 s, 150,000 at 275 s, 200,000
+at 320 s — the gate line `idle waits cut short 1621 (B9)`. Its header
+phase was the slow part: the ranking's best peer was 1,231 KB/s (median
+112) and the 970,339 headers took 165 s from one peer (12:05:35 →
+12:08:20; run 40's took 33 s, Core #7's 45 s). From the first block the
+200,000 blocks took 134 s against run 40's 445 s and Core #7's 239 s:
+the early chain is 3.3× faster than before the fix and 1.8× faster than
+Core #7's, and 200,000 lands at ~170 s with a normal header phase
+against Core #7's 284 s. The header phase itself is a new item (B12
+below). Landed in PR #400 (7027c734) with B11, B10 and the B3 reap fix;
+run 41 carries them.
+
+### B12. The header download is one peer's speed (fix arm: 165 s for 970k headers; run 40: 33 s)
+
+`[dlc] header probe: the first page from 4 candidate(s)` picks the
+fastest first page and then downloads all 970k headers (78 MB) from that
+one peer; a peer that answered its first page fast and then streamed at
+0.5 MB/s cost 165 s. Core's presync is single-peer too (45 s in #7 at ~2
+MB/s). Fix: keep the four candidates and switch when the leader's rate
+falls under half the runner-up's over a 2,000-header page, or fetch
+disjoint ranges from the two fastest and merge (the locator pages are
+independent). Small-medium; measure: boot to block 1 ≤ 50 s on every
+sync.
+
 ### B10. The top-up round after the download re-probes and re-ranks the whole pool (run 40: ~62 of the 99 s tail)
 
 The parallel download ends at the archive tip the gate knew (970,229);
@@ -682,3 +713,123 @@ Measure: A/B to 300,000 after Core #7 (two arms in the same hour, the
 box quiet): put.ins and put.undo per 1,000 inputs at the same heights;
 then a full run. Target: put at or under run 38's 4,994 s, which puts the
 applier at ~12,500 s against Core's 13,909.
+
+## 2026-10-07 — run 41 (main 7027c734: B9 part 2 + B11 + B10 + B3 reap), the parts that were final before the run ended
+
+Launched 12:52:34Z with the sampler and the stall watcher, the box
+under the same load as run 40 and Core #7 (vLLM, the blockyard node,
+the mempool backend, the swap full). From the log (never the RPC):
+
+| milestone | run 41 | run 40 | Core #7 |
+|---|---|---|---|
+| block 1 | 56 s | 46.5 s | 45 s |
+| 100,000 | 1:35 | 4:16 | 2:06 |
+| 200,000 | 2:55 | 8:12 | 4:44 |
+| 300,000 | 6:57 | — | 15:30 |
+| 400,000 | 18:28 | — | — |
+| 500,000 | 44:25 | — | 1:43:30 |
+| 600,000 | 1:11:15 | — | — |
+| 700,000 | 1:42:57 | — | — |
+
+The early chain is closed: 100,000 in 1:35 against Core #7's 2:06 and
+200,000 in 2:55 against 4:44 (B9 part 2, the idle tick cut; run 40 was
+2.0× / 1.7× behind). 300,000 at 6:57 against Core's 15:30 and 500,000
+at 44:25 against 1:43:30 — ahead at every milestone from the first.
+
+B11, measured at matched heights (the `[bench] block` lines summed over
+blocks 1..757,000, the same blocks in both runs): put 2,126 s against
+run 40's 3,801 s (−44%); get 2,089 vs 1,901; flush 72 vs 84; idx 612 vs
+617; the applier's total 5,834 s against 7,247 s (−19%). The put column
+was the waited-for file write-back after all. The full-run put against
+run 40's 7,135 s and the applier against Core #7's 13,340 s follow with
+the result.
+
+The writer: 62 freezes to block 755,005, 0.79 s each (run 40: 0.47–0.68
+s; the frozen copy is now the anonymous table's copy, not a file page
+walk — to be read against the adopt lag when the run ends). Memory at
+14:53Z (block 757k): PSS peak 75.1 GB (run 40's whole run: 67.9), Pss_Anon
+peak 31.4 GB (run 40: 22.1) — the memtable's pages moved from the file
+column to the anon column, as B11 intends; the total is the same
+memory counted once.
+
+### B13. The window-stall rule bans a fresh peer on its first chunk (run 41: 29 stalls, 26 of them a holder that had completed nothing)
+
+`banned 34/132 (amnesty active)` by 13:21Z, 30 of them between 13:09
+and 13:21 (blocks 391,809–430,801, where the blocks pass 1 MB). Every
+stall line reads `dropped after 2 s (next timeout 4 s; peer BANNED for
+the run) | holder fetching for 3–13 s`, and all but three holders had
+`completed 0 chunk(s)/0 block(s) on this peer`: a peer the pool had just
+drawn took the tail chunk (16 blocks, ~16 MB) and had not answered its
+first getdata within the 2 s stall timeout — the timeout never backed
+off because the tail moved between stalls. Core's rule is the same 2 s
+(and it disconnects the staller too); the difference is our ban, and
+the ban only costs when the pool runs low (the amnesty covered it; pool
+idle stayed at 9% and the average download at 57 MB/s, so the sync did
+not pay). Not a release item. Fix when it matters: a fresh holder's
+first chunk gets a grace of its measured first-page RTT, or the drawn
+peer is handed a chunk off the tail until it has delivered one; and the
+stall rule's ban should stay Core's disconnect unless the same peer
+stalls twice. Measure: bans per run ≤ 5 with the same throughput.
+
+Also seen: 4 dead-weight evictions, 17 dials dropped for lacking
+NODE_WITNESS (services=0xc05, one hosting cluster), and the stall
+watcher's three STALL dumps at 12:53:09–20Z are the header phase (stored
+unchanged before block 1) — a false alarm to silence in the watcher
+(gate it on block 1).
+
+## 2026-10-07 — run 41 against the targets: the release build
+
+PASS 970,364, muhash identical; ready 3:48:22 (13,702 s), IBD end
+3:47:48; CPU 27,567 s (the writer 1,859 s of it). Against Core #7:
+sync 0.39 (2.6×), CPU 0.58, the applier 11,842 against 13,340 (bmc by
+11%), waiting 2,220 against 22,060. Stage report:
+`docs/reports/2026-10-07-run41-vs-core7-stage-report.md`.
+
+| target (from "The numbers to move") | run 40 | run 41 | Core #7 |
+|---|---|---|---|
+| 100,000 / 200,000 | 4:16 / 8:12 | **1:35 / 2:55** | 2:06 / 4:44 |
+| the applier's total | 14,650 | **11,842** | 13,340 |
+| ↳ put (ins / get / undo / del / wal) | 7,135 (2,621 / 58 / 979 / 3,079 / 59) | **3,842 (664 / 57 / 921 / 1,822 / 63)** | — |
+| ↳ get | 4,287 | 4,607 | — |
+| ↳ ckpt | 432 | 731 | — |
+| flush on the applier | 131 (112 freezes) | 125 (110 freezes; writer p50 16.6 s, 0 waits, 0 inline) | 868 (16) |
+| tail, download end → ready | 99 s | **34 s** | — |
+| boot → block 1 | 46.5 s | 48 s (liveness 1.3, ranking 8.2, headers 38) | 45 s |
+| distinct peers / chunk wait sum / banned | 70 / 6,790 s / 0 of 161 | 69 / 5,872 s / 34 of 132 | — |
+| PSS mean / peak | 38.5 / 67.9 GB | 39.9 / 75.6 GB | 17.6 / 34.3 GB |
+| anon mean / peak | 10.0 / 22.1 GB | 15.3 / 32.2 GB | 10.0 / 12.0 GB |
+
+B9 part 2: closed (the early chain is bmc's from block 1; gate line
+`idle waits cut short 1670`). B11: closed and past its target (put
+3,842 against the target of ≤ 4,994; the applier 11,842 against the
+~12,500 hoped for). B10: closed (no re-ranking in the tail; the clamp's
+"not believed" line did not print — the claims stayed inside the bound
+this time, the tail is 34 s). B3 reap: not exercised by a benchmark (one
+block an hour is the tip's shape); verify on the deploy.
+
+**A label shift found while adding the column.** The release report's
+"put split (ins / get / undo / del / wal)" row had been filled from the
+stage report's columns ins / undo / del / wal / other — one column off,
+the sampled get (55–58 s) dropped and "other" taken as the WAL. So the
+"undo capture 2,242 → 2,463 → 3,079 s" of the run 38–40 text is the
+`put.del` column (the spent output's delete into the memtable:
+`undo_split_ns(2)`), and the undo capture proper (`undo_split_ns(1)`)
+was 921–979 s in every run and never moved. The row is corrected and the
+narrative re-worded in the report (10-07); the diagnosis stands as
+written — both movers, the insert and the delete, are the two paths that
+write the table and blob pages, which is exactly what B11 changed, and
+both fell (insert −75%, delete −41%).
+
+What grew: `get` 4,287 → 4,607 and `ckpt` 432 → 731 s, the two columns
+that share the cores with the writer child (1,859 s of writer this run
+against 1,545). Small against the 3,293 s the put column gave back; a
+next lever if the applier is to go under 11,000 s: the writer on a
+pinned core, or the checkpoint's fsync batched (B4-class, not planned).
+
+The memory row is Core's by more than in run 40, by design: the
+memtable's table and blob are heap now (anon mean 15.3 against 10.0 GB).
+Noted in the release report §5/§6 with the knob (`bmc.memtableanon=0`).
+
+Open after run 41, in order: B13 (the stall rule's ban on a fresh
+holder), B12 (the single-peer header stream), B9 part 1 (the ranking's
+churn); none of them cost run 41 measurable time.
