@@ -98,6 +98,13 @@ long rj_write(char* out, long cap, const rj_val* v, int pretty);
  * excl. NUL. For responses of unbounded size. NULL only on OOM. */
 char* rj_write_alloc(const rj_val* v, int pretty, long* len_out);
 
+/* rj_measure: the length rj_write_alloc would give, writing nothing.
+ * rj_write_to: the same bytes handed to sink piece by piece, nothing kept --
+ * the server streams a reply this way (2026-10-07). Returns 0, or -1 once
+ * sink returned nonzero (nothing more is handed to it). */
+long rj_measure(const rj_val* v, int pretty);
+int  rj_write_to(const rj_val* v, int pretty, int (*sink)(void* ctx, const char* p, size_t n), void* ctx);
+
 /* Core reports EVERY positional argument whose type is wrong, in one object,
  * in position order -- not just the first:
  *

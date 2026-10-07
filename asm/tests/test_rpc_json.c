@@ -25,6 +25,18 @@ static void ck_str(const char* label, const char* got, const char* expect) {
     }
 }
 
+/* a sink for rj_write_to: collects what it is handed, counts the calls, and
+ * fails from the fail_at'th call on (0 = never) */
+typedef struct { char* b; size_t n, cap; long calls, fail_at; } sink_t;
+static int sink_put(void* ctx, const char* p, size_t n){
+    sink_t* k = (sink_t*)ctx;
+    k->calls++;
+    if (k->fail_at && k->calls >= k->fail_at) return -1;
+    if (k->n + n + 1 > k->cap){ k->cap = (k->n + n + 1) * 2; k->b = realloc(k->b, k->cap); }
+    memcpy(k->b + k->n, p, n); k->n += n; k->b[k->n] = 0;
+    return 0;
+}
+
 int main(void) {
     /* ---- empty object / array ---- */
     {
@@ -418,6 +430,60 @@ int main(void) {
              keep->nitems == 3 && !strcmp(keep->items[0]->str, "kept") && !strcmp(keep->items[2]->str, "after")
              && strlen(fz->str) > 20000u * 34); }
         rj_arena_end();
+    }
+
+    /* ---- streaming (rj_measure / rj_write_to, 2026-10-07): the server
+     * measures a reply for Content-Length, then streams it to the socket
+     * piece by piece. Both must agree with rj_write_alloc byte for byte, in
+     * both layouts, through every kind of value: named and \\u00XX escapes
+     * and DEL, empty containers, numbers, bools, null, a frozen entry, and a
+     * string longer than any buffer. */
+    {
+        size_t bn = 300000; char* big = malloc(bn + 1);
+        for (size_t i = 0; i < bn; i++) big[i] = (char)('a' + i % 26);
+        big[bn] = 0; big[1000] = '"'; big[200000] = '\n';
+        for (int arena = 0; arena < 2; arena++){
+            if (arena) rj_arena_begin();
+            rj_val* v = rj_obj();
+            rj_obj_set(v, "esc", rj_str("q\"b\\s\b\f\n\r\tc\x01d\x7f"));
+            rj_obj_set(v, "k\"ey", rj_num("-42"));
+            rj_obj_set(v, "e1", rj_obj()); rj_obj_set(v, "e2", rj_arr());
+            rj_val* a = rj_arr(); rj_arr_push(a, rj_bool(1)); rj_arr_push(a, rj_bool(0)); rj_arr_push(a, rj_null());
+            rj_arr_push(a, rj_num("7")); rj_obj_set(v, "arr", a);
+            { rj_mark mk = rj_arena_mark(); rj_val* t = rj_obj(); rj_obj_set(t, "fee", rj_num("1000"));
+              rj_obj_set(t, "depends", rj_arr()); rj_obj_set(v, "frozen", rj_freeze(t, mk)); }
+            rj_obj_set(v, "big", rj_str(big));
+            for (int pretty = 0; pretty < 2; pretty++){
+                char lab[160];
+                long wl = 0; char* w = rj_write_alloc(v, pretty, &wl);
+                snprintf(lab, sizeof lab, "stream: rj_measure is rj_write_alloc's length (%s, %s arena)", pretty ? "pretty" : "compact", arena ? "in an" : "no");
+                ck(lab, rj_measure(v, pretty) == wl);
+                sink_t k = {0};
+                int rc = rj_write_to(v, pretty, sink_put, &k);
+                snprintf(lab, sizeof lab, "stream: rj_write_to hands over rj_write_alloc's bytes (%s, %s arena)", pretty ? "pretty" : "compact", arena ? "in an" : "no");
+                ck(lab, rc == 0 && (long)k.n == wl && memcmp(k.b, w, (size_t)wl) == 0 && k.calls > 10);
+                free(k.b); free(w);
+            }
+            /* a failing sink: the call reports it and nothing more is handed over */
+            { sink_t k = { .fail_at = 5 };
+              int rc = rj_write_to(v, 0, sink_put, &k);
+              ck(arena ? "stream: a failing sink is reported, and not called again (in an arena)"
+                       : "stream: a failing sink is reported, and not called again",
+                 rc == -1 && k.calls == 5 && k.n < 64);
+              free(k.b); }
+            if (arena) rj_arena_end(); else rj_free(v);
+        }
+        free(big);
+        /* the bare kinds, compact: what a reply's top level can be */
+        rj_val* kinds[] = { rj_null(), rj_bool(1), rj_num("0"), rj_str(""), rj_arr(), rj_obj() };
+        int ok = 1;
+        for (unsigned i = 0; i < sizeof kinds / sizeof kinds[0]; i++){
+            long wl = 0; char* w = rj_write_alloc(kinds[i], 0, &wl); sink_t k = {0};
+            ok &= rj_measure(kinds[i], 0) == wl && rj_write_to(kinds[i], 0, sink_put, &k) == 0 && (long)k.n == wl
+                  && (wl == 0 || memcmp(k.b, w, (size_t)wl) == 0);
+            free(w); free(k.b); rj_free(kinds[i]);
+        }
+        ck("stream: null, bool, number, empty string, [] and {} measure and stream like rj_write_alloc", ok);
     }
 
     printf("\n%s (%d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);

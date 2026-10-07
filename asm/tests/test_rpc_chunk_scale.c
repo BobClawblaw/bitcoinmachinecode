@@ -129,6 +129,15 @@ static unsigned long mk_tx1w(unsigned char* t, const unsigned char prev[32],
     return n;
 }
 
+/* a stand-in for the client socket: a 64 KB buffer, emptied when full */
+typedef struct { char* buf; size_t n, total; } stream_sink_t;
+static int stream_put(void* ctx, const char* p, size_t n){
+    stream_sink_t* o = (stream_sink_t*)ctx;
+    if (o->n + n > 65536){ o->total += o->n; o->n = 0; if (n >= 65536){ o->total += n; return 0; } }
+    memcpy(o->buf + o->n, p, n); o->n += n;
+    return 0;
+}
+
 int main(int argc, char** argv){
     unsigned want = argc > 1 ? (unsigned)strtoul(argv[1], 0, 10) : 32000u;
     const unsigned DEPTH = 25;                     /* production's modal cluster */
@@ -186,20 +195,36 @@ int main(int argc, char** argv){
 
     long ec = 0; const char* em = NULL;
     /* the first verbose call's peak-memory growth, on the server's path: the
-     * request arena around the call and the compact body written from it
-     * (rpc_server.c render_request). The per-call tables, the reply and the
-     * body are the only large allocations it makes (ru_maxrss is bytes on
-     * Darwin, KB on Linux) */
+     * request arena around the call, the reply measured for Content-Length
+     * and then streamed out through a 64 KB buffer (rpc_server.c
+     * render_request, 2026-10-07 -- here the "socket" counts and drops). The
+     * per-call tables and the reply are the only large allocations it makes
+     * (ru_maxrss is bytes on Darwin, KB on Linux) */
     { struct rusage ru0, ru1; getrusage(RUSAGE_SELF, &ru0);
       rj_arena_begin();
       rj_val* pv = rj_parse("[true]", 6); rj_val* r = NULL;
       g_hold_max = 0;
       rpc_node_dispatch("getrawmempool", pv, &r, &ec, &em);
-      long ab = rj_arena_bytes(), bl = 0;
-      char* body = rj_write_alloc(r, 0, &bl);
+      struct rusage ruh; getrusage(RUSAGE_SELF, &ruh);   /* the handler's own peak */
+      long ab = rj_arena_bytes(), bl = rj_measure(r, 0);
+      stream_sink_t so = { malloc(65536), 0, 0 };
+      int src = rj_write_to(r, 0, stream_put, &so);
       getrusage(RUSAGE_SELF, &ru1);
-      free(body);
+      free(so.buf);
       rj_arena_end();
+      ck("the streamed body is the measured length", src == 0 && (long)(so.total + so.n) == bl);
+      /* 2026-10-07: writing the body adds nothing to the peak. It was
+       * serialized into one buffer that grew by doubling and then copied
+       * behind the headers -- +207 MB here with the buffer alone, +211 MB
+       * with the server's copy, against +177 MB for the handler. */
+      { double wmb = (double)(ru1.ru_maxrss - ruh.ru_maxrss) / (1048576.0
+#ifndef __APPLE__
+                                                                 / 1024.0
+#endif
+                                                                 );
+        char w2[200]; snprintf(w2, sizeof w2, "writing the %.1f MB body raises the peak by under 4 MB (%.1f MB): it is streamed, not buffered",
+                               bl / 1048576.0, wmb);
+        ck(w2, wmb < 4.0); }
 #ifdef __APPLE__
       double mb = (double)(ru1.ru_maxrss - ru0.ru_maxrss) / 1048576.0;
 #else

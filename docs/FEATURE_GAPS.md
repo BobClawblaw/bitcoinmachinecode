@@ -2543,6 +2543,17 @@ peak RSS +356 -> +207 MB, end-to-end time unchanged (~350 ms). What is
 left is mostly the body buffer (39 MB of text in a doubling buffer) and
 the arena's copy of the same text.
 
+Then the body stopped being buffered at all (2026-10-07). `render_request`
+measures the reply (`rj_measure`, a pass that writes nothing) for an exact
+Content-Length and streams it from the tree to the socket through one
+64 KB buffer (`rj_write_to`); it used to serialize into a doubling buffer
+and then copy that behind the headers into a second one. Production shape:
+first-call peak RSS +211 -> +177 MB on the server's path, and the write now
+adds 0.1 MB to the handler's own peak, which is all that is left: the
+call's tables and the 49 MB arena. The cost is that the arena lives until
+the client has read the reply, where it was freed before the write; it
+never outweighed the two body copies it replaces.
+
 ### The wallet has no reorg awareness (WAL-13)
 
 `wallet_scan.c`'s on-disk record is `u32 height | txid | vout | value`

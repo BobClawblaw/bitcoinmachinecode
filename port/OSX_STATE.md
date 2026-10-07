@@ -4,6 +4,19 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-10-07 — the RPC reply is streamed to the socket, not buffered: writing a 39 MB body adds 0.1 MB to the peak (shared C)
+
+After the entries became text, what was left of the server's spike beyond the handler was the body. `render_request` serialized the reply into a buffer that grew by doubling, appended the newline, then copied headers and body into a second buffer for the caller to write.
+- **`rpc_json`:** the writer's buffer (`sbuf`) has two new modes. COUNT adds up the length and writes nothing (`rj_measure`). SINK hands each piece to a callback and keeps nothing (`rj_write_to`); once the callback fails, the rest is dropped and the call returns -1. The escaper now writes through `sb_push`, so it works in all three modes.
+- **`rpc_server.c`:** `render_request` builds the reply (`request_reply`, the old body of `render_request_inner` without the serialization), measures it for an exact Content-Length, and writes headers, body and the RPC-10 newline through `rpc_out`: one 64 KB buffer, flushed to the client fd (or, for the `rpc_render_probe` seam, into memory). A small reply still goes out in one `write()`, headers and body together. `respond()` replaces the `render_request` + `send_response` pair at all three call sites (intake fast path, execution pool, longpoll waiter). No lock is held while writing: since 2026-09-19 `exec_one` takes and releases each method's lock itself.
+- **Trade-off:** the arena now lives until the client has read the reply; it used to be freed before the write. At production shape that is 49 MB against the 39 MB + up to 64 MB of body copies it replaces.
+- **Measured** (`test_rpc_chunk_scale 68000 1048576`, server path): first-call peak RSS +211 → +177 MB (+211 is the old path with the server's header copy; +207, as reported last night, was the doubling buffer alone). The +177 is the handler's own peak, reached before the first byte is written: the call's tables and the 49 MB arena. Writing the 39.3 MB body adds 0.1 MB.
+- **Tests:**
+  - `test_rpc_json` has a stream section. `rj_measure` and `rj_write_to` match `rj_write_alloc` byte for byte, in both layouts and with and without an arena, over every escape kind, empty containers, a frozen entry and a 300 KB string. A failing sink is reported and not called again, and the bare top-level kinds are covered.
+  - `test_rpc_server` sends a 200-call `help` batch to the live test server (613 KB, about ten 64 KB writes). Content-Length equals the bytes received, the body ends in `]\n`, and it is byte-identical to the same request rendered in memory.
+  - `test_rpc_chunk_scale` streams the first call the way the server does and asserts the write raises the peak by under 4 MB. A mutation that makes the sink path also buffer fails it (13.9 MB at the default 32k size).
+- **Full suite:** 424 PASS, 11 SKIP, 14 N/A, 0 FAIL. FEATURE_GAPS.md RPC-12 and note item 24 updated.
+
 ## 2026-10-06 (night, 5) — verbose `getrawmempool` keeps each entry as text, not a tree: reply arena 198 → 49 MB (shared C)
 
 The remaining spike after the compact graph was the reply. The server builds every value in the request arena (`rpc_server.c` `render_request`, plan A5), where `rj_free` is a no-op, so all 68k entry trees stayed live until the body was written: 198 MB of arena for a 39 MB body (measured on the server's path: arena, dispatch, `rj_write_alloc`).

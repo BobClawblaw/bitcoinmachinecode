@@ -777,6 +777,54 @@ int main(void) {
     }
 
     /* ---- teardown ---- */
+    /* ============ the streamed reply (2026-10-07) ============
+     * render_request writes the body straight from the reply tree to the
+     * socket through a 64 KB buffer, after measuring it for Content-Length.
+     * A reply many buffers long must arrive whole: Content-Length equal to
+     * the bytes that follow the headers, and those bytes identical to the
+     * same request rendered into memory in this process (rpc_render_probe
+     * renders through the same writer into a growing buffer). */
+    {   extern long rpc_render_probe(const char* body, unsigned long blen, char** out, unsigned long* outlen);
+        size_t bcap = 16u << 10; char* batch = malloc(bcap); size_t bl = 0;
+        bl += (size_t)snprintf(batch + bl, bcap - bl, "[");
+        for (int i = 0; i < 200; i++)
+            bl += (size_t)snprintf(batch + bl, bcap - bl, "%s{\"id\":%d,\"method\":\"help\",\"params\":[]}", i ? "," : "", i);
+        bl += (size_t)snprintf(batch + bl, bcap - bl, "]");
+        char* req = malloc(bl + 4096);
+        make_post(req, bl + 4096, port, "bitcoin", "bitcoin", batch, NULL);
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in a; memset(&a, 0, sizeof a);
+        a.sin_family = AF_INET; a.sin_port = htons((unsigned short)port);
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        size_t cap = 1u << 20, got = 0; char* in = malloc(cap);
+        if (connect(fd, (struct sockaddr*)&a, sizeof a) == 0 && write(fd, req, strlen(req)) == (ssize_t)strlen(req)){
+            for (;;){                                   /* the server closes after the reply */
+                if (got + 65536 > cap){ cap *= 2; in = realloc(in, cap); }
+                ssize_t n = read(fd, in + got, cap - got - 1);
+                if (n <= 0) break;
+                got += (size_t)n;
+            }
+        }
+        close(fd);
+        in[got] = 0;
+        const char* he = strstr(in, "\r\n\r\n");
+        const char* cl = strstr(in, "Content-Length: ");
+        long want = cl ? strtol(cl + 16, NULL, 10) : -1;
+        size_t body_at = he ? (size_t)(he + 4 - in) : got;
+        char* mine = NULL; unsigned long mlen = 0;
+        rpc_render_probe(batch, bl, &mine, &mlen);
+        const char* mhe = mine ? strstr(mine, "\r\n\r\n") : NULL;
+        size_t mbody_at = mhe ? (size_t)(mhe + 4 - mine) : 0;
+        printf("      (streamed reply: %zu body bytes, Content-Length %ld)\n", got - body_at, want);
+        ck("a streamed reply spans several 64 KB writes", he && got - body_at > 4 * 65536);
+        ck("...its Content-Length is the bytes that follow the headers", he && want == (long)(got - body_at));
+        ck("...it is the whole batch, newline-terminated",
+           he && has_substr(he, "\"id\":199") && got >= 2 && in[got - 2] == ']' && in[got - 1] == '\n');
+        ck("...byte-identical to the same request rendered into memory",
+           he && mhe && mlen - mbody_at == got - body_at && memcmp(in + body_at, mine + mbody_at, got - body_at) == 0);
+        free(mine); free(in); free(req); free(batch);
+    }
+
     kill(srv, SIGTERM);
     waitpid(srv, NULL, 0);
 

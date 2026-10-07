@@ -627,8 +627,8 @@ static rj_val* exec_one(rj_val* req, int* status, int* is_notification) {
     return reply;
 }
 
-/* Build the complete HTTP response for one request into a malloc'd buffer
- * (headers AND body, one allocation) and hand it back; the CALLER writes it.
+/* Build the reply for one request, then write the HTTP response (2026-10-07:
+ * streamed -- see render_request).
  *
  * It used to take the client fd and write the reply itself -- while holding
  * g_exec_lock, because both call sites wrap it in that lock. Execution is
@@ -643,31 +643,113 @@ static rj_val* exec_one(rj_val* req, int* status, int* is_notification) {
  *
  * Rendering needs the lock; writing to a socket does not. Separating them
  * takes network I/O out of the critical section entirely, and the serial
- * execution contract is untouched. */
+ * execution contract is untouched. (Since 2026-09-19 the lock is taken per
+ * method inside exec_one, so by the time a reply is written no lock is held
+ * -- which is what lets render_request stream it.) */
 /* 2026-10-06 (plan A5): one JSON arena per request on the thread that
  * renders it -- the parsed request, the result tree and the reply wrapper
- * are bump-allocated and released together after the body is written
- * (rj_write_alloc's output buffer stays a plain malloc: send_response frees
- * it). getblock verbosity 2 on a full block built ~400,000 values through
- * malloc and freed them one by one: a third of its render time. */
-static char* render_request_inner(const char* body, size_t blen, size_t* outlen);
+ * are bump-allocated and released together after the body is written.
+ * getblock verbosity 2 on a full block built ~400,000 values through
+ * malloc and freed them one by one: a third of its render time.
+ *
+ * 2026-10-07: the body is STREAMED from the reply tree to the client, through
+ * one 64 KB buffer, instead of being serialized into a buffer that grew by
+ * doubling and then copied behind the headers into a second one. A 39 MB
+ * verbose getrawmempool had 64 MB + 39 MB of body in memory next to its
+ * arena. Content-Length is still exact: the tree is measured first
+ * (rj_measure, a pass that writes nothing). The cost is that the arena now
+ * lives until the client has read the reply -- it was freed before the write
+ * -- but it never outweighed the two body copies it replaces. A small reply
+ * still goes out in one write(), headers and body together. */
+#define RPC_OUT_CHUNK 65536
+typedef struct {
+    int fd;                          /* the client; -1 = collect into mem (the probe) */
+    char* mem; size_t mlen, mcap;
+    char* buf; size_t n;             /* RPC_OUT_CHUNK bytes */
+    int failed;                      /* the client is gone: drop the rest */
+} rpc_out;
+static int ro_emit(rpc_out* o, const char* p, size_t n){
+    if (o->failed) return -1;
+    if (o->fd >= 0){ if (write_all(o->fd, p, n) != 0) o->failed = 1; }
+    else {
+        if (o->mlen + n + 1 > o->mcap){
+            size_t c = o->mcap ? o->mcap : RPC_OUT_CHUNK;
+            while (c < o->mlen + n + 1) c *= 2;
+            char* m = realloc(o->mem, c);
+            if (!m){ o->failed = 1; return -1; }
+            o->mem = m; o->mcap = c;
+        }
+        memcpy(o->mem + o->mlen, p, n); o->mlen += n; o->mem[o->mlen] = 0;
+    }
+    return o->failed ? -1 : 0;
+}
+static int ro_flush(rpc_out* o){
+    int r = o->n ? ro_emit(o, o->buf, o->n) : (o->failed ? -1 : 0);
+    o->n = 0;
+    return r;
+}
+static int ro_put(void* ctx, const char* p, size_t n){
+    rpc_out* o = (rpc_out*)ctx;
+    if (o->failed) return -1;
+    if (o->n + n > RPC_OUT_CHUNK){
+        if (ro_flush(o) != 0) return -1;
+        if (n >= RPC_OUT_CHUNK) return ro_emit(o, p, n);   /* a big piece goes straight out */
+    }
+    memcpy(o->buf + o->n, p, n); o->n += n;
+    return 0;
+}
+static rj_val* request_reply(const char* body, size_t blen, int* status_out);
 static long g_last_render_arena_bytes = -1;   /* test seam: the arena's size when the last reply was written (-1 = no arena) */
-static char* render_request(const char* body, size_t blen, size_t* outlen) {
+static void render_request(const char* body, size_t blen, rpc_out* o) {
     rj_arena_begin();
-    char* r = render_request_inner(body, blen, outlen);
+    int status = HTTP_OK;
+    rj_val* reply = request_reply(body, blen, &status);
+    /* RPC-10 (audit 2026-09-03): Core appends a newline to every reply
+     * body -- httprpc.cpp's `req->WriteReply(HTTP_OK, reply.write() + "\n")`
+     * -- so "Core-bit-exact" was off by one byte. Only when there IS a
+     * reply: a v2 notification is a 204 with no body at all, and
+     * test_rpc_server's "no body" case asserts the response ends at the
+     * header terminator.
+     *
+     * Safe for every consumer: rj_parse skips leading and trailing
+     * whitespace before its end-of-input check, and every test assertion
+     * on a body is a prefix or substring match. */
+    long bodylen = reply ? rj_measure(reply, 0) + 1 : 0;
+    char hdr[192];
+    int hl = snprintf(hdr, sizeof hdr,
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %ld\r\n"
+        /* RPC-10: the server closes after every reply, but said so nowhere --
+         * an HTTP/1.1 client that keeps the connection alive (http.client,
+         * requests) saw an unexpected EOF on its NEXT request. */
+        "Connection: close\r\n"
+        "\r\n",
+        status, status_text(status), bodylen);
+    ro_put(o, hdr, (size_t)hl);
+    if (reply){ rj_write_to(reply, 0, ro_put, o); ro_put(o, "\n", 1); }
+    ro_flush(o);
     g_last_render_arena_bytes = rj_arena_bytes();
     rj_arena_end();
-    return r;
+}
+/* Answer one request on cfd and close it. Called with NO lock held, so a
+ * slow reader costs only its own connection. */
+static void respond(int cfd, const char* body, size_t blen) {
+    rpc_out o = { .fd = cfd, .buf = malloc(RPC_OUT_CHUNK) };
+    if (o.buf) render_request(body, blen, &o);   /* out of memory: drop it */
+    free(o.buf);
+    close(cfd);
 }
 /* test seam: render one body in this process and report the arena's size */
 long rpc_render_probe(const char* body, unsigned long blen, char** out, unsigned long* outlen){
-    size_t n = 0; char* r = render_request(body, (size_t)blen, &n);
-    if (out) *out = r; else free(r);
-    if (outlen) *outlen = n;
+    rpc_out o = { .fd = -1, .buf = malloc(RPC_OUT_CHUNK) };
+    if (o.buf) render_request(body, (size_t)blen, &o);
+    free(o.buf);
+    if (out) *out = o.mem; else free(o.mem);
+    if (outlen) *outlen = o.mlen;
     return g_last_render_arena_bytes;
 }
-static char* render_request_inner(const char* body, size_t blen, size_t* outlen) {
-    *outlen = 0;
+static rj_val* request_reply(const char* body, size_t blen, int* status_out) {
     rj_val* req = rj_parse(body, blen);
     int status = HTTP_OK;
     int is_v2_notification = 0;
@@ -729,69 +811,12 @@ static char* render_request_inner(const char* body, size_t blen, size_t* outlen)
     }
 
     if (is_v2_notification && reply) { rj_free(reply); reply = NULL; status = HTTP_NO_CONTENT; }
-
-    /* Body is sized to the value: getblock/getrawtransaction on a real block
-     * is many MB. A fixed buffer + rj_write's returned length used as the
-     * write() size was an out-of-bounds read that leaked process memory to the
-     * client (and produced invalid JSON past the buffer). */
-    char* respbody = NULL;
-    long bodylen = 0;
-    if (reply) {
-        respbody = rj_write_alloc(reply, 0, &bodylen);
-        rj_free(reply);
-        if (bodylen < 0) bodylen = 0;
-        /* RPC-10 (audit 2026-09-03): Core appends a newline to every reply
-         * body -- httprpc.cpp's `req->WriteReply(HTTP_OK, reply.write() + "\n")`
-         * -- so "Core-bit-exact" was off by one byte. Gated on `reply` ON
-         * PURPOSE: a v2 notification takes the 204 path above with no body at
-         * all, and test_rpc_server's "no body" case asserts the response ends
-         * at the header terminator. Appending unconditionally would emit a
-         * 1-byte body on a 204 and break it.
-         *
-         * Safe for every consumer: rj_parse skips leading and trailing
-         * whitespace before its end-of-input check, and every test assertion
-         * on a body is a prefix or substring match. */
-        if (respbody && bodylen > 0) {
-            char* nb = realloc(respbody, (size_t)bodylen + 2);
-            if (nb) { respbody = nb; respbody[bodylen++] = '\n'; respbody[bodylen] = 0; }
-        }
-    }
-
-    char hdr[192];
-    int hl = snprintf(hdr, sizeof hdr,
-        "HTTP/1.1 %d %s\r\n"
-        "Content-Type: application/json\r\n"
-        "Content-Length: %ld\r\n"
-        /* RPC-10: the server closes after every reply, but said so nowhere --
-         * an HTTP/1.1 client that keeps the connection alive (http.client,
-         * requests) saw an unexpected EOF on its NEXT request. */
-        "Connection: close\r\n"
-        "\r\n",
-        status, status_text(status), bodylen);
-    /* One buffer, headers then body: the caller writes it after releasing the
-     * execution lock. (A 204 has no body at all -- respbody is NULL and
-     * bodylen 0 -- so the response ends at the header terminator, which
-     * test_rpc_server asserts.) */
-    char* out = malloc((size_t)hl + (size_t)bodylen + 1);
-    if (!out){ free(respbody); return NULL; }
-    memcpy(out, hdr, (size_t)hl);
-    if (respbody && bodylen > 0) memcpy(out + hl, respbody, (size_t)bodylen);
-    free(respbody);
-    *outlen = (size_t)hl + (size_t)(bodylen > 0 ? bodylen : 0);
-    out[*outlen] = 0;
-    return out;
-}
-
-/* Write a rendered response and close. Called with NO lock held, so a slow
- * reader costs only its own connection. */
-static void send_response(int cfd, char* resp, size_t len) {
-    for (size_t off = 0; resp && off < len; ) {
-        ssize_t wr = write(cfd, resp + off, len - off);
-        if (wr <= 0) break;                 /* client gone or timed out: drop it */
-        off += (size_t)wr;
-    }
-    free(resp);
-    close(cfd);
+    /* (A body is sized to the value, however large: getblock/getrawtransaction
+     * on a real block is many MB. A fixed buffer + rj_write's returned length
+     * used as the write() size was an out-of-bounds read that leaked process
+     * memory to the client.) */
+    *status_out = status;
+    return reply;
 }
 
 /* Serve one connection: read the full request, authenticate, dispatch.
@@ -1176,9 +1201,9 @@ static void* lp_waiter(void* arg){
             nanosleep(&ts, NULL);
         }
     }
-    size_t lp_len = 0;   /* exec_one takes the method's lock for its dispatch */
-    char* lp_resp = render_request(r->buf + r->body_off, r->blen, &lp_len);
-    send_response(r->cfd, lp_resp, lp_len);        /* socket write, lock released */
+    /* exec_one takes the method's lock for its dispatch; the reply is
+     * written with it released */
+    respond(r->cfd, r->buf + r->body_off, r->blen);
     free(r->buf); free(r);
     lp_waiters_release();                          /* RPC-5 */
     return NULL;
@@ -1238,9 +1263,7 @@ static void* exec_thread(void* arg){
         if (!g_run){ pthread_mutex_unlock(&g_xq_lock); return NULL; }   /* stop: queued jobs are closed by rpc_server_stop */
         xjob_t j = g_xq[g_xq_head]; g_xq_head = (g_xq_head + 1) % RPC_QUEUE_CAP; g_xq_n--;
         pthread_mutex_unlock(&g_xq_lock);
-        size_t resplen = 0;
-        char* resp = render_request(j.buf + j.body_off, j.blen, &resplen);
-        send_response(j.cfd, resp, resplen);     /* socket write, no lock held */
+        respond(j.cfd, j.buf + j.body_off, j.blen);   /* socket write, no lock held */
         free(j.buf);
     }
 }
@@ -1390,9 +1413,7 @@ static void service_conn(int cfd) {
      * slow calls parked every -rpcthreads worker on it and the next uptime
      * sat in the accept queue (run 27: 44 s). */
     if (rpc_body_is_fast(body, blen)){
-        size_t resplen = 0;
-        char* resp = render_request(body, blen, &resplen);
-        send_response(cfd, resp, resplen);
+        respond(cfd, body, blen);
         free(buf);
         return;
     }
