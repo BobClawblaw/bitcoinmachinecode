@@ -178,7 +178,13 @@ int rpc_dispatch(const char* method, const rj_val* params, const rpc_wallet* w, 
         }
         *result = arr; return 1; }
     if (!strcmp(method, "getrawmempool") && g_mp_on){ *result = J("[\"6666666666666666666666666666666666666666666666666666666666666666\"]"); return 1; }
-    if (!strcmp(method, "getrawmempool")){ if (params->items[0]->str[0] == '1'){ *result = J("{\"4444444444444444444444444444444444444444444444444444444444444444\":{\"vsize\":110,\"fees\":{\"base\":0.000005}}}"); return 1; }
+    if (!strcmp(method, "getrawmempool")){ if (params->items[0]->str[0] == '1'){
+            /* frozen, as rpc_node's verbose getrawmempool hands its entries
+             * out since 2026-10-06 (rj_freeze): /mempool/recent reads into it */
+            rj_val* o = rj_obj(); rj_mark mk = rj_arena_mark();
+            rj_obj_set(o, "4444444444444444444444444444444444444444444444444444444444444444",
+                       rj_freeze(J("{\"vsize\":110,\"fees\":{\"base\":0.000005}}"), mk));
+            *result = o; return 1; }
         *result = J("[\"4444444444444444444444444444444444444444444444444444444444444444\"]"); return 1; }
     if (!strcmp(method, "getmempoolinfo")){ *result = J("{\"size\":1,\"bytes\":110,\"total_fee\":0.000005}"); return 1; }
     if (!strcmp(method, "sendrawtransaction")){ if (p0 && !strcmp(p0, "0200aa")){ *result = rj_str("4444444444444444444444444444444444444444444444444444444444444444"); return 1; } *ec = -26; *em = "TX rejected"; return 0; }

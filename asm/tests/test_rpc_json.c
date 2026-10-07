@@ -356,6 +356,70 @@ int main(void) {
         { rj_val* after = rj_obj(); ck("A5 after the end values are malloc'd again (not owned by any arena)", !rj_arena_owns(after)); rj_free(after); }
     }
 
+    /* ---- frozen values (rj_freeze / RJ_RAW, 2026-10-06): verbose
+     * getrawmempool keeps each entry's text, not its tree ---- */
+    {
+        const char* ej = "{\"vsize\":141,\"fees\":{\"base\":0.00000282,\"ancestor\":0.00000282},"
+                         "\"depends\":[\"aa\"],\"spentby\":[],\"bip125-replaceable\":false,\"s\":\"q\\\"\\n\"}";
+        for (int arena = 0; arena < 2; arena++){
+            const char* tag = arena ? "under the arena" : "without an arena";
+            char what[160];
+            if (arena) rj_arena_begin();
+            rj_val* parent = rj_obj();
+            rj_obj_set(parent, "first", rj_num("1"));
+            rj_val* ref = rj_parse(ej, strlen(ej));
+            char want_c[512], want_p[1024]; rj_write(want_c, sizeof want_c, ref, 0); rj_write(want_p, sizeof want_p, ref, 2);
+            long b0 = rj_arena_bytes();
+            rj_mark mk = rj_arena_mark();
+            rj_val* tree = rj_parse(ej, strlen(ej));       /* stands in for an entry built after the mark */
+            rj_val* fz = rj_freeze(tree, mk);
+            snprintf(what, sizeof what, "freeze %s: an RJ_RAW holding the compact text", tag);
+            ck(what, fz && fz->typ == RJ_RAW && !strcmp(fz->str, want_c));
+            if (arena){
+                ck("freeze under the arena: the tree's bytes are given back (only the text and its shell remain)",
+                   rj_arena_bytes() - b0 < (long)strlen(want_c) + 128);
+            }
+            rj_obj_set(parent, "e", fz);
+            rj_obj_set(parent, "last", rj_num("2"));
+            char got[1024], wantall[1024];
+            snprintf(wantall, sizeof wantall, "{\"first\":1,\"e\":%s,\"last\":2}", want_c);
+            rj_write(got, sizeof got, parent, 0);
+            snprintf(what, sizeof what, "freeze %s: the parent renders byte-identical (compact)", tag);
+            ck(what, !strcmp(got, wantall));
+            { rj_val* pref = rj_obj(); rj_obj_set(pref, "first", rj_num("1")); rj_obj_set(pref, "e", rj_clone(ref)); rj_obj_set(pref, "last", rj_num("2"));
+              char wp[2048], gp[2048]; rj_write(wp, sizeof wp, pref, 2); rj_write(gp, sizeof gp, parent, 2);
+              snprintf(what, sizeof what, "freeze %s: ...and pretty, re-rendered at its depth", tag);
+              ck(what, !strcmp(wp, gp)); rj_free(pref); }
+            { rj_val* cl = rj_clone(fz); char c1[512]; rj_write(c1, sizeof c1, cl, 0);
+              snprintf(what, sizeof what, "freeze %s: a clone stays frozen and renders the same", tag);
+              ck(what, cl && cl->typ == RJ_RAW && !strcmp(c1, want_c)); rj_free(cl); }
+            ck("rj_type_name of a frozen object is \"object\"", !strcmp(rj_type_name(fz), "object"));
+            { rj_val* vs = rj_obj_get(fz, "vsize"); rj_val* fees = rj_obj_get(fz, "fees");
+              rj_val* base = fees ? rj_obj_get(fees, "base") : NULL;
+              snprintf(what, sizeof what, "freeze %s: rj_obj_get expands it in place and finds the members", tag);
+              ck(what, fz->typ == RJ_OBJ && vs && !strcmp(vs->str, "141") && base && !strcmp(base->str, "0.00000282")); }
+            rj_write(got, sizeof got, parent, 0);
+            snprintf(what, sizeof what, "freeze %s: ...and the expanded value still renders the same", tag);
+            ck(what, !strcmp(got, wantall));
+            rj_free(ref); rj_free(parent);
+            if (arena) rj_arena_end();
+        }
+        /* a rewind across a chunk boundary: the chunks the tree opened are freed */
+        rj_arena_begin();
+        { rj_val* keep = rj_arr(); rj_arr_push(keep, rj_str("kept"));
+          long b0 = rj_arena_bytes(); rj_mark mk = rj_arena_mark();
+          rj_val* big = rj_arr(); for (int i = 0; i < 20000; i++) rj_arr_push(big, rj_str("0123456789abcdef0123456789abcdef"));
+          int spanned = rj_arena_bytes() - b0 > (1L << 20);
+          rj_val* fz = rj_freeze(big, mk);
+          ck("freeze: a tree spanning several arena chunks is rewound to the mark", spanned && fz && fz->typ == RJ_RAW
+             && rj_arena_bytes() - b0 < (long)strlen(fz->str) + 128);
+          rj_arr_push(keep, fz); rj_arr_push(keep, rj_str("after"));
+          ck("freeze: what was built before the mark survives, and the arena keeps working after",
+             keep->nitems == 3 && !strcmp(keep->items[0]->str, "kept") && !strcmp(keep->items[2]->str, "after")
+             && strlen(fz->str) > 20000u * 34); }
+        rj_arena_end();
+    }
+
     printf("\n%s (%d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);
     return fails ? 1 : 0;
 }

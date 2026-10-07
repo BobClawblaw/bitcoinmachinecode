@@ -20,7 +20,12 @@
 
 #include <stddef.h>
 
-enum rj_type { RJ_NULL, RJ_BOOL, RJ_NUM, RJ_STR, RJ_ARR, RJ_OBJ };
+/* RJ_RAW (2026-10-06): an object or array ALREADY SERIALIZED, compact, held
+ * as its text in str -- what rj_freeze makes. The writer copies it through
+ * (and re-renders it in pretty mode); rj_obj_get expands it in place into
+ * the object it was on first lookup, so readers that go through rj_obj_get
+ * see no difference. Code that switches on typ sees RJ_RAW. */
+enum rj_type { RJ_NULL, RJ_BOOL, RJ_NUM, RJ_STR, RJ_ARR, RJ_OBJ, RJ_RAW };
 
 typedef struct rj_val rj_val;
 
@@ -51,6 +56,20 @@ rj_val* rj_hex(const unsigned char* b, size_t n);   /* the bytes as a lowercase-
 rj_val* rj_strf(const char* fmt, ...);
 rj_val* rj_arr(void);
 rj_val* rj_obj(void);
+
+/* Serialize v (compact) and release it, returning an RJ_RAW that holds the
+ * text: a large reply built entry by entry keeps each entry's text, not its
+ * tree. Under the request arena the release is a rewind to m, which must be
+ * the rj_arena_mark() taken just before v was built -- nothing else the
+ * caller keeps may have been allocated since. Without an arena m is ignored
+ * and v is rj_free()d. */
+typedef struct { void* chunk; size_t used, total; } rj_mark;
+rj_mark rj_arena_mark(void);
+rj_val* rj_freeze(rj_val* v, rj_mark m);
+/* Expand an RJ_RAW in place into the value its text holds (a no-op for any
+ * other value). 0 on success, -1 if the text did not parse (it is the
+ * writer's own output, so that is a bug). rj_obj_get calls it. */
+int rj_expand(rj_val* v);
 
 /* Array helpers. */
 void rj_arr_push(rj_val* a, rj_val* v);

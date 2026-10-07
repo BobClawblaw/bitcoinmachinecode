@@ -81,6 +81,22 @@ void rj_arena_end(void){
     free(a); t_arena = NULL;
 }
 int  rj_arena_active(void){ return t_arena != NULL; }
+/* where the arena is now: rj_freeze rewinds to it */
+rj_mark rj_arena_mark(void){
+    rj_mark m = { 0, 0, 0 };
+    if (t_arena){ m.chunk = t_arena->cur; m.used = t_arena->cur ? t_arena->cur->used : 0; m.total = t_arena->total; }
+    return m;
+}
+/* back to m: chunks opened since are freed, the marked chunk is cut back */
+static void arena_rewind(rj_mark m){
+    rj_arena* a = t_arena;
+    rj_chunk* keep = (rj_chunk*)m.chunk;
+    rj_chunk* c = keep ? keep->next : a->head;
+    while (c){ rj_chunk* n = c->next; free(c); a->chunks--; c = n; }
+    if (keep){ keep->next = NULL; keep->used = m.used; }
+    else a->head = NULL;
+    a->cur = keep; a->total = m.total;
+}
 long rj_arena_bytes(void){ return t_arena ? (long)t_arena->total : -1; }
 int  rj_arena_owns(const void* p){ return arena_owns(p); }
 
@@ -201,6 +217,9 @@ rj_val* rj_clone(const rj_val* v){
         case RJ_BOOL: c = rj_bool(v->str && v->str[0] == '1'); break;
         case RJ_NUM:  c = rj_num(v->str ? v->str : "0"); break;
         case RJ_STR:  c = rj_str(v->str ? v->str : ""); break;
+        case RJ_RAW:
+            c = rj_null(); if (!c) return NULL;
+            c->typ = RJ_RAW; c->str = xstrdup(v->str ? v->str : "null"); break;
         case RJ_ARR:
             c = rj_arr();
             if (!c) return NULL;
@@ -224,6 +243,7 @@ rj_val* rj_clone(const rj_val* v){
 }
 
 rj_val* rj_obj_get(const rj_val* o, const char* key) {
+    if (o->typ == RJ_RAW) rj_expand((rj_val*)o);   /* logically const: same value, unfolded */
     for (size_t i = 0; i < o->nmembers; i++)
         if (!strcmp(o->members[i].key, key)) return o->members[i].val;
     return NULL;
@@ -385,6 +405,15 @@ static void rj_w(sbuf* s, const rj_val* v, int pretty, unsigned indent) {
             break;
         case RJ_NUM:
             sb_pushs(s, v->str ? v->str : "0");
+            break;
+        case RJ_RAW:
+            if (!pretty) { sb_pushs(s, v->str ? v->str : "null"); break; }
+            {   /* pretty: the text is compact, so render it again (rare --
+                 * the server writes compact) */
+                rj_val* t = v->str ? rj_parse(v->str, strlen(v->str)) : NULL;
+                rj_w(s, t, pretty, indent);
+                rj_free(t);
+            }
             break;
         case RJ_BOOL:
             sb_pushs(s, (v->str && !strcmp(v->str, "1")) ? "true" : "false");
@@ -643,6 +672,7 @@ rj_val* rj_parse(const char* s, size_t len) {
 
 const char* rj_type_name(const rj_val* v) {
     if (!v) return "null";
+    if (v->typ == RJ_RAW) return (v->str && v->str[0] == '[') ? "array" : (v->str && v->str[0] == '{') ? "object" : "null";
     switch (v->typ) {
         case RJ_NULL: return "null";  case RJ_BOOL: return "bool";
         case RJ_NUM:  return "number"; case RJ_STR: return "string";
@@ -693,4 +723,30 @@ int rj_typeerr_fail(rj_typeerrs* t, long* ec, const char** em) {
     if (!t->n) return 0;
     snprintf(out, sizeof out, "Wrong type passed:\n{\n%s\n}", t->buf);
     *ec = -3; *em = out; return 1;
+}
+
+/* ---------------- frozen values (2026-10-06) ---------------- */
+/* verbose getrawmempool built ~68,000 entry trees and kept them all until the
+ * reply was written: ~200 MB of arena at a 68k pool for ~39 MB of text. Each
+ * entry is now written as soon as it is built and only its text is kept. */
+static __thread char* t_frz; static __thread size_t t_frz_cap;
+rj_val* rj_freeze(rj_val* v, rj_mark m){
+    if (!v) return NULL;
+    sbuf sb = { t_frz, 0, t_frz_cap };          /* one scratch buffer per thread, reused */
+    rj_w(&sb, v, 0, 0);
+    t_frz = sb.buf; t_frz_cap = sb.cap;
+    if (t_arena) arena_rewind(m); else rj_free(v);
+    rj_val* r = xmalloc(sizeof *r); memset(r, 0, sizeof *r);
+    r->typ = RJ_RAW;
+    r->str = xstrndup(sb.buf ? sb.buf : "null", sb.buf ? sb.len : 4);
+    return r;
+}
+int rj_expand(rj_val* v){
+    if (!v || v->typ != RJ_RAW) return 0;
+    rj_val* t = v->str ? rj_parse(v->str, strlen(v->str)) : NULL;
+    if (!t) return -1;
+    xfree(v->str);
+    *v = *t;                     /* take the parsed value's fields */
+    xfree(t);                    /* its shell only */
+    return 0;
 }

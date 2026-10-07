@@ -2529,10 +2529,19 @@ rendered. `pol_entry_info_all` became `pol_graph_all`, which sizes its
 own output, so the capacity retry is gone. At production shape the first
 call's peak RSS went from +794 to +318 MB and its hold from 51.9 to
 26.0 ms (steady 25.3 -> 21.4 ms). The verbose ancestors/descendants
-snapshot uses the same format. **Open:** the remaining ~+318 MB is the
-reply's JSON tree (~244 MB of `rj_val` for 68k entries, ~3.6 KB each, for
-39 MB of text), which only a writer that serializes entry by entry would
-shrink.
+snapshot uses the same format.
+
+The reply is now built entry by entry, too. On the server's path every
+value lives in the request arena until the body is written, and the 68k
+entry trees came to 198 MB of arena for a 39 MB body. Each entry is now
+serialized as soon as it is built (`rj_freeze`): the arena is rewound to
+the mark taken before the entry and only its compact text is kept, as an
+`RJ_RAW` value the writer copies through. `rj_obj_get` expands a frozen
+value in place, so in-process readers (Esplora's `/mempool/recent`) are
+unchanged. Production shape, server path: arena 198 -> 49 MB, first-call
+peak RSS +356 -> +207 MB, end-to-end time unchanged (~350 ms). What is
+left is mostly the body buffer (39 MB of text in a doubling buffer) and
+the arena's copy of the same text.
 
 ### The wallet has no reorg awareness (WAL-13)
 

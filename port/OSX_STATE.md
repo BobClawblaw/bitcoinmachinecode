@@ -4,6 +4,19 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-10-06 (night, 5) — verbose `getrawmempool` keeps each entry as text, not a tree: reply arena 198 → 49 MB (shared C)
+
+The remaining spike after the compact graph was the reply. The server builds every value in the request arena (`rpc_server.c` `render_request`, plan A5), where `rj_free` is a no-op, so all 68k entry trees stayed live until the body was written: 198 MB of arena for a 39 MB body (measured on the server's path: arena, dispatch, `rj_write_alloc`).
+- **`rpc_json`:** a new value type `RJ_RAW` holds an object or array already serialized compactly. `rj_arena_mark()` / `rj_freeze(v, mark)` serialize `v` into a per-thread scratch buffer, rewind the arena to the mark (freeing any chunks opened since), and return the text as an `RJ_RAW`; without an arena they `rj_free` the tree. The writer copies `RJ_RAW` through in compact mode and re-renders it in pretty mode. `rj_clone` keeps it frozen, `rj_type_name` answers from its first byte, and `rj_obj_get` expands it in place (`rj_expand`), so readers that go through `rj_obj_get` see no difference.
+- **`rpc_node.c`:** both verbose loops in `cmd_getrawmempool` (the snapshot one and the under-the-lock fallback) freeze each entry right after `mpe_entry_obj` builds it.
+- **Measured** (`test_rpc_chunk_scale 68000 1048576`, server path): arena 198 → 49 MB; first-call peak RSS +356 → +207 MB. The full server path (arena, dispatch, write, release) is unchanged at ~350 ms: the serialization moved from the writer into the handler, so the handler alone went from ~328 to ~388 ms while the write became a copy.
+- **What is left** of the +207 MB is mostly the 39 MB body in `rj_write_alloc`'s doubling buffer (up to 64 MB) next to the arena's copy of the same text, plus the call's tables. Writing straight to the socket would remove both; that is a change to the server's response path, not done.
+- **Tests:**
+  - `test_rpc_json` gains 17 freeze checks, run both with and without an arena: byte-identical compact and pretty output, clone, `rj_type_name`, expansion through `rj_obj_get`, and an arena rewind across chunk boundaries that keeps what was built before the mark.
+  - `test_rpc_chunk_scale`'s first call now runs on the server's path and asserts the arena stays under twice the body (49.0 MB for 39.3 MB).
+  - `test_rpc_esplora`'s mock `getrawmempool` freezes its entry, so `/mempool/recent` reads through an expansion. Disabling the expansion in `rj_obj_get` fails it and `test_rpc_json`.
+- **Full suite:** 424 PASS, 11 SKIP, 14 N/A, 0 FAIL. FEATURE_GAPS.md RPC-12 and note item 24 updated.
+
 ## 2026-10-06 (night, 4) — verbose `getrawmempool`'s one-pass graph is compact: peak RSS per call +794 → +318 MB (shared C)
 
 The ~+790 MB peak RSS was `pol_entry_info_all` writing one ~8.3 KB `mp_entry_info` (four fixed 64-txid arrays) per registry node, ~560 MB at a 68k pool, under the lock. Now `mpool_policy_graph_all` fills an `mp_graph` (`mempool_entry.h`): per node a header (txid, fees, sizes, sigop cost, four counts) and an offset into one shared txid list, in the order depends, spentby, anc, desc. A singleton costs its header plus two txids. The walk is unchanged: it fills one reusable scratch record and appends it, so the sets are the same members in the same order. `rpc_node.c` reads edges in place (`mp_graph_depends`/`_spentby`, for `mpc_lookup_bulk`) and expands one node into the existing local `mp_entry_info` in `mpe_entry_obj` (`mp_graph_expand`). The hook is `pol_graph_all(polstate, mp_graph*)`, which sizes its own output, so `cmd_getrawmempool`'s capacity retry is gone. The ancestors/descendants component snapshot builds the same format (it had a 256 × 8.3 KB = 2 MB array).

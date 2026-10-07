@@ -185,29 +185,43 @@ int main(int argc, char** argv){
     rpc_node_set_mempool(&h);
 
     long ec = 0; const char* em = NULL;
-    /* the first verbose call's peak-memory growth: the per-call tables are
-     * the only large allocations it makes (ru_maxrss is bytes on Darwin,
-     * KB on Linux) */
+    /* the first verbose call's peak-memory growth, on the server's path: the
+     * request arena around the call and the compact body written from it
+     * (rpc_server.c render_request). The per-call tables, the reply and the
+     * body are the only large allocations it makes (ru_maxrss is bytes on
+     * Darwin, KB on Linux) */
     { struct rusage ru0, ru1; getrusage(RUSAGE_SELF, &ru0);
+      rj_arena_begin();
       rj_val* pv = rj_parse("[true]", 6); rj_val* r = NULL;
       g_hold_max = 0;
       rpc_node_dispatch("getrawmempool", pv, &r, &ec, &em);
+      long ab = rj_arena_bytes(), bl = 0;
+      char* body = rj_write_alloc(r, 0, &bl);
       getrusage(RUSAGE_SELF, &ru1);
+      free(body);
+      rj_arena_end();
 #ifdef __APPLE__
       double mb = (double)(ru1.ru_maxrss - ru0.ru_maxrss) / 1048576.0;
 #else
       double mb = (double)(ru1.ru_maxrss - ru0.ru_maxrss) / 1024.0;
 #endif
-      printf("  first verbose call: %lu-slot table, pool-lock hold %.1f ms, peak RSS +%.0f MB\n",
-             slots, g_hold_max, mb);
+      double live = (double)mpool_count(pool);
+      printf("  first verbose call: %lu-slot table, pool-lock hold %.1f ms, peak RSS +%.0f MB, "
+             "arena %.1f MB for a %.1f MB body\n", slots, g_hold_max, mb, ab / 1048576.0, bl / 1048576.0);
       /* 2026-10-06: the one-pass graph is compact (mempool_entry.h mp_graph).
        * It was an ~8.3 KB mp_entry_info per registry node -- ~12 KB of peak
-       * RSS per entry with the reply tree (~3.6 KB/entry) on top; now ~4.7.
-       * The bound sits between the two. */
+       * RSS per entry with the reply on top. The bound sits well above what
+       * is left. */
       { char w2[160]; snprintf(w2, sizeof w2, "the first verbose call's peak RSS is under 8 KB per entry (%.1f KB)",
-                               mb * 1024.0 / (double)mpool_count(pool));
-        ck(w2, mb * 1048576.0 / (double)mpool_count(pool) < 8192.0); }
-      rj_free(r); rj_free(pv); }
+                               mb * 1024.0 / live);
+        ck(w2, mb * 1048576.0 / live < 8192.0); }
+      /* 2026-10-06: each entry is frozen to its text as it is built
+       * (rj_freeze): the arena held every entry's tree until the body was
+       * written, ~3.0 KB per entry for ~0.6 KB of text. Bound: twice the
+       * body. */
+      { char w2[200]; snprintf(w2, sizeof w2, "the reply's arena is under twice its body (%.1f MB for %.1f MB): entries are kept as text",
+                               ab / 1048576.0, bl / 1048576.0);
+        ck(w2, ab > 0 && bl > 0 && ab < 2 * bl); } }
     double best = 1e18; rj_val* all = NULL; unsigned long builds = 0;
     for (int rep = 0; rep < 3; rep++){
         if (all) rj_free(all);

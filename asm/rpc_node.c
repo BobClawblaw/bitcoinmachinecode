@@ -1933,7 +1933,12 @@ static int cmd_getrawmempool(const rj_val* params, rj_val** res, long* ec, const
             for (unsigned long j=0;j<g_mpe_vs_n;j++){
                 const mpe_vs_t* v = &g_mpe_vs[ordk[j]];
                 char hx[65]; mpe_hex(hx, v->id);
-                rj_obj_set(out, hx, mpe_entry_obj(v->id, NULL, 0));
+                /* 2026-10-06: written as soon as it is built, and only its
+                 * text kept (rj_freeze): the 68k entry trees were ~200 MB of
+                 * the request arena for ~39 MB of reply */
+                rj_mark mk = rj_arena_mark();
+                rj_val* ent = rj_freeze(mpe_entry_obj(v->id, NULL, 0), mk);
+                rj_obj_set(out, hx, ent);
             }
         } else {
             for (unsigned long i=0;i<n;i++){ mp_ent e;
@@ -1942,8 +1947,11 @@ static int cmd_getrawmempool(const rj_val* params, rj_val** res, long* ec, const
                 for (int k=0;k<32;k++){ unsigned char b=e.txid[31-k]; hx[k*2]=HEXD[b>>4]; hx[k*2+1]=HEXD[b&15]; }
                 hx[64]=0;
                 if (!verbose){ rj_arr_push(out, rj_str(hx)); continue; }
-                /* the same builder getmempoolentry uses, under the same pool lock */
-                rj_obj_set(out, hx, mpe_entry_obj(e.txid, e.tx, e.len));
+                /* the same builder getmempoolentry uses, under the same pool
+                 * lock; frozen as the snapshot path's entries are */
+                rj_mark mk = rj_arena_mark();
+                rj_val* ent = rj_freeze(mpe_entry_obj(e.txid, e.tx, e.len), mk);
+                rj_obj_set(out, hx, ent);
             }
         }
         g_mpe_snap = 0;
