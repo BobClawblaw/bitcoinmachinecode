@@ -10,6 +10,7 @@ over everything else in docs/: what happened, why, and what it taught.
 | [21 FOR 21](2026-09-02-21-for-21/) | 2026-08-11 to 2026-09-02: from SHA-256 in assembly to a mainnet node whose UTXO set is MuHash-identical to Core's | published |
 | [The Measuring Equipment](2026-09-19-the-measuring-equipment/) | 2026-09-02 to 2026-09-19: parity with Core v31.1, and making the benchmarks true | complete; the `[[PENDING]]` figures filled in on 2026-09-21 |
 | [Run 28 vs Core](2026-09-21-run-28-vs-core/) | 2026-09-19 to 2026-09-21: the clean benchmark pair, 18 h 24 m 02 s against 19 h 32 m 54 s, UTXO set MuHash-identical | ready to post |
+| [The Applier](2026-10-07-the-applier/) | 2026-09-21 to 2026-10-07: from 5.9% to 2.6× ahead of Core; the win was concurrency, then the applier itself; two outages and the deploy rules they left | ready to post |
 
 Each directory holds the Markdown source (the single source of truth), the
 rendered editions (PDF, and for forum posting BBCode) and the scripts that
@@ -17,6 +18,7 @@ build them. Edit the `.md`, then rebuild:
 
 - 21 FOR 21: `./rebuild.sh` (python3, weasyprint, PyMuPDF)
 - The Measuring Equipment: `python3 make_pdf.py` and `python3 make_bbcode.py`
+- The Applier: the same two scripts
 
 21 FOR 21 was first published from `/storage/bmc-book` on the project's host,
 where the original is still served. The copy here rebuilds to the same PDF
