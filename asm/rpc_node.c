@@ -1632,7 +1632,7 @@ typedef struct { unsigned char id[32]; unsigned long vs, w; long inf; unsigned c
                  unsigned char wtxid[32]; long tm; long long pri; unsigned long ord; } mpe_vs_t;
 static mpe_vs_t* g_mpe_vs; static unsigned long g_mpe_vs_n;
 /* 1 while verbose getrawmempool builds its entries AFTER releasing the pool
- * lock: every per-entry input then comes from g_mpe_vs / g_mpe_inf, and
+ * lock: every per-entry input then comes from g_mpe_vs / g_mpe_g, and
  * nothing may touch the pool, the registry or the arrival/priority tables.
  * Per call, under the mempool lane's mutex like the tables themselves. */
 static int g_mpe_snap;
@@ -1640,9 +1640,10 @@ static int g_mpe_snap;
  * comparison of the two (tests/test_rpc_chunk_scale) */
 static int g_grm_snapshot = 1;
 void rpc_node_set_grm_snapshot(int on){ g_grm_snapshot = on ? 1 : 0; }
-/* the whole graph for this call, filled once by pol_entry_info_all; indexed
-   by the same sorted txid order as the vsize cache above */
-static mp_entry_info* g_mpe_inf; static unsigned char (*g_mpe_inf_id)[32]; static long g_mpe_inf_n;
+/* the whole graph for this call, filled once by pol_graph_all (compact:
+   mempool_entry.h); g_mpe_vs[k].inf is the node's index in it. node is null
+   when the call has no graph. */
+static mp_graph g_mpe_g;
 /* the per-call chunk cache (2026-09-19), parallel to g_mpe_vs: st 0 = not
  * yet computed, 1 = fee/weight hold this entry's chunk, -1 = no honest answer
  * (component beyond the 64 bound, or a graph that did not build). One cluster
@@ -1670,7 +1671,7 @@ static long mpe_vs_find(const unsigned char id[32]){
 }
 static long mpe_inf_lookup(const unsigned char id[32]){
     long k = mpe_vs_find(id);
-    return (k >= 0 && g_mpe_inf) ? g_mpe_vs[k].inf : -1;
+    return (k >= 0 && g_mpe_g.node) ? g_mpe_vs[k].inf : -1;
 }
 static unsigned long mpe_vs_lookup(const unsigned char id[32]){
     long k = mpe_vs_find(id);
@@ -1727,7 +1728,7 @@ static unsigned long mpe_member_vsize(const unsigned char id[32], const unsigned
     if (!memcmp(id, self, 32)) sc = selfinf->sigop_cost;
     else if (!g_mpe_snap && g_mph.polstate && g_mph.pol_entry_info){
         /* (snapshot mode skips it: a member the one-pass graph lacks is not
-         * in the registry -- pol_entry_info_all refuses rather than truncate
+         * in the registry -- pol_graph_all covers the whole registry
          * -- so this lookup could only have answered "not found") */
         static mp_entry_info mi;             /* ~8 KB: kept off the stack */
         if (g_mph.pol_entry_info(g_mph.polstate, id, &mi) == 1) sc = mi.sigop_cost;
@@ -1852,13 +1853,12 @@ static int cmd_getrawmempool(const rj_val* params, rj_val** res, long* ec, const
          * the slower direct path -- correct either way, just slower. */
         /* 2026-10-06: the tables are sized by the LIVE count, not by n. n is
          * the slot table's capacity (mask + 1: 1,048,576 at maxmempool=300MB,
-         * ~15x a 68k pool), and g_mpe_inf's element is a ~8.3 KB
+         * ~15x a 68k pool), and the graph table's element was then a ~8.3 KB
          * mp_entry_info, so sizing by n asked malloc for ~8.7 GB per verbose
          * call -- under the pool lock, every 20 s under BlockYard's poll.
          * The live count plus an eighth is the first try; the vsize table
-         * grows to n if the walk ever outruns it, and the graph call is
-         * retried at n if it refuses the smaller buffer (the registry can
-         * hold a few nodes the pool has already dropped). */
+         * grows to n if the walk ever outruns it. (The graph sizes itself
+         * since it became compact, later the same day.) */
         unsigned long live = g_mph.count ? (unsigned long)g_mph.count(g_mph.mp) : n;
         unsigned long cap = live + live / 8 + 64;
         if (cap > n) cap = n;
@@ -1897,31 +1897,22 @@ static int cmd_getrawmempool(const rj_val* params, rj_val** res, long* ec, const
                     v->ord = g_mpe_vs_n;           /* the pool's order, the reply's */
                     g_mpe_vs_n++;
                 }
-                /* the whole graph in one pass; -1 means fall back per entry */
-                g_mpe_inf_n = -1;
-                if (g_mpe_vs && g_mph.polstate && g_mph.pol_entry_info_all){
-                    unsigned long icap = live + live / 8 + 64;
-                    if (icap > n) icap = n;
-                    for (int attempt = 0; attempt < 2 && g_mpe_inf_n < 0; attempt++){
-                        if (attempt){ if (icap >= n) break; icap = n; }
-                        g_mpe_inf = (mp_entry_info*)malloc((size_t)icap * sizeof *g_mpe_inf);
-                        g_mpe_inf_id = (unsigned char (*)[32])malloc((size_t)icap * 32);
-                        if (g_mpe_inf && g_mpe_inf_id)
-                            g_mpe_inf_n = g_mph.pol_entry_info_all(g_mph.polstate, g_mpe_inf, g_mpe_inf_id, (unsigned)icap);
-                        if (g_mpe_inf_n < 0){ free(g_mpe_inf); free(g_mpe_inf_id); g_mpe_inf=0; g_mpe_inf_id=0; }
-                    }
-                }
+                /* the whole graph in one pass, compact (2026-10-06: it was an
+                 * ~8.3 KB mp_entry_info per registry node, ~+790 MB peak RSS
+                 * per call at a 68k pool); -1 means fall back per entry */
+                if (g_mpe_vs && g_mph.polstate && g_mph.pol_graph_all)
+                    if (g_mph.pol_graph_all(g_mph.polstate, &g_mpe_g) < 0) mp_graph_free(&g_mpe_g);
             }
         }
         /* chunk cache: only with the one-pass graph (the lookup it drives
-         * reads g_mpe_inf); without it, per-entry builds. Allocated here, under
+         * reads g_mpe_g); without it, per-entry builds. Allocated here, under
          * the lock, because the snapshot path needs it: without it
          * mpe_chunk_of would fall back to the registry lookup. */
-        if (g_mpe_vs && g_mpe_inf && g_mpe_vs_n)
+        if (g_mpe_vs && g_mpe_g.node && g_mpe_vs_n)
             g_mpe_chunk = (mpe_chunk_t*)calloc(g_mpe_vs_n, sizeof *g_mpe_chunk);
         /* the snapshot is complete: let the pool go before any of the work */
         unsigned long* ordk = 0;
-        int snap = g_grm_snapshot && g_mpe_vs && g_mpe_inf && g_mpe_chunk;
+        int snap = g_grm_snapshot && g_mpe_vs && g_mpe_g.node && g_mpe_chunk;
         if (snap) ordk = (unsigned long*)malloc((g_mpe_vs_n ? g_mpe_vs_n : 1) * sizeof *ordk);
         if (!ordk) snap = 0;
         if (snap){
@@ -1931,10 +1922,10 @@ static int cmd_getrawmempool(const rj_val* params, rj_val** res, long* ec, const
         }
         if (g_mpe_vs){
             qsort(g_mpe_vs, g_mpe_vs_n, sizeof *g_mpe_vs, mpe_vs_cmp);
-            for (long q=0;q<g_mpe_inf_n;q++){
-                long k = mpe_vs_find(g_mpe_inf_id[q]);
+            for (long q=0;q<g_mpe_g.n;q++){
+                long k = mpe_vs_find(g_mpe_g.node[q].txid);
                 if (k >= 0){ g_mpe_vs[k].inf = q;
-                             g_mpe_vs[k].vs = mpe_adj_vsize(g_mpe_vs[k].w, g_mpe_inf[q].sigop_cost); }
+                             g_mpe_vs[k].vs = mpe_adj_vsize(g_mpe_vs[k].w, g_mpe_g.node[q].sigop_cost); }
             }
         }
         if (snap){
@@ -1959,7 +1950,7 @@ static int cmd_getrawmempool(const rj_val* params, rj_val** res, long* ec, const
         free(ordk);
         free(g_mpe_chunk); g_mpe_chunk = 0;
         free(g_mpe_vs); g_mpe_vs = 0; g_mpe_vs_n = 0;
-        free(g_mpe_inf); free(g_mpe_inf_id); g_mpe_inf = 0; g_mpe_inf_id = 0; g_mpe_inf_n = 0;
+        mp_graph_free(&g_mpe_g);
         if (!snap){
             /* still inside the lock that covered the walk above */
             if (g_mph.mempool_sequence) mseq = g_mph.mempool_sequence();
@@ -2041,7 +2032,10 @@ static int mpc_lookup_bulk(void* ctx, const unsigned char txid[32], mpc_entry* o
     (void)ctx;
     long k = mpe_vs_find(txid);
     if (k < 0 || g_mpe_vs[k].inf < 0) return 0;
-    const mp_entry_info* inf = &g_mpe_inf[g_mpe_vs[k].inf];
+    long q = g_mpe_vs[k].inf;
+    const mp_graph_node* inf = &g_mpe_g.node[q];
+    const unsigned char (*dep)[32] = mp_graph_depends(&g_mpe_g, q);
+    const unsigned char (*sb)[32] = mp_graph_spentby(&g_mpe_g, q);
     memset(out, 0, sizeof *out);
     long long modified = (long long)inf->fee + (g_mpe_snap ? g_mpe_vs[k].pri : pri_delta_of(txid));
     out->fee = modified < 0 ? 0 : (uint64_t)modified;
@@ -2050,11 +2044,11 @@ static int mpc_lookup_bulk(void* ctx, const unsigned char txid[32], mpc_entry* o
       unsigned long long sw = (unsigned long long)inf->sigop_cost * bps;
       out->weight = sw > w ? sw : w; }
     for (int i = 0; i < inf->n_depends && out->n_parents < MPC_MAX_CLUSTER; i++)
-        if (mpe_vs_find(inf->depends[i]) >= 0)
-            memcpy(out->parents[out->n_parents++], inf->depends[i], 32);
+        if (mpe_vs_find(dep[i]) >= 0)
+            memcpy(out->parents[out->n_parents++], dep[i], 32);
     for (int i = 0; i < inf->n_spentby && out->n_children < MPC_MAX_CLUSTER; i++)
-        if (mpe_vs_find(inf->spentby[i]) >= 0)
-            memcpy(out->children[out->n_children++], inf->spentby[i], 32);
+        if (mpe_vs_find(sb[i]) >= 0)
+            memcpy(out->children[out->n_children++], sb[i], 32);
     return 1;
 }
 
@@ -2076,7 +2070,7 @@ static int mpc_lookup_bulk(void* ctx, const unsigned char txid[32], mpc_entry* o
 static int mpe_chunk_of(const unsigned char txid[32], unsigned long long* fee,
                         unsigned long long* weight)
 {
-    int bulk = (g_mpe_chunk && g_mpe_inf && g_mpe_vs);
+    int bulk = (g_mpe_chunk && g_mpe_g.node && g_mpe_vs);
     long self_k = bulk ? mpe_vs_find(txid) : -1;
     if (bulk && self_k >= 0 && g_mpe_chunk[self_k].st){
         if (g_mpe_chunk[self_k].st < 0) return 0;
@@ -2131,13 +2125,13 @@ static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx,
     mp_entry_info inf; int have_inf = 0;
     /* Prefer the one-pass graph when this call built one; otherwise ask per
      * txid. The FALLBACK MATTERS: the bulk build is skipped when the node
-     * exposes no pol_entry_info_all and refused when its allocation fails, and
+     * exposes no pol_graph_all and refused when its allocation fails, and
      * the first cut of this returned no graph at all in those cases -- it made
      * the per-txid branch conditional on there being no bulk cache, so a
      * verbose call with a cache but no graph silently dropped depends,
      * spentby and both counts. The suite caught it immediately. */
-    long myinf = (g_mpe_vs && g_mpe_inf) ? mpe_inf_lookup(txid) : -1;
-    if (myinf >= 0){ inf = g_mpe_inf[myinf]; have_inf = 1; }
+    long myinf = (g_mpe_vs && g_mpe_g.node) ? mpe_inf_lookup(txid) : -1;
+    if (myinf >= 0){ mp_graph_expand(&g_mpe_g, myinf, &inf); have_inf = 1; }
     else if (!g_mpe_snap && g_mph.polstate && g_mph.pol_entry_info)
         have_inf = (int)g_mph.pol_entry_info(g_mph.polstate, txid, &inf);
     if (!have_inf) inf.sigop_cost = 0;
@@ -2251,7 +2245,7 @@ static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx,
  * Instead, under the lock: walk the transaction's connected component (the
  * only nodes any of those lookups can reach) once, one entry_info per node,
  * and copy each pool-present node's inputs into the same per-call tables the
- * bulk getrawmempool path fills (g_mpe_vs / g_mpe_inf / g_mpe_chunk). Then
+ * bulk getrawmempool path fills (g_mpe_vs / g_mpe_g / g_mpe_chunk). Then
  * the caller releases the lock and renders in snapshot mode. A component
  * larger than MPE_REL_CAP, or an allocation that fails, returns 0 and the
  * caller keeps the old all-under-the-lock path (the answer is the same; the
@@ -2261,17 +2255,17 @@ static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx,
 static int mpe_snapshot_component(const unsigned char seed[32]){
     if (!g_mph.polstate || !g_mph.pol_entry_info || !g_mph.get) return 0;
     unsigned char (*ids)[32] = (unsigned char (*)[32])malloc((size_t)MPE_REL_CAP * 32);
-    mp_entry_info* inf = (mp_entry_info*)malloc((size_t)MPE_REL_CAP * sizeof *inf);
+    mp_entry_info* e = (mp_entry_info*)malloc(sizeof *e);   /* one scratch record */
     mpe_vs_t* vs = (mpe_vs_t*)malloc((size_t)MPE_REL_CAP * sizeof *vs);
-    if (!ids || !inf || !vs){ free(ids); free(inf); free(vs); return 0; }
-    /* breadth-first over depends + spentby; ids[] is the queue and the seen set */
-    int nq = 0, ni = 0;
+    mp_graph g; memset(&g, 0, sizeof g);
+    if (!ids || !e || !vs){ free(ids); free(e); free(vs); return 0; }
+    /* breadth-first over depends + spentby; ids[] is the queue and the seen
+     * set, and each registry node joins the compact graph as it is popped */
+    int nq = 0;
     memcpy(ids[nq++], seed, 32);
     for (int h = 0; h < nq; h++){
-        if (g_mph.pol_entry_info(g_mph.polstate, ids[h], &inf[ni]) != 1) continue;
-        mp_entry_info* e = &inf[ni];
-        if (h != ni) memcpy(ids[ni], ids[h], 32);    /* compact: ids[0..ni) pair with inf[] */
-        ni++;
+        if (g_mph.pol_entry_info(g_mph.polstate, ids[h], e) != 1) continue;
+        if (mp_graph_append(&g, ids[h], e) != 0){ free(ids); free(e); free(vs); mp_graph_free(&g); return 0; }
         for (int side = 0; side < 2; side++){
             int ne = side ? e->n_spentby : e->n_depends;
             unsigned char (*ed)[32] = side ? e->spentby : e->depends;
@@ -2279,51 +2273,54 @@ static int mpe_snapshot_component(const unsigned char seed[32]){
                 int seen = 0;
                 for (int q = 0; q < nq && !seen; q++) seen = !memcmp(ids[q], ed[j], 32);
                 if (seen) continue;
-                if (nq >= MPE_REL_CAP){ free(ids); free(inf); free(vs); return 0; }
+                if (nq >= MPE_REL_CAP){ free(ids); free(e); free(vs); mp_graph_free(&g); return 0; }
                 memcpy(ids[nq++], ed[j], 32);
             }
         }
     }
-    /* the queue entries past ni were compacted over; the registry nodes are
-     * ids[0..ni) with inf[0..ni). Now the pool's side of each. */
+    /* the registry nodes are g.node[0..g.n), in the order they were
+     * popped. Now the pool's side of each. */
+    free(e);
     unsigned long nv = 0;
-    for (int i = 0; i < ni; i++){
+    for (long i = 0; i < g.n; i++){
+        const unsigned char* id = g.node[i].txid;
         unsigned long len = 0;
-        const unsigned char* tx = g_mph.get(g_mph.mp, ids[i], &len);
+        const unsigned char* tx = g_mph.get(g_mph.mp, id, &len);
         if (!tx) continue;                               /* stale registry node: not rendered, not summed */
         mpe_vs_t* v = &vs[nv];
-        memcpy(v->id, ids[i], 32);
+        memcpy(v->id, id, 32);
         v->w = mp_tx_weight(tx, len);
         v->rbf = (unsigned char)mp_tx_signals_rbf(tx, len);
         v->vs = (v->w + 3) / 4;
         v->inf = -1;
-        if (g_mph.sha256d) g_mph.sha256d(v->wtxid, tx, len); else memcpy(v->wtxid, ids[i], 32);
-        v->tm = g_mph.time_of ? g_mph.time_of(ids[i]) : 0;
-        v->pri = pri_delta_of(ids[i]);
+        if (g_mph.sha256d) g_mph.sha256d(v->wtxid, tx, len); else memcpy(v->wtxid, id, 32);
+        v->tm = g_mph.time_of ? g_mph.time_of(id) : 0;
+        v->pri = pri_delta_of(id);
         v->ord = nv;
         nv++;
     }
     mpe_chunk_t* ch = (mpe_chunk_t*)calloc(nv ? nv : 1, sizeof *ch);
-    if (!ch){ free(ids); free(inf); free(vs); return 0; }
+    free(ids);
+    if (!ch){ free(vs); mp_graph_free(&g); return 0; }
     g_mpe_vs = vs; g_mpe_vs_n = nv;
-    g_mpe_inf = inf; g_mpe_inf_id = ids; g_mpe_inf_n = ni;
+    g_mpe_g = g;
     g_mpe_chunk = ch;
     return 1;
 }
 /* after the lock: sort the snapshot and pair each pool entry with its node */
 static void mpe_snapshot_index(void){
     qsort(g_mpe_vs, g_mpe_vs_n, sizeof *g_mpe_vs, mpe_vs_cmp);
-    for (long q = 0; q < g_mpe_inf_n; q++){
-        long k = mpe_vs_find(g_mpe_inf_id[q]);
+    for (long q = 0; q < g_mpe_g.n; q++){
+        long k = mpe_vs_find(g_mpe_g.node[q].txid);
         if (k >= 0){ g_mpe_vs[k].inf = q;
-                     g_mpe_vs[k].vs = mpe_adj_vsize(g_mpe_vs[k].w, g_mpe_inf[q].sigop_cost); }
+                     g_mpe_vs[k].vs = mpe_adj_vsize(g_mpe_vs[k].w, g_mpe_g.node[q].sigop_cost); }
     }
 }
 static void mpe_tables_free(void){
     g_mpe_snap = 0;
     free(g_mpe_chunk); g_mpe_chunk = 0;
     free(g_mpe_vs); g_mpe_vs = 0; g_mpe_vs_n = 0;
-    free(g_mpe_inf); free(g_mpe_inf_id); g_mpe_inf = 0; g_mpe_inf_id = 0; g_mpe_inf_n = 0;
+    mp_graph_free(&g_mpe_g);
 }
 
 /* getmempoolancestors / getmempooldescendants (Core rpc/mempool.cpp): the
@@ -4204,7 +4201,7 @@ static int cmd_getmempoolcluster(const rj_val* params, rj_val** res, long* ec, c
  * classes them NOLOCK through rpc_node_method_lane) and under this mutex
  * instead: they read the pool under its own lock (mpl/mpu, shared with the
  * worker) and share only what this file owns -- the per-call tables
- * (g_mpe_vs, g_mpe_inf, g_mpe_chunk), the slot cache (g_mpc) and one
+ * (g_mpe_vs, g_mpe_g, g_mpe_chunk), the slot cache (g_mpc) and one
  * handler's static block buffer -- none of which a write-locked handler
  * touches. Recursive because the facade dispatches one of them from inside
  * another's frame. A slow getrawmempool now waits only its own kind. */

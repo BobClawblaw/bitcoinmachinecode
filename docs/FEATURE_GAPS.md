@@ -2521,6 +2521,19 @@ singletons now carry a witness, so the comparison against the old path
 (which still hashes through the hook) checks the cache against a fresh
 hash, and copying the txid instead fails four checks.
 
+The one-pass graph is compact now (`mp_graph`, `mempool_entry.h`): a
+fixed header per registry node and one shared txid list holding its
+depends, spentby, ancestors and descendants, which `mp_graph_expand`
+turns back into the same `mp_entry_info` for the one entry being
+rendered. `pol_entry_info_all` became `pol_graph_all`, which sizes its
+own output, so the capacity retry is gone. At production shape the first
+call's peak RSS went from +794 to +318 MB and its hold from 51.9 to
+26.0 ms (steady 25.3 -> 21.4 ms). The verbose ancestors/descendants
+snapshot uses the same format. **Open:** the remaining ~+318 MB is the
+reply's JSON tree (~244 MB of `rj_val` for 68k entries, ~3.6 KB each, for
+39 MB of text), which only a writer that serializes entry by entry would
+shrink.
+
 ### The wallet has no reorg awareness (WAL-13)
 
 `wallet_scan.c`'s on-disk record is `u32 height | txid | vout | value`

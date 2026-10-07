@@ -1076,7 +1076,7 @@ static int find_node(void* st, const unsigned char txid[32]){
  * yields children in ascending node order -- the order the scans it replaces
  * produced, so the reported sets keep their shape.
  *
- * One allocation pass per call, freed by the caller. mpool_policy_entry_info_all
+ * One allocation pass per call, freed by the caller. mpool_policy_graph_all
  * builds the same thing inline for its whole-registry sweep. */
 static int mpol_children_build(void* st, uint32_t n,
                                uint32_t** head_o, uint32_t** nxt_o, uint32_t** chld_o){
@@ -3499,7 +3499,7 @@ long mpool_policy_entry(void* st, const unsigned char txid[32],
  * the single RPC execution lock, on a call every monitoring tool polls.
  *
  * The same "per-txid call x n" shape is already called out above
- * mpool_policy_entry_info_all, for the same reason. Returns the entry count.
+ * mpool_policy_graph_all, for the same reason. Returns the entry count.
  * The policy registry and the structural pool are maintained together
  * (mpool_policy_remove_package takes both), so this covers the same
  * transactions the per-slot loop did. */
@@ -3702,15 +3702,31 @@ long mpool_policy_set_sigops(void* st, const unsigned char txid[32], unsigned in
  * Returns the number of entries written, or -1 on a bad state / allocation
  * failure, in which case the caller falls back to the per-entry path.
  *
- * out[i] corresponds to ids[i]; the caller matches by txid. Caller holds
- * mp_lock, exactly as for the single-entry call. */
-long mpool_policy_entry_info_all(void* st, mp_entry_info* out, unsigned char (*ids)[32], uint32_t max)
+ * g->node[i] carries its own txid; the caller matches by it. Caller holds
+ * mp_lock, exactly as for the single-entry call, and frees g with
+ * mp_graph_free.
+ *
+ * 2026-10-06: the output is the compact mp_graph (mempool_entry.h), sized by
+ * the registry itself. It was an mp_entry_info per node in a caller-sized
+ * buffer -- ~8.3 KB each, ~+790 MB peak RSS per verbose getrawmempool at a
+ * 68k pool -- and a buffer smaller than the registry (stale nodes) was
+ * refused with -1, which the caller had to retry at full capacity. */
+long mpool_policy_graph_all(void* st, mp_graph* g)
 {
-    if (!st || *(uint32_t*)st != MPOL_MAGIC || !out || !ids) return -1;
+    if (!st || *(uint32_t*)st != MPOL_MAGIC || !g) return -1;
+    memset(g, 0, sizeof *g);
     mpol_node* t = mpol_nodes_base(st);
     uint32_t n = *(uint32_t*)((char*)st+16);
-    if (n > max) return -1;
     if (n == 0) return 0;
+    /* sized for the common shape (most nodes are singletons: self in anc
+     * and in desc, plus an edge or two); mp_graph_append grows past it */
+    g->node = (mp_graph_node*)malloc((size_t)n * sizeof *g->node);
+    g->mem  = (unsigned char (*)[32])malloc((size_t)n * 4 * 32);
+    /* ONE scratch record, reused per node: only its counted members are
+     * written, so it is not cleared between nodes either */
+    mp_entry_info* o = (mp_entry_info*)malloc(sizeof *o);
+    if (!g->node || !g->mem || !o){ free(o); mp_graph_free(g); return -1; }
+    g->cap = n; g->cap_mem = (unsigned long)n * 4;
 
     /* children index: head[i] is the first child slot, nxt[] chains the rest */
     uint32_t* head = (uint32_t*)malloc((size_t)n * sizeof *head);
@@ -3718,7 +3734,7 @@ long mpool_policy_entry_info_all(void* st, mp_entry_info* out, unsigned char (*i
     for (uint32_t i=0;i<n;i++) edges += t[i].n_parents;
     uint32_t* nxt  = (uint32_t*)malloc((size_t)(edges?edges:1) * sizeof *nxt);
     uint32_t* chld = (uint32_t*)malloc((size_t)(edges?edges:1) * sizeof *chld);
-    if (!head || !nxt || !chld){ free(head); free(nxt); free(chld); return -1; }
+    if (!head || !nxt || !chld){ free(head); free(nxt); free(chld); free(o); mp_graph_free(g); return -1; }
     for (uint32_t i=0;i<n;i++) head[i] = 0xFFFFFFFFu;
     uint32_t e = 0;
     for (uint32_t i=0;i<n;i++)
@@ -3729,10 +3745,9 @@ long mpool_policy_entry_info_all(void* st, mp_entry_info* out, unsigned char (*i
         }
 
     for (uint32_t s=0;s<n;s++){
-        mp_entry_info* o = &out[s];
-        memcpy(ids[s], t[s].txid, 32);
-        memset(o, 0, sizeof *o);
         o->fee = t[s].fee; o->size = t[s].size; o->sigop_cost = t[s].sigop_cost;
+        o->n_depends = o->n_spentby = o->n_anc = o->n_desc = 0;
+        o->anc_fee = o->anc_size = o->desc_fee = 0;
 
         for (uint32_t k=0; k<t[s].n_parents && o->n_depends<MPE_MAX_SET; k++){
             uint32_t p = mpol_par_at(st, &t[s], k);
@@ -3774,8 +3789,10 @@ long mpool_policy_entry_info_all(void* st, mp_entry_info* out, unsigned char (*i
                   if (sp < MPE_MAX_SET) stack[sp++] = i;
               }
           } }
+        if (mp_graph_append(g, t[s].txid, o) != 0){
+            free(head); free(nxt); free(chld); free(o); mp_graph_free(g); return -1; }
     }
-    free(head); free(nxt); free(chld);
+    free(head); free(nxt); free(chld); free(o);
     return (long)n;
 }
 

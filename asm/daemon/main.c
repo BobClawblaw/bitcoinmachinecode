@@ -11671,7 +11671,7 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
       extern long mempool_time_of(const unsigned char*);
       extern long mpool_policy_entry(void*, const unsigned char*,
                                      unsigned long long*, unsigned long long*);
-      extern long mpool_policy_entry_info_all(void*, struct mp_entry_info*, unsigned char (*)[32], unsigned);
+      extern long mpool_policy_graph_all(void*, struct mp_graph*);
       extern long mpool_policy_totals(void*, unsigned long long*, unsigned long long*);
       extern long mpool_policy_entry_pkg_many(void*, const unsigned char (*)[32], unsigned, struct mp_entry_info*, unsigned char*);
 extern long mpool_policy_entry_info(void*, const unsigned char*, struct mp_entry_info*);
@@ -11688,7 +11688,7 @@ extern long mpool_policy_entry_info(void*, const unsigned char*, struct mp_entry
           .time_of = mempool_time_of,
           .pol_entry = mpool_policy_entry,
           .pol_entry_info = mpool_policy_entry_info,
-          .pol_entry_info_all = mpool_policy_entry_info_all,
+          .pol_graph_all = mpool_policy_graph_all,
           .pol_totals = mpool_policy_totals,
           .pol_pkg_many = mpool_policy_entry_pkg_many,
           .estimate = mpool_policy_estimate,

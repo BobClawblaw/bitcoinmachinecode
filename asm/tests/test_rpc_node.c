@@ -1095,17 +1095,16 @@ int main(void){
            * code, and the fast one exists only if it agrees with the slow one.
            * The first cut of the fast path made the per-txid branch
            * conditional on there being no cache, so a node without
-           * pol_entry_info_all got an entry with NO graph at all. */
+           * pol_entry_info_all (now pol_graph_all) got an entry with NO graph at all. */
           { extern long mpool_policy_entry(void*, const unsigned char*,
                                            unsigned long long*, unsigned long long*);
-            extern long mpool_policy_entry_info_all(void*, struct mp_entry_info*,
-                                                    unsigned char (*)[32], unsigned);
+            extern long mpool_policy_graph_all(void*, struct mp_graph*);
             rpc_mempool_hooks h; memset(&h,0,sizeof h);
             h.mp = pool; h.maxbytes = 8388608; h.count = mpool_count;
             h.get = mpool_get; h.polstate = polstate;
             h.pol_entry = mpool_policy_entry;
             h.pol_entry_info = mpool_policy_entry_info;
-            if (bulk_on) h.pol_entry_info_all = mpool_policy_entry_info_all;
+            if (bulk_on) h.pol_graph_all = mpool_policy_graph_all;
             rpc_node_set_mempool(&h); }
           printf("  (graph path: %s)\n", bulk_on ? "one-pass bulk" : "per-txid fallback");
           rj_val* pv2 = rj_parse("[true]", 6); r = NULL;
@@ -1242,8 +1241,7 @@ int main(void){
           extern long mpool_policy_set_sigops(void*, const unsigned char*, unsigned int);
           extern long mpool_policy_entry(void*, const unsigned char*,
                                          unsigned long long*, unsigned long long*);
-          extern long mpool_policy_entry_info_all(void*, struct mp_entry_info*,
-                                                  unsigned char (*)[32], unsigned);
+          extern long mpool_policy_graph_all(void*, struct mp_graph*);
           static unsigned char ta[128], tb[128], td[128], te[128], ts[128], ts2[128];
           unsigned char pa[32], pd[32], ps[32]; memset(pa, 0x66, 32); memset(pd, 0x77, 32); memset(ps, 0x88, 32);
           unsigned char ia[32], ib[32], id_[32], ie[32], is[32], is2[32];
@@ -1280,7 +1278,7 @@ int main(void){
                 h.get = mpool_get; h.polstate = polstate;
                 h.pol_entry = mpool_policy_entry;
                 h.pol_entry_info = mpool_policy_entry_info;
-                if (bulk_on) h.pol_entry_info_all = mpool_policy_entry_info_all;
+                if (bulk_on) h.pol_graph_all = mpool_policy_graph_all;
                 rpc_node_set_mempool(&h); }
               const char* path = bulk_on ? "bulk getrawmempool" : "getmempoolentry";
               rj_val* all = NULL;
@@ -1412,7 +1410,7 @@ int main(void){
                   h.get = mpool_get; h.polstate = polstate;
                   h.pol_entry = mpool_policy_entry;
                   h.pol_entry_info = mpool_policy_entry_info;
-                  if (bulk_on) h.pol_entry_info_all = mpool_policy_entry_info_all;
+                  if (bulk_on) h.pol_graph_all = mpool_policy_graph_all;
                   rpc_node_set_mempool(&h); }
                 const char* path = bulk_on ? "bulk getrawmempool" : "getmempoolentry";
                 rj_val* all = NULL;

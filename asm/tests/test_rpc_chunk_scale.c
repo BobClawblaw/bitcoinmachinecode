@@ -25,7 +25,8 @@
  *   - (2026-10-06) the tables are sized by the pool's LIVE count, not its slot
  *     capacity: with a quarter of the entries gone from the pool but still in
  *     the registry -- more stale nodes than the first buffer's headroom -- the
- *     graph call is retried at capacity and the snapshot path still answers,
+ *     graph still covers them (it was retried at capacity until the graph
+ *     became compact and self-sized) and the snapshot path still answers,
  *     byte-identical, with the short hold. Run with a production-shaped slot
  *     table: ./tests/test_rpc_chunk_scale 68000 1048576.
  *
@@ -70,7 +71,7 @@ extern long   mpool_policy_add(void*, void*, void*, const unsigned char*, unsign
                                const unsigned char*, void*);
 extern long   mpool_policy_entry(void*, const unsigned char*, unsigned long long*, unsigned long long*);
 extern long   mpool_policy_entry_info(void*, const unsigned char*, struct mp_entry_info*);
-extern long   mpool_policy_entry_info_all(void*, struct mp_entry_info*, unsigned char (*)[32], unsigned);
+extern long   mpool_policy_graph_all(void*, struct mp_graph*);
 extern int    tx_txid(unsigned char*, const unsigned char*, unsigned long, unsigned char*, unsigned long);
 
 static int fails;
@@ -178,7 +179,7 @@ int main(int argc, char** argv){
     h.mp = pool; h.maxbytes = 300000000; h.count = mpool_count; h.get = mpool_get;
     h.polstate = polstate; h.pol_entry = mpool_policy_entry;
     h.pol_entry_info = mpool_policy_entry_info;
-    h.pol_entry_info_all = mpool_policy_entry_info_all;
+    h.pol_graph_all = mpool_policy_graph_all;
     h.lock = t_lock; h.unlock = t_unlock;
     h.time_of = t_time_of; h.sha256d = t_sha256d;
     rpc_node_set_mempool(&h);
@@ -199,6 +200,13 @@ int main(int argc, char** argv){
 #endif
       printf("  first verbose call: %lu-slot table, pool-lock hold %.1f ms, peak RSS +%.0f MB\n",
              slots, g_hold_max, mb);
+      /* 2026-10-06: the one-pass graph is compact (mempool_entry.h mp_graph).
+       * It was an ~8.3 KB mp_entry_info per registry node -- ~12 KB of peak
+       * RSS per entry with the reply tree (~3.6 KB/entry) on top; now ~4.7.
+       * The bound sits between the two. */
+      { char w2[160]; snprintf(w2, sizeof w2, "the first verbose call's peak RSS is under 8 KB per entry (%.1f KB)",
+                               mb * 1024.0 / (double)mpool_count(pool));
+        ck(w2, mb * 1048576.0 / (double)mpool_count(pool) < 8192.0); }
       rj_free(r); rj_free(pv); }
     double best = 1e18; rj_val* all = NULL; unsigned long builds = 0;
     for (int rep = 0; rep < 3; rep++){
@@ -360,12 +368,13 @@ int main(int argc, char** argv){
         ck(what, rhold[1] < rhold[0]);
     }
 
-    /* ---- stale registry nodes beyond the first buffer: the retry ----
+    /* ---- stale registry nodes beyond the live count ----
      * every fourth entry leaves the structural pool only (the registry keeps
      * it, as it does for a moment after an eviction): live drops by a
      * quarter, the registry does not, so the live-count buffer is too small
-     * for the one-pass graph and the call must retry at capacity -- or fall
-     * back to the slow under-the-lock path, which the hold check catches */
+     * for a live-sized graph (the old fixed-record buffer needed a retry at
+     * capacity) -- and a graph that missed them would fall back to the slow
+     * under-the-lock path, which the hold check catches */
     if (n > 40){
         unsigned dropped = 0;
         for (int m = 0; m < n; m += 4){
@@ -392,7 +401,7 @@ int main(int argc, char** argv){
                "under-the-lock build, %.1f ms snapshot\n", dropped, mpool_count(pool), sh[0], sh[1]);
         ck("with stale registry nodes the snapshot answer is still byte-identical",
            sb[0] && sb[1] && sl[0] == sl[1] && !memcmp(sb[0], sb[1], (size_t)sl[0]));
-        snprintf(what, sizeof what, "...and it took the snapshot path (hold %.1f ms against %.1f ms): the graph was retried at capacity",
+        snprintf(what, sizeof what, "...and it took the snapshot path (hold %.1f ms against %.1f ms): the graph covers the stale nodes",
                  sh[1], sh[0]);
         ck(what, dropped > (unsigned)n / 8 && sh[1] < sh[0] * 0.5);
         ck("...with every take released", g_takes - tk0 == g_releases - rl0);

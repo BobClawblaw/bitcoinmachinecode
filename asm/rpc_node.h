@@ -577,6 +577,7 @@ void rpc_node_set_submit_wait_ms_for_test(long ms);   /* the submit channel's ac
  * absent/zero bookkeeping; a NULL/all-NULL struct keeps the previous
  * empty-pool reporting (standalone rpcd, static per-process fallback). */
 struct mp_entry_info;   /* mempool_entry.h; only implementations need it */
+struct mp_graph;
 typedef struct {
     void*     mp;             /* structural pool (bitcoin_mempool.asm layout) */
     void*     polstate;       /* tx-accept policy registry (fees, graph) */
@@ -591,9 +592,11 @@ typedef struct {
     long (*pol_entry_info)(void*, const unsigned char*,
                            struct mp_entry_info*);              /* full graph */
     /* every entry's graph in ONE pass: the per-txid call above costs a full
-       scan of the node array, so asking it n times is O(n^2). Returns the
-       count written, or -1 to say "fall back to the per-txid call". */
-    long (*pol_entry_info_all)(void*, struct mp_entry_info*, unsigned char (*)[32], unsigned);
+       scan of the node array, so asking it n times is O(n^2). Fills a
+       compact mp_graph (mempool_entry.h) the caller frees with
+       mp_graph_free. Returns the node count, or -1 to say "fall back to the
+       per-txid call". */
+    long (*pol_graph_all)(void*, struct mp_graph*);
     /* fee/size/sigop_cost/depends/anc for MANY txids in one call -- the fields
        a block template reads, without entry_info's unused spentby scan and
        descendant walk. out[]/found[] are sized by the query count, not the
