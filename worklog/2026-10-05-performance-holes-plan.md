@@ -859,3 +859,24 @@ to FAIL with the switch removed (8 checks), with the hold not carried
 
 Not done: the disjoint-ranges arm (two peers in parallel). Measure on the
 next benchmark: boot to block 1 ≤ 50 s, and the `fell to` line's count.
+
+## 2026-10-07 — B13 built (branch perf/2026-10-07-b13-stall-grace)
+
+The ban half of B13: the stall rule's first eviction of an address is
+Core's disconnect (the chunk is ringed at once, as before) and is
+remembered; the second stall of the same address bans it for the run
+(the usable floor and the manual-peer guard unchanged). Run 20's address,
+handed the same chunk 14 times, is still banned on its second. Keyed by
+address, not pool index. Verdicts: `disconnected, a first stall (banned
+on a second)` / `BANNED for the run (its second stall)`.
+
+Test: `test_dialhelper`'s stall section -- a first stall is not banned,
+the same address's second stall is, the floor guard on a second stall.
+Watched to FAIL with the first stall banning (the old rule) and with no
+ban at all.
+
+Not done: the grace half (a fresh holder's first chunk timed from its
+first-page RTT, or handed a chunk off the tail). The timeout itself is
+still Core's 2 s, so fresh peers are still dropped from the tail; they
+are no longer lost to the pool. Measure on the next benchmark: bans per
+run ≤ 5 (run 41: 34) with the same download rate.
