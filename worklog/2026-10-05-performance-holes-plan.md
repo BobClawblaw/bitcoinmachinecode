@@ -25,6 +25,34 @@ Every step below has (a) a measurement that must move, (b) a test that
 fails with the step reverted, (c) a gate, (d) a `--no-ff` merge, as the
 standing rules require. Nothing lands on a guess.
 
+## Status register (as of 2026-10-07 22:45Z)
+
+The items below were written as plans and then annotated as they landed.
+This table is the one place that says where each one stands. Update it
+when an item moves.
+
+| item | what | status |
+|---|---|---|
+| A1–A3, A5 | txindex lane, facade batch lane, O(1) `getmempoolinfo`, the getblock reader lane | DONE 10-05 (#383). The reader lane leaked per facade thread until #402 (10-07, production RPC down 2 h 17 m: `docs/devlog/INCIDENT_2026-10-07_reader_lane_fd_leak.md`) |
+| A4 | the 150 s freeze after a restart into catch-up | OPEN: not reproduced; per-step timings logged since #376 |
+| A5 (rest) | getblock v2 at 32 clients | DONE 10-06 (#392, the JSON arena) |
+| A6 | exec-lock waits ≥ 2 s | MET: 0 a day since the 10-05 deploy (was ~10) |
+| A7, A8 | getrawtransaction at 32 clients; getdeploymentinfo's 2 s lock | DONE 10-06 (#387, #388) |
+| B1+B2 | the put decomposition; undo capture reuses Phase 1's prevout | DONE 10-05 (#383) |
+| B3 | memtable flush in a forked writer | DONE: #396 (10-06, live in `deploy-20261006d`); the reap at the tip #400; its test #403; live in `deploy-20261007a`, no zombie writer seen since |
+| B4 | index writes in a forked worker | DONE 10-06 (#390) |
+| B5 | header probe, fastest of four | DONE 10-05 (#383) |
+| B6 | per-block window under `dlshape=core` | OPTIONAL, not started |
+| B7 | an eviction the holder never answers | DONE 10-05 (#384, #385) |
+| B8 | chainwork in step with the download | DONE 10-06 (#395) |
+| B9 part 1 | the ranking's top churns between runs | OPEN |
+| B9 part 2 | the 2 s idle tick per window | DONE 10-07 (#400), closed by run 41 |
+| B10 | a claim the chain could not have reached | DONE 10-07 (#400), closed by run 41 |
+| B11 | the memtable in anonymous memory | DONE 10-07 (#400), closed by run 41 (put 3,842 s against the target of 4,994) |
+| B12 | the header leader switch | BUILT 10-07 (#404, merged); the disjoint-ranges arm not done; unmeasured |
+| B13 | ban on a second stall, not the first | BUILT 10-07 (#405, open); the grace half not done; unmeasured |
+| M1 | name the 26 GB | DONE 10-06 (#394): COW pages counted once per child |
+
 ## Part A — RPC: stop the lock-ups (BlockYard-visible)
 
 The lock is `g_exec_lock` (`rpc_server.c`), a writer-preferring rwlock.
@@ -109,7 +137,7 @@ put ≤ 1.5 µs/input → ~3k s off the chain.
   pass with a crash injected between the batch write and the marker — the
   batch must not widen the torn window those tests pin.
 
-### B3. Memtable flush off the applier (medium)
+### B3. Memtable flush off the applier (medium) — DONE (#396 10-06, reap #400, test #403)
 
 **BUILT 10-06 (branch perf/2026-10-06-b3-async-flush; gate and run 40 pending):**
 not a second memtable -- the applier copies the live table + blob prefix
@@ -199,7 +227,7 @@ fallbacks. Target ≤ 90 s.
 16-block chunk. Only the benchmark mode is affected; do it if a third pair
 is scheduled, otherwise document it as the known difference.
 
-### B7. An eviction the holder never answers (found during run 35; small; done on the branch)
+### B7. An eviction the holder never answers (found during run 35; small) — DONE 10-05 (#384, #385)
 Run 35 at 19:57:44Z: the holder of the window's oldest chunk was "dropped"
 twelve times (2 s doubling to 64 s) and never printed its drop line or
 released the chunk; nine workers idle at the full window, 64 chunks staged,
@@ -358,7 +386,7 @@ call 58 vs 87 (was 73). v1 at 32 clients 9 vs 19; v3 single 84 vs 126;
 getrawmempool 114 vs 484 on pools of the same size (26.8k vs 25.5k).
 What is left in the render (perf under the arena): the descriptor
 checksum 9%, bech32 7%, sha256 5% -- Core pays the same three.
-### B8. The 100 s tail after IBD end has a 62 s pause — BUILT 10-06 (branch perf/2026-10-06-b8-chainwork-in-step; gate pending)
+### B8. The 100 s tail after IBD end has a 62 s pause — DONE 10-06 (#395)
 **Re-read on run 38 (10-06, 10:57:52 → 10:58:58), the run 37 reading
 below was wrong about the cause:** the sampler shows the daemon's RSS
 FLAT (82.8 GB) and its CPU idle (1 s per 6 s tick) across the 66 s gap,
@@ -486,7 +514,7 @@ second, staggered sample so each peer's rate is its own and not a share
 of the uplink) stays open; A/B to 300,000 after Core #7, the distinct
 peer count and the wait sum are the metrics.
 
-### M1. Memory: name the 26 GB — BUILT 10-06 (branch perf/2026-10-06-m1-mem-naming; gate pending)
+### M1. Memory: name the 26 GB — DONE 10-06 (#394)
 Anonymous memory held 26.4 GB through the sync with dbcache=8192 (peak 35.2
 GB in a compaction). A per-subsystem `[mem]` line under benchlog at the MEM
 marks (memtable, header tree, download window, index builders, RPC caches),
@@ -605,7 +633,7 @@ the early chain LOST (2.0× at 100,000, 1.7× at 200,000, parity at
 and -run39-vs-core7-. Logs bench/core31-rerun7-20261007-logs/, datadir
 core31-rerun7-20261007 (1.1 TB; the operator decides).
 
-### B9 part 2, found: the download loop's 2 s idle tick, paid once per 1,024-block window — BUILT 10-07 (branch perf/2026-10-07-b9-idle-tick, c6884a22)
+### B9 part 2, found: the download loop's 2 s idle tick, paid once per 1,024-block window — DONE 10-07 (#400)
 
 Run 40's log below 100,000: the `[bench] chunk` completions come in 99
 bursts 2.09 s apart (p10 2.02, p90 2.16), one burst per 1,024-block
@@ -654,7 +682,7 @@ against Core #7's 284 s. The header phase itself is a new item (B12
 below). Landed in PR #400 (7027c734) with B11, B10 and the B3 reap fix;
 run 41 carries them.
 
-### B12. The header download is one peer's speed (fix arm: 165 s for 970k headers; run 40: 33 s)
+### B12. The header download is one peer's speed (fix arm: 165 s for 970k headers; run 40: 33 s) — BUILT 10-07 (#404)
 
 `[dlc] header probe: the first page from 4 candidate(s)` picks the
 fastest first page and then downloads all 970k headers (78 MB) from that
@@ -666,7 +694,7 @@ disjoint ranges from the two fastest and merge (the locator pages are
 independent). Small-medium; measure: boot to block 1 ≤ 50 s on every
 sync.
 
-### B10. The top-up round after the download re-probes and re-ranks the whole pool (run 40: ~62 of the 99 s tail)
+### B10. The top-up round after the download re-probes and re-ranks the whole pool (run 40: ~62 of the 99 s tail) — DONE 10-07 (#400)
 
 The parallel download ends at the archive tip the gate knew (970,229);
 the blocks that arrived during the 4.7 h sync (37) are fetched by the
@@ -678,7 +706,7 @@ download gate extend itself to the current header tip before it closes).
 Small. Measure: the tail from `parallel downloader wrote` to `[ready]`,
 99 s → ~40 s.
 
-### B11. The memtable's backing: file-backed shared mappings, and a put column that moves 2,141 s between runs of the same code
+### B11. The memtable's backing: file-backed shared mappings, and a put column that moves 2,141 s between runs of the same code — DONE 10-07 (#400)
 
 Evidence: put 4,994 / 5,661 / 7,135 s over runs 38 / 39 / 40 (ins 1,377 /
 1,845 / 2,621; undo 2,242 / 2,463 / 3,079) with no change to the put path
@@ -752,7 +780,7 @@ peak 31.4 GB (run 40: 22.1) — the memtable's pages moved from the file
 column to the anon column, as B11 intends; the total is the same
 memory counted once.
 
-### B13. The window-stall rule bans a fresh peer on its first chunk (run 41: 29 stalls, 26 of them a holder that had completed nothing)
+### B13. The window-stall rule bans a fresh peer on its first chunk (run 41: 29 stalls, 26 of them a holder that had completed nothing) — BUILT 10-07 (#405)
 
 `banned 34/132 (amnesty active)` by 13:21Z, 30 of them between 13:09
 and 13:21 (blocks 391,809–430,801, where the blocks pass 1 MB). Every

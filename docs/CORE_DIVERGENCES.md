@@ -1,4 +1,4 @@
-# Where this node still differs from Core — issues to resolve (2026-09-09)
+# Where this node still differs from Core — issues to resolve (2026-09-09; updated 2026-10-07)
 
 An inventory taken after the 09-09 leg and compact-block work, extended the same night with the initial-sync rows from the run 19 measurements, ordered by measured payoff. Each row names what Core does, what this node does, the measured cost, and the fix. Rows move to "closed" with the PR that closes them. Consensus is not on this list: every consensus rule is proven against Core's vectors and the regtest differentials, and the two decided refusals (`assumeutxo`, testnet3) are documented in `FEATURE_GAPS.md`.
 
@@ -25,7 +25,7 @@ An inventory taken after the 09-09 leg and compact-block work, extended the same
 | ad | `getnetworkinfo` carries `bmc_build_commit`/`bmc_build_dirty`: Core has no build attestation over RPC and a monitor could not tell a fixed node from a broken one | #180 |
 | ac | `bmcgetdownloadinfo`: an RPC Core has no counterpart for, exposing the forked downloader's worker->peer->chunk->rate map and window state. Deliberate addition, not a gap | #179 |
 | ab | download concurrency costs a PROCESS per peer here (node_ibd_blocks_s blocks for a chunk and cannot multiplex); Core multiplexes 8 peers in one ThreadMessageHandler thread. Same peer count now, different mechanism | open (architectural) |
-| aa | a peer evicted for stalling the download window is remembered for the run, so the picker cannot hand it the same chunk again (run 20: fourteen times on one chunk) | #177 |
+| aa | a peer evicted for stalling the download window is remembered for the run, so the picker cannot hand it the same chunk again (run 20: fourteen times on one chunk). **Amended 2026-10-07 (B13, #405):** the first stall is Core's disconnect only, and the second stall of the same address bans it. Run 41 had banned 26 fresh peers for one slow first chunk each. | #177, #405 |
 | z | a v2 session exports with the message in flight (the 64 KB blob refused a headers reply and closed healthy legs on snapshot ab); the refusal names its size | #174 |
 | y | the reorg probe runs before the pass on an idle leg (it had probed the socket a pass child was reading: every leg reset within seconds on snapshot aa); no pass runs inline; eight dial helpers | #172 |
 | x | a leg's pass runs in a helper; the sweep, pongs, relay and pushes continue while a block is fetched | #169 |
@@ -266,7 +266,8 @@ each was defended as parity. The rule now is the one Core's source states,
 with the citation above; a change to it belongs here with its own entry.
 
 **What remains genuinely different** is the shape inside a peer, not the
-count: a worker asks for one 40-block chunk in a single `getdata` where Core
+count: a worker asks for one chunk in a single `getdata` (16 blocks since
+2026-10-01, `bmc.dlcchunk`, #361; 40 before) where Core
 keeps 16 blocks in flight and refills as each lands (see
 `docs/CORE_BEHAVIORAL_COMPAT.md`, "Blocks in flight per peer"). And peer
 *selection* is still the open question the 09-14 entry named: workers spend
@@ -276,6 +277,37 @@ Setting `bmc.catchupworkers` to anything but the derived 10 for a benchmark
 against Core makes that benchmark measure peer count, not implementation.
 Runs 27 to 30 ran at 8 and Core's baselines at 10; the pairs are still fair
 in Core's favour, and run 31 is the first at 10.
+
+---
+
+## The initial download's other deliberate differences (2026-10-04 to 10-07)
+
+Each of these is on by default (`bmc.dlshape=bmc`). `bmc.dlshape=core`
+(2026-10-04, #380) runs Core's rules instead, so that a benchmark against Core
+compares validation and not download policy. That means 16 blocks in flight per
+peer topped up as each lands, peers in random order, no ranking, rotation or
+rate floor, a staller disconnected and never banned, and Core's block download
+timeout.
+
+- **Header-sync peer (B5, #383; B12, #404).** Core syncs headers from one peer
+  (`nSyncStarted` is 0 or 1) and tries a second only after a timeout. This node
+  asks four candidates for the first page at once and lets the fastest lead.
+  From 2026-10-07 it also switches forward when the leader's last 4 pages fall
+  under half the next candidate's probed rate. The next candidate continues
+  from where the leader stopped, with the stored headers kept and the low-work
+  hold carried. Why: the header phase is one peer's speed, and a peer that
+  answers its first page fast and then streams at 0.5 MB/s cost 165 s (the B9
+  fix arm) against 33 s on a good draw. Stated in `asm/daemon/dlc_rules.h`.
+- **A repeat staller is banned (B13, #405).** Core disconnects a staller and
+  never bans it. This node does the same on the first stall and bans the
+  address on its second (see row `aa`).
+- **A claim the chain could not have reached is not believed (B10, #400).**
+  Core has no far-behind trigger to fool. This node starts its parallel
+  downloader when two peers claim a height well above its tip. Since
+  2026-10-07, a claim more than 50 blocks plus a block a minute above the
+  pool's last median is not believed: right after run 40's download, two legs
+  claimed 975,945 on a 970,229 chain and cost a 62 s re-ranking for 37 blocks.
+  The highest claim inside the bound is used instead, or the median.
 
 ---
 

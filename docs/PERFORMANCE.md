@@ -1,7 +1,12 @@
 # Serving performance: bitcoinmachinecode vs Bitcoin Core
 
-**Living document.** Last measured 2026-09-17, node commit `07256990`, against
-the Bitcoin Core v31.99 oracle on the same machine.
+**Living document.** The tables below were last measured 2026-09-17, node
+commit `07256990`, against the Bitcoin Core v31.99 oracle on the same machine.
+That oracle was retired on 2026-10-01; every figure since is against v31.1.
+The current head-to-head numbers, for both serving and IBD, are in
+[reports/2026-10-06-core-vs-bmc-performance-release.md](reports/2026-10-06-core-vs-bmc-performance-release.md)
+(the release report, updated through run 41 on 2026-10-07). Read that first.
+This file keeps the method, the history and the reasons.
 
 This covers the node **after** the sync: the RPC surface, memory, and disk.
 Micro-benchmarks of the verification hot paths (hashing, secp256k1, UTXO I/O)
@@ -121,12 +126,22 @@ a **txindex lane** (private store handle and block buffer, one mutex that
 `irs_refresh` also takes — a real lock, the 2026-10-02 crash was this path
 lock-free) serves `rpc_chain_tx_blockhash`, `getrawtransaction` v0/v1 and
 the batch's parent lookups, one entry per batch; `getblock` runs in a
-per-RPC-thread reader lane (class NOLOCK; 8 MB per `-rpcthreads`);
+per-thread reader lane (class NOLOCK; 8 MB and three descriptors per thread
+that has called it);
 `getmempoolinfo`'s totals are memoised on the mempool sequence (advanced on
 every accept, removal, block connect and disconnect), so the slot walk runs
 only when the pool changed. The 32-client rows before/after are in
 `docs/reports/2026-10-06-core-vs-bmc-performance-release.md`, measured with
 `validation/rpc_concurrency_bench.sh`.
+
+**Update 2026-10-07: the reader lane's cost was per thread, and not every
+caller is a pool.** The lane was sized as 8 MB per `-rpcthreads` worker, a fixed
+set. The Esplora facade runs a thread per connection and calls `getblock` in
+process, so every facade block read created a lane on a thread that then exited
+without releasing it. Production reached 1,023 of 1,024 descriptors and RPC
+stopped accepting for 2 h 17 m. A pthread-key destructor now releases the lane at
+thread exit (#402), and `test_rpc_chain` pins it at 64 threads.
+`devlog/INCIDENT_2026-10-07_reader_lane_fd_leak.md` has the full account.
 
 ## 5. Memory
 
@@ -240,9 +255,16 @@ treat the *reason* as unverified even though the number is not.
 
 ## What we have NOT measured
 
-Nothing below has a number yet. Do not let the tables above stand in for them.
+As of 2026-09-17, nothing below had a number. Items 1 and 7 have been measured
+since (2026-10-07 note at each). Do not let the tables above stand in for the rest.
 
-1. **Initial block download, head to head.** The only Core baseline on this box
+1. **Initial block download, head to head.** *Measured since:* runs 28 and 29
+   against an unpolled Core v31.1 (09-21, 09-22) on the old link, then seven
+   Core v31.1 runs on the repaired link. The latest is run 41 against Core
+   rerun #7 (2026-10-07): every index at the tip in 3:48:22 against 9:50:04
+   (0.39), with the UTXO set MuHash-identical. See
+   `reports/2026-10-07-run41-vs-core7-stage-report.md`. The rest of this item
+   is the 09-18 text. The only Core baseline on this box
    (19h 14m) ran on a Samsung Portable SSD T5 at 0.40 GB/s while run 26 ran on
    NVMe. That comparison was withdrawn. A matched pair — same device, same day,
    every index each node supports, configs recorded before launch — is **in
@@ -267,7 +289,8 @@ Nothing below has a number yet. Do not let the tables above stand in for them.
    against 0.6 s warm on a 191 GB run set — a 60× spread that the warm number
    hides completely.
 7. **Boot time.** bmc takes 30–75 s from launch to answering RPC; Core's is
-   unmeasured.
+   unmeasured. *Partly measured since:* boot to the first block of a fresh
+   sync, 48 s (run 41) against Core #7's 45 s, in the stage report above.
 8. **Address queries under concurrency**, and at a journal near its rotation
    size (see below).
 9. **Memory under mempool pressure** — both were measured with bmc's pool at a
@@ -276,6 +299,11 @@ Nothing below has a number yet. Do not let the tables above stand in for them.
 ---
 
 ## Closing or exceeding the gaps
+
+*(2026-10-07: items 1 and 2 were done in #383 on 2026-10-05: the thread-local
+store and block buffer became the RPC lanes, and `getmempoolinfo`'s totals are
+memoised on the mempool sequence. The text below is the 09-17 plan, kept for its
+reasoning.)*
 
 **1. RPC concurrency — reframed, after PR #257.** The cheap chain reads no
 longer need it: `getblockchaininfo` matches Core at 32 clients while still

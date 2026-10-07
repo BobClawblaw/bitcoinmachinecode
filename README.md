@@ -52,17 +52,23 @@ testnet4, signet (public or custom) and regtest.
 
 **Initial block download**
 
-- Headers-first, then 16 download workers each fetching a 40-block chunk
-  with one `getdata` per chunk (blocks placed by hash as they arrive), inside
-  a 4,096-block window above the first unfilled height — Core's
-  `BLOCK_DOWNLOAD_WINDOW` scaled to this node's in-flight count — so the
-  archive consolidates monotonically and a chunk a worker gives up on goes
-  to a retry ring, never a hole left behind. An idle worker fetches the
-  chunk blocking the window after 2 s (Core's stalling timeout). Workers
-  stage each verified chunk to a file and one committer process appends
-  the archive in height order, so the block files are laid out
-  monotonically and the archive never holds a hole (unlike Core's
-  arrival-order `blk*.dat`).
+- Headers first. Four peers are asked for the first header page at once
+  and the fastest leads. A leader that slows to under half the runner-up's
+  rate is switched, and the runner-up continues from where it stopped
+  (2026-10-07). Then blocks: 10 download workers (`bmc.catchupworkers`,
+  Core's preferred-download set), each fetching a 16-block chunk
+  (`bmc.dlcchunk`) with one `getdata` per chunk, with blocks placed by hash
+  as they arrive. Requests stay inside Core's 1,024-block window above the
+  connected tip (`BLOCK_DOWNLOAD_WINDOW`). A chunk a worker gives up on goes
+  to a retry ring, never a hole left behind. Core's stall rule judges the
+  window's tail: while the window is full, the holder of its oldest missing
+  chunk has 2 s (doubling to 64 s). Then it is disconnected and the chunk
+  goes to an idle worker at once. A peer that stalls a second time is banned
+  for the run. Workers stage each verified chunk to a file, and one committer
+  process appends the archive in height order, so the block files are laid
+  out monotonically and the archive never holds a hole (unlike Core's
+  arrival-order `blk*.dat`). `bmc.dlshape=core` downloads by Core's own rules
+  instead, for benchmarks.
 - Peers are ranked by a timed header sample before the download; a peer is
   dropped only by a stall clock (nothing for 120 s) or, at a chunk boundary
   with nothing discarded, for running under half the pool's median. Every
@@ -208,7 +214,7 @@ testnet4, signet (public or custom) and regtest.
   test oracles).
 - Disk: about 1 TB for a full mainnet archive plus the UTXO store. A pruned
   node fits in a few GB.
-- Memory: several GB. The UTXO memtable (`dbcache`, default 1024 MiB) grows
+- Memory: several GB. The UTXO memtable (`dbcache`, default 450 MiB, Core's) grows
   to multiple GB in bulk catch-up mode during initial sync.
 - Optional: a `tor` daemon (SOCKS and control port), an I2P router with the
   SAM bridge (`i2pd`), and `cjdroute` for the respective networks.
@@ -260,7 +266,7 @@ and the archive tools (`check_chain`, `verify`, `dumpblock`, `unified_ibd`,
    else, put the file at `<datadir>/bitcoin.conf` (or export
    `BITCOIN_CONF`). A daemon that finds no file logs `[config] no config
    file at ... -- using compiled defaults` and runs on the defaults: P2P
-   port 8333, RPC on loopback, `dbcache=1024`. The fresh-install acceptance
+   port 8333, RPC on loopback, `dbcache=450` (1024 until 2026-09-29). The fresh-install acceptance
    test (`validation/fresh_install_ibd.sh`) hit exactly this on its first
    run, 2026-09-02.
 
@@ -377,7 +383,7 @@ log echoes the resolved values.
 | `mempoolfullrbf` | — | not an option in Core v31.1 (full RBF is unconditional); logged as an unknown configuration value |
 | `datacarrier` / `datacarriersize` / `permitbaremultisig` / `acceptnonstdtxn` | `1` / `100000` / `1` / `0` | relay policy |
 | `bytespersigop` | `20` | fee rate is judged against `max(vsize, sigops * bytespersigop / 4)` |
-| `dbcache` | `1024` MiB | UTXO memtable sizing |
+| `dbcache` | `450` MiB | UTXO memtable sizing (Core v31.1's default since 2026-09-29; it was 1024) |
 | `par` | `0` (auto) | script-verification threads |
 | `prune` | `0` | `0` off, `1` manual-only, `>=550` target size in MiB |
 | `txindex` / `txospenderindex` / `addrindex` / `blockfilterindex` / `coinstatsindex` | `0` | optional indexes, all built by the daemon during the sync; `addrindex` must be set BEFORE syncing (historic spends need undo) |

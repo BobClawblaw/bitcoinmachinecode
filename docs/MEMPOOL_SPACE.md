@@ -117,6 +117,18 @@ index is built and `addrindex=1` is on, and include unconfirmed activity
 from the mempool. Lightning routes are mempool's own lightning backend and
 are unrelated. The genesis coinbase 404s, as on Core.
 
+**If the backend stops advancing while the node's tip does**, check the node
+before the backend. The facade runs one thread per connection
+(`Connection: close`), so every backend request is a new connection, and the
+node's descriptor limit (1,024 under the reference unit) is shared with
+everything else it serves. On 2026-10-07 a per-thread leak used up all 1,024.
+The facade and RPC stopped accepting while P2P carried on, and the backend
+sat 11 blocks behind for 2 h 17 m
+(`devlog/INCIDENT_2026-10-07_reader_lane_fd_leak.md`). The checks are in
+OPERATIONS.md, *Troubleshooting*. The backend's own Node.js heap is the other
+usual cause: it needs well over upstream's 2 GB default against a full
+mempool (16 GB on the reference box since 2026-10-06).
+
 ## Ports on the reference box
 
 The production node serves P2P on 8332, JSON-RPC on 8331 and the facade

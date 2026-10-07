@@ -6,7 +6,7 @@ indexes, the same other services running beside them; the full tables
 are in `docs/reports/2026-10-06-core-vs-bmc-performance-release.md`
 and the per-segment stage reports beside it. The build is main
 `7027c734` (PR #400). Production runs `deploy-20261006d` (main
-`b194dd01`, PR #397) at the time of writing; the deploy of `7027c734`
+`b194dd01`, PR #396) at the time of writing; the deploy of `7027c734`
 is the operator's next step.
 
 ## The headline
@@ -115,3 +115,20 @@ design (ours carry the spent scripts for the address history).
   s on a bad one (plan B12).
 - The ranking's top churns across runs (69–81 distinct peers serve a
   sync that 25 served in run 38; plan B9 part 1).
+
+## Addendum, later on 2026-10-07
+
+- **Deployed.** `7027c734` went live inside `deploy-20261007a` (main
+  `54ffb790`, 18:42:56Z), together with #402.
+- **"No lock-ups since the 10-05 deploy" needs a qualifier.** It holds for
+  exec-lock waits, but production's RPC was dead for 2 h 17 m on 10-07, from
+  16:26Z, for a different reason. The getblock reader lane leaked three
+  descriptors per Esplora facade connection until accept() hit the 1,024
+  limit. Fixed by #402:
+  `devlog/INCIDENT_2026-10-07_reader_lane_fd_leak.md`.
+- **The B3 reap at the tip has a test.** #403 added
+  `tests/test_utxo_reap_at_tip`.
+- **Two of the open items are built.** B12, the header leader switch, is
+  #404. B13, the stall rule banning on a second stall, is #405. Neither has
+  been measured on a benchmark yet. See
+  `releases/2026-10-07-the-descriptor-outage-and-the-header-leader.md`.
