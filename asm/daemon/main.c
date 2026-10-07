@@ -7096,9 +7096,11 @@ static void dlc_scan_progress(long* out_tip, long* out_present){
 #define DLC_CW_PER_PASS      65536L   /* chainwork records appended per pass (B8, 2026-10-06): the committer's last few seconds, still in the page cache */
 #define DLC_STATUS_MS        10000L   /* the peer-status table's cadence (was the loop's nanosleep) */
 #define DLC_CONNECT_RETRY_MS 30000L   /* after a connect FAILURE (not a hole): keep downloading, retry later */
+#define DLC_IDLE_POLL_MS        20L   /* B9 part 2 (2026-10-07): while idling, how often the committer's tip is read */
 static int  g_dlc_interleave        = 1;                     /* test seam: 0 = the pre-step-1 loop */
 static long g_dlc_connect_budget_ms = DLC_CONNECT_BUDGET_MS;
 static long g_dlc_idle_ms           = DLC_IDLE_MS;
+static long g_dlc_n_idle_cut        = 0;                     /* idle waits ended early because the committer's tip moved (B9 part 2); the gate line prints it, tests read it */
 static pid_t* g_dlc_kids = NULL;   /* dl_catchup's helper pids while it runs; NULL otherwise */
 static int    g_dlc_nw   = 0;
 static void dl_new_block_choke(void);   /* the 3.1 choke point, defined with the worker below */
@@ -8019,6 +8021,7 @@ static long dl_catchup_run(const char* dir, int min_workers){
     long conn_total = 0;                       /* blocks connected by this call's passes */
     long cw_total = 0;                         /* chainwork records appended by this call's passes (B8) */
     long long last_status_ms = dlc_now_ms(), connect_retry_ms = 0;
+    long idle_cut_tip = -2;                    /* the committer tip that last cut an idle wait short (B9 part 2) */
     int alive=nw;
     int dlc_table_this_tick = 1;
     while(alive>0){
@@ -8070,12 +8073,36 @@ static long dl_catchup_run(const char* dir, int min_workers){
         if(done <= 0){
             long ms = interleave ? g_dlc_idle_ms : 10000L;   /* the pre-step-1 loop: sleep 10 s, print */
             /* sleep in 200 ms steps so a worker blocked at the window gets a
-             * fresh anchor without waiting for the 10 s tick */
-            for(long slept=0; slept<ms; slept+=200){
-                if(next_claim[DLC_CTL_WANT_ANCHOR]) dlc_publish_anchor(next_claim, start_h);
-                dlc_stall_tick(next_claim, stats, kids, opid, nw, start_h, end_h, dlc_now_ms(), live, nlive, banned);
-                long step = ms-slept < 200 ? ms-slept : 200;
+             * fresh anchor without waiting for the 10 s tick.
+             *
+             * B9 part 2 (2026-10-07, run 40 against Core rerun #7): the wait
+             * ends as soon as the committer's contiguous tip is above the
+             * connected tip, i.e. there is something to connect. The window
+             * is anchored to the connected tip, and on the early chain the
+             * helpers fill a 1,024-block window of tiny blocks in ~0.3 s and
+             * then block at its edge while this loop slept the whole
+             * DLC_IDLE_MS before connecting them: every window cost one
+             * tick. Run 40's chunk completions came in bursts 2.09 s apart
+             * (p50) through the first 100,000 blocks, one burst per window,
+             * and it reached 100,000 in 4:16 against Core #7's 2:06 (Core
+             * connects on arrival, so its window never waits on a timer).
+             * The tip is read from shared memory every DLC_IDLE_POLL_MS; a
+             * given committer tip cuts the wait at most once, so a pass that
+             * connects nothing (a hole at the front, the connect-failure
+             * backoff) cannot turn this into a spin. The anchor and the stall
+             * tick keep their 200 ms cadence. */
+            for(long slept=0; slept<ms; ){
+                if(slept % 200 == 0){
+                    if(next_claim[DLC_CTL_WANT_ANCHOR]) dlc_publish_anchor(next_claim, start_h);
+                    dlc_stall_tick(next_claim, stats, kids, opid, nw, start_h, end_h, dlc_now_ms(), live, nlive, banned);
+                }
+                if(interleave && dlc_now_ms() >= connect_retry_ms){
+                    long ct = next_claim[DLC_CTL_COMMIT_TIP];
+                    if(ct > utxo_live_applied_height() && ct != idle_cut_tip){ idle_cut_tip = ct; g_dlc_n_idle_cut++; break; }
+                }
+                long step = ms-slept < DLC_IDLE_POLL_MS ? ms-slept : DLC_IDLE_POLL_MS;
                 struct timespec ts={step/1000,(step%1000)*1000000L}; nanosleep(&ts,NULL);
+                slept += step;
             }
         }
         if(g_shutdown_requested){
@@ -8388,8 +8415,8 @@ static long dl_catchup_run(const char* dir, int min_workers){
         fprintf(stderr,"[dlc] chainwork in step with the archive at the download gate: %ld record(s) appended during the download\n", cw_total);
     }
     ixw_catchup_stop("the download is over: the tip's blocks are indexed inline");   /* drains the ring first; the writers re-read their state */
-    if(interleave) fprintf(stderr,"[dlc] connected %ld block(s) during the download; connected tip %ld (the rotation drains the rest)\n",
-                           conn_total, utxo_live_applied_height());
+    if(interleave) fprintf(stderr,"[dlc] connected %ld block(s) during the download; connected tip %ld (the rotation drains the rest); idle waits cut short %ld (B9)\n",
+                           conn_total, utxo_live_applied_height(), g_dlc_n_idle_cut);
     long total=*done_count;
     /* Remember who actually produced blocks. A peer that delivered is worth
      * trying first next boot; the address book alone only records that an IP
