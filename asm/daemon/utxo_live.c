@@ -739,6 +739,11 @@ static void fz_poll(void){
     if (r == g_fz_pid) fz_adopt(fz_status_how(st));
     else if (r < 0 && errno != EINTR) fz_adopt(0);          /* lost (ECHILD): the run is rebuilt inline */
 }
+/* The worker's idle rotation calls this between catch-up passes (main.c),
+ * so a writer or compaction child that has exited is adopted within a
+ * rotation (~200 ms) whatever the catch-up's retry backoff is doing. Both
+ * polls are WNOHANG on their own pid and return at once with no child. */
+void utxo_live_bg_poll(void){ compact_poll(); fz_poll(); }
 static void fz_wait(void){
     if (!g_fz_pid) return;
     int st; pid_t r;
@@ -986,6 +991,41 @@ static void* mmap_file(const char* path, u64 size){
     void* p = mmap(0, size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd); /* mapping stays valid after close */
     if (p == MAP_FAILED) { fprintf(stderr, "[utxo_live] mmap(%s,%lu) failed: %s\n", path, size, strerror(errno)); return 0; }
+    return p;
+}
+/* B11 (2026-10-07): the live memtable in ANONYMOUS memory, the file kept.
+ * Three runs of the same put code read 4,994 / 5,661 / 7,135 s of put
+ * (runs 38 / 39 / 40), the extra time waited for, not computed, and the
+ * table and blob were MAP_SHARED file mappings: every insert dirtied a
+ * file page the kernel wrote back and could reclaim (utxo_init's marking
+ * of 2^25 slots and each freeze's clear dirtied the whole 1.6 GB table
+ * again), and a file-backed mapping gets no transparent huge pages, so a
+ * random-access table of 1.6 GB paid a TLB miss per probe
+ * (tests/bench_utxo_probe measures that share). Nothing reads the table
+ * or blob file back: the boot and every tool rebuild their view by
+ * utxo_lsm_reload (a WAL replay) into their own anonymous tables -- with
+ * two exceptions the file is kept for. The tools derive the slot count
+ * and the blob cap from the FILE SIZES (utxo_probe_one, utxo_dump_keys,
+ * utxo_repair_del, utxo_setinfo), so the file is still created and sized.
+ * And the tx-validation snapshot (tx_accept.c) cross-checks its replay
+ * against the writer's live count, the first qword of the table: so the
+ * table's first page IS the file's first page, mapped MAP_SHARED|MAP_FIXED
+ * over the anonymous region -- the 40-byte header (count, mask, blob
+ * pointer, blob cap, fill) and the first 84 slots stay visible to other
+ * processes, everything else is private, huge-page eligible, never
+ * written back. bmc.memtableanon=0 restores the file mappings. */
+static void* mmap_anon_kept_file(const char* path, u64 size, int header_page){
+    int fd = open(path, O_RDWR | O_CREAT, 0644);
+    if (fd < 0) { fprintf(stderr, "[utxo_live] open(%s) failed: %s\n", path, strerror(errno)); return 0; }
+    if (ftruncate(fd, (off_t)size) != 0) { fprintf(stderr, "[utxo_live] ftruncate(%s,%lu) failed: %s\n", path, size, strerror(errno)); close(fd); return 0; }
+    void* p = mmap(0, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0);
+    if (p == MAP_FAILED) { fprintf(stderr, "[utxo_live] mmap(anon %s,%lu) failed: %s\n", path, size, strerror(errno)); close(fd); return 0; }
+    madvise(p, size, MADV_HUGEPAGE);
+    if (header_page && size >= 4096){
+        void* h = mmap(p, 4096, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED, fd, 0);
+        if (h == MAP_FAILED) { fprintf(stderr, "[utxo_live] mmap(header page of %s) failed: %s\n", path, strerror(errno)); munmap(p, size); close(fd); return 0; }
+    }
+    close(fd);
     return p;
 }
 
@@ -3308,6 +3348,7 @@ static int g_bulk_mode = 0;
  * of the threshold arithmetic has no business setting up. */
 static int g_test_force_sizing = -1;   /* tests: -1 decide as production does, 0 steady-state, 1 bulk (2026-09-09: a fresh datadir is bulk now, and a test that needs the small memtable says so) */
 void utxo_live_test_force_sizing(int mode){ g_test_force_sizing = mode; }
+void* utxo_live_test_table(void){ return g_utxo_table; }   /* test seam (B11, 2026-10-07): the live memtable, for tests/test_utxo_memtable_anon */
 void utxo_live_test_set_bulk_mode(int on){ g_bulk_mode = on; }
 int  utxo_live_is_bulk(void){ return g_bulk_mode; }   /* 2026-09-09: for tests and the boot line */
 /* Read side (daemon/main.c decides whether the coinstats index seeds at boot
@@ -3423,10 +3464,19 @@ int utxo_live_init(const char* dir){
     u64 manifest_cap       = UTXO_LIVE_MANIFEST_CAP;
 
     long ustruct = utxo_struct_size(slots);
-    g_utxo_table = mmap_file("utxo_lsm_table.map", (u64)ustruct);
-    void* blob = mmap_file("utxo_lsm_blob.map", blob_cap);
+    if (g_cfg.memtable_anon){                       /* B11: anonymous table and blob, the files kept (see mmap_anon_kept_file) */
+        g_utxo_table = mmap_anon_kept_file("utxo_lsm_table.map", (u64)ustruct, 1);
+    } else {
+        g_utxo_table = mmap_file("utxo_lsm_table.map", (u64)ustruct);
+    }
+    void* blob = g_cfg.memtable_anon ? mmap_anon_kept_file("utxo_lsm_blob.map", blob_cap, 0)
+                                     : mmap_file("utxo_lsm_blob.map", blob_cap);
     if (!g_utxo_table || !blob) { fprintf(stderr, "[utxo_live] mmap alloc failed\n"); return 0; }
     utxo_init(g_utxo_table, slots, blob, blob_cap);
+    if (g_cfg.memtable_anon){                       /* M1 names for the anonymous parts (the header page is the file's) */
+        benchlog_mem_name_region((char*)g_utxo_table + 4096, (size_t)ustruct - 4096, "utxo-memtable-table");
+        benchlog_mem_name_region(blob, (size_t)blob_cap, "utxo-memtable-blob");
+    }
 
     void* tomb_buf = malloc(tomb_cap*36);
     void* manifest_buf = malloc(manifest_cap*16); /* [gen:8][run_no:8] per entry */
@@ -3782,6 +3832,14 @@ static long catchup_run(void* store_buf, long max_ms, int stop_at_hole){
          * bound: a download that stalls must not hold the checkpoint open */
         if (g_ckpt_since && g_bulk_mode && mono_ms() - g_ckpt_last_ms >= UTXO_CKPT_BULK_MS && !ckpt_now())
             fprintf(stderr, "[utxo_live] WARNING: failed to persist the carried checkpoint at height %ld\n", g_applied_height);
+        /* 2026-10-07 (B3 at the tip): the polls used to run only at the
+         * end of a pass that applied something, i.e. the pass that forked
+         * the writer, before it had exited; at one block an hour the
+         * finished writer sat as a zombie and its run, the WAL hole punch
+         * and the frozen copy's release waited for the next block
+         * (production, deploy-20261006d, 01:16Z). Every pass polls. */
+        compact_poll();
+        fz_poll();
         return 0;
     }
     g_last_fail_kind = UTXO_FAIL_NONE;

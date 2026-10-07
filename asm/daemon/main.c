@@ -5026,6 +5026,7 @@ static long g_dlc_pool_idle_pct = -1;   /* pool-wide share of worker wall-clock 
 #define DLC_MAXPOOL 2048
 #include "dlc_rules.h"
 static long g_live_announced[DLC_MAXPOOL];   /* each ranked live peer's start_height (aligned with live[] after the sort; 0 = unknown) */
+static long g_dl_pool_claim = 0; static long long g_dl_pool_claim_s = 0;   /* B10 (2026-10-07): the pool's median claim from the last ranking and when; see dl_plausible_claim */
 #define DLC_HDR_TRY_PEERS 8
 /* STALL budget: the longest a worker waits for the NEXT block of a chunk
  * before dropping the peer. Re-armed from the pipeline's progress hook on
@@ -7239,6 +7240,7 @@ static void dlc_rank_by_throughput(char live[][DL_POOL_SLOT], int nlive){
     { static long sorted_ann[DLC_MAXPOOL]; for (int i = 0; i < nlive; i++) sorted_ann[i] = ann[idx[i]]; for (int i = 0; i < nlive; i++) g_live_announced[i] = sorted_ann[i]; for (int i = nlive; i < DLC_MAXPOOL; i++) g_live_announced[i] = 0;
       long announced = dlc_announced_height(g_live_announced, nlive); int claimed = 0; for (int i = 0; i < nlive; i++) if (g_live_announced[i] > 0) claimed++;
       fprintf(stderr, "[dlc] the pool announces height %ld (%d of %d peers claimed one; the median claim counts)\n", announced, claimed, nlive);
+      if (announced > 0){ g_dl_pool_claim = announced; g_dl_pool_claim_s = (long long)time(NULL); }   /* B10: what the far-behind trigger measures later claims against */
       munmap(ann, sizeof(long) * (size_t)nlive); }
     int answered = 0; double best = 0.0, worst_answered = 0.0;
     for (int i = 0; i < nlive; i++) if (rate[idx[i]] >= 0.0){ answered++; if (best == 0.0) best = rate[idx[i]]; worst_answered = rate[idx[i]]; }
@@ -8949,6 +8951,26 @@ static long dl_trigger_height(const long* hs, int n){
     for(int i=0;i<n;i++){ if(hs[i] > top){ second = top; top = hs[i]; } else if(hs[i] > second) second = hs[i]; }
     return n >= 2 ? second : top;
 }
+/* 2026-10-07 (run 40, plan B10): the pool's own claim from the last parallel
+ * download's ranking (the median over the handshakes: 135 of 161 peers in
+ * run 40) and when it was taken. Right after a download the legs are fresh
+ * and a cluster's claim passes the second-highest rule unopposed: run 40's
+ * worker saw two legs claim 975,945 on a 970,229 archive four seconds after
+ * a ranking had put the pool's median at 970,265, and ran the full parallel
+ * downloader -- seeds, liveness probe, a 2,000-header ranking of 161 peers,
+ * 62 s -- for the 37 blocks that were really there. The chain grows a block
+ * every ten minutes; a claim more than DL_CLAIM_GROWTH_BLOCKS plus a block
+ * a minute (six times the real rate) above the last median is not believed.
+ * The highest claim within that bound is used instead, else the median. A
+ * fresh node with no ranking behind it keeps the second-highest rule. */
+#define DL_CLAIM_GROWTH_BLOCKS 50L
+static long dl_plausible_claim(long best, const long* hs, int n, long pool_claim, long long pool_s, long long now_s){
+    if(pool_claim <= 0 || best <= 0) return best;
+    long bound = pool_claim + DL_CLAIM_GROWTH_BLOCKS + (long)((now_s - pool_s) / 60);
+    if(best <= bound) return best;
+    long within = 0; for(int i=0;i<n;i++) if(hs[i] <= bound && hs[i] > within) within = hs[i];
+    return within > 0 ? within : pool_claim;
+}
 /* issue #304 (2026-09-28): two agreeing peers were a CLUSTER. Every claim
  * above 973,900 on a 968,5xx chain came from /Satoshi:29.4.x/Knots/ peers
  * following a fork bmc's own reorg probe rejects (6,922 deep at 961,631);
@@ -10540,6 +10562,12 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     if(mux_out_fd[i]>=0 && g_node_status->peers[i].start_height > 0 && dl_claim_believed(i, nows))   /* #304: failing and remembered legs do not vote */
                         hs[nh++] = g_node_status->peers[i].start_height;
             long best = dl_trigger_height(hs, nh);
+            { long b2 = dl_plausible_claim(best, hs, nh, g_dl_pool_claim, g_dl_pool_claim_s, nows);   /* B10 (2026-10-07): a claim the chain could not have reached */
+              if(b2 != best){ static long said = -1;
+                  if(best != said){ said = best;
+                      fprintf(stderr,"[dl] peers announce %ld but the pool's median claim was %ld %llds ago -- not believed (the chain grows a block every ten minutes); using %ld\n",
+                              best, g_dl_pool_claim, (long long)(nows - g_dl_pool_claim_s), b2); }
+                  best = b2; } }
             long atip = (long)(*(int*)(store_buf+24));
             static long noop_best = -1, noop_tip = -1;
             if(g_dl_parallel_now){ g_dl_parallel_now = 0; noop_best = -1; noop_tip = -1; dl_parallel_last_s = 0; }   /* a reorg handoff: fetch now */
@@ -11127,7 +11155,10 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                   prev_drop = hf + hb; } }
             next_heartbeat_ms = now_ms + DL_HEARTBEAT_MS;
         }
-        if(!did){ usleep(200000); }   /* all idle: rest before next rotation */
+        if(!did){
+            if(g_utxo_live_on){ extern void utxo_live_bg_poll(void); utxo_live_bg_poll(); }   /* B3 at the tip (2026-10-07): adopt a finished flush writer / compaction within a rotation */
+            usleep(200000);           /* all idle: rest before next rotation */
+        }
         /* background leg-fill: gradually acquire live legs toward MUX_MAX_OUT
          * from the discovered candidate pool. Boot rarely lands all 8 at once
          * on a variable network, so keep trying to add a leg occasionally
