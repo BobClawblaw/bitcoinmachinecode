@@ -162,6 +162,18 @@ freeze, blocks 300,000+) and 0.74 ms in the rest. The tree's CPU rose by
 the writer's 1,545 s and little else (28,535 → 30,218 s), so the extra
 1,475 s of put was waited for, not computed. See B11. B3 itself: done.
 
+**Production, steady state (10-07 01:16Z, found by the other session on
+deploy-20261006d):** the writer is reaped only by `fz_poll`, and `fz_poll`
+runs only per applied block (utxo_live.c, the per-block call in catch-up
+and the post-catch-up call), both firing right after the fork, before the
+writer has exited. At the tip the writer (3.9 MB run, written in ms) sat
+as a zombie for the whole block interval; the adopt, the WAL hole-punch
+and the frozen copy's release lag by one block (10 min to 1 h+). Safe (a
+crash replays the WAL, the hook waits before the next freeze, shutdown
+reaps) but not the shape intended: poll from the idle heartbeat or on
+SIGCHLD (the compaction child's `compact_poll` has the same shape). Small;
+after Core #7, with B10.
+
 ### B4. Index work off the applier (medium)
 `idx` 1,194 s is the Phase 0.5 index build inside `apply_block_inner`;
 txindex 329 s + bfilter 375 s + csi 460 s are the choke-point writers. Core
