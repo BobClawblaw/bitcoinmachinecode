@@ -592,6 +592,49 @@ None of it is ours to stop; Core rerun #7 (started 01:24:50Z, with the
 sampler) runs on the same box in the same state, which is what makes the
 pair comparable.
 
+**Core rerun #7 (10-07 01:24:50Z → 11:14:54Z, with the sampler):** 9:50:04
+to every index at the tip (IBD end 9:49:43; tip 970,333), 52 minutes
+faster than #6 and all of it before 500,000 (100,000 at 2:06 against
+4:12, 200,000 at 4:44 against 8:15; its connect block 13,340 s against
+13,909, within 4%, so the peers, not the box). CPU 47,700 s (systemd;
+13 h 15 m). Memory: anon mean 10.0 GB, peak 12.0; PSS mean 17.6 GB, peak
+34.3; cgroup MemoryPeak 76.2 GB. Against run 40: the sync 2.09× (0.48);
+the early chain LOST (2.0× at 100,000, 1.7× at 200,000, parity at
+300,000, ahead from 400,000); the applier Core's by 10% (14,650 vs
+13,340). Stage reports: docs/reports/2026-10-07-run40-vs-core7-stage-report.md
+and -run39-vs-core7-. Logs bench/core31-rerun7-20261007-logs/, datadir
+core31-rerun7-20261007 (1.1 TB; the operator decides).
+
+### B9 part 2, found: the download loop's 2 s idle tick, paid once per 1,024-block window — BUILT 10-07 (branch perf/2026-10-07-b9-idle-tick, c6884a22)
+
+Run 40's log below 100,000: the `[bench] chunk` completions come in 99
+bursts 2.09 s apart (p10 2.02, p90 2.16), one burst per 1,024-block
+window; 6,250 chunks completed in 134 distinct seconds of the 210 s the
+first 100,000 blocks took (746 blocks/s while busy; Core #7 landed 1,205
+a second and reached 100,000 in 2:06). The dead time is dl_catchup's own
+loop (main.c, the `done <= 0` branch): each pass connects the contiguous
+prefix and publishes the anchor; the helpers, blocked at the window edge
+(the window is anchored to the CONNECTED tip), fill the next window in
+~0.3 s; the pass right after the connect found nothing new (the helpers
+had just restarted) and slept the whole DLC_IDLE_MS = 2,000 ms in 200 ms
+steps that only re-published the anchor. Above ~300,000 a window takes
+longer than the tick and it no longer shows. The earlier B9 part 2 idea
+(the rolling per-block shape, A/B'd and lost on 10-06) was not the lever.
+
+Fix: the idle wait reads `DLC_CTL_COMMIT_TIP` every DLC_IDLE_POLL_MS (20
+ms) and breaks as soon as it is above `utxo_live_applied_height()`; a
+given committer tip cuts the wait at most once (`idle_cut_tip`) and the
+connect-failure backoff (`connect_retry_ms`) is honoured, so a pass that
+connects nothing cannot become a spin; the anchor publish and the stall
+tick keep their 200 ms cadence; the gate line reports `idle waits cut
+short N (B9)`. tests/test_dlc_interleave: a third phase with the real 2
+s idle and a 120-block window over the 600-block chain (count ≥ 1,
+elapsed < 4 s) — passes (12 cuts, 993 ms); with the cut forced off:
+count 0 FAIL, 2,245 ms. Daemon builds -Werror. A/B to 300,000 launched
+11:50Z (/srv/nvme8tb/bench/ab-tick: ctl = main bf861e5c, then fix =
+c6884a22; validation/ab_dlcchunk.sh arms); then the full gate, PR,
+deploy, run 41.
+
 ### B10. The top-up round after the download re-probes and re-ranks the whole pool (run 40: ~62 of the 99 s tail)
 
 The parallel download ends at the archive tip the gate knew (970,229);
