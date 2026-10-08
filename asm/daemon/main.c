@@ -6453,8 +6453,25 @@ static long dlc_headers_ranges(char live[][DL_POOL_SLOT], int nlive, unsigned ch
     { int alive = 0; for(int k = 0; k < np; k++) if(kids[k] > 0) alive++;
       while(alive > 0 && dlc_now_ms() - t0 < (DLC_HDR_RANGES_S + 2) * 1000L){
           for(int k = 0; k < np; k++) if(kids[k] > 0){ int sv; if(waitpid(kids[k], &sv, WNOHANG) == kids[k]){ kids[k] = 0; alive--; } }
-          int pending = 0, ndone = 0; long long d[DLC_HDR_RANGES_MAXSEG];
-          for(int j = 0; j < nseg; j++){ if(st->status[j] == 0) pending++; if(st->status[j] == 2) d[ndone++] = st->dur[j]; }
+          int pending = 0, held = 0, ndone = 0; long long d[DLC_HDR_RANGES_MAXSEG];
+          for(int j = 0; j < nseg; j++){ if(st->status[j] == 0) pending++; if(st->status[j] == 1) held++; if(st->status[j] == 2) d[ndone++] = st->dur[j]; }
+          /* every range done or given up: the phase is over. Run 44 waited 180 s for a
+           * child that never took a range (stuck connecting to the probe's fastest
+           * peer) after the other three had fetched all 19; its alarm ended the phase */
+          if(!pending && !held){
+              /* the peers that fetched leave on their own once nothing is left: reap them (<= 0.5 s), count the rest */
+              long long tw = dlc_now_ms();
+              for(int fetching = 1; fetching && dlc_now_ms() - tw < 500; ){
+                  fetching = 0;
+                  for(int k = 0; k < np; k++) if(kids[k] > 0){
+                      int sv; if(waitpid(kids[k], &sv, WNOHANG) == kids[k]){ kids[k] = 0; alive--; } else if(st->pages[k] > 0) fetching = 1;
+                  }
+                  if(fetching) usleep(5000);
+              }
+              if(alive > 0) fprintf(stderr,"[dlc] header ranges: every range settled in %.1fs; %d peer(s) holding none stopped\n",
+                                    (double)(tw - t0) / 1000.0, alive);
+              break;
+          }
           if(!pending && ndone > 0 && alive > 1){
               for(int a = 1; a < ndone; a++){ long long v = d[a]; int b = a - 1; while(b >= 0 && d[b] > v){ d[b+1] = d[b]; b--; } d[b+1] = v; }
               long long bar = d[ndone / 2] * DLC_HDR_STRAGGLE_X; if(bar < g_dlc_hr_straggle_min_ms) bar = g_dlc_hr_straggle_min_ms;
