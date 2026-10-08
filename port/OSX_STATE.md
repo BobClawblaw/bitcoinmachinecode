@@ -4,12 +4,23 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-10-08 (3) — `collect_descendant_txids` walks the children index after its first pop (shared C)
+
+The deploy of ac078e42 confirmed the cluster-walk fix: mainnet's refill peaked at 28–47% for about a minute (85.6k transactions), then settled at 1–5%. The same scan pattern was left in `collect_descendant_txids`, which builds the descendant set for RBF eviction (single and package), `mpool_policy_remove_package` and TRUC sibling eviction. It scanned every registry node for each node it popped: d+1 passes over the pool for d descendants.
+- **Now** the first pop (the root) is still a scan, since most roots have no child and one pass is all they need. If the root has a child, the walk builds the children index (one more pass) and finishes through it, so it costs at most two passes. The index yields children in ascending node order, as the scan did, and both push them the same way, so the returned list, its order and the -1 overflow are unchanged. If the index cannot be allocated, the walk keeps scanning. The scan stays as the reference behind `mpool_policy_set_desc_walk_scan`.
+- **Test:** `test_mempool_policy` reuses the cluster-walk workload at limit 64 and runs two checks:
+  - It compares every pool transaction's descendant list under both walks, element for element, at bounds 128 and 3, through the `mpool_policy_descendant_txids` hook. That covers 656 lists, 270 with descendants (largest 54), and 205 that overflow the small bound.
+  - It replays 300 `remove_package` calls on two fresh copies, one per walk; 11 of them take descendant sets.
+
+  Both checks match. A walk that drops children after the first fails both (196 lists differ).
+- **Full suite:** 424 PASS, 11 SKIP, 14 N/A, 0 FAIL. Note item 26 for x86.
+
 ## 2026-10-08 (2) — the cluster-limit walk uses the children index, not a registry scan per node (shared C)
 
 After the deploy of 8e8f2fb0 the mainnet worker sat at 40–65% of a core while the pool refilled (~77k transactions). `sample` put ~63% of its samples in `mpol_add_core`, in the cluster-limit walk (`bitcoin_mempool_policy.c`, the `too-large-cluster` check).
 - **The walk** found each popped node's neighbours by scanning every registry node, checking both directions of the parent links. That is up to 64 passes over the pool per transaction with an in-pool parent, and every pass read every node's parent list. It also ran twice per transaction: `mpool_policy_test`, then `mpool_policy_add`. About 92% of production entries are cluster members, so nearly every accept paid it. Once the refill finished the worker dropped to 1–3%, but every restart repeats the burst, and so does any steady flow of child transactions.
 - **Now** the walk builds the children index once (`mpol_children_build`, O(pool + edges), the same index `mpool_policy_entry_info` uses) and takes a node's neighbours from its own parent list plus its index entry. The outcome depends only on the set the walk reaches (the component through parent links, with members of the eviction set left out), not on the order it reaches it, so the answer is the scan's. The scan stays as the fallback when the index cannot be allocated, and as the reference behind a test knob (`mpool_policy_set_cluster_walk_scan`).
-- **Not changed:** `collect_descendant_txids` uses the same scan pattern. It runs for RBF and removals, which are much rarer than accepts, and did not show in the sample.
+- **Not changed here:** `collect_descendant_txids` uses the same scan pattern. It runs for RBF and removals, which are much rarer than accepts, and did not show in the sample. Fixed in (3) below.
 - **Test:** `test_mempool_policy` replays one random 1,500-transaction workload twice, scan then index, and compares every verdict and reason. It runs at `limitclustercount` 12 (775 too-large-cluster refusals) and 64 (471). The workload includes chains, fan-ins with 2–3 in-pool parents (66 and 176 accepted) and BIP125 replacements whose evicted sets the walk must skip (35 and 48 accepted). Identical on all 3,000.
 - **Full suite:** 424 PASS, 11 SKIP, 14 N/A, 0 FAIL. Note item 25 for x86.
 

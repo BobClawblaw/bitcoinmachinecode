@@ -1200,33 +1200,78 @@ static int find_claim(void* st, const unsigned char prev[32], uint32_t index){
 /* removal machinery (single node; package = node + descendants)              */
 /* ========================================================================== */
 
+/* test knob: 1 makes collect_descendant_txids scan the registry for every
+ * popped node's children, as it did before 2026-10-08, instead of using the
+ * children index -- test_descendant_walk_differential compares the two */
+static int g_mpol_desc_walk_scan;
+void mpool_policy_set_desc_walk_scan(int on){ g_mpol_desc_walk_scan = on ? 1 : 0; }
+
 /* Collect node ci's in-pool descendant TXIDS (self excluded), bounded.
- * Children found by scanning parent links; pops bounded by desc_cnt<=25. */
+ *
+ * Until 2026-10-08 every popped node's children were found by scanning the
+ * whole registry, so a set of d descendants cost d+1 passes over the pool --
+ * the same O(set x pool) shape the cluster-limit walk had (ac078e42). Now the
+ * FIRST pop (ci itself) is still a scan, because most removals are of
+ * childless transactions and one pass is all those need. Only if ci has a
+ * child is the children index built (one more pass) and the rest of the walk
+ * done through it: at most two passes whatever the set's size.
+ *
+ * The index lists children in ascending node order, the order the scan found
+ * them, and both push them the same way, so the output -- order, the -1
+ * bound and all -- is unchanged. If the index cannot be allocated the walk
+ * falls back to scanning. */
 static int collect_descendant_txids(void* st, int ci,
                                     unsigned char out[][32], int cap){
     mpol_node* t = mpol_nodes_base(st);
     uint32_t n = *(uint32_t*)((char*)st+16);
     uint32_t stack[MPOL_PKG_MAX]; int sp = 0, cnt = 0;
     uint32_t seenidx[MPOL_PKG_MAX]; int nseen = 0;
+    uint32_t *head = 0, *nxt = 0, *chld = 0;
+    int have_ch = 0, first = 1, rc = 0;
     stack[sp++] = (uint32_t)ci;
     seenidx[nseen++] = (uint32_t)ci;
+#define MPOL_DW_VISIT(ix) do { \
+        uint32_t i_ = (ix); int seen_ = 0; \
+        for (int k_ = 0; k_ < nseen; k_++) if (seenidx[k_] == i_){ seen_ = 1; break; } \
+        if (seen_) break; \
+        if (cnt >= cap || nseen >= MPOL_PKG_MAX || sp >= MPOL_PKG_MAX){ rc = -1; goto done; } \
+        memcpy(out[cnt++], t[i_].txid, 32); \
+        seenidx[nseen++] = i_; \
+        stack[sp++] = i_; \
+    } while (0)
     while (sp > 0){
         uint32_t cur = stack[--sp];
-        for (uint32_t i = 0; i < n; i++){
-            int is_child = 0;
-            for (uint32_t k = 0; k < t[i].n_parents; k++)
-                if (mpol_par_at(st, &t[i], k) == cur){ is_child = 1; break; }
-            if (!is_child) continue;
-            int seen = 0;
-            for (int k = 0; k < nseen; k++) if (seenidx[k] == i){ seen = 1; break; }
-            if (seen) continue;
-            if (cnt >= cap || nseen >= MPOL_PKG_MAX || sp >= MPOL_PKG_MAX) return -1;
-            memcpy(out[cnt++], t[i].txid, 32);
-            seenidx[nseen++] = i;
-            stack[sp++] = i;
+        if (have_ch){
+            if (cur < n)
+                for (uint32_t e = head[cur]; e != MPOL_IDX_NONE; e = nxt[e]){
+                    MPOL_DW_VISIT(chld[e]);
+                }
+        } else {
+            for (uint32_t i = 0; i < n; i++){
+                int is_child = 0;
+                for (uint32_t k = 0; k < t[i].n_parents; k++)
+                    if (mpol_par_at(st, &t[i], k) == cur){ is_child = 1; break; }
+                if (!is_child) continue;
+                MPOL_DW_VISIT(i);
+            }
         }
+        if (first && sp > 0 && !g_mpol_desc_walk_scan)   /* ci has a child */
+            have_ch = mpol_children_build(st, n, &head, &nxt, &chld);
+        first = 0;
     }
-    return cnt;
+    rc = cnt;
+done:
+#undef MPOL_DW_VISIT
+    if (have_ch){ free(head); free(nxt); free(chld); }
+    return rc;
+}
+
+/* test hook: collect_descendant_txids for txid, -2 if it is not in the pool */
+long mpool_policy_descendant_txids(void* st, const unsigned char txid[32],
+                                   unsigned char (*out)[32], int cap){
+    int ci = find_node(st, txid);
+    if (ci < 0) return -2;
+    return collect_descendant_txids(st, ci, out, cap);
 }
 
 /* Walk ci's ancestors decrementing their with-descendants aggregates by

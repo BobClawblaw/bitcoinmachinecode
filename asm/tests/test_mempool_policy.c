@@ -49,6 +49,7 @@ extern void mpool_policy_set_cluster_limits(void*, unsigned count, unsigned vbyt
 extern void mpool_policy_set_baremultisig(void*, unsigned);
 static int test_bare_multisig(void);   /* defined below main */
 static void test_cluster_walk_differential(void);   /* defined below main */
+static void test_descendant_walk_differential(void);   /* defined below main */
 extern long   mpool_policy_add(void* pol, void* st, void* mp,
                                const unsigned char* tx, unsigned long txlen,
                                const unsigned char txid[32], void* utxo);
@@ -1118,6 +1119,7 @@ int main(void){
     }
 
     test_cluster_walk_differential();
+    test_descendant_walk_differential();
 
     printf("\n%s (%d failures)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED", failures);
     return failures ? 1 : 0;
@@ -1311,7 +1313,8 @@ static int hex_in(unsigned char* out, const char* h){
 extern void mpool_policy_set_cluster_walk_scan(int on);
 #define CWD_STEPS 1500
 static int cwd_run(int scan, unsigned cluster_count, char verdict[CWD_STEPS], char reasons[CWD_STEPS][48],
-                   int* n_cluster_refused, int* n_multi_parent_in, int* n_replaced){
+                   int* n_cluster_refused, int* n_multi_parent_in, int* n_replaced,
+                   void (*after)(void* st, void* mp)){
     static unsigned char pol[128];
     static unsigned char stbuf[1<<22];
     static unsigned char mp[40 + 8192*80 + 8];
@@ -1391,6 +1394,7 @@ static int cwd_run(int scan, unsigned cluster_count, char verdict[CWD_STEPS], ch
     }
     #undef CWD_RND
     mpool_policy_set_cluster_walk_scan(0);
+    if (after) after(stbuf, mp);
     return (int)mpool_count(mp);
 }
 static void test_cluster_walk_differential(void){
@@ -1400,8 +1404,8 @@ static void test_cluster_walk_differential(void){
     const unsigned limits[2] = { 12, 64 };
     for (int L = 0; L < 2; L++){
         int ca, ma, xa, cb, mb, xb;
-        int pa = cwd_run(1, limits[L], va, ra, &ca, &ma, &xa);
-        int pb = cwd_run(0, limits[L], vb, rb, &cb, &mb, &xb);
+        int pa = cwd_run(1, limits[L], va, ra, &ca, &ma, &xa, 0);
+        int pb = cwd_run(0, limits[L], vb, rb, &cb, &mb, &xb, 0);
         int first = -1;
         for (int i = 0; i < CWD_STEPS && first < 0; i++)
             if (va[i] != vb[i] || strcmp(ra[i], rb[i])) first = i;
@@ -1417,4 +1421,84 @@ static void test_cluster_walk_differential(void){
             okv(mb >= 20 && xb >= 5, "...and covers fan-ins (2+ in-pool parents) and accepted replacements");
         }
     }
+}
+
+/* ================================================================
+ * 2026-10-08 (2): collect_descendant_txids -- the descendant set behind RBF
+ * eviction, package removal and sibling eviction -- walks the children index
+ * after its first pop instead of scanning the registry for every node it
+ * pops. Its output is a LIST whose order the removal paths consume, so this
+ * compares the list itself, not just its size:
+ *
+ *   1. On the cluster-walk workload's final pool (limitclustercount 64, so
+ *      clusters run deep), every transaction's descendant list under the scan
+ *      and under the index, element for element, at the full bound and at a
+ *      bound of 3 so the -1 overflow is taken often.
+ *   2. Then a removal sequence run on two fresh copies of that workload, one
+ *      per mode: remove_package on every 5th surviving transaction, comparing
+ *      each removed count and the pool size after.
+ * ================================================================ */
+extern void mpool_policy_set_desc_walk_scan(int on);
+extern long mpool_policy_remove_package(void* st, void* mp, const unsigned char txid[32]);
+extern long mpool_policy_descendant_txids(void* st, const unsigned char txid[32],
+                                          unsigned char (*out)[32], int cap);
+static int dwd_lists, dwd_mismatch, dwd_with_desc, dwd_overflow, dwd_max;
+static long dwd_removed[CWD_STEPS + 1];
+static int dwd_nremoved;
+static void dwd_tid(unsigned char tid[32], int step){
+    memset(tid, 0xD3, 32); tid[0] = (unsigned char)step; tid[1] = (unsigned char)(step >> 8);
+}
+static void dwd_compare(void* st, void* mp){
+    (void)mp;
+    static unsigned char a[128][32], b[128][32];
+    const int caps[2] = { 128, 3 };
+    for (int step = 0; step < CWD_STEPS; step++){
+        unsigned char tid[32]; dwd_tid(tid, step);
+        for (int c = 0; c < 2; c++){
+            mpool_policy_set_desc_walk_scan(1);
+            long na = mpool_policy_descendant_txids(st, tid, a, caps[c]);
+            mpool_policy_set_desc_walk_scan(0);
+            long nb = mpool_policy_descendant_txids(st, tid, b, caps[c]);
+            if (na == -2) break;                          /* not in the pool */
+            dwd_lists++;
+            if (na != nb || (na > 0 && memcmp(a, b, (size_t)na * 32))) dwd_mismatch++;
+            if (c == 0 && na > 0) dwd_with_desc++;
+            if (c == 0 && na > dwd_max) dwd_max = (int)na;
+            if (c == 1 && na == -1) dwd_overflow++;
+        }
+    }
+}
+static void dwd_remove(void* st, void* mp){
+    dwd_nremoved = 0;
+    for (int step = 0; step < CWD_STEPS; step += 5){
+        unsigned char tid[32]; dwd_tid(tid, step);
+        dwd_removed[dwd_nremoved++] = mpool_policy_remove_package(st, mp, tid);
+    }
+    dwd_removed[dwd_nremoved++] = (long)mpool_count(mp);
+}
+static void test_descendant_walk_differential(void){
+    printf("== the descendant walk: children index vs the registry scan ==\n");
+    static char v[CWD_STEPS]; static char r[CWD_STEPS][48];
+    int c, m, x;
+    dwd_lists = dwd_mismatch = dwd_with_desc = dwd_overflow = dwd_max = 0;
+    cwd_run(0, 64, v, r, &c, &m, &x, dwd_compare);
+    printf("      %d lists compared, %d with descendants (largest %d), %d overflowed at a bound of 3, %d differ\n",
+           dwd_lists, dwd_with_desc, dwd_max, dwd_overflow, dwd_mismatch);
+    okv(dwd_mismatch == 0, "every descendant list is the scan's, element for element, at bounds 128 and 3");
+    okv(dwd_with_desc >= 100 && dwd_max >= 10 && dwd_overflow >= 20,
+        "...over sets that are many, deep (10+), and overflow the small bound");
+
+    static long rs[CWD_STEPS + 1]; int ns;
+    mpool_policy_set_desc_walk_scan(1);
+    cwd_run(0, 64, v, r, &c, &m, &x, dwd_remove);
+    mpool_policy_set_desc_walk_scan(0);
+    memcpy(rs, dwd_removed, sizeof rs); ns = dwd_nremoved;
+    cwd_run(0, 64, v, r, &c, &m, &x, dwd_remove);
+    long total = 0, multi = 0;
+    for (int i = 0; i + 1 < ns; i++){ total += rs[i]; if (rs[i] > 1) multi++; }
+    printf("      remove_package x%d: %ld removed, %ld removals took descendants, pool %ld -> %ld\n",
+           ns - 1, total, multi, rs[ns - 1] + total, rs[ns - 1]);
+    okv(ns == dwd_nremoved && !memcmp(rs, dwd_removed, (size_t)ns * sizeof rs[0]),
+        "remove_package: every removed count and the final pool size are the scan's");
+    okv(multi >= 10, "...and at least 10 of those removals took a descendant set");
 }
