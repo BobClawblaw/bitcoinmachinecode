@@ -41,6 +41,13 @@
 	 * site (the nop1/cm script-VM gates caught the resulting chaos). Save
 	 * x30 first (deepest slot), deliver \d by writing the result into \d's
 	 * own save slot, then pop everything. */
+	/* a destination the delivery below does not cover would silently keep
+	 * its old value (2026-10-08: x19-x28 did, in bitcoin_interp.S) */
+	.irp r, x18,x29,x30,sp,fp,lr
+	.ifc "\d", "\r"
+	 .error "TLS_ADDR: unsupported destination register"
+	.endif
+	.endr
 	str  x30, [sp, #-16]!
 	stp  x16, x17, [sp, #-16]!
 	stp  x14, x15, [sp, #-16]!

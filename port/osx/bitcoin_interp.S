@@ -332,6 +332,13 @@ _interp_memeq:
 	 * site (the nop1/cm script-VM gates caught the resulting chaos). Save
 	 * x30 first (deepest slot), deliver \d by writing the result into \d's
 	 * own save slot, then pop everything. */
+	/* a destination the delivery below does not cover would silently keep
+	 * its old value (2026-10-08: x19-x28 did, in bitcoin_interp.S) */
+	.irp r, x18,x29,x30,sp,fp,lr
+	.ifc "\d", "\r"
+	 .error "TLS_ADDR: unsupported destination register"
+	.endif
+	.endr
 	str  x30, [sp, #-16]!
 	stp  x16, x17, [sp, #-16]!
 	stp  x14, x15, [sp, #-16]!
@@ -397,6 +404,16 @@ _interp_memeq:
 	.ifc "\d", "x17"
 	 str  x0, [sp, #136]
 	.endif
+	/* x19-x28 are not in the save area, so the pops below leave them alone:
+	 * the result goes straight in. Missing until 2026-10-08, which left a
+	 * callee-saved destination holding whatever it held before -- the two
+	 * CHECKMULTISIG strip buffers below (TLS_ADDR x27) were written wherever
+	 * the C caller's x27 happened to point. */
+	.irp r, x19,x20,x21,x22,x23,x24,x25,x26,x27,x28
+	.ifc "\d", "\r"
+	 mov  \d, x0
+	.endif
+	.endr
 	ldp  x0,  x1,  [sp], #16
 	ldp  x2,  x3,  [sp], #16
 	ldp  x4,  x5,  [sp], #16

@@ -4,6 +4,16 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-10-08 (6) — `TLS_ADDR` in `bitcoin_interp.S` never delivered a callee-saved destination: the CHECKMULTISIG strip wrote wherever the C caller's x27 pointed (Mac port only)
+
+Found while fixing the worker's memory leak (next section). With that fix in, 14 script-verification tests crashed, most with SEGV or SIGBUS. In the first one, `legacy_sighash` received a garbage `tx` from an `sv_ctx` that was intact on entry. A watchpoint on that `sv_ctx` caught `script_find_and_delete`'s memmove writing over it, called from the interpreter's CHECKMULTISIG strip (`.strip_call`).
+- **The bug:** the Darwin `TLS_ADDR` macro calls a C getter. It saves x0–x17 and x30 around the call and delivers the result by writing it into the destination's save slot. A destination in x19–x28 has no slot, and `bitcoin_interp.S`'s copy had no other path for one, so `TLS_ADDR x27, _cms_scstrip0/1` left x27 holding whatever the C caller had put there. The strip then wrote the signature-stripped scriptCode, up to 10,008 bytes, to that address and read it back from there. (`bitcoin_scriptcodec.S`'s copy of the macro already handled x19–x28; its one such use, `TLS_ADDR x24, _hnd_tab`, was fine.)
+- **Why it never showed:** in the deployed binaries `sv_run_v` keeps its `script` argument in x27 when it calls `script_eval`. So the strip overwrote the script being run with its own scriptCode. With no OP_CODESEPARATOR and no signature inside the script, those are the same bytes. When they differ, it wrote different bytes into the caller's script buffer; for a P2SH redeem script that buffer is the interpreter's own per-thread copy. The leak fix shifted register allocation in `sv_checksig`/`sv_verify_script`, x27 came to point at a stack frame, and the write landed on `sv_ctx`.
+- **Fix:** the macro moves the result straight into x19–x28 (the pops don't touch them). Both copies now `.error` at assembly time on a destination neither handles (x18, x29/fp, x30/lr, sp). Checked with a probe: `TLS_ADDR x29, ...` fails to assemble.
+- **Test:** the 14 tests that crashed pass. There is no separate runtime test: the wrong write either lands where a test cannot observe it or depends on the compiler's register choice. The assembly guard is what stops a recurrence.
+- **x86:** not affected. Its `TLS_ADDR` is native `gottpoff` arithmetic and writes any destination.
+- **Full suite:** 424 PASS, 11 SKIP, 14 N/A, 0 FAIL.
+
 ## 2026-10-08 (4) — a block connect marks conflicts through the children index, not a fixpoint sweep per conflict (shared C)
 
 The last registry-per-step scan on the removal paths: `mpol_mark_with_descendants` marks each pool transaction a block conflicts with, and its descendants, for the batch removal. It swept every node until nothing new was marked, at least two sweeps per conflict.
