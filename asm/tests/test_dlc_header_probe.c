@@ -86,7 +86,8 @@ static void build_chain(void){
 
 /* ---- the fake peer: handshake, then header pages off the locator ---------- */
 typedef struct { long first_delay_ms; int stall_after_pages; int bad_link; int slow_after_pages; long slow_page_ms;
-                 long slow_conn_ms; } fp_opts_t;   /* slow_conn_ms: every page on this peer's 2nd and later connections (B12 ranges) */
+                 long slow_conn_ms; int mute_conn; } fp_opts_t;   /* slow_conn_ms: every page on this peer's 2nd and later connections (B12 ranges);
+                                                                   * mute_conn: those connections never answer the version (run 44's stuck peer) */
 static volatile int* g_served;   /* MAP_SHARED: header pages each peer has sent, probe included (B12) */
 static int fp_version(int cfd){
     unsigned char v[128]; int o=0;
@@ -107,6 +108,7 @@ static void fp_serve(int cfd, const fp_opts_t* op, int who, int conn){
         plen=0; if(p2p_read(cfd,cmd,rb,sizeof rb,&plen)<=0) return;
         cmd[11]=0;
         if(!strncmp(cmd,"version",7)){
+            if(op->mute_conn && conn > 0) continue;
             if(!sent_version){ fp_version(cfd); p2p_write(cfd,"verack",6,"",0); sent_version=1; }
         } else if(!strncmp(cmd,"getheaders",10)){
             if(plen < 5) continue;
@@ -373,6 +375,26 @@ int main(void){
       print_line(line_with(log, "taken back")); print_line(line_with(log, "header ranges: 6 of"));
       { char tb[160]; snprintf(tb, sizeof tb, "held by %s for", peer[3]); ckm("the slow peer's range was taken back", strstr(log, tb) != 0 && line_with(log, "taken back for a waiting peer") != 0); }
       ckm("all six ranges finished", line_with(log, "header ranges: 6 of 6 range(s)") != 0);
+      ck("the whole chain was fetched", got, NB);
+      free(log); }
+
+    printf("\n-- B12 ranges: a peer that never answers its range connection does not hold the phase open\n");
+    { /* run 44: the probe's fastest peer took no range (its child stuck before
+       * the handshake ended) and the phase waited 180 s for it after the other
+       * three had fetched all 19. Peer 1 (the fastest probe here) answers its
+       * probe, then never answers the version on its range connection: the
+       * child's read waits out DLC_HDR_PROBE_S (10 s), the ranges take ms */
+      fp_opts_t ops[4] = { {60,0,0,1,40}, {20,0,0,1,40,0,1}, {40,0,0,1,40}, {80,0,0,1,40} };
+      long long t0 = dlc_now_ms();
+      long got = run_phase("ranges-mute", ops, peer, &log);
+      long long ms = dlc_now_ms() - t0;
+      print_line(line_with(log, "header ranges: 3 of")); print_line(line_with(log, "every range settled"));
+      ckm("all three finished", line_with(log, "header ranges: 3 of 3 range(s)") != 0);
+      ckm("the silent peer took no range", line_with(log, "0 range(s)/0 page(s)") != 0);
+      ckm("the phase ended when the ranges settled, the silent peer stopped", line_with(log, "every range settled in") != 0 && line_with(log, "1 peer(s) holding none stopped") != 0);
+      { const char* l = line_with(log, "header ranges: 3 of 3 range(s) in "); double s = l ? atof(strstr(l, " in ") + 4) : 99.0;
+        printf("  (the ranges phase: %.1fs; the whole header phase: %lld ms)\n", s, ms);
+        ckm("the ranges phase took under 5 s, not the silent peer's 10 s", s < 5.0); }
       ck("the whole chain was fetched", got, NB);
       free(log); }
 

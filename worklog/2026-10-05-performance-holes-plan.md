@@ -49,7 +49,7 @@ when an item moves.
 | B9 part 2 | the 2 s idle tick per window | DONE 10-07 (#400), closed by run 41 |
 | B10 | a claim the chain could not have reached | DONE 10-07 (#400), closed by run 41 |
 | B11 | the memtable in anonymous memory | DONE 10-07 (#400), closed by run 41 (put 3,842 s against the target of 4,994) |
-| B12 | the header leader switch; disjoint ranges | switch MERGED 10-07 (#404), missed in run 42 (block 1 at ~66 s, the switch never fired); ranges BUILT 10-08 (branch perf/2026-10-08-b12-header-ranges); unmeasured |
+| B12 | the header leader switch; disjoint ranges | switch MERGED 10-07 (#404), missed in run 42 (block 1 at ~66 s, the switch never fired); ranges MERGED 10-08 (#410); run 44: all 19 ranges stored through the checks, but the phase waited 180 s for a child that took no range (the probe's fastest peer, stuck connecting) -- fix built (branch fix/2026-10-08-b12-ranges-settle) |
 | B13 | ban on a second stall, not the first | BUILT 10-07 (#405, open); the grace half not done; unmeasured |
 | M1 | name the 26 GB | DONE 10-06 (#394): COW pages counted once per child |
 | M2 | the heap: no fork copies, dbcache is the total | MERGED 10-08 (#407); run 42 (to 813k): heap 6.3 GB mean / 11.8 GB peak (targets met), sync lost to M3 |
@@ -1078,3 +1078,26 @@ pages served, not 11: a refetch from genesis) and the takeback disabled.
 
 Measure on the next benchmark: boot to block 1 <= 50 s (run 42: ~66 s),
 and the ranges' own time against the 61 s single-peer phase.
+
+## 2026-10-08: run 44's header ranges and the child that held the phase open
+
+Run 44 (main abeae7fd, the first run with the ranges): the ranges reached
+every anchor, the replay stored 950,000 headers through the checks (the
+-minimumchainwork hold released 469 pages in 2 s) and the sequential
+fetch took the last 20,515. But the phase took 182.0 s, against run 43's
+49 s from one peer: "19 of 19 range(s) in 182.0s (73.4 MB, 412.9KB/s):
+136.35.8.142:8333 0 range(s)/0 page(s), 47.193.130.31:8333 7 range(s)/175
+page(s), 24.9.164.99:8333 6 range(s)/150 page(s), 3.16.175.255:8333 6
+range(s)/150 page(s)". The probe's fastest peer (987 KB/s) never took a
+range: its child stuck before the handshake ended (the same peer stopped
+answering the sequential fetch after one page). The parent waited while
+any child lived, so the phase ended on that child's 180 s alarm. The
+three working peers' rates are understated by the same 180 s.
+
+Fix: when no range is pending or held, the phase is over. The parent
+reaps the peers that fetched (they leave on their own, <= 0.5 s),
+stops the ones holding none and logs "every range settled in Xs; N
+peer(s) holding none stopped". Test: `test_dlc_header_probe`, a peer
+that answers its probe and never answers the version on its range
+connection; watched to fail with the fix removed (2: the phase waited
+the child's 10 s read timeout, 10.3 s). Stable over 4 runs.
