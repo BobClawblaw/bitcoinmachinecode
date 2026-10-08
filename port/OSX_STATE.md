@@ -4,6 +4,15 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-10-08 (2) — the cluster-limit walk uses the children index, not a registry scan per node (shared C)
+
+After the deploy of 8e8f2fb0 the mainnet worker sat at 40–65% of a core while the pool refilled (~77k transactions). `sample` put ~63% of its samples in `mpol_add_core`, in the cluster-limit walk (`bitcoin_mempool_policy.c`, the `too-large-cluster` check).
+- **The walk** found each popped node's neighbours by scanning every registry node, checking both directions of the parent links. That is up to 64 passes over the pool per transaction with an in-pool parent, and every pass read every node's parent list. It also ran twice per transaction: `mpool_policy_test`, then `mpool_policy_add`. About 92% of production entries are cluster members, so nearly every accept paid it. Once the refill finished the worker dropped to 1–3%, but every restart repeats the burst, and so does any steady flow of child transactions.
+- **Now** the walk builds the children index once (`mpol_children_build`, O(pool + edges), the same index `mpool_policy_entry_info` uses) and takes a node's neighbours from its own parent list plus its index entry. The outcome depends only on the set the walk reaches (the component through parent links, with members of the eviction set left out), not on the order it reaches it, so the answer is the scan's. The scan stays as the fallback when the index cannot be allocated, and as the reference behind a test knob (`mpool_policy_set_cluster_walk_scan`).
+- **Not changed:** `collect_descendant_txids` uses the same scan pattern. It runs for RBF and removals, which are much rarer than accepts, and did not show in the sample.
+- **Test:** `test_mempool_policy` replays one random 1,500-transaction workload twice, scan then index, and compares every verdict and reason. It runs at `limitclustercount` 12 (775 too-large-cluster refusals) and 64 (471). The workload includes chains, fan-ins with 2–3 in-pool parents (66 and 176 accepted) and BIP125 replacements whose evicted sets the walk must skip (35 and 48 accepted). Identical on all 3,000.
+- **Full suite:** 424 PASS, 11 SKIP, 14 N/A, 0 FAIL. Note item 25 for x86.
+
 ## 2026-10-08 — verbose `getrawmempool`'s handler peak: +177 → +88 MB (graph members are indices; the weight cache is 16 bytes a slot) (shared C)
 
 With the body streamed, the call's whole peak was the handler. Instrumented by step at production shape (`test_rpc_chunk_scale 68000 1048576`): +64 MB building the table under the lock, +63 MB for the one-pass graph, +50 MB for the entries (the arena).

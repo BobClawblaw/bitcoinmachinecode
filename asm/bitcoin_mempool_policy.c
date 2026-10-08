@@ -1101,6 +1101,12 @@ static int mpol_children_build(void* st, uint32_t n,
     return 1;
 }
 
+/* test knob: 1 makes mpol_add_core's cluster-limit walk scan the registry for
+ * each node's neighbours, as it did before 2026-10-08, instead of using the
+ * children index -- test_mempool_cluster_walk compares the two */
+static int g_mpol_cluster_walk_scan;
+void mpool_policy_set_cluster_walk_scan(int on){ g_mpol_cluster_walk_scan = on ? 1 : 0; }
+
 /* How many distinct clusters (connected components over parent links) the
  * given pool nodes span -- Core's CTxMemPool::GetUniqueClusterCount, for the
  * replacement limit (2026-10-02). Only called with more than 100 direct
@@ -2693,21 +2699,50 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
             if (nseen >= CLUSTER_LIMIT){ too_big = 1; break; }
             seen[nseen++] = pi; bfs[sp++] = pi; cl_bytes += t[pi].size;
         }
+        /* 2026-10-08: a node's neighbours are its parents (its own list) and
+         * its children (the children index, built once for the walk). The
+         * walk used to find them by scanning EVERY registry node for each
+         * node it popped -- up to 64 passes over the pool, and each pass read
+         * every node's parent list -- for every transaction with an in-pool
+         * parent, twice (mpool_policy_test, then mpool_policy_add). At a 77k
+         * pool that was ~63% of the mainnet worker's CPU while the pool
+         * refilled after a restart, and ~92% of entries are in clusters.
+         * The outcome depends only on the set the walk reaches (the
+         * component through parent links, evicted nodes left out), not on
+         * the order it reaches it, so it is the scan's answer. The scan
+         * stays as the fallback if the index cannot be allocated, and as the
+         * reference test_mempool_cluster_walk compares against. */
+        uint32_t *ch_head = 0, *ch_nxt = 0, *ch_chld = 0;
+        int have_ch = !g_mpol_cluster_walk_scan && sp > 0 && !too_big
+                      && mpol_children_build(st, nn, &ch_head, &ch_nxt, &ch_chld);
+        #define MPOL_CL_VISIT(ix) do { uint32_t _i = (ix); \
+            if (MPOL_CL_EVICTED(_i)) break;              /* leaves the pool if this tx is accepted */ \
+            int _dup = 0; \
+            for (int q = 0; q < nseen; q++) if (seen[q] == _i){ _dup = 1; break; } \
+            if (_dup) break; \
+            if (nseen >= CLUSTER_LIMIT){ too_big = 1; break; } \
+            seen[nseen++] = _i; bfs[sp++] = _i; cl_bytes += t[_i].size; } while (0)
         while (sp > 0 && !too_big){
             uint32_t cur = bfs[--sp];
+            if (have_ch){
+                for (uint32_t k = 0; k < t[cur].n_parents && !too_big; k++){
+                    uint32_t pp = mpol_par_at(st, &t[cur], k);
+                    if (pp < nn) MPOL_CL_VISIT(pp);
+                }
+                for (uint32_t e = ch_head[cur]; e != MPOL_IDX_NONE && !too_big; e = ch_nxt[e])
+                    MPOL_CL_VISIT(ch_chld[e]);
+                continue;
+            }
             for (uint32_t i = 0; i < nn && !too_big; i++){
                 int linked = 0;
                 for (uint32_t k = 0; k < t[i].n_parents; k++) if (mpol_par_at(st, &t[i], k) == cur){ linked = 1; break; }
                 if (!linked) for (uint32_t k = 0; k < t[cur].n_parents; k++) if (mpol_par_at(st, &t[cur], k) == i){ linked = 1; break; }
                 if (!linked) continue;
-                if (MPOL_CL_EVICTED(i)) continue;        /* leaves the pool if this tx is accepted */
-                int dup = 0;
-                for (int q = 0; q < nseen; q++) if (seen[q] == i){ dup = 1; break; }
-                if (dup) continue;
-                if (nseen >= CLUSTER_LIMIT){ too_big = 1; break; }
-                seen[nseen++] = (uint32_t)i; bfs[sp++] = (uint32_t)i; cl_bytes += t[i].size;
+                MPOL_CL_VISIT(i);
             }
         }
+        #undef MPOL_CL_VISIT
+        free(ch_head); free(ch_nxt); free(ch_chld);
         if (too_big || (uint64_t)nseen + 1 > cl_count_limit || cl_bytes + vsize > cl_size_limit){
             _mpol_last_reason = "too-large-cluster"; return 0;
         }
