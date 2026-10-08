@@ -5697,6 +5697,26 @@ static int dlc_dead_weight(double byte_rate, long blocks_this_tick, double floor
         && byte_rate < 2.0 * floor_bps) return 1;                    /* marginal bytes AND stalled blocks */
     return 0;
 }
+/* The rule above, judged on the time the worker was allowed to fetch
+ * (2026-10-08, run 42). A worker waiting at the full window has nothing to
+ * fetch: the parent's tick measured its bytes over the whole 10 s, so a
+ * peer that had delivered 9,600 blocks read "2.8 KB/s" while the applier
+ * held the window and was dropped as dead weight -- 57 drops in run 42's
+ * merge stall (20 logged at the drop, 37 acknowledged late by a worker
+ * waiting at the window), and the run's bans rose with them. Rates are scaled
+ * to the fetching share of the tick; a tick that was mostly waiting is not
+ * judged at all (the caller resets the consecutive count). */
+#define DLC_DEAD_WEIGHT_MIN_ACTIVE 0.5   /* the share of a tick a worker must have been free to fetch */
+static int dlc_dead_weight_judged(double byte_rate, long blocks_this_tick, double floor_bps,
+                                  double tick_s, double waited_s){
+    if (byte_rate < 0.0) return 0;
+    if (tick_s <= 0.0) return dlc_dead_weight(byte_rate, blocks_this_tick, floor_bps);
+    if (waited_s < 0.0) waited_s = 0.0;
+    double active = tick_s - waited_s;
+    if (active < DLC_DEAD_WEIGHT_MIN_ACTIVE * tick_s) return 0;     /* mostly at the window: no evidence */
+    double k = tick_s / active;
+    return dlc_dead_weight(byte_rate * k, (long)((double)blocks_this_tick * k), floor_bps);
+}
 /* ---------------------------------------------------------------- VAL-5
  * The parent's median time past, read from the header store.
  *
@@ -6664,6 +6684,11 @@ typedef struct { char peer[64]; long chunks; long blocks; long guard; double las
                   * block (dlc_now_ms, CLOCK_MONOTONIC, one clock across the
                   * fork); the stall rule restarts the tail's clock from it */
                  long long last_block_ms;
+                 /* 2026-10-08: milliseconds this worker has spent waiting at
+                  * the full window (DLC_PH_WAIT_WINDOW), cumulative; the
+                  * parent takes each tick's share out of the dead-weight
+                  * judgement (dlc_dead_weight_judged) */
+                 volatile long long win_wait_ms;
                } dlc_stat_t;
 /* ---- the downloader's wire accounting (2026-09-19) ------------------------
  * getnettotals.totalbytessent and every download worker's getpeerinfo
@@ -6862,7 +6887,8 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                  * whole run while 64 chunks sat staged above a 7-minute hole. */
                 lo=dlc_take_cursor_want(next_claim, &helping); if(lo>=0) break;
                 if(waited_ticks==0){ __sync_fetch_and_add(&next_claim[DLC_CTL_N_WAIT], 1L); DLC_PHASE(DLC_PH_WAIT_WINDOW); }
-                usleep(200000); waited_ticks++;
+                { long long t0=dlc_now_ms(); usleep(200000); mystat->win_wait_ms += dlc_now_ms()-t0; }
+                waited_ticks++;
             }
             if(lo<0) lo=__sync_fetch_and_add(next_claim,g_dlc_chunk);
         }
@@ -8294,6 +8320,7 @@ static long dl_catchup_run(const char* dir, int min_workers){
      * one large chunk shows 0 chunks for minutes even while actively
      * downloading at full speed, which the byte counter catches. */
     long prev_blocks[64]={0}; long prev_rchar[64]={0}; long prev_wbytes[64]={0}; int dead_ticks[64]={0};
+    long long prev_winwait[64]={0};   /* stats[w].win_wait_ms at the last tick (2026-10-08) */
     enum { ETA_W = 61 };                     /* 61 ticks of 10 s: the ETA's ten-minute rate window */
     long eta_present[ETA_W]; long long eta_ms[ETA_W]; int eta_n=0, eta_i=0;
     long nbanned=0;
@@ -8604,9 +8631,17 @@ static long dl_catchup_run(const char* dir, int min_workers){
                 if(prev_wbytes[w]>0) tick_total_write_bytes+=(double)(wc-prev_wbytes[w]);
                 prev_wbytes[w]=wc;
             }
+            /* this tick's time at the full window: not the peer's to answer for */
+            double waited_s=0.0;
+            { long long ww=stats[w].win_wait_ms;
+              if(ww>=prev_winwait[w]) waited_s=(double)(ww-prev_winwait[w])/1000.0;
+              else waited_s=(double)ww/1000.0;                         /* a new worker in the slot: its counter restarted */
+              /* (the worker adds each 200 ms sleep as it ends: at most one sleep late) */
+              if(waited_s>tick_s) waited_s=tick_s;
+              prev_winwait[w]=ww; }
             char flag[48]="";
             if(kids[w]!=0 && byte_rate>=0.0){
-                if(!g_dlc_core && median_bps > 0.0 && dlc_replace_allowed(free_peers) && dlc_dead_weight(byte_rate, b-prev_blocks[w], floor_bps)){   /* Core has no rate floor */
+                if(!g_dlc_core && median_bps > 0.0 && dlc_replace_allowed(free_peers) && dlc_dead_weight_judged(byte_rate, b-prev_blocks[w], floor_bps, tick_s, waited_s)){   /* Core has no rate floor */
                     dead_ticks[w]++;
                     if(dead_ticks[w]>=g_cfg.dead_weight_ticks){
                         long bidx = stats[w].held_idx;

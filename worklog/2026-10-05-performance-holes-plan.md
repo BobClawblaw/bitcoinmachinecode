@@ -53,7 +53,8 @@ when an item moves.
 | B13 | ban on a second stall, not the first | BUILT 10-07 (#405, open); the grace half not done; unmeasured |
 | M1 | name the 26 GB | DONE 10-06 (#394): COW pages counted once per child |
 | M2 | the heap: no fork copies, dbcache is the total | MERGED 10-08 (#407); run 42 (to 813k): heap 6.3 GB mean / 11.8 GB peak (targets met), sync lost to M3 |
-| M3 | a deferred merge obeys the byte budget at any run count | BUILT 10-08 (branch fix/2026-10-08-merge-budget); unmeasured |
+| M3 | a deferred merge obeys the byte budget at any run count | DONE 10-08 (#408); measured by run 43 |
+| B14 | the dead-weight rule judges a worker waiting at the full window | BUILT 10-08 (branch fix/2026-10-08-dead-weight-window); unmeasured |
 
 ## Part A — RPC: stop the lock-ups (BlockYard-visible)
 
@@ -996,6 +997,39 @@ Not changed: the count threshold (48) stays at its run-41 value; with the
 budget obeyed, the merge after 05:57Z fired on bytes at 44 runs and the
 pace was run 41's. Halve it only if the next run shows the probe count
 costing time.
+
+## 2026-10-08: B14, the dead-weight rule and the full window
+
+Run 42's 29 bans were not the stall rule's (B13 banned nobody: 17 first
+stalls, no second). They came between 03:02Z and 05:23Z, inside the
+merge stall, when the applier held the window full and the workers sat in
+DLC_PH_WAIT_WINDOW. The dead-weight rule measures each worker's bytes over
+the parent's 10 s tick, waiting or not, so a worker with nothing it was
+allowed to fetch read near zero: "90.63.77.252:8333 dead weight (last
+measured 2.8KB/s, completed 600 chunk(s)/9600 block(s) on this peer)",
+and its own line "the parent's drop arrived while this worker was waiting
+at the full window". 57 dead-weight drops between 03:02Z and 05:12Z (20
+logged by the worker at the drop, 37 acknowledged late by a worker
+waiting at the window), and the banned count rose at the same seconds:
+the early-kill path bans the peer while the pool is above its floor. Its
+"[early-kill, ..., peer BANNED]" tag is on the per-worker row, which is
+rarely printed, so a grep for it finds 1; count the drops, not the tag.
+
+Fix: the worker adds each 200 ms window sleep to `win_wait_ms` (a new
+dlc_stat_t field); the parent takes the tick's share out and judges with
+`dlc_dead_weight_judged`: bytes and blocks scaled to the fetching share
+of the tick, and a tick under half free to fetch is not judged (the
+consecutive count resets). Test: `test_dialhelper`, nine cases (run 42's
+2.8 KB/s at 9.8 s waited; 24 KB/s + 6 blocks over 6 s of fetching is
+40 KB/s + 10 blocks; a genuinely dead 0.3 KB/s still killed; the half
+boundary), watched to fail with the wait ignored (3). The writer (the
+worker's wait loop) and the reader (the parent's tick) are not exercised
+by a test; measure by runtime counter on the next run: dead-weight drops
+whose worker answers "waiting at the full window" should be 0.
+
+M3's merge fix removes the stall that exposed this; B14 matters whenever
+the window fills (an applier slower than the download, any flush or
+merge that holds it).
 
 ## 2026-10-08: B12's disjoint-ranges arm (branch perf/2026-10-08-b12-header-ranges)
 
