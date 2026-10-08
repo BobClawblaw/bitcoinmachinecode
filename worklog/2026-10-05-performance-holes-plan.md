@@ -25,7 +25,7 @@ Every step below has (a) a measurement that must move, (b) a test that
 fails with the step reverted, (c) a gate, (d) a `--no-ff` merge, as the
 standing rules require. Nothing lands on a guess.
 
-## Status register (as of 2026-10-07 22:45Z)
+## Status register (as of 2026-10-08 02:00Z)
 
 The items below were written as plans and then annotated as they landed.
 This table is the one place that says where each one stands. Update it
@@ -52,6 +52,7 @@ when an item moves.
 | B12 | the header leader switch | BUILT 10-07 (#404, merged); the disjoint-ranges arm not done; unmeasured |
 | B13 | ban on a second stall, not the first | BUILT 10-07 (#405, open); the grace half not done; unmeasured |
 | M1 | name the 26 GB | DONE 10-06 (#394): COW pages counted once per child |
+| M2 | the heap: no fork copies, dbcache is the total | BUILT 10-08 (branch perf/2026-10-08-m2-memory); unmeasured |
 
 ## Part A — RPC: stop the lock-ups (BlockYard-visible)
 
@@ -908,3 +909,58 @@ first-page RTT, or handed a chunk off the tail). The timeout itself is
 still Core's 2 s, so fresh peers are still dropped from the tail; they
 are no longer lost to the pool. Measure on the next benchmark: bans per
 run ≤ 5 (run 41: 34) with the same download rate.
+
+## 2026-10-08 — M2 built (branch perf/2026-10-08-m2-memory): the heap
+
+The question (operator, 10-08): why twice Core's memory, and how not to
+use 70 GB. Run 41's sampler and `[mem]` lines split the 75.6 GB PSS peak:
+
+- **File-backed, ~35-45 GB: the mapped UTXO run files** (12.8 GB compacted
+  + 14 generation runs of ~1.5 GB at IBD end). Clean pages the kernel can
+  drop; Core's page cache is not in its PSS (its cgroup peak with page cache
+  was 76.2 GB). Not this batch: the run budget is still 35% of RAM, and the
+  merge reads its inputs without dropping them behind.
+- **Heap, steady 15.2 GB against Core's 10.0: two memtables.** dbcache=8192
+  built a 7.6 GB bulk memtable (2^25 slots x 48 B + a 6,144 MB blob) and the
+  async flush (B3) a second buffer of the same shape, the frozen copy, which
+  then kept its pages for the whole generation. The writer needs it for
+  17 s of each 123 s (run 41: 110 writers, mean 16.9 s).
+- **Heap peak 32.7 GB at 15:23:09Z: copy-on-write.** A merge child forked
+  at 15:20:32 (a full merge of 24 runs, done 15:23:34) still shared the
+  memtable and the frozen copy when the freeze of 15:22:57 rewrote the
+  copy and the applier kept writing the memtable: +17.5 GB in two samples,
+  for a child that reads neither.
+
+Built:
+1. **The two children are forked without what they never read.** A merge
+   reads run files through its own mmap'd scratch and nothing of ours; the
+   flush writer reads the frozen copy, the frozen tombstone list and the
+   sort arena. Around those two forks only, the other big buffers (the live
+   memtable and both tombstone hash sets for both; the frozen copy, its
+   tombstone list and the sort arena for the merge) are `MADV_DONTFORK`, and
+   `MADV_DOFORK` again in the parent when fork() returns, so every other
+   fork (probes, passes, helpers) is unchanged. Log, once per kind: `the
+   merge child is forked without N buffer(s), X GB ...`.
+2. **dbcache is the total.** With the async flush the bulk memtable gets one
+   slot-table doubling down and half the blob (`utxo_live_bulk_split`):
+   dbcache=8192 is 2^24 slots and 3,072 MB each for the live memtable and the
+   copy, 7.6 GB together. The `sizing:` line says `(half the dbcache: ...)`.
+   Inline flush keeps the whole dbcache for one memtable.
+3. **The copy is released at the adopt** (`MADV_DONTNEED`, header blob
+   pointer and cap written back); the next freeze faults fresh pages.
+
+Tests: `tests/test_utxo_fork_trim` (new) reads each child's own
+/proc/self/maps by the M1 region names -- the writer has the frozen copy
+and not the memtable, the merge child neither, a plain fork afterwards
+both, and a control with the trim off shows the memtable in the writer;
+after the adopt the copy holds at most its header page (mincore) and every
+coin reads back. `tests/test_utxo_sizing`: the split, the 8,192 MB fit,
+the floors. Watched to FAIL: DONTFORK removed (6), the parent's DOFORK
+removed (5), the release removed (3; 769 table pages and 256 blob pages
+resident), the split ignoring the async flush (3).
+
+Cost, to be read on the next benchmark: twice the freezes (~220 against
+110) at half the size each, more runs and merges, the applier's
+lookups against a smaller memtable, and each freeze's page faults (the
+`[bench] freeze` ms). Targets: heap mean <= 10 GB, heap peak <= 16 GB
+(run 41: 15.3 / 32.2), sync time within 3% of run 41's 3:48:22.

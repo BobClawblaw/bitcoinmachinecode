@@ -37,4 +37,21 @@ static inline int utxo_live_pick_bulk_shape(long runs, unsigned long long run_by
     if (run_budget > 0 && run_bytes >= run_budget) return 1;
     return 0;
 }
+/* dbcache is the total (plan M2, 2026-10-08). Core's -dbcache bounds its
+ * coins cache, the one copy it holds. -dbcache maps to the bulk memtable
+ * (node_config.c: a quarter to the slot table, three quarters to the blob),
+ * and the async flush (B3) keeps a second memtable-shaped buffer, the
+ * frozen copy, for the writer -- so dbcache=8192 held 2 x 7.6 GB while a
+ * writer ran and the heap read 1.5x Core's on average (run 41: 15.3 vs
+ * 10.0 GB). With the async flush each copy gets half: one slot-table
+ * doubling down and half the blob, so live + frozen fit in the dbcache.
+ * The floors are node_config's (2^16 slots, 16 MB). Inline flush: one
+ * copy, the whole dbcache, as before. */
+static inline void utxo_live_bulk_split(int slots_log2, unsigned long blob_mb, int async_flush,
+                                        int* out_slots_log2, unsigned long* out_blob_mb){
+    *out_slots_log2 = slots_log2; *out_blob_mb = blob_mb;
+    if (!async_flush) return;
+    if (slots_log2 > 16) *out_slots_log2 = slots_log2 - 1;
+    *out_blob_mb = blob_mb / 2 < 16 ? (blob_mb < 16 ? blob_mb : 16) : blob_mb / 2;
+}
 #endif

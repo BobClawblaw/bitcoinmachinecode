@@ -41,7 +41,9 @@ and cookie, so no other flags are usually needed.
   The archive re-layout tool needs archive-sized scratch space (about
   1.1 TB). Pruned mode fits in a few GB.
 - RAM: several GB; the initial-sync memtable is sized from `dbcache`
-  (default 1024 MiB, 4096 MiB in the reference configuration).
+  (default 450 MiB, Core's; the benchmarks use 8192). As in Core, `dbcache`
+  is the total: with the async flush the live memtable and the flush
+  writer's frozen copy get half each (2026-10-08, plan M2).
 - Optional: `tor` (SOCKS 9050, control 9051), `i2pd` (SAM 7656), `cjdroute`.
 
 ### Build
