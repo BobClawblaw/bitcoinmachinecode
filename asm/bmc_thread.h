@@ -35,7 +35,50 @@ static inline int bmc_pthread_create(pthread_t* t, void* (*fn)(void*), void* arg
 }
 /* Per-thread scratch that used to be `static __thread u8 buf[N]` (static
  * TLS, i.e. carved out of every thread's stack mapping). Lazily heap-
- * allocated once per thread instead; process-lifetime, never freed. A
- * failed 1 MB malloc is fatal in any case. */
-#define BMC_TLS_BUF(ptr, size) do { if (!(ptr)) { (ptr) = malloc(size); if (!(ptr)) { abort(); } } } while (0)
+ * allocated once per thread instead. A failed malloc is fatal in any case.
+ *
+ * FREED WHEN THE THREAD EXITS (2026-10-08). These were "process-lifetime,
+ * never freed", which holds only for threads that live as long as the
+ * process. txv_verify_all (daemon/tx_verify.c) creates fresh threads for every
+ * mempool transaction with TXV_PARALLEL_MIN or more inputs, and each one
+ * allocated the interpreter's whole scratch set -- ~11 MB of address space:
+ * the 4 MB segwit midstate buffer, the 2.3 MB offset table, three 528 KB
+ * stacks, 1 MB of work space... -- and exited without freeing it. On the
+ * Mac's mainnet worker that was 185k live blocks, 195 GB of address space
+ * and ~0.8 GB resident after two hours, growing ~120 MB an hour.
+ *
+ * Each buffer now goes on a per-thread list whose pthread key destructor
+ * frees it at thread exit. The __thread pointer dies with the thread, so
+ * nothing can see the freed block. The key, its once-guard and the
+ * live count are weak definitions, so every translation unit that includes
+ * this header shares one of each without a .c file to add to every link.
+ * Threads that never exit (the main thread, the pools) keep theirs, as
+ * before. bmc_tls_live counts the buffers held and bmc_tls_made every one
+ * ever allocated, for tests. */
+typedef struct bmc_tls_node { struct bmc_tls_node* next; void* buf; } bmc_tls_node;
+__attribute__((weak)) pthread_key_t bmc_tls_key;
+__attribute__((weak)) pthread_once_t bmc_tls_once = PTHREAD_ONCE_INIT;
+__attribute__((weak)) long bmc_tls_live;
+__attribute__((weak)) long bmc_tls_made;
+static inline void bmc_tls_dtor(void* head){
+    for (bmc_tls_node* n = (bmc_tls_node*)head; n;){
+        bmc_tls_node* next = n->next;
+        free(n->buf); free(n);
+        __sync_fetch_and_sub(&bmc_tls_live, 1);
+        n = next;
+    }
+}
+static inline void bmc_tls_mkkey(void){ if (pthread_key_create(&bmc_tls_key, bmc_tls_dtor) != 0) abort(); }
+static inline void* bmc_tls_alloc(size_t size){
+    void* p = malloc(size);
+    bmc_tls_node* n = (bmc_tls_node*)malloc(sizeof *n);
+    if (!p || !n) abort();
+    pthread_once(&bmc_tls_once, bmc_tls_mkkey);
+    n->buf = p; n->next = (bmc_tls_node*)pthread_getspecific(bmc_tls_key);
+    if (pthread_setspecific(bmc_tls_key, n) != 0) abort();
+    __sync_fetch_and_add(&bmc_tls_live, 1);
+    __sync_fetch_and_add(&bmc_tls_made, 1);
+    return p;
+}
+#define BMC_TLS_BUF(ptr, size) do { if (!(ptr)) { (ptr) = bmc_tls_alloc(size); } } while (0)
 #endif

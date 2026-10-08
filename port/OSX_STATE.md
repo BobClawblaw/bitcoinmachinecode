@@ -6,13 +6,28 @@ status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
 ## 2026-10-08 (6) — `TLS_ADDR` in `bitcoin_interp.S` never delivered a callee-saved destination: the CHECKMULTISIG strip wrote wherever the C caller's x27 pointed (Mac port only)
 
-Found while fixing the worker's memory leak (next section). With that fix in, 14 script-verification tests crashed, most with SEGV or SIGBUS. In the first one, `legacy_sighash` received a garbage `tx` from an `sv_ctx` that was intact on entry. A watchpoint on that `sv_ctx` caught `script_find_and_delete`'s memmove writing over it, called from the interpreter's CHECKMULTISIG strip (`.strip_call`).
+Found through (5). With the leak fix in, 14 script-verification tests crashed, most with SEGV or SIGBUS. In the first one, `legacy_sighash` received a garbage `tx` from an `sv_ctx` that was intact on entry. A watchpoint on that `sv_ctx` caught `script_find_and_delete`'s memmove writing over it, called from the interpreter's CHECKMULTISIG strip (`.strip_call`).
 - **The bug:** the Darwin `TLS_ADDR` macro calls a C getter. It saves x0–x17 and x30 around the call and delivers the result by writing it into the destination's save slot. A destination in x19–x28 has no slot, and `bitcoin_interp.S`'s copy had no other path for one, so `TLS_ADDR x27, _cms_scstrip0/1` left x27 holding whatever the C caller had put there. The strip then wrote the signature-stripped scriptCode, up to 10,008 bytes, to that address and read it back from there. (`bitcoin_scriptcodec.S`'s copy of the macro already handled x19–x28; its one such use, `TLS_ADDR x24, _hnd_tab`, was fine.)
 - **Why it never showed:** in the deployed binaries `sv_run_v` keeps its `script` argument in x27 when it calls `script_eval`. So the strip overwrote the script being run with its own scriptCode. With no OP_CODESEPARATOR and no signature inside the script, those are the same bytes. When they differ, it wrote different bytes into the caller's script buffer; for a P2SH redeem script that buffer is the interpreter's own per-thread copy. The leak fix shifted register allocation in `sv_checksig`/`sv_verify_script`, x27 came to point at a stack frame, and the write landed on `sv_ctx`.
 - **Fix:** the macro moves the result straight into x19–x28 (the pops don't touch them). Both copies now `.error` at assembly time on a destination neither handles (x18, x29/fp, x30/lr, sp). Checked with a probe: `TLS_ADDR x29, ...` fails to assemble.
 - **Test:** the 14 tests that crashed pass. There is no separate runtime test: the wrong write either lands where a test cannot observe it or depends on the compiler's register choice. The assembly guard is what stops a recurrence.
 - **x86:** not affected. Its `TLS_ADDR` is native `gottpoff` arithmetic and writes any destination.
 - **Full suite:** 424 PASS, 11 SKIP, 14 N/A, 0 FAIL.
+
+## 2026-10-08 (5) — the worker's memory growth: per-thread interpreter scratch leaked on every 8+-input transaction (shared C)
+
+The mainnet worker's RSS had risen at each deploy (about 4.2 → 4.9 → 6.0 → 6.5 GB), and two hours after the bee50e2b deploy it was at 9.1 GB.
+- **What the RSS was made of** (`vmmap --summary`):
+  - 4.1 GB was clean, read-only pages of the mapped UTXO run file (`utxo_run_020206.dat`, 3.4 GB resident of 12.5 GB) and the other UTXO and index runs. That is file cache; it rises as lookups touch the file and macOS can drop it. It is not a leak.
+  - The dirty 4.6 GB was mostly malloc. "Malloc Large" grew steadily, by roughly 45 regions a minute.
+- **The leak** (`heap`): 185k live blocks, 195 GB of address space, almost all untouched. They came in fixed sizes: 4096K ×20k, 2352K ×25k, 1024K ×22k, 528K ×38k, 64K ×38k and 20K ×20k. Every one is a `BMC_TLS_BUF` per-thread scratch buffer: segwit midstate, offset table, sighash preimage, script stacks of 1000 × 528, and so on. `lldb` reads of sample blocks found scriptPubKeys, a 2-of-3 multisig script and DER signatures.
+- **The cause:** `BMC_TLS_BUF` never freed a thread's buffers. That was safe for long-lived threads, but `txv_verify_all` creates fresh threads for every transaction with 8+ inputs, so each such accept leaked about 11 MB of address space. About 18 KB of it is touched per block, which comes to ~120 MB resident an hour. RPC was not involved: it runs in the parent process.
+- **Fix** (`bmc_thread.h`): each buffer is recorded on a per-thread list, and a `pthread_key` destructor frees the list at thread exit. The key, once-guard and counters (`bmc_tls_live`, `bmc_tls_made`) are weak definitions, shared by every file that includes the header.
+- **Tests:**
+  - `leaks --atExit` on `test_tx_verify_parallel`: 1,989 leaks (2.0 GB) before, 0 after.
+  - `test_tx_verify_parallel` now checks that its 20 parallel calls allocate scratch (1,800 buffers) and hold nothing afterwards. Without the destructor the count goes 90 → 1,890 and the check fails.
+- **Not changed:** the RPC side's hand-rolled heap TLS in `rpc_chain.c`/`rpc_server.c`. It lives on pool threads, but Esplora connection threads and longpoll waiters are per-request; not measured.
+- **Full suite:** 424 PASS, 11 SKIP, 14 N/A, 0 FAIL. Note item 28 for x86.
 
 ## 2026-10-08 (4) — a block connect marks conflicts through the children index, not a fixpoint sweep per conflict (shared C)
 
