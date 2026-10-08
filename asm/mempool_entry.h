@@ -42,11 +42,17 @@ typedef struct mp_entry_info {
  * get one mp_entry_info per node: four fixed 64-txid arrays, ~8.3 KB each,
  * ~560 MB written at a 68k pool and ~+790 MB peak RSS per verbose
  * getrawmempool. Here each node is a small header and its four sets live in
- * one shared txid list, in order depends, spentby, anc, desc -- a singleton
- * costs its header plus two txids (itself, in anc and in desc).
+ * one shared member list, in order depends, spentby, anc, desc.
  * mp_graph_expand rebuilds the node's mp_entry_info exactly (same members,
  * same order) for the consumers that read that shape. Owner frees with
- * mp_graph_free. */
+ * mp_graph_free.
+ *
+ * 2026-10-07: a member is the INDEX of its node in this graph (4 bytes), not
+ * its txid (32): every member of a node's sets is itself a node, so its txid
+ * is node[i].txid. At a 68k pool that is mostly chains -- the test's shape
+ * and, at ~90% cluster members, production's -- the txid list was ~50 MB of
+ * the call's ~63 MB graph. A builder whose member is not (yet) a node cannot
+ * use this format; mp_graph_append's caller resolves each member first. */
 typedef struct mp_graph_node {
     unsigned char txid[32];
     unsigned long long fee, size, anc_fee, anc_size, desc_fee;
@@ -56,7 +62,7 @@ typedef struct mp_graph_node {
 } mp_graph_node;
 typedef struct mp_graph {
     mp_graph_node* node; long n, cap;
-    unsigned char (*mem)[32]; unsigned long n_mem, cap_mem;
+    unsigned int* mem; unsigned long n_mem, cap_mem;   /* node indices */
 } mp_graph;
 
 #include <stdlib.h>
@@ -64,9 +70,12 @@ typedef struct mp_graph {
 static inline void mp_graph_free(mp_graph* g){
     free(g->node); free(g->mem); memset(g, 0, sizeof *g);
 }
-/* append one node from its full record; 0 on success, -1 on allocation
+/* append one node: its header from e (the counts and sums; e's txid arrays
+ * are not read) and its members from idx, the node indices of e's depends,
+ * spentby, anc and desc in that order. 0 on success, -1 on allocation
  * failure (the graph is left valid, without the node) */
-static inline int mp_graph_append(mp_graph* g, const unsigned char txid[32], const mp_entry_info* e){
+static inline int mp_graph_append(mp_graph* g, const unsigned char txid[32], const mp_entry_info* e,
+                                  const unsigned int* idx){
     unsigned long k = (unsigned long)e->n_depends + e->n_spentby + e->n_anc + e->n_desc;
     if (g->n == g->cap){
         long c2 = g->cap ? g->cap * 2 : 1024;
@@ -77,7 +86,7 @@ static inline int mp_graph_append(mp_graph* g, const unsigned char txid[32], con
     if (g->n_mem + k > g->cap_mem){
         unsigned long c2 = g->cap_mem ? g->cap_mem * 2 : 4096;
         while (c2 < g->n_mem + k) c2 *= 2;
-        unsigned char (*m2)[32] = (unsigned char (*)[32])realloc(g->mem, (size_t)c2 * 32);
+        unsigned int* m2 = (unsigned int*)realloc(g->mem, (size_t)c2 * sizeof *m2);
         if (!m2) return -1;
         g->mem = m2; g->cap_mem = c2;
     }
@@ -88,34 +97,30 @@ static inline int mp_graph_append(mp_graph* g, const unsigned char txid[32], con
     o->off = g->n_mem;
     o->n_depends = (unsigned short)e->n_depends; o->n_spentby = (unsigned short)e->n_spentby;
     o->n_anc = (unsigned short)e->n_anc; o->n_desc = (unsigned short)e->n_desc;
-    unsigned char (*m)[32] = g->mem + g->n_mem;
-    memcpy(m, e->depends, (size_t)e->n_depends * 32); m += e->n_depends;
-    memcpy(m, e->spentby, (size_t)e->n_spentby * 32); m += e->n_spentby;
-    memcpy(m, e->anc, (size_t)e->n_anc * 32); m += e->n_anc;
-    memcpy(m, e->desc, (size_t)e->n_desc * 32);
+    memcpy(g->mem + g->n_mem, idx, (size_t)k * sizeof *idx);
     g->n_mem += k; g->n++;
     return 0;
 }
-/* node q's direct edges, without expanding it */
-static inline const unsigned char (*mp_graph_depends(const mp_graph* g, long q))[32]{
-    return (const unsigned char (*)[32])g->mem + g->node[q].off;
+/* node q's direct edges, as node indices, without expanding it */
+static inline const unsigned int* mp_graph_depends(const mp_graph* g, long q){
+    return g->mem + g->node[q].off;
 }
-static inline const unsigned char (*mp_graph_spentby(const mp_graph* g, long q))[32]{
-    return (const unsigned char (*)[32])g->mem + g->node[q].off + g->node[q].n_depends;
+static inline const unsigned int* mp_graph_spentby(const mp_graph* g, long q){
+    return g->mem + g->node[q].off + g->node[q].n_depends;
 }
 /* node q as the full record: the counted members are set, the arrays past
  * them are not (no consumer reads past a count) */
 static inline void mp_graph_expand(const mp_graph* g, long q, mp_entry_info* out){
     const mp_graph_node* o = &g->node[q];
-    const unsigned char (*m)[32] = (const unsigned char (*)[32])g->mem + o->off;
+    const unsigned int* m = g->mem + o->off;
     out->fee = o->fee; out->size = o->size; out->sigop_cost = o->sigop_cost;
     out->anc_fee = o->anc_fee; out->anc_size = o->anc_size; out->desc_fee = o->desc_fee;
     out->n_depends = o->n_depends; out->n_spentby = o->n_spentby;
     out->n_anc = o->n_anc; out->n_desc = o->n_desc;
-    memcpy(out->depends, m, (size_t)o->n_depends * 32); m += o->n_depends;
-    memcpy(out->spentby, m, (size_t)o->n_spentby * 32); m += o->n_spentby;
-    memcpy(out->anc, m, (size_t)o->n_anc * 32); m += o->n_anc;
-    memcpy(out->desc, m, (size_t)o->n_desc * 32);
+    for (int i = 0; i < o->n_depends; i++) memcpy(out->depends[i], g->node[*m++].txid, 32);
+    for (int i = 0; i < o->n_spentby; i++) memcpy(out->spentby[i], g->node[*m++].txid, 32);
+    for (int i = 0; i < o->n_anc; i++)     memcpy(out->anc[i],     g->node[*m++].txid, 32);
+    for (int i = 0; i < o->n_desc; i++)    memcpy(out->desc[i],    g->node[*m++].txid, 32);
 }
 
 #endif

@@ -1114,19 +1114,34 @@ static int mp_tx_signals_rbf(const unsigned char* tx, unsigned long len);   /* b
  * re-parsed only when its slot's txid or length changed since the last walk,
  * and a walk of unchanged slots is a memcmp per slot. Keyed on txid AND
  * length so a same-txid different-witness replacement is not served the old
- * weight. Guarded by the mempool lane's mutex (rpc_node_dispatch). */
-typedef struct { unsigned char id[32]; unsigned long len, w; unsigned char rbf, used; } mpc_t;
+ * weight. Guarded by the mempool lane's mutex (rpc_node_dispatch).
+ *
+ * 2026-10-07: 16 bytes a slot, not 56. The table is indexed by slot, so it
+ * is the slot table's CAPACITY long -- 1,048,576 at maxmempool=300MB -- and a
+ * 68k pool's entries are spread over all of it, so every page is touched:
+ * ~56 MB of RSS from the first verbose getrawmempool on, the largest single
+ * piece of that call's peak. The key is now 64 bits, the txid's first eight
+ * bytes XORed with the slot's cached wtxid's (which commits to every byte,
+ * witness included), plus the length; weight and the BIP125 bit share a
+ * word. A wrong hit needs a transaction ground to match another's 64-bit key
+ * in the same slot -- ~2^64 work -- and would show a wrong vsize. */
+typedef struct { unsigned long long key; unsigned int len, wr; } mpc_t;   /* wr: weight | rbf << 31; len 0 = unused */
 static mpc_t* g_mpc; static unsigned long g_mpc_n;
 static long g_mpc_hits, g_mpc_parses;                 /* test hooks */
 void rpc_node_mpc_stats(long* hits, long* parses){ if (hits) *hits = g_mpc_hits; if (parses) *parses = g_mpc_parses; }
+unsigned long rpc_node_mpc_bytes(void){ return g_mpc ? g_mpc_n * sizeof *g_mpc : 0; }   /* test hook */
 static unsigned long mpc_weight(unsigned long n, unsigned long i, const mp_ent* e, unsigned char* rbf){
     if (g_mpc_n != n){ free(g_mpc); g_mpc = (mpc_t*)calloc(n ? n : 1, sizeof *g_mpc); g_mpc_n = g_mpc ? n : 0; }
     mpc_t* c = (g_mpc && i < g_mpc_n) ? &g_mpc[i] : 0;
-    if (c && c->used && c->len == e->len && !memcmp(c->id, e->txid, 32)){ g_mpc_hits++; if (rbf) *rbf = c->rbf; return c->w; }
+    unsigned long long a, b; memcpy(&a, e->txid, 8); memcpy(&b, e->wtxid, 8);
+    unsigned long long key = a ^ b;
+    if (c && c->len && c->len == e->len && c->key == key){
+        g_mpc_hits++; if (rbf) *rbf = (unsigned char)(c->wr >> 31); return c->wr & 0x7fffffffu; }
     unsigned long w = mp_tx_weight(e->tx, e->len);
     unsigned char r = (unsigned char)mp_tx_signals_rbf(e->tx, e->len);
     g_mpc_parses++;
-    if (c){ memcpy(c->id, e->txid, 32); c->len = e->len; c->w = w; c->rbf = r; c->used = 1; }
+    if (c && e->len && e->len <= 0xffffffffUL && w <= 0x7fffffffUL){
+        c->key = key; c->len = (unsigned int)e->len; c->wr = (unsigned int)w | ((unsigned int)(r ? 1 : 0) << 31); }
     if (rbf) *rbf = r;
     return w;
 }
@@ -2042,8 +2057,8 @@ static int mpc_lookup_bulk(void* ctx, const unsigned char txid[32], mpc_entry* o
     if (k < 0 || g_mpe_vs[k].inf < 0) return 0;
     long q = g_mpe_vs[k].inf;
     const mp_graph_node* inf = &g_mpe_g.node[q];
-    const unsigned char (*dep)[32] = mp_graph_depends(&g_mpe_g, q);
-    const unsigned char (*sb)[32] = mp_graph_spentby(&g_mpe_g, q);
+    const unsigned int* dep = mp_graph_depends(&g_mpe_g, q);
+    const unsigned int* sb = mp_graph_spentby(&g_mpe_g, q);
     memset(out, 0, sizeof *out);
     long long modified = (long long)inf->fee + (g_mpe_snap ? g_mpe_vs[k].pri : pri_delta_of(txid));
     out->fee = modified < 0 ? 0 : (uint64_t)modified;
@@ -2051,12 +2066,12 @@ static int mpc_lookup_bulk(void* ctx, const unsigned char txid[32], mpc_entry* o
       unsigned long long w = g_mpe_vs[k].w;
       unsigned long long sw = (unsigned long long)inf->sigop_cost * bps;
       out->weight = sw > w ? sw : w; }
-    for (int i = 0; i < inf->n_depends && out->n_parents < MPC_MAX_CLUSTER; i++)
-        if (mpe_vs_find(dep[i]) >= 0)
-            memcpy(out->parents[out->n_parents++], dep[i], 32);
-    for (int i = 0; i < inf->n_spentby && out->n_children < MPC_MAX_CLUSTER; i++)
-        if (mpe_vs_find(sb[i]) >= 0)
-            memcpy(out->children[out->n_children++], sb[i], 32);
+    for (int i = 0; i < inf->n_depends && out->n_parents < MPC_MAX_CLUSTER; i++){
+        const unsigned char* id = g_mpe_g.node[dep[i]].txid;
+        if (mpe_vs_find(id) >= 0) memcpy(out->parents[out->n_parents++], id, 32); }
+    for (int i = 0; i < inf->n_spentby && out->n_children < MPC_MAX_CLUSTER; i++){
+        const unsigned char* id = g_mpe_g.node[sb[i]].txid;
+        if (mpe_vs_find(id) >= 0) memcpy(out->children[out->n_children++], id, 32); }
     return 1;
 }
 
@@ -2266,14 +2281,41 @@ static int mpe_snapshot_component(const unsigned char seed[32]){
     mp_entry_info* e = (mp_entry_info*)malloc(sizeof *e);   /* one scratch record */
     mpe_vs_t* vs = (mpe_vs_t*)malloc((size_t)MPE_REL_CAP * sizeof *vs);
     mp_graph g; memset(&g, 0, sizeof g);
-    if (!ids || !e || !vs){ free(ids); free(e); free(vs); return 0; }
+    /* each popped node's header and its members' txids, until every node is
+     * known: the graph stores a member as its node's index (2026-10-07) */
+    typedef struct { unsigned long long fee, size, anc_fee, anc_size, desc_fee; unsigned int sigop_cost;
+                     int n_depends, n_spentby, n_anc, n_desc; unsigned long off; } pend_t;
+    pend_t* pd = (pend_t*)malloc((size_t)MPE_REL_CAP * sizeof *pd);
+    unsigned char (*pm)[32] = NULL; unsigned long npm = 0, cpm = 0;
+    if (!ids || !e || !vs || !pd){ free(ids); free(e); free(vs); free(pd); return 0; }
     /* breadth-first over depends + spentby; ids[] is the queue and the seen
-     * set, and each registry node joins the compact graph as it is popped */
-    int nq = 0;
+     * set, and each registry node joins the graph, in the order popped */
+    int nq = 0, npd = 0;
+    unsigned char (*nid)[32] = (unsigned char (*)[32])malloc((size_t)MPE_REL_CAP * 32);   /* node txids */
+    if (!nid){ free(ids); free(e); free(vs); free(pd); return 0; }
+#define MPE_COMP_FAIL() do { free(ids); free(e); free(vs); free(pd); free(pm); free(nid); mp_graph_free(&g); return 0; } while (0)
     memcpy(ids[nq++], seed, 32);
     for (int h = 0; h < nq; h++){
         if (g_mph.pol_entry_info(g_mph.polstate, ids[h], e) != 1) continue;
-        if (mp_graph_append(&g, ids[h], e) != 0){ free(ids); free(e); free(vs); mp_graph_free(&g); return 0; }
+        { unsigned long k = (unsigned long)e->n_depends + e->n_spentby + e->n_anc + e->n_desc;
+          if (npm + k > cpm){
+              unsigned long c2 = cpm ? cpm * 2 : 1024; while (c2 < npm + k) c2 *= 2;
+              unsigned char (*m2)[32] = (unsigned char (*)[32])realloc(pm, (size_t)c2 * 32);
+              if (!m2) MPE_COMP_FAIL();
+              pm = m2; cpm = c2;
+          }
+          pend_t* d = &pd[npd];
+          d->fee = e->fee; d->size = e->size; d->sigop_cost = e->sigop_cost;
+          d->anc_fee = e->anc_fee; d->anc_size = e->anc_size; d->desc_fee = e->desc_fee;
+          d->n_depends = e->n_depends; d->n_spentby = e->n_spentby;
+          d->n_anc = e->n_anc; d->n_desc = e->n_desc;
+          d->off = npm;
+          memcpy(pm + npm, e->depends, (size_t)e->n_depends * 32); npm += (unsigned long)e->n_depends;
+          memcpy(pm + npm, e->spentby, (size_t)e->n_spentby * 32); npm += (unsigned long)e->n_spentby;
+          memcpy(pm + npm, e->anc, (size_t)e->n_anc * 32);         npm += (unsigned long)e->n_anc;
+          memcpy(pm + npm, e->desc, (size_t)e->n_desc * 32);       npm += (unsigned long)e->n_desc;
+          memcpy(nid[npd], ids[h], 32);
+          npd++; }
         for (int side = 0; side < 2; side++){
             int ne = side ? e->n_spentby : e->n_depends;
             unsigned char (*ed)[32] = side ? e->spentby : e->depends;
@@ -2281,11 +2323,33 @@ static int mpe_snapshot_component(const unsigned char seed[32]){
                 int seen = 0;
                 for (int q = 0; q < nq && !seen; q++) seen = !memcmp(ids[q], ed[j], 32);
                 if (seen) continue;
-                if (nq >= MPE_REL_CAP){ free(ids); free(e); free(vs); mp_graph_free(&g); return 0; }
+                if (nq >= MPE_REL_CAP) MPE_COMP_FAIL();
                 memcpy(ids[nq++], ed[j], 32);
             }
         }
     }
+    /* every node is known: resolve each member to its node and build the
+     * graph. A member that is not a node (outside what the walk reached)
+     * cannot be stored; the caller then keeps the old path, whose answer
+     * is the same -- every reader skips a member the tables lack. */
+    { unsigned int idx[4 * MPE_MAX_SET];
+      for (int q = 0; q < npd; q++){
+          const pend_t* d = &pd[q];
+          unsigned long k = (unsigned long)d->n_depends + d->n_spentby + d->n_anc + d->n_desc;
+          for (unsigned long j = 0; j < k; j++){
+              int f = -1;
+              for (int r = 0; r < npd && f < 0; r++) if (!memcmp(nid[r], pm[d->off + j], 32)) f = r;
+              if (f < 0) MPE_COMP_FAIL();
+              idx[j] = (unsigned int)f;
+          }
+          /* e, the scratch record, carries the header (its arrays are not read) */
+          e->fee = d->fee; e->size = d->size; e->sigop_cost = d->sigop_cost;
+          e->anc_fee = d->anc_fee; e->anc_size = d->anc_size; e->desc_fee = d->desc_fee;
+          e->n_depends = d->n_depends; e->n_spentby = d->n_spentby; e->n_anc = d->n_anc; e->n_desc = d->n_desc;
+          if (mp_graph_append(&g, nid[q], e, idx) != 0) MPE_COMP_FAIL();
+      } }
+#undef MPE_COMP_FAIL
+    free(pd); free(pm); free(nid);
     /* the registry nodes are g.node[0..g.n), in the order they were
      * popped. Now the pool's side of each. */
     free(e);

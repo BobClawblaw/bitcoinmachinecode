@@ -2554,6 +2554,16 @@ call's tables and the 49 MB arena. The cost is that the arena lives until
 the client has read the reply, where it was freed before the write; it
 never outweighed the two body copies it replaces.
 
+Then the handler's own peak (2026-10-08): +177 -> +88 MB at production
+shape. Two thirds of it was not the reply. The per-slot weight cache is the
+slot table's capacity long (1,048,576 at maxmempool=300MB), every page of it
+touched, at 56 bytes a slot; it is 16 now, keyed on txid and the slot's
+cached wtxid. And the one-pass graph stored each ancestor and descendant as
+a 32-byte txid; a member is now a 4-byte node index (mempool_entry.h), 204
+bytes per entry against ~960. The reply is byte-identical. What is left is
+the 49 MB arena -- the reply's text, kept until it is written -- and a ~9 MB
+table.
+
 ### The wallet has no reorg awareness (WAL-13)
 
 `wallet_scan.c`'s on-disk record is `u32 height | txid | vout | value`

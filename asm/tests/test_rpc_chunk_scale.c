@@ -235,11 +235,29 @@ int main(int argc, char** argv){
              "arena %.1f MB for a %.1f MB body\n", slots, g_hold_max, mb, ab / 1048576.0, bl / 1048576.0);
       /* 2026-10-06: the one-pass graph is compact (mempool_entry.h mp_graph).
        * It was an ~8.3 KB mp_entry_info per registry node -- ~12 KB of peak
-       * RSS per entry with the reply on top. The bound sits well above what
-       * is left. */
-      { char w2[160]; snprintf(w2, sizeof w2, "the first verbose call's peak RSS is under 8 KB per entry (%.1f KB)",
+       * RSS per entry with the reply on top.
+       * 2026-10-07: 1.6 KB. The graph's members are node indices, not txids
+       * (~50 MB of the 63 MB graph at production shape), and the per-slot
+       * weight cache is 16 bytes a slot, not 56: +177 -> +88 MB at
+       * 68000/1048576, 1.33 KB per entry; 1.18 KB at the default shape, where
+       * txid members would put it back near 1.9. */
+      { char w2[160]; snprintf(w2, sizeof w2, "the first verbose call's peak RSS is under 1.6 KB per entry (%.2f KB)",
                                mb * 1024.0 / live);
-        ck(w2, mb * 1048576.0 / live < 8192.0); }
+        ck(w2, mb * 1048576.0 / live < 1.6 * 1024.0); }
+      /* the graph itself, measured directly: peak RSS hides it at the
+       * default shape, where the heap the pool build freed absorbs it. Each
+       * set member is a 4-byte node index (2026-10-07; it was a 32-byte
+       * txid, ~1 KB per entry on this pool's chains) */
+      { mp_graph g; long gn = mpool_policy_graph_all(polstate, &g);
+        double per = gn > 0 ? (double)((size_t)g.n * sizeof *g.node + g.n_mem * sizeof *g.mem) / (double)gn : 0;
+        double mem_per = gn > 0 ? (double)g.n_mem / (double)gn : 0;
+        mp_graph_free(&g);
+        char w2[200]; snprintf(w2, sizeof w2, "the one-pass graph is under 300 bytes per entry (%.0f: %.1f members each)", per, mem_per);
+        ck(w2, gn > 0 && per < 300.0); }
+      { extern unsigned long rpc_node_mpc_bytes(void);
+        double per = (double)rpc_node_mpc_bytes() / (double)slots;
+        char w2[160]; snprintf(w2, sizeof w2, "the per-slot weight cache is 16 bytes a slot (%.0f)", per);
+        ck(w2, per > 0 && per <= 16.0); }
       /* 2026-10-06: each entry is frozen to its text as it is built
        * (rj_freeze): the arena held every entry's tree until the body was
        * written, ~3.0 KB per entry for ~0.6 KB of text. Bound: twice the

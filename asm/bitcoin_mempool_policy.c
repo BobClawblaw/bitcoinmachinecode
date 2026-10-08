@@ -3721,11 +3721,14 @@ long mpool_policy_graph_all(void* st, mp_graph* g)
     /* sized for the common shape (most nodes are singletons: self in anc
      * and in desc, plus an edge or two); mp_graph_append grows past it */
     g->node = (mp_graph_node*)malloc((size_t)n * sizeof *g->node);
-    g->mem  = (unsigned char (*)[32])malloc((size_t)n * 4 * 32);
+    g->mem  = (unsigned int*)malloc((size_t)n * 4 * sizeof *g->mem);
     /* ONE scratch record, reused per node: only its counted members are
      * written, so it is not cleared between nodes either */
     mp_entry_info* o = (mp_entry_info*)malloc(sizeof *o);
-    if (!g->node || !g->mem || !o){ free(o); mp_graph_free(g); return -1; }
+    /* each set's members as node indices: node q is registry node q, since
+     * every node is appended, in order (2026-10-07: mempool_entry.h) */
+    uint32_t (*ix)[MPE_MAX_SET] = (uint32_t (*)[MPE_MAX_SET])malloc(4 * sizeof *ix);
+    if (!g->node || !g->mem || !o || !ix){ free(o); free(ix); mp_graph_free(g); return -1; }
     g->cap = n; g->cap_mem = (unsigned long)n * 4;
 
     /* children index: head[i] is the first child slot, nxt[] chains the rest */
@@ -3734,7 +3737,7 @@ long mpool_policy_graph_all(void* st, mp_graph* g)
     for (uint32_t i=0;i<n;i++) edges += t[i].n_parents;
     uint32_t* nxt  = (uint32_t*)malloc((size_t)(edges?edges:1) * sizeof *nxt);
     uint32_t* chld = (uint32_t*)malloc((size_t)(edges?edges:1) * sizeof *chld);
-    if (!head || !nxt || !chld){ free(head); free(nxt); free(chld); free(o); mp_graph_free(g); return -1; }
+    if (!head || !nxt || !chld){ free(head); free(nxt); free(chld); free(o); free(ix); mp_graph_free(g); return -1; }
     for (uint32_t i=0;i<n;i++) head[i] = 0xFFFFFFFFu;
     uint32_t e = 0;
     for (uint32_t i=0;i<n;i++)
@@ -3752,16 +3755,16 @@ long mpool_policy_graph_all(void* st, mp_graph* g)
         for (uint32_t k=0; k<t[s].n_parents && o->n_depends<MPE_MAX_SET; k++){
             uint32_t p = mpol_par_at(st, &t[s], k);
             if (p >= n) continue;
-            if (!mpe_seen(o->depends, o->n_depends, t[p].txid))
-                memcpy(o->depends[o->n_depends++], t[p].txid, 32);
+            if (!mpe_seen(o->depends, o->n_depends, t[p].txid)){
+                ix[0][o->n_depends] = p; memcpy(o->depends[o->n_depends++], t[p].txid, 32); }
         }
         for (uint32_t c = head[s]; c != 0xFFFFFFFFu && o->n_spentby<MPE_MAX_SET; c = nxt[c]){
             uint32_t i = chld[c];
-            if (!mpe_seen(o->spentby, o->n_spentby, t[i].txid))
-                memcpy(o->spentby[o->n_spentby++], t[i].txid, 32);
+            if (!mpe_seen(o->spentby, o->n_spentby, t[i].txid)){
+                ix[1][o->n_spentby] = i; memcpy(o->spentby[o->n_spentby++], t[i].txid, 32); }
         }
         { uint32_t stack[MPE_MAX_SET]; int sp=0;
-          memcpy(o->anc[o->n_anc++], t[s].txid, 32);
+          ix[2][o->n_anc] = s; memcpy(o->anc[o->n_anc++], t[s].txid, 32);
           o->anc_fee = t[s].fee; o->anc_size = t[s].size;
           stack[sp++] = s;
           while (sp > 0){
@@ -3770,13 +3773,13 @@ long mpool_policy_graph_all(void* st, mp_graph* g)
                   uint32_t p = mpol_par_at(st, &t[cur], k);
                   if (p >= n || mpe_seen(o->anc, o->n_anc, t[p].txid)) continue;
                   if (o->n_anc >= MPE_MAX_SET) break;
-                  memcpy(o->anc[o->n_anc++], t[p].txid, 32);
+                  ix[2][o->n_anc] = p; memcpy(o->anc[o->n_anc++], t[p].txid, 32);
                   o->anc_fee += t[p].fee; o->anc_size += t[p].size;
                   if (sp < MPE_MAX_SET) stack[sp++] = p;
               }
           } }
         { uint32_t stack[MPE_MAX_SET]; int sp=0;
-          memcpy(o->desc[o->n_desc++], t[s].txid, 32); o->desc_fee = t[s].fee;
+          ix[3][o->n_desc] = s; memcpy(o->desc[o->n_desc++], t[s].txid, 32); o->desc_fee = t[s].fee;
           stack[sp++] = s;
           while (sp > 0){
               uint32_t cur = stack[--sp];
@@ -3784,15 +3787,20 @@ long mpool_policy_graph_all(void* st, mp_graph* g)
                   uint32_t i = chld[c];
                   if (mpe_seen(o->desc, o->n_desc, t[i].txid)) continue;
                   if (o->n_desc >= MPE_MAX_SET) break;
-                  memcpy(o->desc[o->n_desc++], t[i].txid, 32);
+                  ix[3][o->n_desc] = i; memcpy(o->desc[o->n_desc++], t[i].txid, 32);
                   o->desc_fee += t[i].fee;
                   if (sp < MPE_MAX_SET) stack[sp++] = i;
               }
           } }
-        if (mp_graph_append(g, t[s].txid, o) != 0){
-            free(head); free(nxt); free(chld); free(o); mp_graph_free(g); return -1; }
+        { uint32_t all[4 * MPE_MAX_SET]; uint32_t k = 0;   /* in mp_graph's order */
+          memcpy(all + k, ix[0], (size_t)o->n_depends * 4); k += (uint32_t)o->n_depends;
+          memcpy(all + k, ix[1], (size_t)o->n_spentby * 4); k += (uint32_t)o->n_spentby;
+          memcpy(all + k, ix[2], (size_t)o->n_anc * 4);     k += (uint32_t)o->n_anc;
+          memcpy(all + k, ix[3], (size_t)o->n_desc * 4);
+          if (mp_graph_append(g, t[s].txid, o, all) != 0){
+              free(head); free(nxt); free(chld); free(o); free(ix); mp_graph_free(g); return -1; } }
     }
-    free(head); free(nxt); free(chld); free(o);
+    free(head); free(nxt); free(chld); free(o); free(ix);
     return (long)n;
 }
 

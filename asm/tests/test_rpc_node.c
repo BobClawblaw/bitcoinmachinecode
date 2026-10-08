@@ -747,6 +747,23 @@ int main(void){
         ck("slot cache: the second getmempoolinfo parsed no entry (2 hits, 0 parses)", h1 - h0 == 2 && p1 == p0);
         ck("...and answers the same bytes (198)", r && S(r,"bytes") && !strcmp(S(r,"bytes"),"198"));
         rj_free(r);
+        /* 2026-10-07: the cache keys on the slot's wtxid as well as the txid
+         * (16 bytes a slot, not 56). The same txid with a different witness
+         * of the same length in the same slot is a different transaction:
+         * it is parsed again, not served from the cache. */
+        { extern long mpool_del(void*, const unsigned char*);
+          static unsigned char wtx2[400]; memcpy(wtx2, wtx, wln); wtx2[wln - 5] ^= 0x5a;   /* a witness byte */
+          ck("test pool: swap in the same txid with another witness", mpool_del(pool, wid) == 1 && mpool_put(pool, wid, wtx2, wln) == 1);
+          g_fk_seq_val++;
+          long h2, p2, h3, p3; rpc_node_mpc_stats(&h2, &p2);
+          r = NULL; rpc_node_dispatch("getmempoolinfo", NULL, &r, &ec, &em);
+          rpc_node_mpc_stats(&h3, &p3);
+          ck("slot cache: a new witness under the same txid and length is parsed again (1 hit, 1 parse), same bytes 198",
+             h3 - h2 == 1 && p3 - p2 == 1 && r && S(r,"bytes") && !strcmp(S(r,"bytes"),"198"));
+          rj_free(r);
+          ck("test pool: put the first witness back", mpool_del(pool, wid) == 1 && mpool_put(pool, wid, wtx, wln) == 1);
+          g_fk_seq_val++;
+          r = NULL; rpc_node_dispatch("getmempoolinfo", NULL, &r, &ec, &em); rj_free(r); }
         /* ---- 2026-10-05: getmempoolinfo's totals keyed on the mempool
          * sequence (Core keeps them incrementally; here every add and removal
          * takes the sequence, so the same number is the same pool). Measured

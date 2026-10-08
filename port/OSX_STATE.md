@@ -4,6 +4,22 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-10-08 — verbose `getrawmempool`'s handler peak: +177 → +88 MB (graph members are indices; the weight cache is 16 bytes a slot) (shared C)
+
+With the body streamed, the call's whole peak was the handler. Instrumented by step at production shape (`test_rpc_chunk_scale 68000 1048576`): +64 MB building the table under the lock, +63 MB for the one-pass graph, +50 MB for the entries (the arena).
+- **The table step was almost all the per-slot weight cache** (`g_mpc`, 2026-09-30). It is indexed by slot, so it is the slot table's capacity long: 1,048,576 entries of 56 bytes. A 68k pool's entries are spread over all of it, so every page is touched. An entry is now 16 bytes: a 64-bit key (the txid's first eight bytes XORed with the slot's cached wtxid's), the length, and weight with the BIP125 bit in one word. The wtxid commits to the witness, so a same-txid, same-length, different-witness replacement is now re-parsed; under the old key it was a hit. A wrong hit would need a transaction ground to match another's 64-bit key in the same slot, about 2^64 work, and would show a wrong vsize.
+- **The graph's members were 32-byte txids**, and most of a node's members are its ancestor and descendant sets. That is about 27 per entry on the test pool's chains, and production is ~90% cluster members. A member is now a 4-byte node index (`mempool_entry.h`): every member is itself a node, so its txid is `node[i].txid`, and `mp_graph_expand` rebuilds the same record. `mpool_policy_graph_all` records each member's registry index as it adds it (node q is registry node q). `mpe_snapshot_component` (verbose ancestors/descendants) collects its members as txids during the walk and resolves them once every node is known. A member that is not a node sends the call down the old path, whose answer is the same, because every reader already skips a member the tables lack.
+- **Measured:** first-call peak RSS +177 → +88 MB at production shape; 1.18 KB per entry at the default 32k shape. Graph: 204 bytes per entry (27.1 members each), where txid members would be ~960. The reply is byte-identical to the previous commit: the same FNV hash over 41,189,425 bytes at production shape, checked with a `HEAD` worktree. What is left is mostly the arena (49 MB: the reply's text plus each entry's key and shell) and the ~9 MB table.
+- **Tests:**
+  - `test_rpc_chunk_scale`:
+    - The peak bound is now 1.6 KB per entry (was 8).
+    - New direct checks: the graph is under 300 bytes per entry, and the cache is 16 bytes a slot.
+    - Peak RSS alone did not catch a graph regression at the default shape: heap freed by the pool build absorbed it. The direct graph check does; widening the members to 8 bytes fails it at 313.
+    - Padding the cache entry back to 56 bytes fails the cache check.
+    - The ancestors/descendants comparison still runs against the old path, which does not use the graph, with the snapshot taken (1.95 ms hold against 99 ms).
+  - `test_rpc_node`: a same-txid, same-length, different-witness swap is parsed again (1 hit, 1 parse) with the same `bytes`.
+- **Full suite:** 424 PASS, 11 SKIP, 14 N/A, 0 FAIL. FEATURE_GAPS.md RPC-12 and note item 24 updated.
+
 ## 2026-10-07 — the RPC reply is streamed to the socket, not buffered: writing a 39 MB body adds 0.1 MB to the peak (shared C)
 
 After the entries became text, what was left of the server's spike beyond the handler was the body. `render_request` serialized the reply into a buffer that grew by doubling, appended the newline, then copied headers and body into a second buffer for the caller to write.
