@@ -386,3 +386,21 @@ the relative rule decides. And the log line now says *which* clock fired.
 Two lessons on top of the rule: a timeout is a rate threshold whenever the
 work it bounds has a size, and a log line that names one rule for two
 mechanisms hides the one that is actually firing.
+
+**A third time, a month later: measured while it was not allowed to work.**
+Run 42 (2026-10-08) held the download window full for 90 minutes while a
+merge waited (the M3 fix, #408). A worker at the full window may fetch
+nothing, and sleeps until the window moves. The dead-weight rule still
+measured it over the whole 10 s tick, so 57 healthy workers read near zero
+and were dropped. One had served 9,600 blocks and "measured 2.8KB/s". The
+run's 29 bans rose at the same seconds, because the early-kill path bans a
+dropped peer while the pool is above its floor. The rate was relative to
+the pool, as rule 11 asks, but the pool median is no defence when the whole
+pool is idle. The denominator was wrong: time the worker was forbidden to
+work. Since #409 the worker records its time at the window, the parent
+scales the tick's bytes and blocks to the time the worker was free to fetch,
+and a tick less than half free is not judged. A grep for the early-kill tag
+found 1 ban, because the tag prints only on the rarely printed per-worker
+row. Counting the drops found 57. Third lesson: a rate is only evidence
+over the time the thing was allowed to work, and a tally keyed on a tag
+counts the tag, not the event.

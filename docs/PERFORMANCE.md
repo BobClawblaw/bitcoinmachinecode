@@ -263,7 +263,10 @@ since (2026-10-07 note at each). Do not let the tables above stand in for the re
    Core v31.1 runs on the repaired link. The latest is run 41 against Core
    rerun #7 (2026-10-07): every index at the tip in 3:48:22 against 9:50:04
    (0.39), with the UTXO set MuHash-identical. See
-   `reports/2026-10-07-run41-vs-core7-stage-report.md`. The rest of this item
+   `reports/2026-10-07-run41-vs-core7-stage-report.md`. Runs 42 and 43
+   (2026-10-08, the heap cut under Core's and the merge budget) are in
+   `releases/2026-10-08-the-heap-the-merge-budget-and-header-ranges.md`:
+   run 43 at 4:05:03, heap peak 10.7 GB, 16 minutes behind run 41. The rest of this item
    is the 09-18 text. The only Core baseline on this box
    (19h 14m) ran on a Samsung Portable SSD T5 at 0.40 GB/s while run 26 ran on
    NVMe. That comparison was withdrawn. A matched pair — same device, same day,

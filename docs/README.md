@@ -180,6 +180,7 @@ last); since then the notes here are the only summary layer.
 | [`releases/2026-10-03-the-outage-and-cores-words.md`](releases/2026-10-03-the-outage-and-cores-words.md) | The 23-hour outage and its fix; inbound serving past the boot height; buffered v2 messages; wtxid relay; Core's exact rejection text (26/26) and stage order; crash backtraces without core files (2026-10-03) |
 | [`releases/2026-10-07-faster-than-core-in-every-stage-of-the-sync.md`](releases/2026-10-07-faster-than-core-in-every-stage-of-the-sync.md) | The performance release: run 41 against Core rerun #7, 3:48:22 against 9:50:04, faster in every 100k segment; memory is the category Core keeps (2026-10-07) |
 | [`releases/2026-10-07-the-descriptor-outage-and-the-header-leader.md`](releases/2026-10-07-the-descriptor-outage-and-the-header-leader.md) | The getblock reader lane closes at thread exit (production RPC down 2 h 17 m); the B3 reap test; the header leader switch (B12); a staller banned on its second stall (B13) (2026-10-07) |
+| [`releases/2026-10-08-the-heap-the-merge-budget-and-header-ranges.md`](releases/2026-10-08-the-heap-the-merge-budget-and-header-ranges.md) | 2026-10-08 — The heap under Core's (M2, #407), the merge budget that cost run 42 1 h 30 m (M3, #408), the dead-weight rule at the full window (B14, #409), the headers in parallel ranges from an anchor table (B12, #410); runs 42 and 43 |
 
 ## Development history
 

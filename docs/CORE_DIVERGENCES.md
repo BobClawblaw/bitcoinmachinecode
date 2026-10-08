@@ -1,4 +1,4 @@
-# Where this node still differs from Core — issues to resolve (2026-09-09; updated 2026-10-07)
+# Where this node still differs from Core — issues to resolve (2026-09-09; updated 2026-10-08)
 
 An inventory taken after the 09-09 leg and compact-block work, extended the same night with the initial-sync rows from the run 19 measurements, ordered by measured payoff. Each row names what Core does, what this node does, the measured cost, and the fix. Rows move to "closed" with the PR that closes them. Consensus is not on this list: every consensus rule is proven against Core's vectors and the regtest differentials, and the two decided refusals (`assumeutxo`, testnet3) are documented in `FEATURE_GAPS.md`.
 
@@ -280,7 +280,7 @@ in Core's favour, and run 31 is the first at 10.
 
 ---
 
-## The initial download's other deliberate differences (2026-10-04 to 10-07)
+## The initial download's other deliberate differences (2026-10-04 to 10-08)
 
 Each of these is on by default (`bmc.dlshape=bmc`). `bmc.dlshape=core`
 (2026-10-04, #380) runs Core's rules instead, so that a benchmark against Core
@@ -298,6 +298,25 @@ timeout.
   hold carried. Why: the header phase is one peer's speed, and a peer that
   answers its first page fast and then streams at 0.5 MB/s cost 165 s (the B9
   fix arm) against 33 s on a good draw. Stated in `asm/daemon/dlc_rules.h`.
+- **Headers in parallel ranges from an anchor table (B12, #410).** Core
+  has no such table: its only hard-coded mainnet hashes are the assumeutxo
+  snapshots (840k, 880k, 910k, 935k) and `assumevalid` (938,343), and it
+  never asks two peers for different parts of the header chain. Since
+  2026-10-08 this node carries `hdr_anchors` in chainparams, 19 mainnet
+  block hashes every 50,000 from 50,000 to 950,000. They were read from
+  production's `headers.dat` with each hash recomputed, and checked against
+  the Core v31.1 node's `getblockhash` at all 19 heights (operator decision,
+  10-08). The probe's answering peers (up to 4) each fetch the range between
+  two anchors, and each range must end on its anchor's hash. The anchors are
+  a starting point, never a trust root. Every header is still checked for
+  linkage, proof of work and the contextual rules, and is held below
+  `-minimumchainwork`, by the same code that stores a single peer's pages. A
+  wrong anchor costs only the parallel fetch: the sequential fetch takes
+  over from the last good range. Off under `bmc.dlshape=core`. Why: run
+  42's header phase was one peer at 1.3 MB/s for 61 s, and the first block
+  was asked for ~66 s after boot against Core #7's 45 s. A new table means a
+  new hash list to keep correct; past 950,000 the sequential fetch does the
+  work.
 - **A repeat staller is banned (B13, #405).** Core disconnects a staller and
   never bans it. This node does the same on the first stall and bans the
   address on its second (see row `aa`).
