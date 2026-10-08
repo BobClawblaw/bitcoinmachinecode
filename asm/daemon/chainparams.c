@@ -131,6 +131,32 @@ static const char* const SEEDS_T4[] = {
 static const char* const SEEDS_SIGNET[] = {
     "seed.signet.bitcoin.sprovoost.nl", "seed.signet.achownodes.xyz" };
 
+/* B12 (2026-10-08): mainnet header-range anchors, every 50,000 blocks to
+ * 950,000. Read from production's headers.dat (each record's hash
+ * recomputed from its header) and checked against the Core v31.1 node's
+ * getblockhash at every height on 2026-10-08. A hint for where a parallel
+ * header range may start, never a trust root: see chainparams.h. */
+static const struct hdr_anchor MAIN_HDR_ANCHORS[] = {
+    {  50000, "000000001aeae195809d120b5d66a39c83eb48792e068f8ea1fea19d84a4278a" },
+    { 100000, "000000000003ba27aa200b1cecaad478d2b00432346c3f1f3986da1afd33e506" },
+    { 150000, "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b" },
+    { 200000, "000000000000034a7dedef4a161fa058a2d67a173a90155f3a2fe6fc132e0ebf" },
+    { 250000, "000000000000003887df1f29024b06fc2200b55f8af8f35453d7be294df2d214" },
+    { 300000, "000000000000000082ccf8f1557c5d40b21edabb18d2d691cfbf87118bac7254" },
+    { 350000, "0000000000000000053cf64f0400bb38e0c4b3872c38795ddde27acb40a112bb" },
+    { 400000, "000000000000000004ec466ce4732fe6f1ed1cddc2ed4b328fff5224276e3f6f" },
+    { 450000, "0000000000000000014083723ed311a461c648068af8cef8a19dcd620c07a20b" },
+    { 500000, "00000000000000000024fb37364cbf81fd49cc2d51c09c75c35433c3a1945d04" },
+    { 550000, "000000000000000000223b7a2298fb1c6c75fb0efc28a4c56853ff4112ec6bc9" },
+    { 600000, "00000000000000000007316856900e76b4f7a9139cfbfba89842c8d196cd5f91" },
+    { 650000, "0000000000000000000060e32d547b6ae2ded52aadbc6310808e4ae42b08cc6a" },
+    { 700000, "0000000000000000000590fc0f3eba193a278534220b2b37e9849e1a770ca959" },
+    { 750000, "0000000000000000000592a974b1b9f087cb77628bb4a097d5c2c11b3476a58e" },
+    { 800000, "00000000000000000002a7c4c1e48d76c5a37902165a270156b7a8d72728a054" },
+    { 850000, "00000000000000000002a0b5db2a7f8d9087464c2586b546be7bce8eb53b8187" },
+    { 900000, "000000000000000000010538edbfd2d5b809a33dd83f284aeea41c6d0d96968a" },
+    { 950000, "000000000000000000010b93c9ea1c29fea277383f0f7d1f26de8b5802e885ff" },
+};
 static const chainparams_t PARAMS_MAIN = {
     .id = CHAIN_MAIN, .name = "main",
     .min_chain_work_hex = "0000000000000000000000000000000000000001128750f82f4c366153a3a030",
@@ -144,6 +170,7 @@ static const chainparams_t PARAMS_MAIN = {
     .bech32_hrp = "bc",
     .xpub_version = 0x0488B21Eu, .xprv_version = 0x0488ADE4u,
     .assumevalid = "00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac",   /* Core v31.99 defaultAssumeValid, height 938343 */
+    .hdr_anchors = MAIN_HDR_ANCHORS, .n_hdr_anchors = (int)(sizeof MAIN_HDR_ANCHORS / sizeof MAIN_HDR_ANCHORS[0]),
     .dns_seeds = 1,
     .allow_min_difficulty = 0,
     .enforce_bip94 = 0,
