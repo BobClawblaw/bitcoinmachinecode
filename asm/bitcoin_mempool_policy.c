@@ -1684,13 +1684,36 @@ static long mpol_remove_marked(void* st, void* mp, uint32_t n){
 }
 
 /* Mark a node and every in-pool DESCENDANT of it, for batch removal.
- * Sweeps to a fixpoint rather than walking children, because there is no
- * child index: a node is a descendant if any of its parents is marked, so
- * repeating the sweep until nothing new is marked closes the set. The round
- * bound is 128 -- twice the 64-transaction cluster limit, so it can never cut
- * a legitimate closure short, and it still terminates if the graph is ever
- * malformed. Only reached when a block actually conflicts with something in
- * the pool, which is the rare case. */
+ *
+ * Until 2026-10-08 this swept the whole registry to a fixpoint -- a node is a
+ * descendant if any of its parents is marked 2, repeated until nothing new is
+ * marked, at least two full sweeps per conflict and up to 129 -- because
+ * there was no child index. Now the block connect builds the children index
+ * once, the first time a block conflicts with anything (the graph does not
+ * change while marking; removal comes after), and each call walks down from
+ * its root through it.
+ *
+ * Why walking from the root alone gives the sweep's answer: the sweep closes
+ * the WHOLE level-2 set, not just the root's descendants. But level 2 is only
+ * ever set here, and every call leaves the set closed, so the only open edges
+ * are the root's. The one way the set can be opened from outside is the
+ * confirm mark (level 1) landing on a node already at 2; that raises
+ * g_rm_reseed, and the next call seeds its walk from every level-2 node
+ * instead, exactly as the sweep would see it. The sweep stopped after 128
+ * rounds, twice the 64-transaction cluster limit, so it never cut a
+ * legitimate closure short; the walk has no bound and terminates because
+ * every node is pushed at most once. If the index cannot
+ * be built the sweep runs, as before, and a test knob forces it. */
+static int g_mpol_rm_fixpoint_scan;
+void mpool_policy_set_rm_fixpoint_scan(int on){ g_mpol_rm_fixpoint_scan = on ? 1 : 0; }
+static uint32_t *g_rm_ch_head, *g_rm_ch_nxt, *g_rm_ch_chld;
+static int g_rm_ch_state;              /* 0 not built yet, 1 built, -1 could not build */
+static int g_rm_reseed;                /* a level-2 node was set back to 1 */
+static void mpol_rm_children_free(void){
+    if (g_rm_ch_state == 1){ free(g_rm_ch_head); free(g_rm_ch_nxt); free(g_rm_ch_chld); }
+    g_rm_ch_head = g_rm_ch_nxt = g_rm_ch_chld = 0;
+    g_rm_ch_state = 0; g_rm_reseed = 0;
+}
 /* TWO MARK LEVELS, and the distinction is the whole correctness of the batch:
  *
  *   1 = this node leaves ALONE. A transaction the block CONFIRMED: its
@@ -1712,6 +1735,28 @@ static void mpol_mark_with_descendants(void* st, uint32_t n, uint32_t root, uint
     if (root >= n || g_rm_mark[root] == 2) return;
     if (!g_rm_mark[root]) g_rm_order[root] = order;
     g_rm_mark[root] = 2;
+    if (g_rm_ch_state == 0 && !g_mpol_rm_fixpoint_scan)
+        g_rm_ch_state = mpol_children_build(st, n, &g_rm_ch_head, &g_rm_ch_nxt, &g_rm_ch_chld) ? 1 : -1;
+    if (g_rm_ch_state == 1 && !g_mpol_rm_fixpoint_scan){
+        /* g_rm_remap is free until mpol_remove_marked; each node is pushed at
+         * most once (when it reaches 2, or as a seed), so n slots suffice */
+        uint32_t* stack = g_rm_remap; uint32_t sp = 0;
+        if (g_rm_reseed){
+            for (uint32_t i = 0; i < n; i++) if (g_rm_mark[i] == 2) stack[sp++] = i;
+            g_rm_reseed = 0;
+        } else stack[sp++] = root;
+        while (sp){
+            uint32_t cur = stack[--sp];
+            for (uint32_t e = g_rm_ch_head[cur]; e != MPOL_IDX_NONE; e = g_rm_ch_nxt[e]){
+                uint32_t c = g_rm_ch_chld[e];
+                if (g_rm_mark[c] == 2) continue;
+                if (!g_rm_mark[c]) g_rm_order[c] = order;
+                g_rm_mark[c] = 2;
+                stack[sp++] = c;
+            }
+        }
+        return;
+    }
     mpol_node* t = mpol_nodes_base(st);
     int changed = 1, rounds = 0;
     while (changed && rounds++ <= 128){
@@ -1726,6 +1771,7 @@ static void mpol_mark_with_descendants(void* st, uint32_t n, uint32_t root, uint
             }
         }
     }
+    g_rm_reseed = 0;                   /* the sweep closed the whole set */
 }
 
 /* Remove a tx AND its whole in-pool descendant set (by txid). Returns the
@@ -3461,7 +3507,7 @@ long mpool_policy_block_connect(void* st, void* mp,
      * failure -- a block connect must not be skippable on an allocation. */
     uint32_t n_nodes = *(uint32_t*)((char*)st+16);
     int batch = (n_nodes > 0) && g_batch_connect && mpol_rm_reserve(n_nodes);
-    if (batch) memset(g_rm_mark, 0, n_nodes);
+    if (batch){ memset(g_rm_mark, 0, n_nodes); mpol_rm_children_free(); }
 
     for (uint64_t j = 0; j < ntx; j++){
         unsigned char info[64];
@@ -3479,6 +3525,7 @@ long mpool_policy_block_connect(void* st, void* mp,
                 self_ci = find_node(st, txid);
                 if (self_ci >= 0){
                     if (!g_rm_mark[self_ci]) g_rm_order[self_ci] = (uint32_t)j;
+                    if (g_rm_mark[self_ci] == 2) g_rm_reseed = 1;   /* see mpol_mark_with_descendants */
                     g_rm_mark[self_ci] = 1;                 /* confirmed: alone */
                 }
             } else {
@@ -3527,7 +3574,7 @@ long mpool_policy_block_connect(void* st, void* mp,
         }
         p += txlen;
     }
-    if (batch){ mpol_phase("remove_marked"); removed += mpol_remove_marked(st, mp, n_nodes); }   /* the per-tx fallback removed inside "mark" */
+    if (batch){ mpol_rm_children_free(); mpol_phase("remove_marked"); removed += mpol_remove_marked(st, mp, n_nodes); }   /* the per-tx fallback removed inside "mark" */
     mpol_phase("rejects_clear+note");
     /* MEM-10: Core resets m_recent_rejects on every new block, because a
      * block can make a previously-invalid transaction valid -- its missing

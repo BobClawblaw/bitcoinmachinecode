@@ -4,6 +4,17 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-10-08 (4) — a block connect marks conflicts through the children index, not a fixpoint sweep per conflict (shared C)
+
+The last registry-per-step scan on the removal paths: `mpol_mark_with_descendants` marks each pool transaction a block conflicts with, and its descendants, for the batch removal. It swept every node until nothing new was marked, at least two sweeps per conflict.
+- **Now** the block connect builds the children index once, the first time the block conflicts with anything, and each conflict walks down from its root. The only way the level-2 set can be open on entry is a confirm mark downgrading a level-2 node. That case sets `g_rm_reseed`, and the next walk then seeds from every level-2 node, which is the set the sweep would close. So the marks and the block order recorded with them are unchanged, and with them what leaves and the order of the sequence hook's removals. If the index cannot be built, the sweep runs as before; a test knob (`mpool_policy_set_rm_fixpoint_scan`) also forces it.
+- **Test:** `test_mempool_policy` connects one block conflicting with every third transaction of the cluster-walk pool, on two fresh copies, sweep then walk. It compares the removed count, the pool left, and every departure and sequence callback in order: 233 removed and 466 callbacks, all identical.
+  - Giving descendants the wrong block order fails the callback check.
+  - Stopping the walk one level down fails both checks.
+  - The reseed path is not exercised: a valid block cannot confirm a descendant of a transaction it conflicts with.
+  - The test now links `bitcoin_tx.o` (`asm/Makefile`), as `test_mempool_core_parity` does. The block connect needs `tx_parse`.
+- **Full suite:** 424 PASS, 11 SKIP, 14 N/A, 0 FAIL. Note item 27 for x86.
+
 ## 2026-10-08 (3) — `collect_descendant_txids` walks the children index after its first pop (shared C)
 
 The deploy of ac078e42 confirmed the cluster-walk fix: mainnet's refill peaked at 28–47% for about a minute (85.6k transactions), then settled at 1–5%. The same scan pattern was left in `collect_descendant_txids`, which builds the descendant set for RBF eviction (single and package), `mpool_policy_remove_package` and TRUC sibling eviction. It scanned every registry node for each node it popped: d+1 passes over the pool for d descendants.

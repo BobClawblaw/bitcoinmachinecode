@@ -1826,8 +1826,8 @@ tests/test_mempool_core_parity: tests/test_mempool_core_parity.c bitcoin_mempool
 
 tests/test_mempool_cluster: tests/test_mempool_cluster.c mempool_cluster.c mempool_cluster.h
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_mempool_cluster.c mempool_cluster.c
-tests/test_mempool_policy: tests/test_mempool_policy.c tests/mempool_policy_vec.h bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c $(POLICYOBJS) bitcoin_hash.o sha256.o
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_mempool_policy.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c $(POLICYOBJS) bitcoin_hash.o sha256.o
+tests/test_mempool_policy: tests/test_mempool_policy.c tests/mempool_policy_vec.h bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_mempool_policy.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
 
 # NOTE: placed BELOW $(POLICYOBJS). Prerequisite lists expand IMMEDIATELY,
 # so a rule above the variable gets an EMPTY list -- the mistake this pass

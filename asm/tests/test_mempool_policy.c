@@ -50,6 +50,7 @@ extern void mpool_policy_set_baremultisig(void*, unsigned);
 static int test_bare_multisig(void);   /* defined below main */
 static void test_cluster_walk_differential(void);   /* defined below main */
 static void test_descendant_walk_differential(void);   /* defined below main */
+static void test_conflict_mark_differential(void);   /* defined below main */
 extern long   mpool_policy_add(void* pol, void* st, void* mp,
                                const unsigned char* tx, unsigned long txlen,
                                const unsigned char txid[32], void* utxo);
@@ -1120,6 +1121,7 @@ int main(void){
 
     test_cluster_walk_differential();
     test_descendant_walk_differential();
+    test_conflict_mark_differential();
 
     printf("\n%s (%d failures)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED", failures);
     return failures ? 1 : 0;
@@ -1501,4 +1503,98 @@ static void test_descendant_walk_differential(void){
     okv(ns == dwd_nremoved && !memcmp(rs, dwd_removed, (size_t)ns * sizeof rs[0]),
         "remove_package: every removed count and the final pool size are the scan's");
     okv(multi >= 10, "...and at least 10 of those removals took a descendant set");
+}
+
+/* ================================================================
+ * 2026-10-08 (3): a block connect marks each pool transaction the block
+ * CONFLICTS with, and its descendants, by walking the children index (built
+ * once per block) instead of sweeping the registry to a fixpoint per conflict.
+ * The marks decide what leaves, and the block index recorded with each mark
+ * decides the ORDER the sequence hook publishes removals in, so this compares
+ * what a subscriber sees, not just what is left:
+ *
+ * On the cluster-walk workload's final pool (limitclustercount 64), one
+ * block spends output 0 of every 3rd pool transaction. Whatever in the pool
+ * spends that output is a conflict and leaves with its descendants. Many
+ * conflicts sit below an earlier one, which is the case the walk must skip.
+ * The block is connected on two fresh copies, sweep then walk, and the
+ * test compares the removed count, the pool after, and every departure and
+ * sequence callback in order.
+ * ================================================================ */
+extern void mpool_policy_set_rm_fixpoint_scan(int on);
+extern long mpool_policy_block_connect(void* st, void* mp, const unsigned char* block, unsigned long blen);
+extern void mpool_policy_set_depart_cb(void (*fn)(const unsigned char*, unsigned long long, unsigned long long, int));
+extern void mpool_policy_set_seq_cb(void (*fn)(const unsigned char*, int));
+#define RFX_EV 4096
+static struct { unsigned char txid[32]; int kind, why; } rfx_ev[RFX_EV];
+static int rfx_nev, rfx_nconf, rfx_conf_with_desc;
+static long rfx_removed, rfx_left;
+static void rfx_depart(const unsigned char* txid, unsigned long long sz, unsigned long long fee, int why){
+    (void)sz; (void)fee;
+    if (rfx_nev < RFX_EV){ memcpy(rfx_ev[rfx_nev].txid, txid, 32); rfx_ev[rfx_nev].kind = 0; rfx_ev[rfx_nev].why = why; rfx_nev++; }
+}
+static void rfx_seq(const unsigned char* txid, int mined){
+    if (rfx_nev < RFX_EV){ memcpy(rfx_ev[rfx_nev].txid, txid, 32); rfx_ev[rfx_nev].kind = 1; rfx_ev[rfx_nev].why = mined; rfx_nev++; }
+}
+static unsigned long rfx_tx(unsigned char* o, const unsigned char prev[32], unsigned vout, unsigned char tag){
+    unsigned long n = 0;
+    o[n++]=2;o[n++]=0;o[n++]=0;o[n++]=0;
+    o[n++]=1; memcpy(o+n, prev, 32); n+=32;
+    for (int b=0;b<4;b++) o[n++]=(unsigned char)(vout>>(8*b));
+    o[n++]=0; memset(o+n,0xff,4); n+=4;
+    o[n++]=1; for (int b=0;b<8;b++) o[n++]=(unsigned char)(1000ULL>>(8*b));
+    o[n++]=22; o[n++]=0x00; o[n++]=0x14; memset(o+n, tag, 20); n+=20;
+    memset(o+n,0,4); n+=4;
+    return n;
+}
+static void rfx_block(void* st, void* mp){
+    static unsigned char blk[80 + 3 + 600 * 90];
+    static unsigned char pick[600][32];
+    unsigned char a[128][32];
+    int np = 0, seen = 0;
+    rfx_nconf = rfx_conf_with_desc = 0;
+    for (int step = 0; step < CWD_STEPS && np < 600; step++){
+        unsigned char tid[32]; dwd_tid(tid, step);
+        if (mpool_policy_descendant_txids(st, tid, a, 128) == -2) continue;
+        if (seen++ % 3) continue;
+        memcpy(pick[np++], tid, 32);
+    }
+    unsigned long n = 80; memset(blk, 0, 80);
+    unsigned ntx = (unsigned)np + 1;
+    if (ntx < 0xfd) blk[n++] = (unsigned char)ntx;               /* canonical varint */
+    else { blk[n++] = 0xfd; blk[n++] = (unsigned char)ntx; blk[n++] = (unsigned char)(ntx >> 8); }
+    unsigned char zero[32]; memset(zero, 0, 32);
+    n += rfx_tx(blk + n, zero, 0xffffffffu, 0xEE);          /* the coinbase: skipped */
+    for (int k = 0; k < np; k++) n += rfx_tx(blk + n, pick[k], 0, (unsigned char)k);
+    rfx_nev = 0;
+    mpool_policy_set_depart_cb(rfx_depart);
+    mpool_policy_set_seq_cb(rfx_seq);
+    long before = (long)mpool_count(mp);
+    rfx_removed = mpool_policy_block_connect(st, mp, blk, n);
+    rfx_left = (long)mpool_count(mp);
+    mpool_policy_set_depart_cb(0);
+    mpool_policy_set_seq_cb(0);
+    for (int i = 0; i < rfx_nev; i++) if (rfx_ev[i].kind == 0 && rfx_ev[i].why == 5) rfx_nconf++;
+    rfx_conf_with_desc = (int)(before - rfx_left);
+}
+static void test_conflict_mark_differential(void){
+    printf("== block-connect conflict marking: children index vs the fixpoint sweep ==\n");
+    static char v[CWD_STEPS]; static char r[CWD_STEPS][48];
+    int c, m, x;
+    static struct { unsigned char txid[32]; int kind, why; } ev_a[RFX_EV];
+    mpool_policy_set_rm_fixpoint_scan(1);
+    cwd_run(0, 64, v, r, &c, &m, &x, rfx_block);
+    mpool_policy_set_rm_fixpoint_scan(0);
+    long rem_a = rfx_removed, left_a = rfx_left; int nev_a = rfx_nev;
+    memcpy(ev_a, rfx_ev, sizeof ev_a);
+    cwd_run(0, 64, v, r, &c, &m, &x, rfx_block);
+    int same_ev = (nev_a == rfx_nev);
+    for (int i = 0; same_ev && i < nev_a; i++)
+        if (ev_a[i].kind != rfx_ev[i].kind || ev_a[i].why != rfx_ev[i].why || memcmp(ev_a[i].txid, rfx_ev[i].txid, 32)) same_ev = 0;
+    printf("      block connect: %ld removed (%d as conflicts), pool %ld -> %ld, %d callbacks\n",
+           rfx_removed, rfx_nconf, rfx_left + rfx_conf_with_desc, rfx_left, rfx_nev);
+    okv(rem_a == rfx_removed && left_a == rfx_left,
+        "the removed count and the pool left are the sweep's");
+    okv(same_ev, "every departure and sequence callback, in order, is the sweep's");
+    okv(rfx_nconf >= 50, "...over a block conflicting with at least 50 pool transactions");
 }
