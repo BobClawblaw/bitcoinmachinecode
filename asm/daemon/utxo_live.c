@@ -242,6 +242,8 @@ long utxo_live_compact_threshold(void);
 #define UTXO_LIVE_BULK_WAL_BYTES (256ULL<<20)
 
 static void* g_utxo_table = 0;
+static int   g_bulk_slots_log2 = 0;      /* the bulk memtable as built: dbcache, halved under the async flush (plan M2) */
+static unsigned long g_bulk_blob_mb = 0;
 
 struct lsm_state g_utxo_lst;
 
@@ -400,6 +402,79 @@ static void child_sig_acquire(void){ if (g_child_users++ == 0) g_child_prev_sigc
 static void child_sig_release(void){ if (g_child_users > 0 && --g_child_users == 0) signal(SIGCHLD, g_child_prev_sigchld); }
 static void fz_poll(void);
 static void fz_shutdown(void);
+
+/* ---- what a forked child is not given (plan M2, 2026-10-08) ----------------
+ * Run 41's heap peaked at 32.2 GB against a steady 15.2: at 15:23:03Z a
+ * merge child (forked 15:20:32) was running when a freeze rewrote the frozen
+ * copy and the applier kept writing the live memtable. Both were still
+ * shared with the child, so every 2 MB page the parent wrote was copied for
+ * it -- ~17 GB in two samples -- and the child reads none of them. A merge
+ * reads run files through its own mmap'd scratch (bitcoin_utxo_lsm.asm,
+ * utxo_lsm_compact: "NOT lst->scratch_buf") and touches no memtable,
+ * tombstone list or hash set; the flush writer (utxo_lsm_build_run) reads
+ * the frozen copy, the frozen tombstone list and the sort arena and nothing
+ * else of ours. So, around those two forks only, every big buffer the
+ * child does not read is MADV_DONTFORK -- absent from the child, so the
+ * parent's writes copy nothing -- and MADV_DOFORK again in the parent the
+ * moment fork() returns, so every other fork in this process (probes,
+ * passes, helpers) inherits exactly what it did before. A malloc'd buffer
+ * is trimmed to its whole pages (never a neighbour's page). */
+#define FORK_FOR_MERGE  1
+#define FORK_FOR_WRITER 2
+static void* g_fz_table;                 /* the frozen copy (defined with the async flush below) */
+static u64   g_mt_table_bytes = 0;       /* the live table's mapping, header page included */
+static u64   g_fz_table_bytes = 0;       /* the frozen copy's table mapping */
+static int   g_fork_trim = 1;            /* TEST-ONLY 0: fork with everything, as before M2 */
+static void (*g_test_child_probe)(int who) = 0;   /* TEST-ONLY: runs first in the child */
+struct fork_rgn { unsigned long a, len; };
+#define FORK_RGN_MAX 12
+static int fork_rgn_add(struct fork_rgn* r, int n, const void* p, u64 len){
+    const unsigned long pg = 4096;
+    if (!p || !len || n >= FORK_RGN_MAX) return n;
+    unsigned long a = ((unsigned long)p + pg - 1) & ~(pg - 1), e = ((unsigned long)p + len) & ~(pg - 1);
+    if (e > a){ r[n].a = a; r[n].len = e - a; n++; }
+    return n;
+}
+/* a memtable-shaped buffer: its table, then the blob its header names (+16, cap +24) */
+static int fork_rgn_add_table(struct fork_rgn* r, int n, void* t, u64 bytes){
+    if (!t || !bytes) return n;
+    n = fork_rgn_add(r, n, t, bytes);
+    return fork_rgn_add(r, n, (void*)(uintptr_t)((u64*)t)[2], ((u64*)t)[3]);
+}
+static int fork_rgns(struct fork_rgn* r, int who){
+    int n = 0;
+    if (!g_fork_trim) return 0;
+    n = fork_rgn_add_table(r, n, g_utxo_table, g_mt_table_bytes);
+    n = fork_rgn_add(r, n, g_utxo_lst.tomb_buf, g_utxo_lst.tomb_cap * 36);
+    if (g_utxo_lst.tomb_hash_buf)    n = fork_rgn_add(r, n, g_utxo_lst.tomb_hash_buf, (g_utxo_lst.tomb_hash_mask + 1) * 8);
+    if (g_utxo_lst.fz_tomb_hash_buf) n = fork_rgn_add(r, n, g_utxo_lst.fz_tomb_hash_buf, (g_utxo_lst.fz_tomb_hash_mask + 1) * 8);
+    if (who == FORK_FOR_MERGE){
+        n = fork_rgn_add_table(r, n, g_fz_table, g_fz_table_bytes);
+        n = fork_rgn_add(r, n, g_utxo_lst.fz_tomb_buf, g_utxo_lst.tomb_cap * 36);
+        n = fork_rgn_add(r, n, g_utxo_lst.scratch_buf, g_utxo_lst.scratch_cap);
+    }
+    return n;
+}
+static void fork_rgns_advise(const struct fork_rgn* r, int n, int advice){
+    static int warned = 0;
+    for (int i = 0; i < n; i++)
+        if (madvise((void*)r[i].a, r[i].len, advice) != 0 && !warned){
+            warned = 1;
+            fprintf(stderr, "[utxo_live] WARNING: madvise(%s) on a %.1f MB buffer failed (%s) -- a forked child may share (and copy) it\n",
+                    advice == MADV_DONTFORK ? "DONTFORK" : "DOFORK", (double)r[i].len / 1e6, strerror(errno));
+        }
+}
+/* said once per kind, for the benchmark log: what the child went without */
+static void fork_rgns_note(const struct fork_rgn* r, int n, int who){
+    static int said = 0;
+    if (said & who) return;
+    said |= who;
+    u64 sum = 0; for (int i = 0; i < n; i++) sum += r[i].len;
+    fprintf(stderr, "[utxo_live] the %s is forked without %d buffer(s), %.1f GB of address space it never reads (%s; plan M2)\n",
+            who == FORK_FOR_MERGE ? "merge child" : "flush writer", n, (double)sum / 1e9,
+            who == FORK_FOR_MERGE ? "the memtable, the frozen copy, both tombstone lists and hash sets, the sort arena"
+                                  : "the live memtable, its tombstone list, both hash sets");
+}
 static int  g_fz_enabled = 0;          /* plan B3: the async flush is installed (see the flush writer below) */
 static u64     g_cmp_old_base = ~0ULL;   /* persisted runs-only live count at fork time */
 static int     g_cmp_is_full = 0;        /* the k inputs were the whole manifest at fork */
@@ -530,7 +605,10 @@ static int compact_start_async(long height, const char* why){
     g_cmp_n_before = g_utxo_lst.manifest_n; g_cmp_height = height;
     g_cmp_old_base = lsm_manifest_persisted_live();
     child_sig_acquire();
+    struct fork_rgn rg[FORK_RGN_MAX]; int nrg = fork_rgns(rg, FORK_FOR_MERGE);
+    fork_rgns_advise(rg, nrg, MADV_DONTFORK);
     pid_t p = fork();
+    if (p != 0){ fork_rgns_advise(rg, nrg, MADV_DOFORK); if (p > 0) fork_rgns_note(rg, nrg, FORK_FOR_MERGE); }
     if (p < 0){
         child_sig_release();
         g_cmp_fallbacks++;
@@ -545,6 +623,7 @@ static int compact_start_async(long height, const char* why){
          * apply -- nice 10 and best-effort I/O at the lowest priority (not
          * the idle class: an idle-class writer starves outright under a
          * busy apply and the merge never lands, see the 09-08 note). */
+        if (g_test_child_probe) g_test_child_probe(FORK_FOR_MERGE);
         setpriority(PRIO_PROCESS, 0, 10);
         syscall(SYS_ioprio_set, 1 /* IOPRIO_WHO_PROCESS */, 0, (2 << 13) | 7 /* best-effort, prio 7 */);
         utxo_lsm_set_flush_hook(0);
@@ -693,6 +772,24 @@ static void fz_retire_wal(void){
     }
     g_wal_live_start = off;
 }
+/* plan M2 (2026-10-08): the frozen copy is needed from a freeze to its
+ * adopt -- run 41: the writer's 17 s of each 123 s generation -- and held
+ * its pages for the other 86%. They go back to the kernel at the adopt;
+ * the next freeze faults fresh zero pages under its copy. The header's
+ * blob pointer and cap are all a freeze keeps of the old contents (the
+ * asm restores them around its copy), so they are written back. The cost
+ * is the next freeze's page faults (zeroing what it copies into), on the
+ * applier; the [bench] freeze line's ms is where it shows. */
+static u64 g_fz_released = 0;            /* adopts that released the copy (tests) */
+static void fz_release_copy(void){
+    if (!g_fz_table || !g_fz_table_bytes) return;
+    u64 blob = ((u64*)g_fz_table)[2], cap = ((u64*)g_fz_table)[3];
+    int bad = madvise(g_fz_table, (size_t)g_fz_table_bytes, MADV_DONTNEED) != 0;
+    if (blob && cap) bad |= madvise((void*)(uintptr_t)blob, (size_t)cap, MADV_DONTNEED) != 0;
+    ((u64*)g_fz_table)[2] = blob; ((u64*)g_fz_table)[3] = cap;
+    if (bad){ static int warned = 0; if (!warned){ warned = 1; fprintf(stderr, "[utxo_live] WARNING: madvise(DONTNEED) on the frozen copy failed (%s) -- it keeps its pages between flushes\n", strerror(errno)); } return; }
+    g_fz_released++;
+}
 /* the parent's half, once the writer is gone. how: 1 = it wrote the run,
  * 2 = it had nothing to write, 0 = it failed or was lost (build inline). */
 static void fz_adopt(int how){
@@ -722,6 +819,7 @@ static void fz_adopt(int how){
     }
     fz_retire_wal();
     g_utxo_lst.fz_active = 0; g_utxo_lst.fz_tomb_n = 0;
+    fz_release_copy();
     g_fz_count++;
     if (g_cfg.benchlog){
         u64 bytes = 0; char nm[64]; snprintf(nm, sizeof nm, "utxo_run_%06u.dat", (unsigned)g_utxo_lst.fz_run_no);
@@ -762,7 +860,10 @@ static long fz_hook(void* lst, void* u){
     if (r < 0) return -1;
     if (r == 0) return 1;                               /* nothing to flush: the ops netted to an empty generation */
     child_sig_acquire();
+    struct fork_rgn rg[FORK_RGN_MAX]; int nrg = fork_rgns(rg, FORK_FOR_WRITER);
+    fork_rgns_advise(rg, nrg, MADV_DONTFORK);
     pid_t p = fork();
+    if (p != 0){ fork_rgns_advise(rg, nrg, MADV_DOFORK); if (p > 0) fork_rgns_note(rg, nrg, FORK_FOR_WRITER); }
     if (p < 0){
         child_sig_release(); g_fz_inline++;
         fprintf(stderr, "[utxo_live] fork for the flush writer failed (%s) -- writing run %lu inline\n", strerror(errno), (unsigned long)g_utxo_lst.fz_run_no);
@@ -773,6 +874,7 @@ static long fz_hook(void* lst, void* u){
     }
     if (p == 0){
         /* the writer: no stdio, no hooks, the run from the copy, then gone */
+        if (g_test_child_probe) g_test_child_probe(FORK_FOR_WRITER);
         utxo_lsm_set_flush_hook(0); utxo_lsm_set_freeze_hook(0);
         long cr = utxo_lsm_build_run(lst, g_utxo_lst.fz_u, g_utxo_lst.fz_tomb_buf, g_utxo_lst.fz_tomb_n, g_utxo_lst.fz_gen, g_utxo_lst.fz_run_no);
         _exit(cr == 1 ? 0 : cr == 0 ? 3 : 2);
@@ -798,6 +900,16 @@ long utxo_live_flush_now(void){
 long utxo_live_test_freeze_nowait(void){ return g_fz_enabled ? fz_hook(&g_utxo_lst, g_utxo_table) : -1; }
 int  utxo_live_test_writer_pid(void){ return (int)g_fz_pid; }
 unsigned long utxo_live_test_fz_adopted(void){ return g_fz_count; }
+/* TEST-ONLY (plan M2, tests/test_utxo_fork_trim): a hook the merge child and
+ * the flush writer run first; the pre-M2 fork (everything inherited); a
+ * background merge started without waiting and its pid; the adopts that
+ * released the frozen copy; the copy itself. */
+void utxo_live_test_set_child_probe(void (*fn)(int who)){ g_test_child_probe = fn; }
+void utxo_live_test_set_fork_trim(int on){ g_fork_trim = on ? 1 : 0; }
+int  utxo_live_test_compact_nowait(void){ return compact_start_async(g_apply_height, "test"); }
+int  utxo_live_test_compact_pid(void){ return (int)g_cmp_pid; }
+unsigned long long utxo_live_test_fz_released(void){ return g_fz_released; }
+void* utxo_live_test_fz_table(void){ return g_fz_table; }
 /* the shutdown path: the writer gets its seconds (its run is adopted, so the
  * next boot replays one generation less); past 30 s it is killed and the
  * generation replays from the WAL. */
@@ -3454,14 +3566,18 @@ int utxo_live_init(const char* dir){
     }
     txv_set_bulk_mode(g_bulk_mode);
 
-    unsigned long slots = g_bulk_mode ? (1UL << g_cfg.utxo_bulk_slots_log2)
+    /* plan M2: with the async flush the dbcache holds two memtable-shaped
+     * buffers, the live one and the frozen copy (utxo_live_sizing.h) */
+    { unsigned long bmb; utxo_live_bulk_split(g_cfg.utxo_bulk_slots_log2, (unsigned long)g_cfg.utxo_bulk_blob_mb, g_cfg.async_flush, &g_bulk_slots_log2, &bmb); g_bulk_blob_mb = bmb; }
+    unsigned long slots = g_bulk_mode ? (1UL << g_bulk_slots_log2)
                                       : (1UL << UTXO_LIVE_SLOTS_LOG2);
-    u64 blob_cap = g_bulk_mode ? ((u64)g_cfg.utxo_bulk_blob_mb << 20) : UTXO_LIVE_BLOB_BYTES;
-    fprintf(stderr, "[utxo_live] sizing: %s (applied=%ld tip=%ld gap=%ld) slots=2^%d blob=%lluMB compact_at=%ld\n",
+    u64 blob_cap = g_bulk_mode ? ((u64)g_bulk_blob_mb << 20) : UTXO_LIVE_BLOB_BYTES;
+    fprintf(stderr, "[utxo_live] sizing: %s (applied=%ld tip=%ld gap=%ld) slots=2^%d blob=%lluMB compact_at=%ld%s\n",
             g_bulk_mode ? "BULK -- far behind, batch-sized memtable" : "steady-state",
             boot_applied, boot_tip, boot_gap,
-            g_bulk_mode ? g_cfg.utxo_bulk_slots_log2 : UTXO_LIVE_SLOTS_LOG2,
-            (unsigned long long)(blob_cap >> 20), utxo_live_compact_threshold());
+            g_bulk_mode ? g_bulk_slots_log2 : UTXO_LIVE_SLOTS_LOG2,
+            (unsigned long long)(blob_cap >> 20), utxo_live_compact_threshold(),
+            g_bulk_mode && g_cfg.async_flush ? " (half the dbcache: the flush writer's frozen copy takes the other half)" : "");
     u64 fill_threshold = (u64)slots * 3 / 4;
     u64 op_threshold    = (u64)slots * 2;
     u64 tomb_cap         = op_threshold;
@@ -3478,6 +3594,7 @@ int utxo_live_init(const char* dir){
     void* blob = g_cfg.memtable_anon ? mmap_anon_kept_file("utxo_lsm_blob.map", blob_cap, 0)
                                      : mmap_file("utxo_lsm_blob.map", blob_cap);
     if (!g_utxo_table || !blob) { fprintf(stderr, "[utxo_live] mmap alloc failed\n"); return 0; }
+    g_mt_table_bytes = (u64)ustruct;
     utxo_init(g_utxo_table, slots, blob, blob_cap);
     if (g_cfg.memtable_anon){                       /* M1 names for the anonymous parts (the header page is the file's) */
         benchlog_mem_name_region((char*)g_utxo_table + 4096, (size_t)ustruct - 4096, "utxo-memtable-table");
@@ -3517,6 +3634,7 @@ int utxo_live_init(const char* dir){
             madvise(fzt, (size_t)ustruct, MADV_HUGEPAGE); madvise(fzb, (size_t)blob_cap, MADV_HUGEPAGE);
             ((u64*)fzt)[2] = (u64)(uintptr_t)fzb; ((u64*)fzt)[3] = blob_cap;   /* +16 blob, +24 blob_cap: what the freeze keeps */
             g_fz_table = fzt;
+            g_fz_table_bytes = (u64)ustruct;
             g_utxo_lst.fz_u = fzt; g_utxo_lst.fz_tomb_buf = tomb2;
             /* M1: named for maps/smaps and the [mem] line (the writer's copy
              * of the table and blob prefix; virtual until the first freeze) */
@@ -3665,7 +3783,7 @@ int utxo_live_init(const char* dir){
     benchlog_mem_name_region(g_utxo_lst.manifest_buf, g_utxo_lst.manifest_cap * 16, "utxo-manifest");
     if (g_utxo_lst.tomb_hash_buf) benchlog_mem_name_region(g_utxo_lst.tomb_hash_buf, (g_utxo_lst.tomb_hash_mask + 1) * 8, "utxo-tomb-hash");
     fprintf(stderr, "[utxo_live] init dir=%s slots=2^%d %s applied_height=%ld manifest_n=%lu live=%ld\n",
-            dir, g_bulk_mode ? g_cfg.utxo_bulk_slots_log2 : UTXO_LIVE_SLOTS_LOG2,
+            dir, g_bulk_mode ? g_bulk_slots_log2 : UTXO_LIVE_SLOTS_LOG2,
             have_prior_state ? "reload" : "fresh",
             g_applied_height, g_utxo_lst.manifest_n, utxo_lsm_count(&g_utxo_lst));
     return 1;
