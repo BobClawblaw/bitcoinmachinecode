@@ -354,6 +354,22 @@ int main(void){
       double early = dlc_effective_floor(5.6 * 1024.0);
       ok(!dlc_dead_weight(9.0 * 1024.0, 12, early), "the run-7 case: 9 KB/s and 12 blocks at height 50k is HEALTHY, not dead weight");
       ok(dlc_dead_weight(300.0, 1, early), "0.3 KB/s and one block at the same floor: genuinely dead, still killed"); }
+      /* 2026-10-08 (run 42): judged on the time the worker was free to
+       * fetch. A worker waiting at the full window moves nothing; run 42's
+       * applier held the window for 90 minutes and a peer that had served
+       * 9,600 blocks read 2.8 KB/s over the tick and was dropped -- 57
+       * dead-weight drops in the stall, the run's bans rising with them. Watched to fail with
+       * dlc_dead_weight_judged ignoring waited_s. */
+      { double F = (double)g_cfg.dead_weight_bps;
+      ok(!dlc_dead_weight_judged(2800.0, 0, F, 10.0, 9.8), "run 42's case: 2.8 KB/s over a tick spent 9.8 s at the full window is not judged");
+      ok(dlc_dead_weight_judged(2800.0, 0, F, 10.0, 0.0), "...the same rate with no wait: dead weight, as before");
+      ok(!dlc_dead_weight_judged(24000.0, 6, F, 10.0, 4.0), "24 KB/s and 6 blocks over 6 s of fetching is 40 KB/s and 10 blocks: not dead");
+      ok(dlc_dead_weight(24000.0, 6, F), "...which the whole-tick rule called dead");
+      ok(dlc_dead_weight_judged(300.0, 0, F, 10.0, 4.0), "0.3 KB/s over 6 s of fetching: genuinely dead, still killed");
+      ok(dlc_dead_weight_judged(2800.0, 0, F, 10.0, 5.0), "half the tick free to fetch is enough to judge");
+      ok(!dlc_dead_weight_judged(2800.0, 0, F, 10.0, 5.1), "...less than half is not");
+      ok(!dlc_dead_weight_judged(-1.0, 0, F, 10.0, 0.0), "no rate sample yet: not judged");
+      ok(dlc_dead_weight_judged(2800.0, 0, F, 10.0, -3.0), "a negative wait reads as none"); }
       /* 2026-09-07: boundary rotation. With the flat chunk budget gone (PR
        * #68) nothing removed a delivering-but-slow peer: the floor is 32 KB/s
        * at the tail, so a 250 KB/s peer against an 800 KB/s median held its
