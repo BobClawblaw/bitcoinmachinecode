@@ -557,7 +557,10 @@ u64 utxo_live_run_budget(void){
     return g_run_budget;
 }
 void utxo_live_set_run_budget(unsigned long long bytes){ g_run_budget = bytes; }
-static long compact_pick_now(long* lo){
+/* *over_budget = the run files' total is past the run budget (the bytes, not
+ * the count: the deferral below must see it at any run count -- see there) */
+static long compact_pick_now(long* lo, int* over_budget){
+    *over_budget = 0;
     long n = (long)g_utxo_lst.manifest_n;
     if (n < 2) return 0;
     static u64 sizes[256];
@@ -570,8 +573,10 @@ static long compact_pick_now(long* lo){
     }
     u64 budget = utxo_live_run_budget();
     long k = lsm_compact_pick_budget(sizes, n, utxo_live_compact_threshold(), 64, budget, lo);
+    u64 total = 0; for (long i = 0; i < n; i++) total += sizes[i];
+    *over_budget = budget && total > budget;
     if (k && n < utxo_live_compact_threshold()){
-        static long announced = -1; u64 total = 0; for (long i = 0; i < n; i++) total += sizes[i];
+        static long announced = -1;
         if (announced != n){ announced = n;
             fprintf(stderr, "[utxo_live] run files total %.1f GB > budget %.1f GB (35%% of RAM) -- compacting %ld of %ld runs below the count threshold\n",
                     (double)total / 1e9, (double)budget / 1e9, k, n); }
@@ -584,14 +589,23 @@ static int g_cmp_defer_logged = 0;
 unsigned long utxo_live_compactions_deferred(void){ return g_cmp_deferred; }
 static int compact_start_async(long height, const char* why){
     if (g_cmp_pid) return 0;
-    long lo = 0, k = compact_pick_now(&lo);
+    long lo = 0; int over_budget = 0;
+    long k = compact_pick_now(&lo, &over_budget);
     if (k == 0) return 0;
     /* 2026-09-09: while the apply is behind the download the disk is the
      * apply's; a merge waits, up to a ceiling on the run count and never
-     * when the run files are over the memory budget (compact_pick_now picks
-     * below the count threshold only for that reason) */
+     * when the run files are over the memory budget.
+     *
+     * 2026-10-08: "over the budget" was (n < thr) -- true only when the
+     * count threshold had not picked, so past the count threshold the
+     * budget never overrode the wait. Harmless while the bulk runs were big
+     * enough to cross the budget before the count (run 41: 27 runs at
+     * 46 GB); M2 halved the memtable and so each run, the count (48) came
+     * first, and run 42 waited to the ceiling of 96 runs with 72.7 GB of
+     * run files against a 46.3 GB budget: lookups probed up to 96 runs and
+     * faulted from disk, and blocks 600k-700k took 2 h against run 41's
+     * 30 min. The bytes decide now, at any run count. */
     { long n = (long)g_utxo_lst.manifest_n, thr = utxo_live_compact_threshold();
-      int over_budget = (n < thr);
       if (compact_should_defer(g_apply_lag, n, thr, over_budget)){
           g_cmp_deferred++;
           if (!g_cmp_defer_logged){ g_cmp_defer_logged = 1;
@@ -908,6 +922,7 @@ void utxo_live_test_set_child_probe(void (*fn)(int who)){ g_test_child_probe = f
 void utxo_live_test_set_fork_trim(int on){ g_fork_trim = on ? 1 : 0; }
 int  utxo_live_test_compact_nowait(void){ return compact_start_async(g_apply_height, "test"); }
 int  utxo_live_test_compact_pid(void){ return (int)g_cmp_pid; }
+void utxo_live_test_set_apply_lag(long lag){ g_apply_lag = lag; }
 unsigned long long utxo_live_test_fz_released(void){ return g_fz_released; }
 void* utxo_live_test_fz_table(void){ return g_fz_table; }
 /* the shutdown path: the writer gets its seconds (its run is adopted, so the
@@ -3758,7 +3773,7 @@ int utxo_live_init(const char* dir){
     for (unsigned long guard = 0; g_utxo_lst.manifest_n >= 2 && guard < UTXO_LIVE_MANIFEST_CAP; guard++) {
         /* count threshold OR byte budget (2026-09-01): compact_pick_now applies both */
         u64 before = g_utxo_lst.manifest_n;
-        long lo = 0, k = compact_pick_now(&lo);
+        long lo = 0; int ob = 0; long k = compact_pick_now(&lo, &ob);
         if (k == 0) break;
         long cr = utxo_lsm_compact_range(&g_utxo_lst, (unsigned long)lo, (unsigned long)k);
         fprintf(stderr, "[utxo_live] init: pre-catchup compact manifest_n=%lu -> %lu (result=%ld)\n",
