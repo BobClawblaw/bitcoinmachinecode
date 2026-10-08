@@ -5948,6 +5948,32 @@ static double g_dlc_hdr_switch_bps = 0;   /* the bar for the fetch in progress, 
 static int    g_dlc_hdr_slow = 0;         /* the last fetch stopped because its window fell under the bar */
 static double g_dlc_hdr_slow_bps = 0;     /* the window's rate when it did */
 static int    g_dlc_hdr_carry = 0;        /* the next fetch continues the previous one's low-work hold */
+/* ---- B12, the disjoint-ranges arm (2026-10-08): the replay source ---------
+ * dlc_headers_ranges (below) fetches the chain in parallel ranges into
+ * g_hr_buf; the pages are then taken by THIS fetch, with fd ==
+ * DLC_HDR_REPLAY_FD: each "reply" is the next full page after the
+ * locator's first entry (the held tail or the stored tip), read from the
+ * buffer instead of a socket. Everything after the reply is unchanged --
+ * the link to our locator, the low-work hold, dlc_take_page's linkage, PoW
+ * and contextual rules -- so a range is stored exactly as a peer's pages
+ * would be, or not at all. Full pages only: a short page below the floor
+ * would end the hold (LOWWORK_APPEND), so a remainder under DLC_HDR_PAGE is
+ * left to the sequential fetch, as is everything past the last range. */
+#define DLC_HDR_REPLAY_FD (-7)
+static unsigned char* g_hr_buf = 0;          /* 80-byte headers, index height - g_hr_base */
+static long g_hr_base = -1, g_hr_hi = -1;    /* the buffer holds heights [base, hi], fetched and contiguous */
+static size_t g_hr_blen = 0;
+static int dlc_replay_page(long from_h, unsigned char* msg, unsigned long cap, unsigned* mlen){
+    long a = from_h + 1, n = 0;
+    if(g_hr_buf && a >= g_hr_base && a + DLC_HDR_PAGE - 1 <= g_hr_hi) n = DLC_HDR_PAGE;
+    if(3 + (unsigned long)n * 81 > cap) n = 0;
+    unsigned o;
+    if(n >= 253){ msg[0] = 0xfd; msg[1] = (unsigned char)(n & 0xff); msg[2] = (unsigned char)((n >> 8) & 0xff); o = 3; }
+    else { msg[0] = (unsigned char)n; o = 1; }
+    for(long i = 0; i < n; i++){ memcpy(msg + o, g_hr_buf + (size_t)(a - g_hr_base + i) * 80, 80); msg[o + 80] = 0; o += 81; }
+    *mlen = o;
+    return 1;
+}
 static long dlc_fetch_headers(int fd, unsigned char* hst, const char* cand){
     long have0 = hst_count(hst), added = 0; int lw_started = 0; g_dlc_hdr_stalled = 0; g_dlc_hdr_slow = 0;
     int carried = g_dlc_hdr_carry && g_lw.held > 0; g_dlc_hdr_carry = 0;   /* B12: a switch hands over the hold */
@@ -5973,16 +5999,19 @@ static long dlc_fetch_headers(int fd, unsigned char* hst, const char* cand){
               memmove(loc + 32, loc, (size_t)nl * 32); memmove(lh + 1, lh, (size_t)nl * sizeof lh[0]);
               memcpy(loc, th, 32); lh[0] = tht; nl++;
           } }
-        long plen = p2p_getheaders(page, loc, nl, stop);
         long long pg_t0 = dlc_now_ms();
+        unsigned mlen = 0; char cmd[12]; int got = 0;
+        if(fd == DLC_HDR_REPLAY_FD) got = dlc_replay_page(lh[0], msg, sizeof msg, &mlen);   /* B12: the ranges' pages */
+        else {
+        long plen = p2p_getheaders(page, loc, nl, stop);
         if(plen <= 0 || p2p_write(fd, "getheaders", 10, page, (unsigned)plen) < 0) return -1;
         /* the reply: skip anything else the peer says first (inv, ping, ...) */
-        unsigned mlen = 0; char cmd[12]; int got = 0;
         for(int k = 0; k < 40 && !got; k++){
             int r = p2p_read(fd, cmd, msg, sizeof msg, &mlen);
             if(r <= 0) break;
             if(!strncmp(cmd, "headers", 12)) got = 1;
             else if(!strncmp(cmd, "ping", 12) && mlen == 8) p2p_write(fd, "pong", 4, msg, 8);
+        }
         }
         if(!got){ if(added){ g_dlc_hdr_stalled = 1; break; } return -1; }
         { long long pg_ms = dlc_now_ms() - pg_t0; sw_b[sw_k % sw_n] = (long long)mlen; sw_ms[sw_k % sw_n] = pg_ms > 0 ? pg_ms : 1; sw_k++; }
@@ -6255,6 +6284,195 @@ static int dlc_headers_probe(char live[][DL_POOL_SLOT], int nlive, unsigned char
     munmap(res, sizeof(dlc_hprobe_t) * DLC_HDR_PROBE_N);
     return answered;
 }
+/* ---- B12, the disjoint-ranges arm (2026-10-08) ------------------------------
+ * The probe and the switch pick ONE peer for the chain, and the header phase
+ * is that peer's speed: run 42's leader held 1.3 MB/s for 61 s (970k headers,
+ * 78 MB) and the first block was asked for 66 s after boot, against a target
+ * of 50 (Core #7: 45 s at ~2 MB/s). A peer can only be asked for headers that
+ * follow a hash we hold, so the ranges start at the chain's anchors
+ * (chainparams hdr_anchors, every 50,000 blocks on mainnet): range 0 runs
+ * from our stored tip to the first anchor, range j from anchor j-1 to anchor
+ * j, and the peers that answered the probe (up to DLC_HDR_PROBE_N) each take
+ * the next pending range until none is left. A range is linkage- and
+ * PoW-checked as it arrives and must end on its anchor's hash; a peer whose
+ * range fails gives it back (DLC_HDR_RANGES_TRIES in all) and stops. The
+ * contiguous prefix of finished ranges is then stored through
+ * dlc_fetch_headers' replay (above) -- every rule a peer's page meets -- and
+ * the sequential fetch continues from where it ended, the low-work hold
+ * carried, to the real tip. A wrong anchor or a failed range only shortens
+ * the prefix. Off under bmc.dlshape=core (Core syncs headers from one peer),
+ * with fewer than two answering peers, and for anchors at or past the pool's
+ * announced height. */
+#define DLC_HDR_RANGES_MAXSEG 64
+#define DLC_HDR_RANGES_S 180          /* every range child's cap */
+#define DLC_HDR_RANGES_TRIES 3        /* a range given back this often is given up */
+typedef struct {
+    volatile int status[DLC_HDR_RANGES_MAXSEG];   /* 0 pending, 1 taken, 2 done, 3 given up */
+    volatile int tries[DLC_HDR_RANGES_MAXSEG];
+    volatile int by[DLC_HDR_RANGES_MAXSEG];       /* the peer (0..) that finished it */
+    volatile long pages[DLC_HDR_PROBE_N];         /* pages each peer served */
+    volatile long long bytes;
+    volatile int owner[DLC_HDR_RANGES_MAXSEG];    /* the peer holding a taken range */
+    volatile long long t0[DLC_HDR_RANGES_MAXSEG], dur[DLC_HDR_RANGES_MAXSEG];   /* when it was taken; how long a finished one took */
+} dlc_hranges_t;
+/* a range still held when nothing is left to hand out, for longer than
+ * DLC_HDR_STRAGGLE_X times the finished ranges' median (and at least
+ * g_dlc_hr_straggle_min_ms), is taken back from its peer and handed to one
+ * that is waiting: one slow peer does not hold the phase to its cap */
+#define DLC_HDR_STRAGGLE_X 3
+static long g_dlc_hr_straggle_min_ms = 5000;   /* test seam */
+static const struct hdr_anchor* g_dlc_hr_anchors_test = NULL; static int g_dlc_hr_n_test = -1;   /* test seam: -1 = the chain's */
+static void dlc_hr_hash(const char* hx, unsigned char out[32]){
+    for(int q = 0; q < 32; q++){
+        int hi = hx[2*q], lo = hx[2*q+1];
+        hi = hi>='0'&&hi<='9'?hi-'0':hi>='a'&&hi<='f'?hi-'a'+10:hi-'A'+10;
+        lo = lo>='0'&&lo<='9'?lo-'0':lo>='a'&&lo<='f'?lo-'a'+10:lo-'A'+10;
+        out[31-q] = (unsigned char)((hi<<4)|lo);
+    }
+}
+/* one range on an open connection: heights (lo, hi], starting after
+ * `from` (the hash at lo), into g_hr_buf. 1 = it ended on `to`; 0 = the
+ * range is wrong (no link, a broken chain, failed PoW, the wrong end): the
+ * peer may still serve another; -1 = the connection failed */
+static int dlc_hr_fetch_range(int fd, const unsigned char from[32], long lo, long hi, const unsigned char to[32],
+                              dlc_hranges_t* st, int who){
+    static unsigned char page[DLC_HDR_PAGE * 81 + 16]; static unsigned char msg[2 << 20];
+    unsigned char last[32]; memcpy(last, from, 32); long h = lo;
+    while(h < hi){
+        long plen = p2p_getheaders(page, last, 1, to);
+        if(plen <= 0 || p2p_write(fd, "getheaders", 10, page, (unsigned)plen) < 0) return -1;
+        unsigned mlen = 0; char cmd[12]; int got = 0;
+        for(int k = 0; k < 40 && !got; k++){
+            int r = p2p_read(fd, cmd, msg, sizeof msg, &mlen); if(r <= 0) break;
+            if(!strncmp(cmd, "headers", 12)) got = 1;
+            else if(!strncmp(cmd, "ping", 12) && mlen == 8) p2p_write(fd, "pong", 4, msg, 8);
+        }
+        if(!got) return -1;
+        unsigned long used; unsigned long cnt = dlc_varint(msg, mlen, &used);
+        if(!used || cnt == 0 || cnt > DLC_HDR_PAGE || used + cnt * 81 > mlen) return 0;
+        __sync_fetch_and_add(&st->pages[who], 1L); __sync_fetch_and_add(&st->bytes, (long long)mlen);
+        for(unsigned long j = 0; j < cnt && h < hi; j++){
+            const unsigned char* hd = msg + used + j * 81;
+            if(hd[80] != 0 || memcmp(hd + 4, last, 32) != 0 || !pow_check(hd)) return 0;
+            memcpy(g_hr_buf + (size_t)(h + 1 - g_hr_base) * 80, hd, 80);
+            block_hash(last, hd); h++;
+        }
+    }
+    return memcmp(last, to, 32) == 0;
+}
+/* the ranges, fetched and left in g_hr_buf: returns the last height covered
+ * contiguously from our stored tip (>= the tip's height), or -1 when the arm
+ * does not run */
+static long dlc_headers_ranges(char live[][DL_POOL_SLOT], int nlive, unsigned char* hst,
+                               const int* order, const double* order_bps, long announced){
+    if(g_cfg.dl_shape_core) return -1;
+    const struct hdr_anchor* A = g_dlc_hr_n_test >= 0 ? g_dlc_hr_anchors_test : (g_chainp ? g_chainp->hdr_anchors : NULL);
+    int nA = g_dlc_hr_n_test >= 0 ? g_dlc_hr_n_test : (g_chainp ? g_chainp->n_hdr_anchors : 0);
+    long have = hst_count(hst);
+    if(!A || nA <= 0 || have <= 0 || announced <= 0) return -1;
+    /* the ranges: anchors a page or more past our tip and below the pool's claim */
+    static long seg_lo[DLC_HDR_RANGES_MAXSEG], seg_hi[DLC_HDR_RANGES_MAXSEG];
+    static unsigned char seg_from[DLC_HDR_RANGES_MAXSEG][32], seg_to[DLC_HDR_RANGES_MAXSEG][32];
+    int nseg = 0; long lo = have - 1;
+    { unsigned char rec[112]; if(hst_get_at(hst, (unsigned long long)(have - 1), rec) != 1) return -1; memcpy(seg_from[0], rec + 80, 32); }
+    for(int i = 0; i < nA && nseg < DLC_HDR_RANGES_MAXSEG; i++){
+        if(A[i].height < lo + DLC_HDR_PAGE || A[i].height >= announced) continue;
+        seg_lo[nseg] = lo; seg_hi[nseg] = A[i].height; dlc_hr_hash(A[i].hash, seg_to[nseg]);
+        if(nseg > 0) memcpy(seg_from[nseg], seg_to[nseg - 1], 32);
+        lo = A[i].height; nseg++;
+    }
+    int peer[DLC_HDR_PROBE_N]; int np = 0;
+    for(int oi = 0; oi < nlive && np < DLC_HDR_PROBE_N; oi++) if(order_bps[oi] > 0) peer[np++] = order[oi];
+    if(nseg < 2 || np < 2) return -1;
+    long top = seg_hi[nseg - 1];
+    size_t blen = (size_t)(top - have + 1) * 80;
+    unsigned char* buf = mmap(NULL, blen, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0);
+    dlc_hranges_t* st = mmap(NULL, sizeof *st, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
+    if(buf == MAP_FAILED || st == MAP_FAILED){ if(buf != MAP_FAILED) munmap(buf, blen); if(st != MAP_FAILED) munmap(st, sizeof *st); return -1; }
+    memset(st, 0, sizeof *st);
+    g_hr_buf = buf; g_hr_blen = blen; g_hr_base = have; g_hr_hi = have - 1;
+    fprintf(stderr,"[dlc] header ranges: %d range(s) from height %ld to %ld (anchors every %ld) across %d peer(s), the probe's fastest\n",
+            nseg, have - 1, top, nseg > 1 ? seg_hi[1] - seg_hi[0] : 0L, np);
+    long long t0 = dlc_now_ms();
+    pid_t kids[DLC_HDR_PROBE_N];
+    for(int k = 0; k < np; k++){
+        pid_t pid = fork(); if(pid < 0){ kids[k] = 0; continue; }
+        if(pid == 0){
+            alarm(DLC_HDR_RANGES_S);                                  /* nothing below may outlive this */
+            const char* c = live[peer[k]];
+            unsigned ip = 0; int pport = 0; if(!dlc_parse_peer(c, &ip, &pport)) _exit(0);
+            int cport = pport ? pport : node_config_peer_port(c);
+            dial_gate_wait();
+            int fd = tcp_connect_ip(ip, (unsigned short)htons((unsigned short)(cport ? cport : g_chainp->default_port)));
+            if(fd < 0) _exit(0);
+            struct timeval tv; tv.tv_sec = DLC_HDR_PROBE_S; tv.tv_usec = 0; setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+            bmc_v2_close(fd);
+            if(node_handshake(fd) != 1 || !peer_has_witness(c)){ close(fd); _exit(0); }
+            unsigned char mine[DLC_HDR_RANGES_MAXSEG]; memset(mine, 0, sizeof mine);   /* ranges this peer has failed */
+            for(;;){
+                int j = -1, busy = 0;
+                for(int q = 0; q < nseg && j < 0; q++){
+                    if(mine[q]) continue;
+                    if(__sync_bool_compare_and_swap(&st->status[q], 0, 1)) j = q;
+                    else if(st->status[q] == 1) busy = 1;               /* in another peer's hands: it may come back */
+                }
+                if(j < 0){ if(!busy) break; usleep(20000); continue; }
+                st->owner[j] = k; st->t0[j] = dlc_now_ms();
+                int r = dlc_hr_fetch_range(fd, seg_from[j], seg_lo[j], seg_hi[j], seg_to[j], st, k);
+                if(r > 0){ st->by[j] = k; st->dur[j] = dlc_now_ms() - st->t0[j]; __sync_synchronize(); st->status[j] = 2; continue; }
+                int t = __sync_add_and_fetch(&st->tries[j], 1);
+                st->status[j] = t >= DLC_HDR_RANGES_TRIES ? 3 : 0;    /* given back (or up) */
+                if(r < 0) break;                                       /* the connection failed: this peer stops */
+                mine[j] = 1;                                           /* a wrong range: never again from this peer, the others still */
+            }
+            close(fd); _exit(0);
+        }
+        kids[k] = pid;
+    }
+    /* wait for the peers; take a straggler's range back (see DLC_HDR_STRAGGLE_X) */
+    { int alive = 0; for(int k = 0; k < np; k++) if(kids[k] > 0) alive++;
+      while(alive > 0 && dlc_now_ms() - t0 < (DLC_HDR_RANGES_S + 2) * 1000L){
+          for(int k = 0; k < np; k++) if(kids[k] > 0){ int sv; if(waitpid(kids[k], &sv, WNOHANG) == kids[k]){ kids[k] = 0; alive--; } }
+          int pending = 0, ndone = 0; long long d[DLC_HDR_RANGES_MAXSEG];
+          for(int j = 0; j < nseg; j++){ if(st->status[j] == 0) pending++; if(st->status[j] == 2) d[ndone++] = st->dur[j]; }
+          if(!pending && ndone > 0 && alive > 1){
+              for(int a = 1; a < ndone; a++){ long long v = d[a]; int b = a - 1; while(b >= 0 && d[b] > v){ d[b+1] = d[b]; b--; } d[b+1] = v; }
+              long long bar = d[ndone / 2] * DLC_HDR_STRAGGLE_X; if(bar < g_dlc_hr_straggle_min_ms) bar = g_dlc_hr_straggle_min_ms;
+              for(int j = 0; j < nseg; j++){
+                  if(st->status[j] != 1) continue;
+                  long long held = dlc_now_ms() - st->t0[j]; int o = st->owner[j];
+                  if(held <= bar || o < 0 || o >= np || kids[o] <= 0) continue;
+                  int sv; kill(kids[o], SIGKILL); waitpid(kids[o], &sv, 0); kids[o] = 0; alive--;
+                  int t = __sync_add_and_fetch(&st->tries[j], 1);
+                  st->status[j] = t >= DLC_HDR_RANGES_TRIES ? 3 : 0;
+                  fprintf(stderr,"[dlc] header ranges: range %d held by %s for %.1fs against a median of %.1fs -- taken back%s\n",
+                          j, live[peer[o]], (double)held / 1000.0, (double)d[ndone / 2] / 1000.0, st->status[j] == 0 ? " for a waiting peer" : " and given up");
+              }
+          }
+          usleep(20000);
+      }
+      for(int k = 0; k < np; k++) if(kids[k] > 0){ int sv; dl_kill_reap(kids[k], &sv, "header range"); } }
+    double secs = (double)(dlc_now_ms() - t0) / 1000.0; if(secs < 0.001) secs = 0.001;
+    int done = 0, first_gap = -1;
+    for(int j = 0; j < nseg; j++){ if(st->status[j] == 2){ done++; if(first_gap < 0) g_hr_hi = seg_hi[j]; } else if(first_gap < 0) first_gap = j; }
+    char per[DLC_HDR_PROBE_N * 96]; int w = 0;
+    for(int k = 0; k < np; k++){ int r = 0; for(int j = 0; j < nseg; j++) if(st->status[j] == 2 && st->by[j] == k) r++;
+        w += snprintf(per + w, sizeof per - (size_t)w, "%s%s %d range(s)/%ld page(s)", k ? ", " : "", live[peer[k]], r, st->pages[k]); }
+    char rate[16]; dlc_fmt_rate(rate, sizeof rate, (double)st->bytes / secs);
+    fprintf(stderr,"[dlc] header ranges: %d of %d range(s) in %.1fs (%.1f MB, %s): %s; heights %ld..%ld are contiguous%s\n",
+            done, nseg, secs, (double)st->bytes / 1048576.0, rate, per, have, g_hr_hi,
+            first_gap >= 0 ? " -- the sequential fetch continues from there" : "");
+    if(first_gap >= 0)
+        fprintf(stderr,"[dlc] header ranges: range %d (heights %ld..%ld) %s after %d attempt(s)\n",
+                first_gap, seg_lo[first_gap] + 1, seg_hi[first_gap],
+                st->status[first_gap] == 3 ? "was given up" : "was not finished", st->tries[first_gap]);
+    munmap(st, sizeof *st);
+    return g_hr_hi;
+}
+static void dlc_hr_release(void){                /* after the replay: the hold keeps its own copies */
+    if(g_hr_buf) munmap(g_hr_buf, g_hr_blen);
+    g_hr_buf = 0; g_hr_blen = 0; g_hr_base = g_hr_hi = -1;
+}
 static long dlc_headers(char live[][DL_POOL_SLOT], int nlive){
     static unsigned char hst[4096]; hst_init(hst);
     struct stat hs;
@@ -6284,6 +6502,21 @@ static long dlc_headers(char live[][DL_POOL_SLOT], int nlive){
     static int order[DLC_MAXPOOL]; static double order_bps[DLC_MAXPOOL];
     dlc_headers_probe(live, nlive, hst, order, order_bps);   /* 2026-10-05: the fastest first page leads */
     g_dlc_hdr_carry = 0; int slow_i = -1;
+    /* B12: the ranges in parallel, then stored through the checks in order */
+    { long rh = dlc_headers_ranges(live, nlive, hst, order, order_bps, announced);
+      if(rh >= 0){
+          long radded = dlc_fetch_headers(DLC_HDR_REPLAY_FD, hst, "the header ranges");
+          dlc_hr_release();
+          if(radded < 0)
+              fprintf(stderr,"[dlc] header ranges: the replay refused them -- nothing from them stored; the sequential fetch starts at height %ld\n", hst_count(hst) - 1);
+          else {
+              unsigned char th[32]; long held_tip = -1; int held = lowwork_tail(&g_lw, th, &held_tip) ? g_lw.held : 0;
+              if(held) fprintf(stderr,"[dlc] header ranges: +%ld stored through the checks (total %ld), the rest held below -minimumchainwork through height %ld\n", radded, hst_count(hst), held_tip);
+              else     fprintf(stderr,"[dlc] header ranges: +%ld stored through the checks (total %ld)\n", radded, hst_count(hst));
+              if(held) g_dlc_hdr_carry = 1;             /* the sequential fetch continues the hold, as after a switch */
+              have = hst_count(hst);                    /* a later rollback keeps what the ranges stored */
+          }
+      } }
     for(int oi=0;oi<nlive && tried<DLC_HDR_TRY_PEERS; oi++){
         int i = order[oi];
         int why=0;

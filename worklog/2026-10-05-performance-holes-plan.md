@@ -49,7 +49,7 @@ when an item moves.
 | B9 part 2 | the 2 s idle tick per window | DONE 10-07 (#400), closed by run 41 |
 | B10 | a claim the chain could not have reached | DONE 10-07 (#400), closed by run 41 |
 | B11 | the memtable in anonymous memory | DONE 10-07 (#400), closed by run 41 (put 3,842 s against the target of 4,994) |
-| B12 | the header leader switch | BUILT 10-07 (#404, merged); the disjoint-ranges arm not done; unmeasured |
+| B12 | the header leader switch; disjoint ranges | switch MERGED 10-07 (#404), missed in run 42 (block 1 at ~66 s, the switch never fired); ranges BUILT 10-08 (branch perf/2026-10-08-b12-header-ranges); unmeasured |
 | B13 | ban on a second stall, not the first | BUILT 10-07 (#405, open); the grace half not done; unmeasured |
 | M1 | name the 26 GB | DONE 10-06 (#394): COW pages counted once per child |
 | M2 | the heap: no fork copies, dbcache is the total | MERGED 10-08 (#407); run 42 (to 813k): heap 6.3 GB mean / 11.8 GB peak (targets met), sync lost to M3 |
@@ -996,3 +996,51 @@ Not changed: the count threshold (48) stays at its run-41 value; with the
 budget obeyed, the merge after 05:57Z fired on bytes at 44 runs and the
 pace was run 41's. Halve it only if the next run shows the probe count
 costing time.
+
+## 2026-10-08: B12's disjoint-ranges arm (branch perf/2026-10-08-b12-header-ranges)
+
+Run 42 missed B12's target: the first block was asked for ~66 s after
+boot. All 970k headers came from one peer at a steady 1.3 MB/s (61 s);
+the switch never fired because that peer never fell under half the
+runner-up's probed 743 KB/s. The phase is one peer's speed.
+
+A peer can only be asked for headers after a hash we hold, so parallel
+ranges need anchors. Core ships hashes only at 840k-938k (assumeutxo,
+assumevalid); the operator chose a new table (10-08): mainnet block
+hashes every 50,000 to 950,000 in chainparams (`hdr_anchors`), read from
+production's headers.dat (each hash recomputed) and checked against the
+Core v31.1 node's getblockhash at all 19 heights. A starting point, not a
+trust root.
+
+`dlc_headers_ranges`: range 0 from the stored tip to the first anchor,
+range j from anchor j-1 to anchor j (anchors a page past the tip and below
+the pool's announced height); the probe's answering peers (up to 4) each
+take the next pending range. Each range is linkage- and PoW-checked as it
+arrives and must end on its anchor's hash. A wrong range is handed back
+and that peer moves on; a failed connection stops the peer; a range is
+given up after 3 attempts. A range held, when nothing is left to hand
+out, for over 3x the finished ranges' median (min 5 s) is taken back from
+its peer for a waiting one. The contiguous prefix of finished ranges is
+then stored by `dlc_fetch_headers` reading a replay source instead of a
+socket (full pages only), so every rule a peer's page meets applies,
+the -minimumchainwork hold included; a hold left at the end is carried
+into the sequential fetch (as after a B12 switch), which takes the rest
+to the real tip. Off under bmc.dlshape=core, with under two answering
+peers, or with under two ranges. Memory: a shared buffer of 80 bytes a
+header (76 MB to 950k), released after the replay.
+
+Log lines: `[dlc] header ranges: N range(s) from height A to B ...`,
+`... K of N range(s) in Xs (MB, rate): <peer> r range(s)/p page(s), ...;
+heights a..b are contiguous`, `... range j ... was given up | was not
+finished`, `... range j held by P for Xs against a median of Ys -- taken
+back`, `... +N stored through the checks (total T)[, the rest held ...]`.
+
+Test: `test_dlc_header_probe`, five new cases against four loopback peers
+(three ranges in parallel; a wrong anchor; the floor armed with the pool
+announcing 9,000; a straggler taken back; dlshape=core). Watched to fail
+with the ranges call removed (10), the end-of-range anchor check removed
+(3: the wrong anchor's range stored), the replay's hold not carried (15
+pages served, not 11: a refetch from genesis) and the takeback disabled.
+
+Measure on the next benchmark: boot to block 1 <= 50 s (run 42: ~66 s),
+and the ranges' own time against the 61 s single-peer phase.
