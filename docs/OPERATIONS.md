@@ -668,16 +668,24 @@ Two lines every 10 s (since 2026-09-08; before that the tick was eight lines):
 
 Lines that still print one per event, because each one is worth reading:
 `chunk [lo,hi] ABANDONED -> retry ring`, `dead weight (...)` (the parent's
-pool-relative verdict, with the measured rate and the bar), `stalled: no
+pool-relative verdict, with the measured rate and the bar; since
+2026-10-08, #409, the rate covers only the part of the 10 s tick the
+worker was free to fetch, and a tick it spent mostly waiting at the full
+window is not judged at all), `stalled: no
 block for 120s`, `attempt N failed after M ms: <reason>` (only the third in
 a row on one chunk and every hundredth), and `REJECT h=`.
 
-The download's other one-per-event lines (2026-10-05 to 10-07):
+The download's other one-per-event lines (2026-10-05 to 10-08):
 
 | line | meaning |
 |---|---|
 | `[dlc] header probe: the first page from N candidate(s) in Xs: <peer> R KB/s (...), ... -- <peer> leads, the rest are fallbacks` | B5: the first header page was asked of four candidates. The fastest leads the header download. |
 | `[dlc] headers from X fell to N KB/s over its last 4 page(s), under half of Y's probed M KB/s -- switching at height H (+S stored, P page(s) held and carried); Y continues from there` | B12 (#404): the header leader slowed. The next candidate continues from H, with nothing re-downloaded. Never printed under `bmc.dlshape=core`. |
+| `[dlc] header ranges: N range(s) from height A to B (anchors every S) across P peer(s), the probe's fastest` | B12 ranges (#410): the probe's answering peers (up to 4) fetch the chain in parallel, one range between two anchor hashes at a time. The anchors are mainnet block hashes every 50,000 in chainparams (see `CORE_DIVERGENCES.md`). Not printed under `bmc.dlshape=core`, with fewer than two answering peers, or on a chain without anchors. |
+| `[dlc] header ranges: K of N range(s) in Xs (MB, rate): <peer> r range(s)/p page(s), ...; heights a..b are contiguous[ -- the sequential fetch continues from there]` | the end of the parallel fetch. Each range was checked for linkage and proof of work and ends on its anchor's hash. Only the contiguous prefix from our tip is used. |
+| `[dlc] header ranges: range j (heights a..b) was given up \| was not finished after N attempt(s)` | the first gap. A range that failed 3 times is given up; the sequential fetch takes it and everything after. |
+| `[dlc] header ranges: range j held by P for Xs against a median of Ys -- taken back for a waiting peer \| and given up` | a straggler: held over 3x the finished ranges' median (at least 5 s) with nothing left to hand out. Its peer is stopped and the range handed back. |
+| `[dlc] header ranges: +N stored through the checks (total T)[, the rest held below -minimumchainwork through height H]` | the prefix stored by the same code as a peer's pages, every check and the `-minimumchainwork` hold included. A hold left over is carried into the sequential fetch. `the replay refused them -- nothing from them stored` means a check failed, and the sequential fetch starts from the tip as before. |
 | `[dlc] headers from X stopped answering after +N (chain at H) -- the next candidate takes over` | the leader went silent. What it served is rolled back and the next candidate starts over. |
 | `[dlc] wN <peer> is stalling the window: chunk [lo,hi] is the oldest missing and the window (W above A) is full -- dropped after N s (next timeout T s; peer <verdict>) \| holder <phase> for N s, ...` | Core's stall rule. The verdict is `disconnected, a first stall (banned on a second)` or `BANNED for the run (its second stall)` (B13), `disconnected, not banned (Core)` under `bmc.dlshape=core`, or one of the guards: `manual, kept selectable`, `at the usable floor, kept selectable`, `already banned`. |
 | `[dlc] chunk [lo,hi] goes to the retry ring for an idle worker as well (Core: ...)` | the stalled chunk was handed to an idle worker at once, as Core re-requests a disconnected staller's blocks. |
@@ -721,6 +729,7 @@ The download's other one-per-event lines (2026-10-05 to 10-07):
 | `[pool] N peer(s) sampled from the book: ipv4 a, ipv6 b, onion c, i2p d, cjdns e (...)` | the dial pool's per-network composition at boot; anonymity networks appear only when their transport is configured |
 | `[mempool] block <h>: removed N pool tx (confirmed/conflicted)` | a block connected |
 | `compaction of N run(s) ... started in background pid P` / `background compaction done in Xs` | UTXO maintenance |
+| `[utxo_live] merge of N run(s) deferred: the apply is X blocks behind the archive (waits under M runs)` | during a sync, a merge waits while the apply is 256 or more blocks behind, until twice the count threshold (48 → 96 runs). Since #408 it starts at once when the run files pass the run budget (35% of RAM), at any count. A deferral that lasts more than a few minutes with the apply falling further behind is run 42's 1 h 35 m stall. Look for the `compaction done` line. |
 | `RECOVERY: rolled back N ghost block(s)`, `rolled back ghost application`, `init: swept N orphan file(s)` | healthy crash recovery at boot |
 | `[utxo_live] flush: async (...)`, `[bench] freeze ...` | B3: the memtable is frozen and a forked writer flushes it. The writer is a short-lived child that is adopted between blocks. |
 | `[rpc] accept: out of file descriptors (...) -- backing off; the RPC listener is degraded` | printed **once** per process. RPC and the facade are no longer accepting. See *Troubleshooting*. |
