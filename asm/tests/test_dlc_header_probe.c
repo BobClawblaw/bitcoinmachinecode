@@ -188,7 +188,9 @@ static long run_phase(const char* tag, const fp_opts_t* ops, char peer[4][DL_POO
     for(int i=0;i<4;i++){ snprintf(live[i], DL_POOL_SLOT, "127.0.0.%d:%u", i+1, (unsigned)ports[i]); memcpy(peer[i], live[i], DL_POOL_SLOT); }
     for(int i=0;i<DLC_MAXPOOL;i++) g_live_announced[i] = i < 4 ? g_announce : 0;
     capture_begin("hdr.log");
+    signal(SIGCHLD, SIG_IGN);             /* as the download worker runs it: children auto-reap, waitpid never returns their pid */
     long got = dlc_headers(live, 4);
+    signal(SIGCHLD, SIG_DFL);             /* stop_peers below waits on the fake peers */
     *out_log = capture_end("hdr.log");
     stop_peers(pids, 4);
     return got;
@@ -322,6 +324,7 @@ int main(void){
       ckm("the sequential fetch took the last 1999", line_with(log, "[dlc] headers +1999 from") != 0);
       ck("the whole chain was fetched", got, NB);
       { int busy=0; for(int i=0;i<4;i++) if(g_served[i] > 1) busy++; ckm("more than one peer served range pages", busy >= 2); }
+      ckm("every peer left on its own once the ranges settled (none stopped; run 45 stopped all four)", line_with(log, "every range settled") == 0);
       sum=0; for(int i=0;i<4;i++) sum+=g_served[i];
       ck("pages served: 4 probe + 6 range + 1 sequential", sum, 11);
       { int fd=open("headers.dat",O_RDONLY); unsigned char rec[112]; int same=1;
@@ -391,7 +394,7 @@ int main(void){
       print_line(line_with(log, "header ranges: 3 of")); print_line(line_with(log, "every range settled"));
       ckm("all three finished", line_with(log, "header ranges: 3 of 3 range(s)") != 0);
       ckm("the silent peer took no range", line_with(log, "0 range(s)/0 page(s)") != 0);
-      ckm("the phase ended when the ranges settled, the silent peer stopped", line_with(log, "every range settled in") != 0 && line_with(log, "1 peer(s) holding none stopped") != 0);
+      ckm("the phase ended when the ranges settled, only the silent peer stopped", line_with(log, "every range settled in") != 0 && line_with(log, "1 peer(s) still connected stopped (1 never served a page)") != 0);
       { const char* l = line_with(log, "header ranges: 3 of 3 range(s) in "); double s = l ? atof(strstr(l, " in ") + 4) : 99.0;
         printf("  (the ranges phase: %.1fs; the whole header phase: %lld ms)\n", s, ms);
         ckm("the ranges phase took under 5 s, not the silent peer's 10 s", s < 5.0); }

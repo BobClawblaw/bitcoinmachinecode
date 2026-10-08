@@ -6449,27 +6449,33 @@ static long dlc_headers_ranges(char live[][DL_POOL_SLOT], int nlive, unsigned ch
         }
         kids[k] = pid;
     }
-    /* wait for the peers; take a straggler's range back (see DLC_HDR_STRAGGLE_X) */
+    /* wait for the peers; take a straggler's range back (see DLC_HDR_STRAGGLE_X).
+     * The download worker runs with SIGCHLD = SIG_IGN: a child that exited is
+     * auto-reaped and waitpid fails ECHILD, it never returns the pid (see
+     * dl_reap_bounded). Comparing against the pid alone never saw a peer leave:
+     * run 45 stopped all four as "holding none", three of which had fetched */
     { int alive = 0; for(int k = 0; k < np; k++) if(kids[k] > 0) alive++;
       while(alive > 0 && dlc_now_ms() - t0 < (DLC_HDR_RANGES_S + 2) * 1000L){
-          for(int k = 0; k < np; k++) if(kids[k] > 0){ int sv; if(waitpid(kids[k], &sv, WNOHANG) == kids[k]){ kids[k] = 0; alive--; } }
+          for(int k = 0; k < np; k++) if(kids[k] > 0 && dl_reap_bounded(kids[k], &(int){0}, 0)){ kids[k] = 0; alive--; }
           int pending = 0, held = 0, ndone = 0; long long d[DLC_HDR_RANGES_MAXSEG];
           for(int j = 0; j < nseg; j++){ if(st->status[j] == 0) pending++; if(st->status[j] == 1) held++; if(st->status[j] == 2) d[ndone++] = st->dur[j]; }
-          /* every range done or given up: the phase is over. Run 44 waited 180 s for a
-           * child that never took a range (stuck connecting to the probe's fastest
-           * peer) after the other three had fetched all 19; its alarm ended the phase */
+          /* every range done or given up: the phase is over. Run 44 waited 180 s after
+           * all 19 had come in: one peer never took a range, and since no exit was
+           * ever seen (SIG_IGN, above) the loop could only end at this cap */
           if(!pending && !held){
-              /* the peers that fetched leave on their own once nothing is left: reap them (<= 0.5 s), count the rest */
+              /* a peer finds nothing left within its 20 ms poll and leaves: give them
+               * 0.5 s, then stop and count the ones still connected (stuck in a
+               * connect or a handshake, or between pages) */
               long long tw = dlc_now_ms();
-              for(int fetching = 1; fetching && dlc_now_ms() - tw < 500; ){
-                  fetching = 0;
-                  for(int k = 0; k < np; k++) if(kids[k] > 0){
-                      int sv; if(waitpid(kids[k], &sv, WNOHANG) == kids[k]){ kids[k] = 0; alive--; } else if(st->pages[k] > 0) fetching = 1;
-                  }
-                  if(fetching) usleep(5000);
+              while(alive > 0 && dlc_now_ms() - tw < 500){
+                  for(int k = 0; k < np; k++) if(kids[k] > 0 && dl_reap_bounded(kids[k], &(int){0}, 0)){ kids[k] = 0; alive--; }
+                  if(alive > 0) usleep(5000);
               }
-              if(alive > 0) fprintf(stderr,"[dlc] header ranges: every range settled in %.1fs; %d peer(s) holding none stopped\n",
-                                    (double)(tw - t0) / 1000.0, alive);
+              if(alive > 0){
+                  int idle = 0; for(int k = 0; k < np; k++) if(kids[k] > 0 && st->pages[k] == 0) idle++;
+                  fprintf(stderr,"[dlc] header ranges: every range settled in %.1fs; %d peer(s) still connected stopped (%d never served a page)\n",
+                          (double)(tw - t0) / 1000.0, alive, idle);
+              }
               break;
           }
           if(!pending && ndone > 0 && alive > 1){
@@ -6479,7 +6485,7 @@ static long dlc_headers_ranges(char live[][DL_POOL_SLOT], int nlive, unsigned ch
                   if(st->status[j] != 1) continue;
                   long long held = dlc_now_ms() - st->t0[j]; int o = st->owner[j];
                   if(held <= bar || o < 0 || o >= np || kids[o] <= 0) continue;
-                  int sv; kill(kids[o], SIGKILL); waitpid(kids[o], &sv, 0); kids[o] = 0; alive--;
+                  int sv; dl_kill_reap(kids[o], &sv, "header range"); kids[o] = 0; alive--;   /* bounded: a blocking waitpid under SIG_IGN waits for every child */
                   int t = __sync_add_and_fetch(&st->tries[j], 1);
                   st->status[j] = t >= DLC_HDR_RANGES_TRIES ? 3 : 0;
                   fprintf(stderr,"[dlc] header ranges: range %d held by %s for %.1fs against a median of %.1fs -- taken back%s\n",
