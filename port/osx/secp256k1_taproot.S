@@ -31,10 +31,13 @@
  * Scratch is THREAD-LOCAL, as on x86 since 2026-08-23 (tx_verify.c's worker
  * threads hash in parallel). x86 puts both buffers in .tbss; here tagh_buf
  * (32 bytes) is a Mach-O TLV of its own, and tap_preimg is a per-thread
- * POINTER to a 4 MiB buffer malloc'd on the thread's first use -- dyld
+ * POINTER to a 4 MiB buffer allocated on the thread's first use -- dyld
  * allocates and zeroes a TLV block eagerly for every thread that touches the
  * image's TLVs, where the ELF .tbss is demand-paged, so a 4 MiB TLV would cost
  * each thread 4 MiB of resident memory. The C twin used the same design.
+ * The buffer comes from bmc_tls_alloc_export, so it is freed when the
+ * thread exits (2026-10-08: it was malloc'd and leaked by every short-lived
+ * verification thread).
  * ========================================================================== */
 #define TAP_PREIMG_CAP 0x400000
 
@@ -55,7 +58,7 @@ Ltap_bufs:
     cbnz  x19, 1f
     str   x0, [sp, #24]
     mov   x0, #TAP_PREIMG_CAP
-    bl    _malloc
+    bl    _bmc_tls_alloc_export           /* freed at thread exit (bmc_tls_export.c) */
     cbz   x0, Ltap_abort
     mov   x19, x0
     ldr   x1, [sp, #24]

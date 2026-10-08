@@ -4,6 +4,15 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-10-08 (7) — the second per-thread leak: taproot's 4 MiB preimage buffer (Mac port only)
+
+After the ae2085f0 deploy, the mainnet worker's large-malloc count still grew: 3,282 → 3,423 in 5.3 minutes. That is about 27 a minute, down from ~45. `heap` showed the sizes (5) fixed holding steady at 1–6 live blocks each, but 4 MiB blocks accumulating: 3,377 of them, all exactly 4,194,304 bytes. Each began with SHA256("TapSighash") written twice, the BIP340 tag prefix of a taproot sighash preimage.
+- **Cause:** `secp256k1_taproot.S` keeps a per-thread pointer (a Mach-O TLV) to a 4 MiB `tap_preimg` buffer and `malloc`'d it on the thread's first use, never freeing it. This is the same leak as `BMC_TLS_BUF`, in assembly, so (5) did not reach it. Every short-lived verification thread that checked a taproot input left one behind. (5)'s attribution of the ~20k "4096K" blocks to the segwit midstate buffer was wrong: most were these.
+- **Fix:** the buffer comes from `bmc_tls_alloc_export` (new `port/osx/bmc_tls_export.c`, a wrapper the assembly can call), so it is on the thread's list and freed at exit. `bitcoin_utxo_lsm.S`, the only other assembly that allocates, uses a fixed TLV, which dyld frees with the thread.
+- **Test:** `test_taproot_thread_stress` now checks that its 8 threads allocate their buffers through the tracker and hold none afterwards (8 allocated, held 1 → 1). With plain `malloc` restored, the check fails. On x86 the counters are absent (weak), and it prints N/A.
+- **x86:** not affected; its `tap_preimg` is `.tbss`.
+- **Full suite:** 424 PASS, 11 SKIP, 14 N/A, 0 FAIL.
+
 ## 2026-10-08 (6) — `TLS_ADDR` in `bitcoin_interp.S` never delivered a callee-saved destination: the CHECKMULTISIG strip wrote wherever the C caller's x27 pointed (Mac port only)
 
 Found through (5). With the leak fix in, 14 script-verification tests crashed, most with SEGV or SIGBUS. In the first one, `legacy_sighash` received a garbage `tx` from an `sv_ctx` that was intact on entry. A watchpoint on that `sv_ctx` caught `script_find_and_delete`'s memmove writing over it, called from the interpreter's CHECKMULTISIG strip (`.strip_call`).
