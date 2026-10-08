@@ -52,7 +52,8 @@ when an item moves.
 | B12 | the header leader switch | BUILT 10-07 (#404, merged); the disjoint-ranges arm not done; unmeasured |
 | B13 | ban on a second stall, not the first | BUILT 10-07 (#405, open); the grace half not done; unmeasured |
 | M1 | name the 26 GB | DONE 10-06 (#394): COW pages counted once per child |
-| M2 | the heap: no fork copies, dbcache is the total | BUILT 10-08 (branch perf/2026-10-08-m2-memory); unmeasured |
+| M2 | the heap: no fork copies, dbcache is the total | MERGED 10-08 (#407); run 42 (to 813k): heap 6.3 GB mean / 11.8 GB peak (targets met), sync lost to M3 |
+| M3 | a deferred merge obeys the byte budget at any run count | BUILT 10-08 (branch fix/2026-10-08-merge-budget); unmeasured |
 
 ## Part A — RPC: stop the lock-ups (BlockYard-visible)
 
@@ -964,3 +965,34 @@ Cost, to be read on the next benchmark: twice the freezes (~220 against
 lookups against a smaller memtable, and each freeze's page faults (the
 `[bench] freeze` ms). Targets: heap mean <= 10 GB, heap peak <= 16 GB
 (run 41: 15.3 / 32.2), sync time within 3% of run 41's 3:48:22.
+
+## 2026-10-08: run 42 and M3, the merge budget
+
+Run 42 (main 6554de3f: M2 + B12 + B13) met M2's heap targets on the way:
+heap 6.3 GB mean and 11.8 GB peak (run 41: 15.3 / 32.2; Core #7:
+10.0 / 12.0). The PSS peak barely moved (68.7 GB at 05:14Z, against
+75.6): the file-backed run pages, item 3.
+
+It lost the sync. Level with run 41 to 600,000 (1:19 against 1:14), it
+took 2 h for 600k-700k against 30 min, applier-bound (100% landed, lag
+~1,000, the window's width). The cause is in compact_start_async: the
+deferral (while the apply is >= 256 blocks behind, a merge waits until
+twice the count threshold) is lifted when the run files are over the
+memory budget, but "over the budget" was computed as (run count < count
+threshold) -- true only when the byte rule had picked the merge. Run 41's
+runs were big enough to cross 46.3 GB at ~27 runs, before the count of 48,
+so it never mattered. M2 halved each run: the count of 48 came first
+(02:55Z, "merge of 48 run(s) deferred ... waits under 96 runs"), and the
+store waited to 96 runs and 72.7 GB, every lookup probing up to 96 runs
+and faulting from disk, until the merge at 05:02Z. The apply caught the
+download within ten minutes of it (lag 0 at 05:23Z).
+
+M3: compact_pick_now reports the run files' bytes against the budget, and
+the deferral reads that at any run count.
+Test: `tests/test_utxo_merge_budget` (two runs at a count threshold of 2,
+the apply 1,000 behind: under the budget the merge defers, over it the
+merge starts), watched to fail with `(n < thr)` put back.
+Not changed: the count threshold (48) stays at its run-41 value; with the
+budget obeyed, the merge after 05:57Z fired on bytes at 44 runs and the
+pace was run 41's. Halve it only if the next run shows the probe count
+costing time.
