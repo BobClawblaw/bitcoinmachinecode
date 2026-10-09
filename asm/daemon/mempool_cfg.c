@@ -193,11 +193,29 @@ static int g_mp_robust = 0;               /* MEM-20: PTHREAD_MUTEX_ROBUST armed 
  * the Linux kernel hands the next locker. The pool's state is then treated
  * as mp_lock's comment above says. (A dead holder's pid reused by a new
  * process inside those 20 ms would keep the lock held; Darwin assigns pids
- * sequentially, so that needs ~100k process creations in the window.) */
+ * sequentially, so that needs ~100k process creations in the window.)
+ *
+ * 2026-10-09: a newcomer does not jump the queue. An unlock frees the word
+ * and wakes one sleeper, but the releasing thread's next take is a single
+ * CAS and won the race before the woken waiter was scheduled. On mainnet a
+ * client polling getmempoolentry (a 3-18 ms hold per call) kept the
+ * worker's accepts waiting 1-6 s while 97-216 takes went by
+ * (test_mempool_lock_fair: 2.8-3.7 s behind a 3 ms poller). So a thread
+ * that arrives while others sleep first waits for one take by somebody
+ * else -- the `takes` count moving -- or 1 ms, whichever is first, and only
+ * then tries. It sleeps on `takes`, not on the word, so an unlock's
+ * wake-one still goes to a real waiter. Bounded at 1 ms, it is not a queue
+ * and cannot wedge: a waiter that died counted only costs later newcomers
+ * that millisecond. */
 #include <stdint.h>
 #include <os/os_sync_wait_on_address.h>
 #include <sys/sysctl.h>
-typedef struct { uint32_t word; uint32_t waiters; } mp_rlock_t;
+typedef struct { uint32_t word; uint32_t waiters; uint32_t takes; uint32_t deferring; } mp_rlock_t;
+static void mp_rlock_took(mp_rlock_t* l){
+    __atomic_add_fetch(&l->takes, 1, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&l->deferring, __ATOMIC_SEQ_CST))
+        os_sync_wake_by_address_all(&l->takes, sizeof l->takes, OS_SYNC_WAKE_BY_ADDRESS_SHARED);
+}
 #define MP_RL ((mp_rlock_t*)(void*)g_mp_mutex)
 static int mp_pid_gone(pid_t p){
     if (kill(p, 0) != 0 && errno == ESRCH) return 1;
@@ -206,9 +224,17 @@ static int mp_pid_gone(pid_t p){
 }
 static int mp_rlock_lock(mp_rlock_t* l){
     const uint32_t me = (uint32_t)getpid();
+    if (__atomic_load_n(&l->waiters, __ATOMIC_SEQ_CST)){         /* others were here first: let one go */
+        uint32_t t = __atomic_load_n(&l->takes, __ATOMIC_SEQ_CST);
+        __atomic_add_fetch(&l->deferring, 1, __ATOMIC_SEQ_CST);
+        if (__atomic_load_n(&l->waiters, __ATOMIC_SEQ_CST))
+            os_sync_wait_on_address_with_timeout(&l->takes, t, sizeof l->takes, OS_SYNC_WAIT_ON_ADDRESS_SHARED,
+                                                 OS_CLOCK_MACH_ABSOLUTE_TIME, 1000ull * 1000);
+        __atomic_sub_fetch(&l->deferring, 1, __ATOMIC_SEQ_CST);
+    }
     for (;;){
         uint32_t cur = 0;
-        if (__atomic_compare_exchange_n(&l->word, &cur, me, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return 0;
+        if (__atomic_compare_exchange_n(&l->word, &cur, me, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)){ mp_rlock_took(l); return 0; }
         __atomic_add_fetch(&l->waiters, 1, __ATOMIC_SEQ_CST);
         cur = __atomic_load_n(&l->word, __ATOMIC_SEQ_CST);        /* after the count: an unlock now wakes us */
         int rc = 0, timed_out = 0;
@@ -220,7 +246,7 @@ static int mp_rlock_lock(mp_rlock_t* l){
         __atomic_sub_fetch(&l->waiters, 1, __ATOMIC_SEQ_CST);
         if (timed_out && cur != me && mp_pid_gone((pid_t)cur)){
             uint32_t exp = cur;                                       /* one waiter wins the takeover */
-            if (__atomic_compare_exchange_n(&l->word, &exp, me, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return EOWNERDEAD;
+            if (__atomic_compare_exchange_n(&l->word, &exp, me, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)){ mp_rlock_took(l); return EOWNERDEAD; }
         }
     }
 }

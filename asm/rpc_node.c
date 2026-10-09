@@ -2015,6 +2015,9 @@ static long long pri_delta_of(const unsigned char txid[32]);
 static rj_val* mpe_amount(unsigned long long sat){
     return rj_numf("%llu.%08llu", sat/100000000ULL, sat%100000000ULL);
 }
+static int mpe_snapshot_component(const unsigned char seed[32]);
+static void mpe_snapshot_index(void);
+static void mpe_tables_free(void);
 static int cmd_getmempoolentry(const rj_val* params, rj_val** res, long* ec, const char** em){
     static __thread char embuf[256];
     if (!params || params->typ != RJ_ARR || params->nitems < 1){
@@ -2039,6 +2042,25 @@ static int cmd_getmempoolentry(const rj_val* params, rj_val** res, long* ec, con
     unsigned long len=0;
     const unsigned char* tx = g_mph.get(g_mph.mp, txid, &len);
     if (!tx){ mpu(); *ec=-5; *em="Transaction not in mempool"; return 0; }
+    /* 2026-10-09: rendered from a snapshot of the component, after the lock,
+     * as verbose ancestors/descendants are (mpe_snapshot_component). Built
+     * under the lock, the entry asked the registry once for itself, once per
+     * ancestor and descendant and once per cluster member for its chunk --
+     * each an O(pool) children-index rebuild -- and linearized the cluster
+     * there too. On mainnet a client polling getmempoolentry held the lock
+     * 3-18 ms a call, and three calls held it ~2.4 s each. At production
+     * shape (test_rpc_chunk_scale 68000 1048576) the longest hold on a
+     * 25-chain goes 10.4 -> 3.5 ms; the linearization now runs unlocked. */
+    if (g_grm_snapshot && mpe_snapshot_component(txid)){
+        mpu();
+        g_mpe_snap = 1;
+        mpe_snapshot_index();
+        rj_val* so = mpe_vs_find(txid) >= 0 ? mpe_entry_obj(txid, NULL, 0) : NULL;
+        mpe_tables_free();
+        if (!so){ *ec=-5; *em="Transaction not in mempool"; return 0; }
+        *res = so;
+        return 1;
+    }
     rj_val* o = mpe_entry_obj(txid, tx, len);
     mpu();
     *res = o;

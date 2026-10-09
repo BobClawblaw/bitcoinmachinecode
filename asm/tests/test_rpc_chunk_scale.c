@@ -425,6 +425,47 @@ int main(int argc, char** argv){
         ck(what, rhold[1] < rhold[0]);
     }
 
+    /* ---- 2026-10-09: getmempoolentry, old path vs the component snapshot ----
+     * production: a client polling getmempoolentry kept the worker's accepts
+     * waiting 1-6 s, every call building its entry under the pool lock */
+    if (n > 40){
+        const int pick[6] = { 0, 1, 12, 24, 25 * 7 + 13, n - 1 };
+        int same = 1, calls = 0;
+        double ehold[2] = { 0, 0 }, ewall[2] = { 0, 0 };
+        long tk0 = g_takes, rl0 = g_releases;
+        for (int q = 0; q < 6; q++){
+            char pa[160]; snprintf(pa, sizeof pa, "[\"%s\"]", all->members[pick[q]].key);
+            char* rb[2] = { NULL, NULL }; long rl[2] = { 0, 0 };
+            for (int mode = 0; mode < 2; mode++){
+                rpc_node_set_grm_snapshot(mode);
+                rj_val* pp = rj_parse(pa, strlen(pa)); rj_val* r = NULL;
+                g_hold_max = 0; double t0 = now_ms();
+                rpc_node_dispatch("getmempoolentry", pp, &r, &ec, &em);
+                double dt = now_ms() - t0;
+                if (g_hold_max > ehold[mode]) ehold[mode] = g_hold_max;
+                if (dt > ewall[mode]) ewall[mode] = dt;
+                rb[mode] = r ? rj_write_alloc(r, 0, &rl[mode]) : NULL;
+                rj_free(r); rj_free(pp);
+            }
+            calls++;
+            if (!rb[0] || !rb[1] || rl[0] != rl[1] || memcmp(rb[0], rb[1], (size_t)rl[0])){
+                if (same) printf("  (first getmempoolentry disagreement on member %d)\n", pick[q]);
+                same = 0;
+            }
+            free(rb[0]); free(rb[1]);
+        }
+        rpc_node_set_grm_snapshot(1);
+        printf("  getmempoolentry, longest pool-lock hold over %d calls: %.2f ms building under the lock "
+               "(call %.2f ms), %.2f ms copying under it (call %.2f ms)\n", calls, ehold[0], ewall[0], ehold[1], ewall[1]);
+        snprintf(what, sizeof what, "getmempoolentry is byte-identical on both paths (%d calls)", calls);
+        ck(what, same);
+        snprintf(what, sizeof what, "...with every take released (%ld takes, %ld releases)",
+                 g_takes - tk0, g_releases - rl0);
+        ck(what, g_takes - tk0 == g_releases - rl0 && g_takes > tk0);
+        snprintf(what, sizeof what, "...and a shorter longest hold (%.2f ms against %.2f ms)", ehold[1], ehold[0]);
+        ck(what, ehold[1] < ehold[0]);
+    }
+
     /* ---- stale registry nodes beyond the live count ----
      * every fourth entry leaves the structural pool only (the registry keeps
      * it, as it does for a moment after an eviction): live drops by a

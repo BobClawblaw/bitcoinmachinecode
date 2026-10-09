@@ -171,12 +171,19 @@ int main(void){
     ck("D: a stray step does not leak into the next hold's line", dl && !strstr(dl, "nowhere"));
     ck("D: a hold with no steps ends at the wait count", dl && strstr(dl, " ms); 0 waiting behind it"));
 
-    /* ---- E: a convoy of 3 ms holds; this thread waits behind it ---- */
+    /* ---- E: a convoy of 3 ms holds; this thread waits behind it ----
+     * 2026-10-09: the Mac's lock no longer lets a releaser retake it ahead
+     * of a woken waiter (test_mempool_lock_fair), so a waiter behind six
+     * 3 ms holders got in within a few holds and never reached 100 ms. The
+     * convoy is still the thing pinned, at a smaller scale: twelve holders
+     * and a 20 ms threshold -- a 20 ms wait made of 3 ms holds is a convoy
+     * that no single hold explains. */
+    mp_lock_set_log_ms(20);
     { const char* cl = NULL; long waited = -1;
       for (int attempt = 0; attempt < 8 && !cl; attempt++){   /* a fair handoff can let the waiter in early; under a loaded suite that happened 3 times running once */
           g_convoy_stop = 0;
-          pthread_t ct[6];
-          for (int i = 0; i < 6; i++) pthread_create(&ct[i], NULL, convoy_thread, NULL);
+          pthread_t ct[12];
+          for (int i = 0; i < 12; i++) pthread_create(&ct[i], NULL, convoy_thread, NULL);
           usleep(30000);                                     /* the convoy is running */
           ev0 = mp_lock_slow_events();
           mp_lock_at("behind_the_convoy");
@@ -187,24 +194,25 @@ int main(void){
           mp_lock_slow_log(log, sizeof log);
           mp_unlock();
           g_convoy_stop = 1;
-          for (int i = 0; i < 6; i++) pthread_join(ct[i], NULL);
+          for (int i = 0; i < 12; i++) pthread_join(ct[i], NULL);
           cl = strstr(log, "[mempool] pool lock: behind_the_convoy (pid ");
           if (cl && mp_lock_slow_events() == ev0) cl = NULL;   /* a stale ring entry */
           if (cl) waited = ms_in(cl, ") waited ");
           if (!cl) printf("      (attempt %d: the waiter got in under the threshold; retrying)\n", attempt + 1);
       }
-      ck("E: the waiter sat through a convoy for >= 100 ms (a wait line)", cl != NULL);
+      ck("E: the waiter sat through a convoy for >= 20 ms (a wait line)", cl != NULL);
       if (cl){
           long went_by = ms_in(cl, "held ") >= 0 ? atol(strstr(cl, "ms); ") + 5) : -1;
           long longest = ms_in(cl, "the longest of them held ");
           printf("      %s\n", cl);
-          ck("E: the line counts the takes that went by (>= 10 in >= 100 ms of 3 ms holds)", went_by >= 10);
-          ck("E: the longest of them is a short hold (< 100 ms), named", longest >= 0 && longest < 100 && strstr(cl, "ms (convoy_site)") != NULL);
-          ck("E: the last release was short too (< 100 ms)", ms_in(cl, ", held ") >= 0 && ms_in(cl, ", held ") < 100);
-          ck("E: the wait is longer than any single hold: a convoy, said so by the line", waited > longest && waited >= 100);
+          ck("E: the line counts the takes that went by (>= 3 in >= 20 ms of 3 ms holds)", went_by >= 3);
+          ck("E: the longest of them is a short hold (< 20 ms), named", longest >= 0 && longest < 20 && strstr(cl, "ms (convoy_site)") != NULL);
+          ck("E: the last release was short too (< 20 ms)", ms_in(cl, ", held ") >= 0 && ms_in(cl, ", held ") < 20);
+          ck("E: the wait is longer than any single hold: a convoy, said so by the line", waited > longest && waited >= 20);
           ck("E: no hold line was written by anyone (no hold reached the threshold)", strstr(log, "convoy_site (pid ") == NULL || strstr(strstr(log, "convoy_site (pid "), ") held ") == NULL);
       }
     }
+    mp_lock_set_log_ms(100);
     /* the convoy's reset: with nobody waiting, the next quiet take reports no convoy */
     mp_lock_at("quiet_after"); mp_unlock();
 

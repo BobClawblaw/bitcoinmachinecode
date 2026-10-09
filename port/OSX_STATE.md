@@ -4,6 +4,17 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-10-09 (2) — the pool lock: `getmempoolentry` builds after the lock, and a newcomer no longer jumps the queue (shared C + Mac lock)
+
+Item 24 (verbose `getrawmempool` holding the lock for its JSON build) was already fixed on 2026-10-06. The log after the e9a44c97 restart showed a different shape: 29 wait lines in about an hour, every one behind `getmempoolentry`.
+- **Starved waiters:** the worker's accepts (`tx_accept_validate_p2p`, `tx_accept_validate_reason`, `txacc_note_sigops`) waited 1.0–6.0 s while 97–216 takes went by, none longer than 18 ms. A client polls `getmempoolentry` in a loop.
+- **Long holds:** three single `getmempoolentry` calls held the lock about 2.4 s each, ~69 s apart, in the first five minutes.
+- **Cause 1, the hold:** `getmempoolentry` built its entry under the lock through the per-entry path. That is one registry call for the transaction, one per ancestor and descendant, one per cluster member for the chunk (each rebuilding the O(pool) children index), plus the cluster's optimal linearization. **Fix:** it snapshots the component under the lock and renders after it, as verbose ancestors/descendants have done since 2026-10-06 (`mpe_snapshot_component`). `test_rpc_chunk_scale 68000 1048576`: longest hold over six members of 25-chains 10.4 → 3.5 ms, answers byte-identical. The 2.4 s holds were not reproduced offline; the linearization, the likely cost for a large cluster, now runs after the release.
+- **Cause 2, the starvation:** `mp_unlock` frees the word and wakes one sleeper, but the releaser's next take is one CAS and won before the woken waiter ran. **Fix** (`mp_rlock_lock`, the Mac's lock): a thread that arrives while others sleep first waits for one take by somebody else (a new `takes` count in the lock word, which it sleeps on, so an unlock's wake-one still reaches a real waiter) or 1 ms, then tries. It is bounded, so it is not a queue and cannot wedge, and the uncontended path costs one atomic load.
+- **Test:** new `test_mempool_lock_fair`. A child process takes, holds 3 ms, releases and takes again at once; the parent times 20 takes. Before: median 0–206 ms, longest 2.8–3.7 s, 8 s for the 20. After: median ~1 ms, longest 3.0–3.2 ms, 80 ms for the 20. `test_rpc_chunk_scale` gains the `getmempoolentry` old-vs-snapshot section. `test_mempool_lock_log`'s convoy section (E) relied on the starvation: its waiter behind six 3 ms holders now gets in within a few holds, short of the 100 ms threshold. It runs at a smaller scale, twelve holders and a 20 ms threshold, and still pins a wait made of short holds (39–160 ms through 11–44 takes in five runs).
+- **x86:** the `getmempoolentry` change is shared C. Its lock is a process-shared `pthread_mutex`, which probably barges the same way; the fairness test is N/A there until it gets an equivalent.
+- **Full suite:** 425 PASS, 11 SKIP, 14 N/A, 0 FAIL.
+
 ## 2026-10-09 (1) — the RPC side's per-thread buffers: freed, and the read lane's archive handle closed, at thread exit (shared C)
 
 (5) and (7) left the RPC code's hand-rolled heap TLS alone. Most of it lives on the RPC pools' long-lived threads, so the question was which short-lived threads reach it.
