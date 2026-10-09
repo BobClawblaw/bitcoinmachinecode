@@ -1040,10 +1040,12 @@ static rj_val* tx_to_json_pv(const u8* tx, const txw_t* w, long long in_total,
     rj_val* o = rj_obj();
     u8 txid[32], wtxid[32]; char hx[65];
     /* 2026-10-06: a per-thread scratch for the stripped copy, grown as
-     * needed -- a malloc per transaction went to mmap above 128 KB */
-    static __thread u8* scratch; static __thread size_t scratch_cap;
-    if (scratch_cap < w->len){ size_t nc = w->len < (256u << 10) ? (256u << 10) : w->len; u8* ns = realloc(scratch, nc); if (ns){ scratch = ns; scratch_cap = nc; } }
-    if (scratch && scratch_cap >= w->len){ tx_txid(txid, tx, w->len, scratch, w->len); } else memset(txid, 0, 32);
+     * needed -- a malloc per transaction went to mmap above 128 KB. Freed at
+     * thread exit (bmc_thread.h): Esplora runs this on a thread per
+     * connection (2026-10-09) */
+    static __thread bmc_tls_grow* scr; BMC_TLS_GROW(scr);
+    if (scr->cap < w->len){ size_t nc = w->len < (256u << 10) ? (256u << 10) : w->len; u8* ns = realloc(scr->buf, nc); if (ns){ scr->buf = ns; scr->cap = nc; } }
+    if (scr->buf && scr->cap >= w->len){ tx_txid(txid, tx, w->len, scr->buf, w->len); } else memset(txid, 0, 32);
     if (w->segwit) sha256d(wtxid, tx, w->len); else memcpy(wtxid, txid, 32);
     hex_rev(hx, txid, 32);  rj_obj_set(o, "txid", rj_str(hx));
     hex_rev(hx, wtxid, 32); rj_obj_set(o, "hash", rj_str(hx));
@@ -1869,10 +1871,11 @@ static int cmd_getblock(const rj_val* params, rj_val** res, long* ec, const char
      * (fee omitted, honest -- we keep only a recent-heights window). */
     enum { UNDO_CAP = 600000 };
     /* per thread, not static: getblock runs in the reader lane, several at
-     * once (2026-10-05); allocated on a thread's first verbosity >= 2 call */
+     * once (2026-10-05); allocated on a thread's first verbosity >= 2 call,
+     * freed when the thread exits (bmc_thread.h, 2026-10-09) */
     static __thread u64* undo_vals; long undo_n = -1, undo_cur = 0;
     if (verbosity >= 2){
-        if (!undo_vals) undo_vals = malloc(UNDO_CAP * sizeof *undo_vals);
+        if (!undo_vals) undo_vals = bmc_tls_keep(malloc(UNDO_CAP * sizeof *undo_vals), NULL);
         if (!undo_vals){ rj_free(txs); if (cb) rj_free(cb); rj_free(o); *ec = -7; *em = "out of memory"; return 0; }
         undo_n = undo_block_values(h, undo_vals, UNDO_CAP);
     }
@@ -1890,7 +1893,7 @@ static int cmd_getblock(const rj_val* params, rj_val** res, long* ec, const char
     static __thread undo_prevout_t* undo_pv; long undo_pn = -1;
     u8* undo_raw = NULL;
     if (verbosity >= 3){
-        if (!undo_pv) undo_pv = malloc(UNDO_CAP * sizeof *undo_pv);
+        if (!undo_pv) undo_pv = bmc_tls_keep(malloc(UNDO_CAP * sizeof *undo_pv), NULL);
         if (undo_pv) undo_pn = undo_block_load(h, undo_pv, UNDO_CAP, &undo_raw);
     }
     for (u64 i = 0; i < ntx; i++){
@@ -2171,16 +2174,27 @@ long g_txi_lane_entries;   /* test seam: lane entries so far */
  * no execution lock, as many at once as there are RPC threads. The handles
  * follow lanes_open (a reindex) through a generation count. */
 static long g_lanes_gen;
-static __thread u8 t_rd_st[ST_SIZE]; static __thread int t_rd_ok; static __thread u8* t_rd_bb; static __thread long t_rd_gen = -1;
+/* 2026-10-09: the handle and the block buffer are heap blocks on the
+ * thread-exit list (bmc_thread.h), and the handle's finaliser closes its
+ * descriptors. The pool threads keep theirs for the process lifetime, as
+ * before. An Esplora connection thread (rpc_server.c) is one thread per
+ * connection and reaches this through getblock: each one used to leave an
+ * open archive handle and the 8 MB buffer behind. */
+typedef struct { u8 st[ST_SIZE]; int ok; } rd_handle_t;
+long g_rd_handles_closed;  /* test seam: handles closed at thread exit */
+static void rd_handle_fin(void* p){ rd_handle_t* h = p; if (h->ok){ lane_handle_close(h->st); h->ok = 0; __sync_fetch_and_add(&g_rd_handles_closed, 1); } }
+static __thread rd_handle_t* t_rd_h; static __thread u8* t_rd_bb; static __thread long t_rd_gen = -1;
 typedef txi_lane_t rd_lane_t;
 long g_rd_lane_entries;    /* test seam */
 static rd_lane_t rd_lane_enter(void){
     rd_lane_t sv = { t_st, t_blockbuf, t_blockbuf_h, 0 };
-    if (t_rd_gen != g_lanes_gen){ if (t_rd_ok){ lane_handle_close(t_rd_st); t_rd_ok = 0; } t_rd_gen = g_lanes_gen; }
-    if (!t_rd_bb) t_rd_bb = malloc(BLOCKBUF_CAP);
-    if (!t_rd_ok){ static pthread_mutex_t open_mu = PTHREAD_MUTEX_INITIALIZER;   /* once per thread; the open is not reentrant */
-        pthread_mutex_lock(&open_mu); lane_handle_open(t_rd_st, &t_rd_ok); pthread_mutex_unlock(&open_mu); }
-    if (t_rd_bb && t_rd_ok){ t_st = t_rd_st; t_blockbuf = t_rd_bb; t_blockbuf_h = -1; sv.ok = 1; }
+    if (!t_rd_h) t_rd_h = bmc_tls_keep(calloc(1, sizeof *t_rd_h), rd_handle_fin);
+    if (!t_rd_bb) t_rd_bb = bmc_tls_keep(malloc(BLOCKBUF_CAP), NULL);
+    if (!t_rd_h || !t_rd_bb){ g_rd_lane_entries++; return sv; }
+    if (t_rd_gen != g_lanes_gen){ if (t_rd_h->ok){ lane_handle_close(t_rd_h->st); t_rd_h->ok = 0; } t_rd_gen = g_lanes_gen; }
+    if (!t_rd_h->ok){ static pthread_mutex_t open_mu = PTHREAD_MUTEX_INITIALIZER;   /* once per thread; the open is not reentrant */
+        pthread_mutex_lock(&open_mu); lane_handle_open(t_rd_h->st, &t_rd_h->ok); pthread_mutex_unlock(&open_mu); }
+    if (t_rd_h->ok){ t_st = t_rd_h->st; t_blockbuf = t_rd_bb; t_blockbuf_h = -1; sv.ok = 1; }
     g_rd_lane_entries++;
     return sv;
 }

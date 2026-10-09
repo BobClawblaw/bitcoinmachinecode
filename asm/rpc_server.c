@@ -355,10 +355,10 @@ void rpc_cookie_remove(void) {
  * write and the read are the same thread's. Threading an out-parameter
  * through auth_ok's four call sites would do the same thing with more
  * surface; this is the smaller change and the comment now matches the code. */
-static __thread char* g_last_auth_user;   /* bmc_osx: heap TLS scratch (bmc_thread.h convention), not a Mach-O TLV array */
+static __thread char* g_last_auth_user;   /* bmc_osx: heap TLS scratch (BMC_TLS_BUF: freed at thread exit), not a Mach-O TLV array */
 static int auth_ok(const char* headers, size_t hlen,
                    const char* user, const char* pass) {
-    if (!g_last_auth_user) { g_last_auth_user = malloc(64); if (!g_last_auth_user) abort(); }
+    BMC_TLS_BUF(g_last_auth_user, 64);
     g_last_auth_user[0] = 0;
     const char* auth = find_header(headers, hlen, "Authorization", 13);
     if (!auth) return 0;

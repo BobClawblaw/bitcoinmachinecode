@@ -5,6 +5,7 @@
  * asm does not get the TLV fixup kind -- see OSX_ROADMAP). */
 #include <stdint.h>
 #include <stdlib.h>
+#include "bmc_thread.h"   /* bmc_tls_keep */
 __thread unsigned char scriptnum_buf[16];
 __thread unsigned char snum_overflow[8];
 __thread unsigned char elem_tmp0[528];
@@ -21,7 +22,12 @@ __thread unsigned char elem_tmp3[528];
  * CONDITIONAL" at the ENDIF (testnet4 h=123,615, tx#57/62 -- real blocks,
  * found by the UTXO connect after the radix/tie-break fixes unblocked it).
  * The buffer is now a lazily-allocated per-thread heap block behind the
- * existing getter, zero-filled to match the x86 .tbss semantics. */
+ * existing getter, zero-filled to match the x86 .tbss semantics.
+ *
+ * 2026-10-09: freed when the thread exits (bmc_thread.h), like the rest of
+ * the interpreter's per-thread scratch. The mainnet worker held 16 of these
+ * and the count did not grow over eight minutes -- long-lived threads -- but
+ * any thread that runs a script and exits would have left 5 MiB behind. */
 static __thread uint8_t* vfexec_ptr;
 #define VFEXEC_MAX_BYTES (5*1024*1024)
 __thread unsigned char vfexec_sp[8];
@@ -37,7 +43,7 @@ void *tls_get__elem_tmp1(void) { return elem_tmp1; }
 void *tls_get__elem_tmp2(void) { return elem_tmp2; }
 void *tls_get__elem_tmp3(void) { return elem_tmp3; }
 void *tls_get__vfexec(void) {
-    if (!vfexec_ptr) vfexec_ptr = calloc(1, VFEXEC_MAX_BYTES);
+    if (!vfexec_ptr) vfexec_ptr = bmc_tls_keep(calloc(1, VFEXEC_MAX_BYTES), NULL);
     return vfexec_ptr;
 }
 void *tls_get__vfexec_sp(void) { return vfexec_sp; }

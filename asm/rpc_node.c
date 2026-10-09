@@ -43,6 +43,7 @@ int rpc_msg_index(const char* cmd, unsigned cmdlen){
 #include <stdlib.h>   /* atof/atol/atoll -- implicitly declared before 2026-08-25,
                         * which silently corrupted their return values */
 #include <pthread.h>
+#include "bmc_thread.h"   /* BMC_TLS_GROW */
 #include <unistd.h>  /* getcwd -- implicitly declared until 2026-08-27, which on
                       * this ABI means int, truncating the returned pointer */
 #include <time.h>
@@ -3185,11 +3186,11 @@ static int cmd_importmempool(const rj_val* params, rj_val** res, long* ec, const
  * the hex. */
 #define CORE_DECODE_MSG "TX decode failed. Make sure the tx has at least one input."
 static const char* core_decode_msg_hex(const char* hex){
-    static __thread char* b; static __thread size_t cap;
+    static __thread bmc_tls_grow* g; BMC_TLS_GROW(g);   /* freed at thread exit */
     size_t need = strlen(hex) + 80;
-    if (need > cap){ char* nb = (char*)realloc(b, need); if (!nb) return "TX decode failed"; b = nb; cap = need; }
-    snprintf(b, cap, "TX decode failed: %s Make sure the tx has at least one input.", hex);
-    return b;
+    if (need > g->cap){ char* nb = (char*)realloc(g->buf, need); if (!nb) return "TX decode failed"; g->buf = nb; g->cap = need; }
+    snprintf(g->buf, g->cap, "TX decode failed: %s Make sure the tx has at least one input.", hex);
+    return g->buf;
 }
 
 static int cmd_sendrawtransaction(const rj_val* params, rj_val** res, long* ec, const char** em){

@@ -11,6 +11,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include "bmc_thread.h"   /* BMC_TLS_GROW */
 
 /* ---------------- the request arena (2026-10-06, plan A5) ----------------
  *
@@ -752,13 +753,15 @@ int rj_typeerr_fail(rj_typeerrs* t, long* ec, const char** em) {
 /* ---------------- frozen values (2026-10-06) ---------------- */
 /* verbose getrawmempool built ~68,000 entry trees and kept them all until the
  * reply was written: ~200 MB of arena at a 68k pool for ~39 MB of text. Each
- * entry is now written as soon as it is built and only its text is kept. */
-static __thread char* t_frz; static __thread size_t t_frz_cap;
+ * entry is now written as soon as it is built and only its text is kept.
+ * The scratch is freed at thread exit (bmc_thread.h, 2026-10-09). */
+static __thread bmc_tls_grow* t_frz;
 rj_val* rj_freeze(rj_val* v, rj_mark m){
     if (!v) return NULL;
-    sbuf sb = { .buf = t_frz, .cap = t_frz_cap };   /* one scratch buffer per thread, reused */
+    BMC_TLS_GROW(t_frz);
+    sbuf sb = { .buf = t_frz->buf, .cap = t_frz->cap };   /* one scratch buffer per thread, reused */
     rj_w(&sb, v, 0, 0);
-    t_frz = sb.buf; t_frz_cap = sb.cap;
+    t_frz->buf = sb.buf; t_frz->cap = sb.cap;
     if (t_arena) arena_rewind(m); else rj_free(v);
     rj_val* r = xmalloc(sizeof *r); memset(r, 0, sizeof *r);
     r->typ = RJ_RAW;

@@ -4,6 +4,20 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-10-09 (1) — the RPC side's per-thread buffers: freed, and the read lane's archive handle closed, at thread exit (shared C)
+
+(5) and (7) left the RPC code's hand-rolled heap TLS alone. Most of it lives on the RPC pools' long-lived threads, so the question was which short-lived threads reach it.
+- **Who can:** the Esplora facade runs one thread per connection (`esp_conn_thread`, capped at 16 live), and its routes call `getblock` in that thread through `rpc_dispatch`. `getblock` enters the per-thread read lane (2026-10-05). On a thread's first call, the lane opens a private archive handle (its own `index.dat` descriptor and block-file descriptors) and allocates an 8 MB block buffer. At verbosity 2/3 it also allocates 4.8 MB and 19 MB of undo arrays, and the txid scratch, 256 KB or more. None of this was released at thread exit, so each Esplora connection that served a block left about 32 MB **and three open descriptors** behind. The descriptors run out first. Longpoll waiters only run `getblocktemplate` and reach none of it.
+- **Deployed nodes:** neither the mainnet nor the signet config enables Esplora, so neither was leaking. The RPC parent's 1.1 GB of malloc is 332 blocks, mostly a few fixed buffers (384, 256, 192 and 64 MB), and does not grow with requests.
+- **Fix:**
+  - `bmc_thread.h` gains `bmc_tls_keep(p, fin)`, which puts a block the caller already has on the thread-exit list, optionally with a finaliser, and `BMC_TLS_GROW`, a holder for buffers that `realloc`.
+  - `rpc_chain.c`: the read lane's handle becomes a heap block whose finaliser closes its descriptors. The block buffer, the undo arrays and the txid scratch go on the list.
+  - Also on the list: `rpc_json.c`'s freeze scratch, `rpc_node.c`'s decode-error message, and `rpc_server.c`'s auth-user name (now `BMC_TLS_BUF`).
+  - `tls_bitcoin_scriptcodec.c` (Mac): the interpreter's 5 MiB IF/ELSE stack (`vfexec`). The mainnet worker holds 16 of these and the count stayed flat for eight minutes, so they belong to long-lived threads, but any thread that ran a script and exited would have kept one.
+- **Test:** `test_rpc_chain` runs `getblock <h> 3` on 6 threads, one after another, each of which exits. It requires the 6 handles to be closed by the finaliser, the descriptor count unchanged (14 → 14), the lane's buffers to have gone on the list (30), and none held afterwards. With the lane back on plain `malloc`, it goes 14 → 32 descriptors with 0 handles closed, and the test fails.
+- **x86:** the same code, and the same exposure wherever Esplora is on.
+- **Full suite:** 424 PASS, 11 SKIP, 14 N/A, 0 FAIL.
+
 ## 2026-10-08 (7) — the second per-thread leak: taproot's 4 MiB preimage buffer (Mac port only)
 
 After the ae2085f0 deploy, the mainnet worker's large-malloc count still grew: 3,282 → 3,423 in 5.3 minutes. That is about 27 a minute, down from ~45. `heap` showed the sizes (5) fixed holding steady at 1–6 live blocks each, but 4 MiB blocks accumulating: 3,377 of them, all exactly 4,194,304 bytes. Each began with SHA256("TapSighash") written twice, the BIP340 tag prefix of a taproot sighash preimage.
