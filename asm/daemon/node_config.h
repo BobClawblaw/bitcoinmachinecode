@@ -138,7 +138,7 @@ typedef struct {
     char alertnotify[512];
     char startupnotify[512];
     char shutdownnotify[512];
-    long maxtxfee_sat;               /* -maxtxfee, satoshis (0 = no cap)                  */
+    long maxtxfee_sat;               /* -maxtxfee, satoshis: the most fee one wallet transaction may pay (Core: 0.1 BTC) */
     char rpcauth[8][256];            /* -rpcauth, repeatable: user:salt$hash */
     int  n_rpcauth;
     char asmap[512];                 /* -asmap: AS map file; empty = /16 bucketing        */

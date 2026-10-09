@@ -131,6 +131,7 @@ typedef struct {
     long maxapsfee_sat;               /* extra absolute fee tolerated for partial-spend avoidance; -1 = always */
     int  avoidpartialspends;          /* group coins by destination           */
     int  spendzeroconfchange;         /* 0 = unconfirmed change is not spendable */
+    long maxtxfee_sat;                /* -maxtxfee: the most fee one transaction may pay; <= 0 = Core's 0.1 BTC */
 } rpc_wops_defaults;
 void rpc_wops_set_defaults(const rpc_wops_defaults* d);
 int  rpc_wops_default_type(int is_change);

@@ -1004,30 +1004,33 @@ int main(void){
         ck("...naming what is actually available", rc == 0 && em && strstr(em, "available"));
         rj_free(r); rj_free(p); }
 
-      /* ---- WAL-17 (audit 2026-09-03): the -maxtxfee ceiling is NOT tested
-       * here, and this note is why.
-       *
-       * BF_MAXTXFEE_SAT (Core's -maxtxfee default, 0.1 BTC) existed but was
-       * consulted ONLY by bumpfee, so every ordinary funding path had no
-       * ceiling: a bad estimate could burn the wallet to fee. wf_fund now
-       * refuses above it.
-       *
-       * Triggering that from a test would need a feerate high enough to blow
-       * the ceiling, and there is NO WAY IN: wf_fund takes conf_target only,
-       * and fundrawtransaction's `feeRate` option is parsed nowhere -- it is
-       * silently ignored, which is itself a divergence from Core and is
-       * recorded rather than fixed here. The rate therefore always comes from
-       * the estimator, which returns the floor on an empty fee history.
-       *
-       * A first draft of this asserted a 5.0 BTC/kvB feeRate is refused; it
-       * failed with fee=0.00000141, i.e. the default rate, which is how the
-       * ignored option was found. Asserting "feeRate is ignored" would pin a
-       * defect as correct behaviour -- the exact pattern that let eight other
-       * findings in this audit survive -- so it is deliberately not asserted.
-       *
-       * The guard's opposite half IS covered: the ordinary fundrawtransaction
-       * cases above must keep succeeding, which they do, so the ceiling is not
-       * applied too eagerly. */
+      /* ---- WAL-17 (audit 2026-09-03) and -maxtxfee (2026-10-09) ----
+       * wf_fund refuses a fee over the ceiling. Raising the feerate is no way
+       * in (fundrawtransaction's `feeRate` is parsed nowhere -- a recorded
+       * divergence, not asserted), so the ceiling comes down instead: until
+       * 2026-10-09 maxtxfee= was stored by the config and never read, and the
+       * constant 0.1 BTC applied whatever the operator set. Here -maxtxfee is
+       * 100 sat, under the 141 sat this transaction pays at the floor rate.
+       * fallbackfee 1000 sat/kvB is the rate the unset defaults fall back to,
+       * so the cases after this one fund exactly as before. */
+      { rpc_wops_defaults wd = { WOT_BECH32, -1, 6, 1, 1, 1000, 1000, 10000, 10000, 0, 0, 1, 100 };
+        rpc_wops_set_defaults(&wd);
+        const char* OUTS =
+          "02000000" "00" "01" "00e1f50500000000"
+          "16" "0014c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3" "00000000";
+        char js[400]; snprintf(js, sizeof js, "[\"%s\"]", OUTS);
+        rj_val* p = P(js);
+        D("fundrawtransaction", p);
+        if (rc == 1) printf("      (funded with maxtxfee=100 sat: fee %s)\n", r && S(r,"fee") ? S(r,"fee") : "?");
+        ck("maxtxfee=100 sat: a 141-sat fee is refused with -4",
+           rc == 0 && ec == -4 && em && strstr(em, "exceeds the maximum fee (0.000001)"));
+        rj_free(r); rj_free(p);
+        wd.maxtxfee_sat = 10000000;                  /* Core's default again */
+        rpc_wops_set_defaults(&wd);
+        p = P(js);
+        D("fundrawtransaction", p);
+        ck("...and at the default 0.1 BTC the same transaction funds", rc == 1 && r && S(r,"hex"));
+        rj_free(r); rj_free(p); }
 
       { /* a transaction that already has inputs is refused, not mis-funded */
         const char* WITHIN =
