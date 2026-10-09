@@ -278,9 +278,14 @@ and the archive tools (`check_chain`, `verify`, `dumpblock`, `unified_ibd`,
 
    `serve` is the production mode: it binds the P2P listener, discovers
    peers, syncs headers, fills any archive gap with parallel download
-   workers (default 16), builds the UTXO set with full script verification,
-   then follows the tip while serving inbound peers and RPC. A first mainnet
-   sync takes days and is CPU-bound on signature verification. The `[dl]
+   workers (default 10, Core's preferred-download set: the 8 full-relay and
+   2 block-relay-only outbound peers; `bmc.catchupworkers` overrides), builds
+   the UTXO set with full script verification, then follows the tip while
+   serving inbound peers and RPC. A first mainnet sync on the benchmark box
+   (Ryzen 9 9950X3D, 16 cores, 123 GiB RAM, NVMe; default settings, so
+   `assumevalid` on) reached the tip with every index in 4 h 2 m (run 44,
+   2026-10-08); Core v31.1 took 9 h 50 m there. With `assumevalid=0` it took
+   8 h 0 m. Expect longer on fewer cores, a slower disk or a slower link. The `[dl]
    heartbeat:` log line reports tip height, live peers, UTXO count and uptime.
    The daemon honours `SIGTERM` and the `stop` RPC.
 
@@ -499,9 +504,6 @@ in [`docs/FEATURE_GAPS.md`](docs/FEATURE_GAPS.md):
   (Core: `bitcoind.pid`) — nothing this node ships or writes carries a
   Bitcoin Core file name, so both can live on one box. Every other config
   default matches Core's (`docs/audits/CONFIG_DEFAULTS_VS_CORE_2026-09-06.md`).
-- **Download window.** 4,096 blocks above the first unfilled height against
-  Core's 1,024: Core keeps ~128–160 blocks in flight, this node 640, and the
-  window preserves Core's slack ratio rather than its constant.
 - **Wallet.** The seed wallet always carries bech32 (wpkh); `createwalletdescriptor`
   adds legacy (pkh, 44'), p2sh-segwit (sh(wpkh), 49') and bech32m (tr, 86'),
   after which `getnewaddress`/`getrawchangeaddress` accept that address type,
@@ -555,11 +557,10 @@ in [`docs/FEATURE_GAPS.md`](docs/FEATURE_GAPS.md):
   Bitcoin Core itself ships only the negotiation (its `-txreconciliation` is
   off by default and its message processing has no `reqrecon`/`sketch`).
 - **Not implemented:** UPnP/NAT-PMP, BIP37 bloom filters
-  (`peerbloomfilters`), `whitelistrelay`/`whitelistforcerelay`, GUI,
-  `loadtxoutset` (assumeutxo import; export via `dumptxoutset` works),
-  `walletnotify`, `maxtxfee` enforcement, `uacomment`,
-  `includeconf`/`settings`. Each unimplemented
-  Core option is named in the startup log when set.
+  (`peerbloomfilters`), GUI, `loadtxoutset` (assumeutxo import; export via
+  `dumptxoutset` works), and `settings` (values set over RPC are not
+  persisted). Each option that has no effect here is named in the startup
+  log when set, with the reason (`k_noeffect` in `asm/daemon/node_config.c`).
 - **Chains.** Legacy testnet3 (`testnet=1`, `chain=test`) is refused.
 - **One relay edge.** A transaction announced exactly once during a leg's
   sync pass can be drained unexamined; Core's periodic re-announcement
@@ -595,7 +596,11 @@ September 2026. The clean pair (2026-09-21): Core 19 h 32 m 54 s, this node
 18 h 24 m 02 s, with the UTXO set identical by MuHash. A full-verification
 sync (`assumevalid=0`, every script of every block) completed on 2026-09-27
 in 8 h 0 m at nice 10 on the benchmark box, its per-height digests equal to
-Core's throughout. Signature verification is level with libsecp256k1 on one
+Core's throughout. The latest default sync (run 44, 2026-10-08) reached the
+tip with every index in 4 h 2 m against Core rerun #7's 9 h 50 m, with a
+heap peak of 11.3 GB against Core's 12.0
+([`docs/releases/2026-10-08-the-heap-the-merge-budget-and-header-ranges.md`](docs/releases/2026-10-08-the-heap-the-merge-budget-and-header-ranges.md)).
+Signature verification is level with libsecp256k1 on one
 core (2026-09-27). The landing notes in [`docs/releases/`](docs/releases/)
 record each change and the run that measured it; the daily record is in
 [`worklog/`](worklog/).

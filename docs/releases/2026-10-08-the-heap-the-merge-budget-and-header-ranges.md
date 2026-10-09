@@ -5,7 +5,8 @@ report (`worklog/2026-10-05-performance-holes-plan.md`), and three
 benchmark syncs. #407 (M2) cuts the heap. #408 (M3) fixes the merge
 deferral that M2 exposed in run 42. #409 (B14) stops the dead-weight
 rule from judging a worker that is waiting at the full window. #410 (B12)
-fetches the header chain in parallel ranges. Main is `abeae7fd`.
+fetches the header chain in parallel ranges. Main is `abeae7fd`; run 44
+measured it, and #412 (`15b2ce7f`) fixed what run 44 found in the ranges.
 Production still runs `deploy-20261007a`, and none of the four is
 deployed. #409 and #410 change only a node's own initial download. #407
 and #408 change the UTXO store of every node, and wait for a deploy
@@ -17,31 +18,31 @@ peak was first written as 68.7 GB (the MiB / 1000); it is 67.1 here.
 
 ## The runs
 
-| | run 41 (release) | run 42 (M2 + B12 switch + B13) | run 43 (+ M3) |
-|---|---|---|---|
-| main | `7027c734` | `6554de3f` | `06e4b323` |
-| every index at the tip | **3:48:22** | 5:31:27 | 4:05:03 |
-| UTXO set at the tip | MuHash = Core | MuHash = Core (970,461) | MuHash = Core (970,510) |
-| heap (anonymous) mean over the sync | 15.3 GB | 6.4 GB | 6.5 GB |
-| heap peak | 32.2 GB | 11.8 GB | **10.7 GB** |
-| PSS peak (file-backed run pages included) | 75.6 GB | 67.1 GB | **55.1 GB** |
-| memtable freezes; applier time in them | 110; 99 s | 222; 519 s | 218; 456 s |
-| merges; their total time | 5; 771 s | 7; 1,425 s | 5; 998 s |
-| first block asked for | 48 s | ~66 s | ~50 s |
-| peers banned | — | 29 | 1 |
+| | run 41 (release) | run 42 (M2 + B12 switch + B13) | run 43 (+ M3) | run 44 (+ B14 + B12 ranges) |
+|---|---|---|---|---|
+| main | `7027c734` | `6554de3f` | `06e4b323` | `abeae7fd` |
+| every index at the tip | **3:48:22** | 5:31:27 | 4:05:03 | 4:02:04 |
+| UTXO set at the tip | MuHash = Core | MuHash = Core (970,461) | MuHash = Core (970,510) | MuHash = Core (970,536) |
+| heap (anonymous) mean over the sync | 15.3 GB | 6.4 GB | 6.5 GB | 6.5 GB |
+| heap peak | 32.2 GB | 11.8 GB | **10.7 GB** | 11.3 GB |
+| PSS peak (file-backed run pages included) | 75.6 GB | 67.1 GB | **55.1 GB** | 55.9 GB |
+| memtable freezes; applier time in them | 110; 99 s | 222; 519 s | 218; 456 s | 218; 471 s |
+| merges; their total time | 5; 771 s | 7; 1,425 s | 5; 998 s | 5; 1,042 s |
+| first block asked for | 48 s | ~66 s | ~50 s | ~3.5 min (headers 182 s, below) |
+| peers banned | — | 29 | 1 | **0** |
 
 Core rerun #7 for scale: 9:50:04, heap mean 10.0 GB and peak 12.0 GB, a
 cgroup peak of 76.2 GB with page cache. Elapsed at each height, from the
 5-minute heartbeat:
 
-| height | run 41 | run 42 | run 43 |
-|---|---|---|---|
-| 500,000 | 0:44:17 | 0:43:51 | 0:49:17 |
-| 600,000 | 1:14:13 | 1:19:01 | 1:19:22 |
-| 700,000 | 1:44:23 | **3:19:14** | 1:54:25 |
-| 800,000 | 2:19:10 | 3:54:13 | 2:29:33 |
-| 900,000 | 3:09:19 | 4:49:19 | 3:24:38 |
-| 950,000 | 3:34:28 | 5:19:19 | 3:49:40 |
+| height | run 41 | run 42 | run 43 | run 44 |
+|---|---|---|---|---|
+| 500,000 | 0:44:17 | 0:43:51 | 0:49:17 | 0:46:45 |
+| 600,000 | 1:14:13 | 1:19:01 | 1:19:22 | 1:11:53 |
+| 700,000 | 1:44:23 | **3:19:14** | 1:54:25 | 1:46:46 |
+| 800,000 | 2:19:10 | 3:54:13 | 2:29:33 | 2:21:52 |
+| 900,000 | 3:09:19 | 4:49:19 | 3:24:38 | 3:21:59 |
+| 950,000 | 3:34:28 | 5:19:19 | 3:49:40 | 3:47:06 |
 
 ## M2: the heap (#407)
 
@@ -67,8 +68,9 @@ heartbeat shows it as a steady drift, 5 minutes by 500,000 and 15 by
 many at half the size, each one faulting in fresh pages after the
 release. That is 456 s of applier time against 99 s, about 6 of the 16
 minutes. The rest is not yet decomposed; more runs and lookups against a
-smaller memtable are the candidates. Run 44 (B12 + B14, launched
-17:47Z) gives a third point.
+smaller memtable are the candidates. Run 44 gives a third point: 4:02:04,
+3 minutes ahead of run 43 after losing 2 minutes to its header ranges,
+with the same 218 freezes (471 s). The gap to run 41 is still there.
 
 ## M3: the merge budget (#408)
 
@@ -99,7 +101,9 @@ banned the peer while the pool was above its floor. The worker now
 records its time at the window, the rule judges only the time it was free
 to fetch, and a tick less than half free is not judged. Run 43, with M3
 and without B14, had 3 drops and 1 ban: without the stall the window
-rarely fills. Run 44 is the first run with B14. The lesson is in
+rarely fills. Run 44, the first run with B14, had 0 drops and 0 bans
+("banned 0/131"); it logged 4 "stalling the window" lines and banned none
+of them. The lesson is in
 `docs/ENGINEERING_RULES.md` §11, beside the two earlier dead-weight
 thresholds. Test: `test_dialhelper`, nine cases, watched to fail with the
 wait ignored.
@@ -121,11 +125,16 @@ peer's pages, `-minimumchainwork` hold included. The log lines are in
 `docs/OPERATIONS.md`. Tests: `test_dlc_header_probe`, five cases, each
 part watched to fail with its code removed.
 
-**Known issue, found in run 44 and not yet merged.** All 19 ranges came in
-and were stored correctly, but the phase took 182 s against run 43's
-49 s. One of the four peers never took a range: its child stuck while
-connecting. The parent waited for every child, so the phase ended on that
-child's 180 s alarm. The fix ends the phase when every range is done or
-given up (branch `fix/2026-10-08-b12-ranges-settle`, a PR after its full
-gate). Until it lands, a stuck peer costs up to 3 minutes at boot. Run 44
-cannot measure B12's speed, so run 45 will.
+**Run 44, and the fix (#412).** All 19 ranges came in and were stored
+correctly, but the phase took 182 s against run 43's 49 s. This was first
+put down to one peer whose child stuck before taking a range. The real
+cause is that the download worker runs with `SIGCHLD = SIG_IGN`: an exited
+child is reaped by the kernel, `waitpid` fails with ECHILD and never
+returns the pid, and the parent compared only against the pid. It never
+saw a child exit, so the wait could only end at its 180 s cap. #412 ends
+the phase once every range is done or given up, which covered it. Run 45
+(main `15b2ce7f`) fetched all 19 ranges in 21.5 s and asked for its first
+block about 50 s after launch. Its settle line still counted all four
+peers as "holding none" when three had fetched: the same reaping. That fix
+(the reaps through `dl_reap_bounded`, the line naming who was still
+connected) is on `fix/2026-10-08-b12-settle-count`, a PR after its gate.
