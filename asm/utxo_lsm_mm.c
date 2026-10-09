@@ -310,9 +310,28 @@ static u32 bloom_h(const u8 *key, u32 seed){
     return h;
 }
 
-static int bloom_test(const u8 *bloom, u32 bits_mask, const u8 *key, u32 seed){
-    u32 bit = bloom_h(key, seed) & bits_mask;
+static int bloom_bit(const u8 *bloom, u32 bits_mask, u32 h){
+    u32 bit = h & bits_mask;
     return (bloom[bit >> 3] >> (bit & 7)) & 1;
+}
+
+/* 2026-10-09: the three hashes of the key a get() is walking the runs with.
+ * Every run uses the same three seeds and only its mask differs, so one
+ * get() needs them once -- not once per run (3 x 36-byte FNV, ~50 ns, times
+ * 26 runs in run 45's mid-chain). utxo_lsm_get asks each run in turn with
+ * the same key; per thread, as the mapping cache is. */
+static __thread u8  t_hkey[KEY_SIZE];
+static __thread u32 t_h[3];
+static __thread int t_hset;
+static const u32 *key_hashes(const u8 *key){
+    if (!t_hset || memcmp(key, t_hkey, KEY_SIZE) != 0) {
+        memcpy(t_hkey, key, KEY_SIZE);
+        t_h[0] = bloom_h(key, 0x811c9dc5u);
+        t_h[1] = bloom_h(key, 0xa1b2c3d4u);
+        t_h[2] = bloom_h(key, 0x5bd1e995u);
+        t_hset = 1;
+    }
+    return t_h;
 }
 
 /* mac_cmp_key semantics: the 36-byte key compared big-endian-wise, which is
@@ -343,9 +362,10 @@ long lsm_run_lookup_mm(void *lst, u64 run_no, u64 gen,
     /* ---- bloom: 3 seeds, all must hit ---- */
     const u8 *bloom = s->base + s->header_size;
     if (s->bloom_bytes) {
-        if (!bloom_test(bloom, (u32)s->bits_mask, key, 0x811c9dc5u)) return LSM_MM_ABSENT;
-        if (!bloom_test(bloom, (u32)s->bits_mask, key, 0xa1b2c3d4u)) return LSM_MM_ABSENT;
-        if (!bloom_test(bloom, (u32)s->bits_mask, key, 0x5bd1e995u)) return LSM_MM_ABSENT;
+        const u32 *h = key_hashes(key);
+        if (!bloom_bit(bloom, (u32)s->bits_mask, h[0])) return LSM_MM_ABSENT;
+        if (!bloom_bit(bloom, (u32)s->bits_mask, h[1])) return LSM_MM_ABSENT;
+        if (!bloom_bit(bloom, (u32)s->bits_mask, h[2])) return LSM_MM_ABSENT;
     }
 
     /* ---- sparse index: largest sampled key <= target ---- */
@@ -366,8 +386,9 @@ long lsm_run_lookup_mm(void *lst, u64 run_no, u64 gen,
      *
      * UTX-9 (audit 2026-09-03): the bound was s->len, the whole MAPPING, not
      * the records region. For a target greater than every key in the run --
-     * reached whenever the bloom passes, and a saturated 4 MiB filter on a
-     * 30M-record bulk run passes almost always -- the scan ran off the end of
+     * reached whenever the bloom passes, and a saturated 4 MiB filter (the
+     * cap until 2026-10-09's RUN_BLOOM_MAX_BYTES) on a 30M-record bulk run
+     * passes almost always -- the scan ran off the end of
      * the records and into the SPARSE-INDEX TRAILER, parsing 44-byte index
      * entries as records and skipping by whatever their bytes happened to say
      * `slen` was. It stayed inside the mapping, so nothing was ever read out

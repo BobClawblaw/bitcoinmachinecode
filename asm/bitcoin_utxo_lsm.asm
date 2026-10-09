@@ -231,7 +231,20 @@ MAGIC_MANIFEST   equ 0x4E414D55      ; "UMAN" little-endian dword -- OLD format,
 ; one-time full dedup recount (mac_lsm_recount) to establish the baseline,
 ; mirroring the MAGIC_RUN -> MAGIC_RUN2 discipline for run files above.
 MAGIC_MANIFEST2  equ 0x324E4D55      ; "UMN2" little-endian dword -- adds trailing total_live qword
-BLOOM_MAX_BYTES  equ 4*1024*1024     ; 4MB bloom scratch (~3.35M entries @10 bits/entry)
+BLOOM_MAX_BYTES  equ 4*1024*1024     ; 4MB: the get-time bloom scratch (lsm_get_scratch, static TLS) and the
+                                     ; flush scratch's bloom area (the callers' scratch_cap counts it)
+; RUN_BLOOM_MAX_BYTES (2026-10-09): the largest bloom a run is written with.
+; The bloom was capped at BLOOM_MAX_BYTES, sized for ~3.35M entries at 10
+; bits each; a bulk flush run holds ~19M records, so it got 1.76 bits per
+; key and passed 55% of absent keys (run 45's files), each pass then a
+; ~500 ns sparse search + scan, ~350 ns per run per lookup that reaches the
+; runs. 256 MiB = 2^31 bits, 10 bits per key for up to ~200M records (the
+; masks are 32-bit, so 2^31 is within reach of every bit helper). A bloom
+; over BLOOM_MAX_BYTES gets its own anonymous mapping in the writer (the
+; flush scratch keeps its layout) and the merge's own scratch grows to fit;
+; readers take the size from the header, and the asm fallback lookup, whose
+; TLS copy is BLOOM_MAX_BYTES, skips the filter of a larger run.
+RUN_BLOOM_MAX_BYTES equ 256*1024*1024
 SCRIPT_MAX_BYTES equ 65536           ; get-time script-read scratch
 
 ; mac_run_lookup (utxo_lsm_get's disk-run-hit path) used to stage its bloom
@@ -292,7 +305,7 @@ SLOT_RD_POS        equ SLOT_RD_FILL + 8              ; bytes consumed
 SLOT_RD_BUF        equ SLOT_RD_FILL + 16             ; the buffer itself
 COMPACT_SLOT_SIZE  equ SLOT_RD_BUF + COMPACT_RDBUF
 COMPACT_SLOTS_BYTES equ COMPACT_MAX_RUNS * COMPACT_SLOT_SIZE
-COMPACT_SCRATCH_BYTES equ COMPACT_SLOTS_BYTES + BLOOM_MAX_BYTES
+COMPACT_SCRATCH_BYTES equ COMPACT_SLOTS_BYTES + RUN_BLOOM_MAX_BYTES
 
 manifest_name:     db "utxo_manifest.dat", 0
 manifest_tmp_name:  db "utxo_manifest.tmp", 0
@@ -2005,6 +2018,8 @@ mac_run_lookup:
     mov  rcx, [rbp-0x200+24]
     mov  [rbp-0x58], rcx        ; bits_mask
     mov  rax, [rbp-0x200+16]    ; bloom_bytes
+    cmp  rax, BLOOM_MAX_BYTES
+    ja   .ml_nobloom            ; larger than the TLS copy (RUN_BLOOM_MAX_BYTES): search without it
 
     mov  rdi, [rbp-0x68]
     TLS_ADDR rsi, lsm_get_scratch
@@ -2047,7 +2062,20 @@ mac_run_lookup:
     call mac_bloom_testbit
     test eax, eax
     jz   .ml_absent_close
+    jmp  .ml_sparse
 
+    ; a run whose bloom is past the TLS copy: the filter is only a shortcut,
+    ; so this (rare, mmap-declined) path goes to the sparse index directly.
+    ; The key is built here as the bloom path builds it above.
+.ml_nobloom:
+    lea  rdi, [rbp-0x100]
+    mov  rsi, [rbp-0x30]
+    mov  rdx, 32
+    call mac_memcpy
+    mov  eax, [rbp-0x38]
+    mov  [rbp-0x100+32], eax
+
+.ml_sparse:
     ; ---- sparse index acceleration ----
     ; records_start = header_size + bloom_bytes: the position the file is
     ; ALREADY sitting at (untouched since the bloom-bytes read above) --
@@ -2680,6 +2708,7 @@ mac_build_run:
     mov  [rbp-0x1B8], rcx    ; tomb_n
     mov  [rbp-0x1C0], r8     ; gen
     mov  [rbp-0x1C8], r9     ; run_no
+    mov  qword [rbp-0x1D0], 0 ; the bloom's own mapping (0 = it lives in the scratch)
     ; (frame 0x308, not mac_flush's 0x300: this function has an ABI entry
     ; (rsp 8 mod 16) where mac_flush has the compensated one, and the moved
     ; body's calls were tuned to the latter)
@@ -2824,7 +2853,7 @@ mac_build_run:
     shl  rcx, 1
     jmp  .fl_bb_loop
 .fl_bb2:
-    mov  rdx, BLOOM_MAX_BYTES*8
+    mov  rdx, RUN_BLOOM_MAX_BYTES*8
     cmp  rcx, rdx
     jbe  .fl_bb3
     mov  rcx, rdx
@@ -2835,6 +2864,29 @@ mac_build_run:
     mov  [rbp-0x68], rax           ; bloom_bytes
     dec  rcx
     mov  [rbp-0x78], rcx           ; bits_mask
+
+    ; ---- a bloom past the scratch's BLOOM_MAX_BYTES area gets its own
+    ; mapping (fresh, so already zero). off_bloom becomes the mapping's
+    ; distance from scratch_buf (mod 2^64), so every "scratch_buf +
+    ; off_bloom" below lands on it unchanged; .fl_ret unmaps it. ----
+    mov  rax, [rbp-0x68]
+    cmp  rax, BLOOM_MAX_BYTES
+    jbe  .fl_bz_scratch
+    xor  edi, edi
+    mov  rsi, rax
+    mov  edx, 3                     ; PROT_READ|PROT_WRITE
+    mov  r10d, 0x22                  ; MAP_PRIVATE|MAP_ANONYMOUS
+    mov  r8, -1
+    xor  r9d, r9d
+    mov  eax, 9                       ; mmap
+    syscall
+    cmp  rax, -4095
+    jae  .fl_err
+    mov  [rbp-0x1D0], rax
+    sub  rax, [r12+128]
+    mov  [rbp-0x48], rax            ; off_bloom -> the mapping
+    jmp  .fl_bz_done
+.fl_bz_scratch:
 
     ; ---- zero bloom region ----
     mov  rdi, [r12+128]
@@ -3071,6 +3123,16 @@ mac_build_run:
 .fl_err:
     mov  rax, -1
 .fl_ret:
+    mov  rdi, [rbp-0x1D0]
+    test rdi, rdi
+    jz   .fl_ret_nomap
+    mov  rbx, rax                    ; the result (rbx is restored by the epilogue)
+    mov  rsi, [rbp-0x68]
+    mov  eax, 11                     ; munmap
+    syscall
+    mov  qword [rbp-0x1D0], 0
+    mov  rax, rbx
+.fl_ret_nomap:
     add  rsp, 0x308
     pop  r15
     pop  r14
@@ -4643,7 +4705,7 @@ utxo_lsm_compact:
     shl  rcx, 1
     jmp  .cc_bb_loop
 .cc_bb2:
-    mov  rdx, BLOOM_MAX_BYTES*8
+    mov  rdx, RUN_BLOOM_MAX_BYTES*8
     cmp  rcx, rdx
     jbe  .cc_bb3
     mov  rcx, rdx
@@ -4655,18 +4717,9 @@ utxo_lsm_compact:
     dec  rcx
     mov  [rbp-0x48], rcx             ; bits_mask
 
-    ; zero the bloom region in OUR scratch
-    mov  rdi, r13
-    add  rdi, COMPACT_SLOTS_BYTES
-    mov  rcx, [rbp-0x50]
-.cc_bz:
-    test rcx, rcx
-    jz   .cc_bz_done
-    mov  byte [rdi], 0
-    inc  rdi
-    dec  rcx
-    jmp  .cc_bz
-.cc_bz_done:
+    ; the bloom region of OUR scratch needs no zeroing: the scratch is this
+    ; call's own fresh anonymous mmap (above), and a byte loop over a
+    ; RUN_BLOOM_MAX_BYTES region would touch every page of it
 
     ; ---- second, separate mmap for the sparse-index build buffer ----
     ; Sized from upper_bound (the sum of input runs' own nrec, already known
