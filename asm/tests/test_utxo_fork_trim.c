@@ -1,6 +1,9 @@
 /* tests/test_utxo_fork_trim.c -- plan M2 (2026-10-08): the merge child and
- * the flush writer are forked without the buffers they never read, and the
- * frozen copy gives its pages back at the adopt.
+ * the flush writer are forked without the buffers they never read. The
+ * frozen copy keeps its pages between flushes (2026-10-09): M2 released them
+ * at the adopt, and every freeze then faulted ~3 GB of huge pages back in,
+ * each behind a direct memory compaction on a box full of page cache
+ * (run 45: 2.4 s a freeze where the copy is 0.2 s).
  *
  * Run 41's heap peaked at 32.2 GB against a steady 15.2: a merge child
  * forked at 15:20:32Z still shared the live memtable and the frozen copy
@@ -12,8 +15,9 @@
  * Pinned (the children's views are their own /proc/self/maps, written by a
  * test hook that runs first in each child; the regions carry their M1 names):
  *   A. the flush writer's map has the frozen copy and not the live memtable;
- *      after its adopt the copy holds at most its header page (mincore) and
- *      the frozen coins read back from the run;
+ *      after its adopt the copy still holds its pages (mincore: the next
+ *      freeze copies into resident memory) and the frozen coins read back
+ *      from the run;
  *   B. a merge child's map has neither the memtable nor the frozen copy, and
  *      the merged store still reads every coin;
  *   C. a plain fork() afterwards inherits both again (the DOFORK is undone
@@ -22,8 +26,9 @@
  *      show the memtable -- the probe can see what A says is absent.
  *
  * Revert checks: A and B FAIL with the MADV_DONTFORK calls removed; C FAILS
- * with the parent's MADV_DOFORK removed; A's residency check FAILS with
- * fz_release_copy's call removed from fz_adopt. */
+ * with the parent's MADV_DOFORK removed; A's residency checks FAIL with
+ * M2's release (MADV_DONTNEED on the copy's table and blob) put back in
+ * fz_adopt. */
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -55,7 +60,6 @@ extern void utxo_live_test_set_child_probe(void (*fn)(int who));
 extern void utxo_live_test_set_fork_trim(int on);
 extern int  utxo_live_test_compact_nowait(void);
 extern int  utxo_live_test_compact_pid(void);
-extern unsigned long long utxo_live_test_fz_released(void);
 extern void* utxo_live_test_fz_table(void);
 extern long utxo_lsm_get(void* lst, void* u, const u8* txid, unsigned index, u64* value, unsigned long* height, unsigned long* cb, const u8** script, unsigned long* slen);
 
@@ -147,22 +151,19 @@ int main(void){
     utxo_live_test_set_child_probe(probe);
 
     printf("-- A: the flush writer is forked with the frozen copy and without the live memtable\n");
-    unsigned long long r0 = utxo_live_test_fz_released();
     flush_gen(0, 64);
     ck("  the writer wrote its map", has("maps.writer", "utxo-frozen-table") >= 0, 1);
     ck("  it has the frozen table", has("maps.writer", "utxo-frozen-table"), 1);
     ck("  it has the frozen blob", has("maps.writer", "utxo-frozen-blob"), 1);
     ck("  it does NOT have the live table", has("maps.writer", "utxo-memtable-table"), 0);
     ck("  it does NOT have the live blob", has("maps.writer", "utxo-memtable-blob"), 0);
-    ck("  the adopt released the frozen copy", (long)(utxo_live_test_fz_released() - r0), 1);
     { u8* fz = utxo_live_test_fz_table();
       u64 blob = ((u64*)fz)[2], cap = ((u64*)fz)[3];
       ckm("  the copy's header still names its blob", blob != 0 && cap != 0);
       size_t tb = (size_t)(((u64*)utxo_live_test_tbl())[1] + 1) * 48 + 40;   /* the copy is shaped like the live table (mask at +8) */
-      long rt = resident(fz, tb);                     /* the freeze filled all of it */
-      ckm("  the frozen table holds at most its header page", rt >= 0 && rt <= 1);
-      if (rt > 1) printf("     (%ld pages resident)\n", rt);
-      ck("  the frozen blob holds no page", resident((void*)(uintptr_t)blob, 1UL << 20), 0); }
+      long rt = resident(fz, tb), np = (long)((tb + 4095) / 4096);   /* the freeze filled all of it */
+      ck("  the frozen table keeps every page after the adopt", rt, np);
+      ckm("  the frozen blob keeps its first page", resident((void*)(uintptr_t)blob, 4096) == 1); }
     ck("  the frozen coins read back from the run", found(0, 64), 64);
 
     printf("\n-- B: a merge child is forked without the memtable and the frozen copy\n");

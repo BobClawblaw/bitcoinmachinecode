@@ -534,11 +534,15 @@ static void compact_poll(void){
  * waits for anything -- run numbers are reserved, adoption reconciles -- it
  * just adopts a finished child first so the flush builds on the merged set. */
 static u64 g_bench_flush_ops = 0;   /* bmc.benchlog: puts+dels the flushing memtable held (op_count before the flush resets it) */
+static u64 clock_ns(void);
+static u64 g_gate_ns;                  /* the last compaction gate's time (the freeze's [bench] line splits it out) */
 static void compact_flush_hook(void){
+    u64 t0 = clock_ns();
     if (g_tm_on){ g_tm_flush_t0 = tm_now(); g_tm_flush_armed = 1; }   /* step-0 timing: the flush starts here */
     g_bench_flush_ops = g_utxo_lst.op_count;
     compact_poll();
     fz_poll();
+    g_gate_ns = clock_ns() - t0;
 }
 /* Leveled: which runs to merge, by size ratio (lsm_compact_pick). Sizes come
  * from the run files themselves. Returns k, sets *lo. */
@@ -786,24 +790,16 @@ static void fz_retire_wal(void){
     }
     g_wal_live_start = off;
 }
-/* plan M2 (2026-10-08): the frozen copy is needed from a freeze to its
- * adopt -- run 41: the writer's 17 s of each 123 s generation -- and held
- * its pages for the other 86%. They go back to the kernel at the adopt;
- * the next freeze faults fresh zero pages under its copy. The header's
- * blob pointer and cap are all a freeze keeps of the old contents (the
- * asm restores them around its copy), so they are written back. The cost
- * is the next freeze's page faults (zeroing what it copies into), on the
- * applier; the [bench] freeze line's ms is where it shows. */
-static u64 g_fz_released = 0;            /* adopts that released the copy (tests) */
-static void fz_release_copy(void){
-    if (!g_fz_table || !g_fz_table_bytes) return;
-    u64 blob = ((u64*)g_fz_table)[2], cap = ((u64*)g_fz_table)[3];
-    int bad = madvise(g_fz_table, (size_t)g_fz_table_bytes, MADV_DONTNEED) != 0;
-    if (blob && cap) bad |= madvise((void*)(uintptr_t)blob, (size_t)cap, MADV_DONTNEED) != 0;
-    ((u64*)g_fz_table)[2] = blob; ((u64*)g_fz_table)[3] = cap;
-    if (bad){ static int warned = 0; if (!warned){ warned = 1; fprintf(stderr, "[utxo_live] WARNING: madvise(DONTNEED) on the frozen copy failed (%s) -- it keeps its pages between flushes\n", strerror(errno)); } return; }
-    g_fz_released++;
-}
+/* The frozen copy keeps its pages between flushes (2026-10-09). Plan M2
+ * gave them back at every adopt (MADV_DONTNEED), so each freeze faulted
+ * ~3 GB of fresh huge pages under its copy, and on a box whose memory is
+ * page cache those faults compact memory first: a freeze took 2.4 s
+ * (run 45: 231 of them, 554 s on the applier) where the copy itself is
+ * ~0.2 s. Measured on the 10-09 diagnostic sync: two freezes, 1,531
+ * huge-page faults, 1,742 direct-compaction stalls. Holding the pages
+ * costs no peak -- live + frozen are both counted in the dbcache budget
+ * (half each) and both are resident at every freeze anyway -- only the
+ * mean between flushes. */
 /* the parent's half, once the writer is gone. how: 1 = it wrote the run,
  * 2 = it had nothing to write, 0 = it failed or was lost (build inline). */
 static void fz_adopt(int how){
@@ -833,7 +829,6 @@ static void fz_adopt(int how){
     }
     fz_retire_wal();
     g_utxo_lst.fz_active = 0; g_utxo_lst.fz_tomb_n = 0;
-    fz_release_copy();
     g_fz_count++;
     if (g_cfg.benchlog){
         u64 bytes = 0; char nm[64]; snprintf(nm, sizeof nm, "utxo_run_%06u.dat", (unsigned)g_utxo_lst.fz_run_no);
@@ -864,6 +859,7 @@ static void fz_wait(void){
 }
 void utxo_live_flush_wait(void){ fz_wait(); }
 /* utxo_lsm_put/del's threshold crossing (bitcoin_utxo_lsm.asm's mac_freeze_hook): -1 is a flush error to the caller */
+static u64 g_fz_part_ns[4];            /* the last freeze in parts: the asm freeze (gate, WAL drain, copy, clear), DONTFORK, fork, DOFORK */
 static long fz_hook(void* lst, void* u){
     if (g_fz_fatal) return -1;
     if (g_fz_pid){ g_fz_waits++; fz_wait(); if (g_fz_fatal) return -1; }
@@ -873,11 +869,15 @@ static long fz_hook(void* lst, void* u){
     long r = utxo_lsm_freeze(lst, u, g_fz_table);      /* the compaction gate runs inside it first, as in mac_flush */
     if (r < 0) return -1;
     if (r == 0) return 1;                               /* nothing to flush: the ops netted to an empty generation */
+    u64 t1 = clock_ns();
     child_sig_acquire();
     struct fork_rgn rg[FORK_RGN_MAX]; int nrg = fork_rgns(rg, FORK_FOR_WRITER);
     fork_rgns_advise(rg, nrg, MADV_DONTFORK);
+    u64 t2 = clock_ns();
     pid_t p = fork();
+    u64 t3 = clock_ns();
     if (p != 0){ fork_rgns_advise(rg, nrg, MADV_DOFORK); if (p > 0) fork_rgns_note(rg, nrg, FORK_FOR_WRITER); }
+    g_fz_part_ns[0] = t1 - t0; g_fz_part_ns[1] = t2 - t1; g_fz_part_ns[2] = t3 - t2; g_fz_part_ns[3] = clock_ns() - t3;
     if (p < 0){
         child_sig_release(); g_fz_inline++;
         fprintf(stderr, "[utxo_live] fork for the flush writer failed (%s) -- writing run %lu inline\n", strerror(errno), (unsigned long)g_utxo_lst.fz_run_no);
@@ -896,9 +896,10 @@ static long fz_hook(void* lst, void* u){
     g_fz_pid = p; clock_gettime(CLOCK_MONOTONIC, &g_fz_t0);
     g_fz_freeze_ns = clock_ns() - t0;
     if (g_cfg.benchlog)
-        fprintf(stderr, "[bench] freeze at block %ld: %.2f ms, %llu ops, gen %llu run %06u -> writer pid %d\n",
+        fprintf(stderr, "[bench] freeze at block %ld: %.2f ms, %llu ops, gen %llu run %06u -> writer pid %d (drain+copy %.0f ms, gate %.0f, fork %.0f)\n",
                 g_apply_height, (double)g_fz_freeze_ns / 1e6, (unsigned long long)g_fz_ops,
-                (unsigned long long)g_utxo_lst.fz_gen, (unsigned)g_utxo_lst.fz_run_no, (int)p);
+                (unsigned long long)g_utxo_lst.fz_gen, (unsigned)g_utxo_lst.fz_run_no, (int)p,
+                (g_fz_part_ns[0] - g_gate_ns) / 1e6, g_gate_ns / 1e6, (g_fz_part_ns[1] + g_fz_part_ns[2] + g_fz_part_ns[3]) / 1e6);
     return 1;
 }
 /* a flush that is complete when it returns: the freeze + the writer awaited (the caught-up downshift, tests, ops) */
@@ -916,14 +917,12 @@ int  utxo_live_test_writer_pid(void){ return (int)g_fz_pid; }
 unsigned long utxo_live_test_fz_adopted(void){ return g_fz_count; }
 /* TEST-ONLY (plan M2, tests/test_utxo_fork_trim): a hook the merge child and
  * the flush writer run first; the pre-M2 fork (everything inherited); a
- * background merge started without waiting and its pid; the adopts that
- * released the frozen copy; the copy itself. */
+ * background merge started without waiting and its pid; the copy itself. */
 void utxo_live_test_set_child_probe(void (*fn)(int who)){ g_test_child_probe = fn; }
 void utxo_live_test_set_fork_trim(int on){ g_fork_trim = on ? 1 : 0; }
 int  utxo_live_test_compact_nowait(void){ return compact_start_async(g_apply_height, "test"); }
 int  utxo_live_test_compact_pid(void){ return (int)g_cmp_pid; }
 void utxo_live_test_set_apply_lag(long lag){ g_apply_lag = lag; }
-unsigned long long utxo_live_test_fz_released(void){ return g_fz_released; }
 void* utxo_live_test_fz_table(void){ return g_fz_table; }
 /* the shutdown path: the writer gets its seconds (its run is adopted, so the
  * next boot replays one generation less); past 30 s it is killed and the
@@ -3975,7 +3974,7 @@ static long catchup_run(void* store_buf, long max_ms, int stop_at_hole){
          * end of a pass that applied something, i.e. the pass that forked
          * the writer, before it had exited; at one block an hour the
          * finished writer sat as a zombie and its run, the WAL hole punch
-         * and the frozen copy's release waited for the next block
+         * and the WAL's retirement waited for the next block
          * (production, deploy-20261006d, 01:16Z). Every pass polls. */
         compact_poll();
         fz_poll();
