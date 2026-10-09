@@ -411,6 +411,9 @@ int main(void){
     if (g_cfg.mintxfee_satkvb==2000 && g_cfg.fallbackfee_satkvb==20000 && g_cfg.discardfee_satkvb==5000 && g_cfg.consolidatefeerate_satkvb==3000 && g_cfg.maxapsfee_sat==-1)
         printf("PASS: wallet fee options in sat/kvB; maxapsfee=-1 means always\n");
     else { printf("FAIL: wallet fees (%ld %ld %ld %ld %ld)\n", g_cfg.mintxfee_satkvb, g_cfg.fallbackfee_satkvb, g_cfg.discardfee_satkvb, g_cfg.consolidatefeerate_satkvb, g_cfg.maxapsfee_sat); failures++; }
+    if (g_cfg.maxtxfee_sat==10000000)
+        printf("PASS: maxtxfee absent -> Core's 0.1 BTC (10000000 sat)\n");
+    else { printf("FAIL: maxtxfee default (%ld)\n", g_cfg.maxtxfee_sat); failures++; }
     if (g_cfg.avoidpartialspends==1 && g_cfg.spendzeroconfchange==0 && g_cfg.walletrbf==0 && g_cfg.txconfirmtarget==3 && g_cfg.walletbroadcast==0 && g_cfg.keypool==50)
         printf("PASS: wallet bools/ints; txconfirmtarget=5000 (over 1008) refused, 3 kept\n");
     else { printf("FAIL: wallet bools (%d %d %d %d %d %d)\n", g_cfg.avoidpartialspends, g_cfg.spendzeroconfchange, g_cfg.walletrbf, g_cfg.txconfirmtarget, g_cfg.walletbroadcast, g_cfg.keypool); failures++; }
@@ -434,6 +437,20 @@ int main(void){
     if (g_cfg.limitclustercount==30 && g_cfg.limitclustersize_kvb==50 && g_cfg.limitancestorcount==25 && g_cfg.limitdescendantcount==25)
         printf("PASS: limitclustercount/size set the cluster limits and leave the deprecated ancestor/descendant counts alone\n");
     else { printf("FAIL: cluster limits (cluster %ld/%ld anc %ld desc %ld)\n", (long)g_cfg.limitclustercount, (long)g_cfg.limitclustersize_kvb, (long)g_cfg.limitancestorcount, (long)g_cfg.limitdescendantcount); failures++; }
+    /* -maxtxfee (2026-10-09): parsed into satoshis and, since this date, read
+     * by the wallet; a non-amount is refused, and a value under the minrelay
+     * fee for 1 kvB (Core refuses those) keeps Core's 0.1 BTC */
+    wr("mtf1.conf", "maxtxfee=0.01\n");  node_config_load("mtf1.conf");
+    long m1 = g_cfg.maxtxfee_sat;
+    wr("mtf2.conf", "maxtxfee=lots\n");  node_config_load("mtf2.conf");
+    long m2 = g_cfg.maxtxfee_sat;
+    wr("mtf3.conf", "maxtxfee=0\n");     node_config_load("mtf3.conf");
+    long m3 = g_cfg.maxtxfee_sat;
+    wr("mtf4.conf", "minrelaytxfee=0.00001\nmaxtxfee=0.000005\n"); node_config_load("mtf4.conf");
+    long m4 = g_cfg.maxtxfee_sat;
+    if (m1==1000000 && m2==10000000 && m3==10000000 && m4==10000000)
+        printf("PASS: maxtxfee=0.01 -> 1000000 sat; 'lots' refused; 0 and 500 sat (under a 1000 sat/kvB minrelay) keep 0.1 BTC\n");
+    else { printf("FAIL: maxtxfee parse (%ld %ld %ld %ld)\n", m1, m2, m3, m4); failures++; }
     /* limitclustercount above Core's MAX_CLUSTER_COUNT_LIMIT (64) is refused */
     node_config_load("/nonexistent/reset.conf");
     wr("bmc_clu.conf", "limitclustercount=65\n");

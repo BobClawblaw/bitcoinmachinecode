@@ -76,6 +76,7 @@ node_config_t g_cfg = {
     .mempooljournal        = 0,      /* EXTENSION: off unless asked for       */
     .maxuploadtarget_mb    = 0,      /* Core -maxuploadtarget default: none  */
     .minrelaytxfee_satkvb  = 100,    /* Core -minrelaytxfee 0.000001 BTC/kvB (v30: 0.1 sat/vB) */
+    .maxtxfee_sat          = 10000000, /* Core DEFAULT_TRANSACTION_MAXFEE, 0.1 BTC */
     .incrementalrelayfee_satkvb = 100, /* Core -incrementalrelayfee default (v30)             */
     .limitancestorcount    = 25,     /* Core -limitancestorcount default     */
     .limitancestorsize_kvb = 101,    /* Core -limitancestorsize default (kvB)*/
@@ -366,7 +367,7 @@ static void set_defaults(void){
     g_cfg.alertnotify[0]        = 0;
     g_cfg.startupnotify[0]      = 0;
     g_cfg.shutdownnotify[0]     = 0;
-    g_cfg.maxtxfee_sat          = 0;
+    g_cfg.maxtxfee_sat          = 10000000;   /* Core DEFAULT_TRANSACTION_MAXFEE, 0.1 BTC */
     g_cfg.asmap[0]              = 0;
     g_cfg.n_rpcauth             = 0;
     g_cfg.maxsendbuffer_kb      = 1000;   /* Core -maxsendbuffer default */
@@ -957,9 +958,13 @@ long node_config_load(const char* path){
         else if(!strcmp(key,"shutdownnotify")){
             snprintf(g_cfg.shutdownnotify,sizeof g_cfg.shutdownnotify,"%s",val); applied++; }
         else if(!strcmp(key,"maxtxfee")){
-            /* Core takes BTC; stored in satoshis like every other fee here */
-            double b = atof(val); if(b >= 0) g_cfg.maxtxfee_sat = (long)(b * 100000000.0 + 0.5);
-            applied++; }
+            /* Core takes BTC; stored in satoshis like every other fee here.
+             * Until 2026-10-09 the value was stored and never read: the wallet
+             * capped at a constant 0.1 BTC whatever this said, so maxtxfee=0.01
+             * looked applied and was not. main.c now hands it to the wallet. */
+            char* end = NULL; double b = strtod(val, &end);
+            if(end == val || *end || b < 0 || b > 21e6){ fprintf(stderr,"[config] maxtxfee=%s is not an amount -- ignoring\n", val); bad++; }
+            else { g_cfg.maxtxfee_sat = (long)(b * 100000000.0 + 0.5); applied++; } }
         else if(!strcmp(key,"rpccookiefile")){
             snprintf(g_cfg.rpccookiefile,sizeof g_cfg.rpccookiefile,"%s",val); applied++; }
         else if(!strcmp(key,"minimumchainwork")){
@@ -1351,6 +1356,16 @@ long node_config_load(const char* path){
         g_cfg.max_block_relay_only=2; g_cfg.max_feeler=1;
         bad++;
     }
+    /* Core refuses a -maxtxfee below the minimum relay fee for 1 kvB (a cap
+     * that low cannot pay for a relayable transaction; wallet.cpp "must be at
+     * least the minrelay fee"). This node does not refuse to start on a wallet
+     * option: it says so and keeps Core's default. Over 1 BTC Core warns. */
+    if(g_cfg.maxtxfee_sat < g_cfg.minrelaytxfee_satkvb){
+        fprintf(stderr,"[config] maxtxfee=%ld sat is below the minrelay fee of %ld sat/kvB (Core refuses it) -- keeping the default 0.1 BTC\n",
+                g_cfg.maxtxfee_sat, g_cfg.minrelaytxfee_satkvb);
+        g_cfg.maxtxfee_sat = 10000000; bad++;
+    } else if(g_cfg.maxtxfee_sat > 100000000)
+        fprintf(stderr,"[config] maxtxfee is set very high (%ld sat)! Fees this large could be paid on a single transaction.\n", g_cfg.maxtxfee_sat);
     /* Core's download shape (2026-09-29): during IBD Core fetches blocks from
      * every outbound peer that can serve them -- its full-relay AND its
      * block-relay-only peers (fPreferredDownload) -- so the parallel download

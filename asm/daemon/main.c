@@ -11845,6 +11845,7 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
       wd.discardfee_satkvb = g_cfg.discardfee_satkvb; wd.consolidatefeerate_satkvb = g_cfg.consolidatefeerate_satkvb;
       wd.maxapsfee_sat = g_cfg.maxapsfee_sat; wd.avoidpartialspends = g_cfg.avoidpartialspends;
       wd.spendzeroconfchange = g_cfg.spendzeroconfchange;
+      wd.maxtxfee_sat = g_cfg.maxtxfee_sat;
       rpc_wops_set_defaults(&wd); }
     if(g_cfg.walletdir[0]){
         struct stat wsb;

@@ -387,7 +387,7 @@ static int wop_exists(const char* rel){
  * the legacy layout (the chain directory, or data/ beneath it). Set by
  * main.c from the config so this file carries no node_config dependency. */
 void rpc_wops_set_walletdir(const char* d){ snprintf(g_walletdir, sizeof g_walletdir, "%s", d ? d : ""); }
-static rpc_wops_defaults g_wdef = { WOT_BECH32, -1, 6, 1, 1, 1000, 0, 10000, 10000, 0, 0, 1 };
+static rpc_wops_defaults g_wdef = { WOT_BECH32, -1, 6, 1, 1, 1000, 0, 10000, 10000, 0, 0, 1, 10000000 };
 static int g_wdef_set = 0;   /* 0 = pre-config behaviour (min-relay fallback when the estimator is empty) */
 void rpc_wops_set_defaults(const rpc_wops_defaults* d){ if (d){ g_wdef = *d; g_wdef_set = 1; } }
 int rpc_wops_default_type(int is_change){
@@ -3019,6 +3019,9 @@ static void wf_hex(char* out, const unsigned char* b, long n){
 /* WAL-17 (audit 2026-09-03): moved up from the bumpfee section -- the fee
  * ceiling now guards the ORDINARY funding path too, not just bumpfee. */
 #define BF_MAXTXFEE_SAT 10000000ULL         /* Core -maxtxfee default, 0.1 BTC */
+/* the ceiling in force: -maxtxfee from the config (2026-10-09; it was parsed
+ * and never read, so the constant applied whatever the operator set) */
+static unsigned long long wf_maxtxfee(void){ return g_wdef.maxtxfee_sat > 0 ? (unsigned long long)g_wdef.maxtxfee_sat : BF_MAXTXFEE_SAT; }
 /* Core's FormatMoney: BTC with trailing zeros stripped ("0.00001"). */
 static void bf_fmt_money(long long sat, char* out, size_t cap){
     snprintf(out, cap, "%lld.%08lld", sat/100000000LL, sat%100000000LL);
@@ -3225,10 +3228,10 @@ static int wf_fund(const rpc_wallet* w, const wf_out* outs, int nout,
      *
      * Refuse rather than clamp: silently paying less than asked would produce
      * a transaction the caller did not request, and Core raises here too. */
-    if (fee > BF_MAXTXFEE_SAT){
+    if (fee > wf_maxtxfee()){
         static char e[192]; char a[32], b[32];
         bf_fmt_money((long long)fee, a, sizeof a);
-        bf_fmt_money((long long)BF_MAXTXFEE_SAT, b, sizeof b);
+        bf_fmt_money((long long)wf_maxtxfee(), b, sizeof b);
         snprintf(e, sizeof e,
                  "Fee (%s) exceeds the maximum fee (%s) -- raise -maxtxfee or lower the feerate", a, b);
         free(hx); if (pv) rj_free(pv);
@@ -4067,9 +4070,9 @@ static int cmd_bumpfee_common(const rj_val* params, const rpc_wallet* w,
                    "required fee %s)", a);
           return wop_err(ec, em, -8, m);
       } }
-    if (new_fee > (long long)BF_MAXTXFEE_SAT){
+    if (new_fee > (long long)wf_maxtxfee()){
         static char m[192]; char a[24], b[24];
-        bf_fmt_money(new_fee, a, sizeof a); bf_fmt_money((long long)BF_MAXTXFEE_SAT, b, sizeof b);
+        bf_fmt_money(new_fee, a, sizeof a); bf_fmt_money((long long)wf_maxtxfee(), b, sizeof b);
         snprintf(m, sizeof m, "Specified or calculated fee %s is too high (cannot "
                  "be higher than -maxtxfee %s)", a, b);
         return wop_err(ec, em, -4, m);
