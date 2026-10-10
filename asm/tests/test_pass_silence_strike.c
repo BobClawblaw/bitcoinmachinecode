@@ -120,6 +120,21 @@ int main(void){
     ck("two counted failures", g_sync_fail_streak[0] == 2);
     pass_fail_bookkeeping(0, 1, 0, 0.3);
     ck("a good pass resets the streak", g_sync_fail_streak[0] == 0);
+    /* 2026-10-09: a closed leg's slot keeps no strikes, and the heartbeat
+     * counts connected legs only. Watched to fail first: without the reset
+     * in the closes, leg 0 kept 2 after closing and sync_failing read 1 with
+     * no failing leg connected. */
+    pass_fail_bookkeeping(0, 0, 3, 0.3);
+    ck("one counted failure on leg 0", g_sync_fail_streak[0] == 1 && legs_sync_failing() == 1);
+    leg_close_theirs(0, "test", "(nothing)");
+    ck("leg 0 closed by the peer: its slot keeps no strike", g_sync_fail_streak[0] == 0);
+    ck("...and the heartbeat counts no failing leg", legs_sync_failing() == 0);
+    pass_fail_bookkeeping(1, 0, 3, 0.3);
+    leg_close_ours(1, "test", "");
+    ck("leg 1 closed by us mid-streak: its slot keeps no strike either", g_sync_fail_streak[1] == 0 && legs_sync_failing() == 0);
+    g_sync_fail_streak[1] = 2;
+    ck("a stale count in an empty slot is not reported", mux_out_fd[1] < 0 && legs_sync_failing() == 0);
+    g_sync_fail_streak[1] = 0;
     leg_shut(0); leg_shut(1);
 
     /* ---- 6. the reorg probe's gate: no probe while the host hears nothing ---- */

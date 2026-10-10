@@ -1410,8 +1410,15 @@ static int leg_peer_hung_up(int fd, short* revents_out){
  * the parent replays the same bookkeeping from the report, once. */
 static int g_pass_in_child = 0;
 static long g_pass_child_rewound = -1;
+/* 2026-10-09: a closed leg's slot keeps no strikes. Neither close reset the
+ * streak -- only a good pass or the next peer in the slot did -- so a leg
+ * closed for any other reason after a failing pass or two left its count
+ * in an empty slot, and slots no dial candidate could fill (three of ten on
+ * mainnet for hours) carried it into every heartbeat: sync_failing=2-3 for
+ * a whole two-hour run in which no leg reached the third strike. */
 static void leg_close_ours(int i, const char* reason, const char* detail){
     if(g_pass_in_child) return;                        /* the parent decides from the report */
+    g_sync_fail_streak[i] = 0;
     fprintf(stderr,"[dl:%d] %s connection closed ours/%s after %llds%s%s\n", i, mux_out_host[i][0] ? mux_out_host[i] : "?", reason, leg_age_s(i),
             detail && detail[0] ? " -- " : "", detail ? detail : "");
     if(mux_out_fd[i] >= 0){ bmc_v2_close(mux_out_fd[i]), close(mux_out_fd[i]); mux_out_fd[i] = -1; }
@@ -1419,6 +1426,7 @@ static void leg_close_ours(int i, const char* reason, const char* detail){
 }
 static void leg_close_theirs(int i, const char* how, const char* unread){
     if(g_pass_in_child) return;                        /* the parent decides from the report */
+    g_sync_fail_streak[i] = 0;
     long long age = leg_age_s(i);
     fprintf(stderr,"[dl:%d] %s connection closed theirs (%s) after %llds; unread: %s\n", i, mux_out_host[i][0] ? mux_out_host[i] : "?", how, age, unread ? unread : "(nothing)");
     if(g_dialmem && age >= 0 && age <= DM_EARLY_S) dialmem_note_failure(g_dialmem, mux_out_host[i], age <= DM_REFUSED_S ? DM_REFUSED : DM_EARLY_DROP, dialmem_now());
@@ -4000,6 +4008,12 @@ static void pass_fail_bookkeeping(int i, long ok, int fail_code, double sync_s){
         g_sync_fail_streak[i] = 0;
         mux_out_nextretry[i] = 0;   /* re-dial on the next rotation, not after the dead-slot backoff */
     }
+}
+/* the heartbeat's sync_failing: CONNECTED legs with a failing streak */
+static int legs_sync_failing(void){
+    int failing = 0;
+    for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && g_sync_fail_streak[k]) failing++;
+    return failing;
 }
 static long do_outbound_sync(int i){
     /* STAGE B: a REAL multi-hash locator built fresh from our stored chain on
@@ -11167,7 +11181,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         if(now_ms >= next_heartbeat_ms){
             int live_peers=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) live_peers++;
             char upbuf[UPTIME_BUF];
-            int failing=0; for(int k=0;k<mux_n_out;k++) if(g_sync_fail_streak[k]) failing++;
+            int failing=legs_sync_failing();
             char failbuf[32]; failbuf[0]=0;
             if(failing) snprintf(failbuf, sizeof failbuf, " sync_failing=%d", failing);
             char storedbuf[40]; storedbuf[0]=0;

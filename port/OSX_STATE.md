@@ -4,6 +4,13 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-10-10 (1) — `sync_failing` counted closed legs; signet retired
+
+- **Signet:** stopped and its launch agent (`com.bmc.signet`) disabled at the user's request; `~/bmc_signet` and the plist are left in place. Deploys now go to mainnet only.
+- **`sync_failing` in the heartbeat:** it never cleared. It read 1–4, mostly 2–3, for all 127 heartbeats of a two-hour run in which no leg was closed for `sync-failed-3x`, and it never exceeded the number of empty slots. The count is legs with a nonzero failing streak, and neither `leg_close_ours` nor `leg_close_theirs` reset the streak; only a good pass or the next peer in the slot did. A leg closed for another reason after a failing pass or two left its count in an empty slot, and three slots that no dial candidate could fill carried it for hours. **Fix:** both closes reset the slot's streak, and the heartbeat counts connected legs only (`legs_sync_failing`). **Test:** `test_pass_silence_strike` gains four checks (a close by either side clears the slot; a stale count in an empty slot is not reported); without the fix all four fail.
+- **Found, not fixed:** why those slots stay empty. The worker samples 64 addresses from the book once at start (3,401 dialable) and redials only from them. As they enter dial backoff or are held by other legs, slots find no free candidate ("no dial candidate is free", 15,517 lines in the log) and the node runs with 6–8 of its 10–11 outbound peers. Core picks each outbound from its whole table.
+- **Full suite:** 425 PASS, 11 SKIP, 14 N/A, 0 FAIL.
+
 ## 2026-10-09 (3) — the worker's own long accept holds now name their steps (shared C, logging only)
 
 In the ten minutes after the f7ce2d72 deploy, the lock log's only long hold was the worker's: `tx_accept_validate_p2p held 1170 ms (waited 0 ms)`. There were eight such lines on 10-09 (1.0–5.8 s), with up to two waiters behind some. Most coincide with my own load on the Mac (the full suite at 23:34–23:35, the `getmempoolentry` timing at 23:41), so some may be a busy CPU stretching an ordinary hold. The log could not say where the time went: script checking runs before the lock, but `mpool_policy_add` and the fee-estimator note named no steps.
