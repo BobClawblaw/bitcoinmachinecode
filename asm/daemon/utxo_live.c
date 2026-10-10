@@ -1685,6 +1685,13 @@ static void idxbuild_on_output(void* ctxv, u32 out_index, u64 value, const u8* s
      * exceed MAX_MONEY without money_bad already firing, and ntx x
      * MAX_MONEY still fits u64 for any ntx a 4 MB block can carry. */
     if (c->ptx_out) c->ptx_out[c->tx_index] += value;
+    /* 2026-10-10: warm this output's home slot for STAGE B's insert, as
+     * idxbuild_on_input does for a spend. While utxo_hash put a txid's
+     * outputs side by side, the insert of output k+1 found output k's line
+     * already loaded; the multiply mix spreads them, so each insert is its
+     * own miss -- run 47's put.ins doubled (126 -> 242 s over 575k-775k)
+     * while put.del fell 502 -> 292 s. Pure hint. */
+    utxo_prefetch(g_utxo_table, c->txid, out_index);
 }
 
 /* Apply every tx's puts/dels in one block. Returns 1 on a clean apply, 0 on
