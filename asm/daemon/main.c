@@ -4584,6 +4584,65 @@ static int mux_refuse_log_due(int i){
     g_mux_refuse_logged[i] = now; return 1;
 }
 
+/* Is peers[p] free for slot i to dial? Not on an anonymity net (the helper
+ * dials those), not under dial-memory backoff unless it is a manual peer,
+ * and not a host another live leg already holds. */
+static int mux_candidate_free(int i, const char* host){
+    char me[128]; ctl_ip_only(host, me, sizeof me);
+    if(leg_is_anon_net(leg_net_of(host))) return 0;
+    if(g_dialmem && !node_config_is_manual(me) && !dialmem_allowed(g_dialmem, host, dialmem_now())) return 0;
+    for(int k = 0; k < mux_n_out; k++){
+        if(k == i || mux_out_fd[k] < 0) continue;
+        char other[128]; ctl_ip_only(mux_out_host[k], other, sizeof other);
+        if(me[0] && !strcmp(me, other)) return 0;
+    }
+    return 1;
+}
+/* 2026-10-10: the redial pool is refreshed from the book when it runs dry.
+ * Every pool a slot redials from was sampled ONCE, when the worker started
+ * -- 64 addresses of the book's 3,401 dialable on mainnet. As they went into
+ * dial backoff or were held by other legs, slots found no free candidate
+ * ("no dial candidate is free", 15,517 lines) and the node ran on 6-8 of
+ * its 10-11 outbound legs for hours. Core picks every outbound from its
+ * whole table. So when the caller's pool has nothing free, a second pool,
+ * sampled fresh from the book, is tried with the same gates. It is re-drawn
+ * at most every MUX_RESAMPLE_MS, and never under connect= (those are the
+ * only peers). The callers' pools are left alone: some are connect= lists
+ * and anchors, and mux_out_peer[] indexes them. */
+#ifndef MUX_RESAMPLE_MS
+#define MUX_RESAMPLE_MS (5 * 60 * 1000LL)
+#endif
+#define DL_POOL_SLOT 80   /* a pool entry, "host:port": why 80, with dl_pool_from_book below */
+static char g_mux_fresh[64][DL_POOL_SLOT]; static int g_mux_fresh_n = 0, g_mux_fresh_cur = 0;
+static long long g_mux_fresh_at = 0;   /* when it was drawn (0 = never) */
+long g_mux_resamples = 0;              /* test seam: draws taken */
+static int dl_pool_from_book(void* ab, char out[][DL_POOL_SLOT], int nitems);
+static const char* mux_fresh_pick(int i){
+    if(g_cfg.connect_only) return NULL;
+    long long now = dh_now_ms();
+    for(int pass = 0; pass < 2; pass++){
+        for(int t = 0; t < g_mux_fresh_n; t++){
+            int q = (g_mux_fresh_cur + t) % g_mux_fresh_n;
+            if(mux_candidate_free(i, g_mux_fresh[q])){ g_mux_fresh_cur = (q + 1) % g_mux_fresh_n; return g_mux_fresh[q]; }
+        }
+        if(pass || (g_mux_fresh_at && now - g_mux_fresh_at < MUX_RESAMPLE_MS) || !addr_book()) return NULL;
+        g_mux_fresh_n = dl_pool_from_book(NULL, g_mux_fresh, 64); g_mux_fresh_cur = 0;
+        g_mux_fresh_at = now; g_mux_resamples++;
+        fprintf(stderr, "[mux] the dial pool has no free candidate: %d address(es) sampled fresh from the book\n", g_mux_fresh_n);
+    }
+    return NULL;
+}
+/* The host slot i dials next: the caller's pool, rotating from the slot's
+ * pointer, else the fresh pool. NULL when neither has a free candidate. */
+static const char* mux_pick_host(int i, const char* peers[], int pool_len){
+    int p = (mux_out_peer[i]+1) % (pool_len>0?pool_len:1);
+    for(int tries = 0; tries < pool_len; tries++){
+        if(mux_candidate_free(i, peers[p])){ mux_out_peer[i] = p; return peers[p]; }
+        p = (p + 1) % (pool_len > 0 ? pool_len : 1);
+    }
+    mux_out_peer[i] = p;
+    return mux_fresh_pick(i);
+}
 static void mux_next_peer(int i, const char* peers[], int pool_len, int out_port){
     /* 2026-09-17: this used to drop a LIVE leg silently -- the slot changed
      * hands and the log said nothing, so the departure had no owner. Every
@@ -4598,43 +4657,26 @@ static void mux_next_peer(int i, const char* peers[], int pool_len, int out_port
      * gates every reconnect -- a toggle that only dropped the current legs
      * would be undone by the next rotation. */
     if(g_node_status && !g_node_status->net_active) return;
-    /* rotate to the next seed in the pool (wrap); avoids hammering the same dead host */
-    int p = (mux_out_peer[i]+1) % (pool_len>0?pool_len:1);
-    int free_pick = 0;                                     /* a candidate passed every gate */
-    /* ...and never onto a host another live leg already holds: each leg
-     * rotates its own pointer, so two legs could land on one peer (deploy g,
-     * 2026-09-01: legs 1 and 2 both on 108.245.166.132). Compared by HOST,
-     * so a book carrying one peer under two ports still yields one leg. */
-    { char me[128];
-      for(int tries = 0; tries < pool_len; tries++){
-          ctl_ip_only(peers[p], me, sizeof me);
-          int held = leg_is_anon_net(leg_net_of(peers[p]));   /* anonymity dials belong to the helper, never inline */
-          /* 2026-09-09: under backoff. 2026-09-24: a manual peer is exempt;
-           * the retry floor below bounds it instead. */
-          if(!held && g_dialmem && !node_config_is_manual(me) &&
-             !dialmem_allowed(g_dialmem, peers[p], dialmem_now())) held = 1;
-          for(int k = 0; k < mux_n_out && !held; k++){
-              if(k == i || mux_out_fd[k] < 0) continue;
-              char other[128]; ctl_ip_only(mux_out_host[k], other, sizeof other);
-              if(me[0] && !strcmp(me, other)) held = 1;
-          }
-          if(!held){ free_pick = 1; break; }
-          p = (p + 1) % (pool_len > 0 ? pool_len : 1);
-      } }
-    mux_out_peer[i] = p;
-    if(!free_pick){
+    /* rotate to the next seed in the pool (wrap); avoids hammering the same
+     * dead host -- and never onto a host another live leg already holds:
+     * each leg rotates its own pointer, so two legs could land on one peer
+     * (deploy g, 2026-09-01: legs 1 and 2 both on 108.245.166.132). Compared
+     * by HOST, so a book carrying one peer under two ports still yields one
+     * leg. The gates: mux_candidate_free. */
+    const char* host = mux_pick_host(i, peers, pool_len);
+    if(!host){
         if(mux_refuse_log_due(i)) fprintf(stderr,"[mux:%d] no dial candidate is free (backoff / already held / anonymity net) -- the leg stays down\n", i);
         return;
     }
     /* a banned peer is not dialed. Checked HERE for the same reason: this is
      * the only path to a new outbound leg. */
-    { char ip[128]; ctl_ip_only(peers[p], ip, sizeof ip);
+    { char ip[128]; ctl_ip_only(host, ip, sizeof ip);
       if(ctl_is_banned(ip)){
-          fprintf(stderr,"[mux:%d] %s is banned -- not dialing\n", i, peers[p]);
+          fprintf(stderr,"[mux:%d] %s is banned -- not dialing\n", i, host);
           return;
       } }
     /* the manual-peer retry floor: at most one dial per slot per floor */
-    { char ip[128]; ctl_ip_only(peers[p], ip, sizeof ip);
+    { char ip[128]; ctl_ip_only(host, ip, sizeof ip);
       int kind = node_config_manual_kind(ip);
       if(kind){
           long long now = dh_now_ms(), floor_ms = kind == 2 ? CONNECT_RETRY_FLOOR_MS : ADDNODE_RETRY_FLOOR_MS;
@@ -4651,7 +4693,7 @@ static void mux_next_peer(int i, const char* peers[], int pool_len, int out_port
      * fills THIS slot. One helper per slot; the caller's backoff stamp keeps
      * the slot from asking again before the helper has answered. */
     if(dh_inflight_for(i)) return;
-    if(!dh_start_slot(peers[p], out_port, i)) fprintf(stderr,"[mux:%d] no dial helper free for %s -- the leg stays down until the next retry\n", i, peers[p]);
+    if(!dh_start_slot(host, out_port, i)) fprintf(stderr,"[mux:%d] no dial helper free for %s -- the leg stays down until the next retry\n", i, host);
 }
 
 /* ---- per-leg sync wall-clock budget (accept-starve fix, t_7ea57703) ----
@@ -4847,7 +4889,7 @@ static long dl_bootstrap(void* ab, const char* peers[], int pool_len){
  * since the port had to survive the trip from the book, and an onion name is
  * 62 chars -- "<onion>:65535" is 68, so the old 64 truncated every Tor peer
  * to "<onion>:", undialable and still burning a slot. */
-#define DL_POOL_SLOT 80
+/* DL_POOL_SLOT is 80 (defined with the dial pool, above) */
 /* The pool's entries are "host:port" ("[v6]:port" for IPv6/CJDNS). Every
  * consumer that used to inet_pton() a bare host MUST split first -- three of
  * them did not, and the node came up with zero outbound legs and skipped its

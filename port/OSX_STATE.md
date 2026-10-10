@@ -4,11 +4,18 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-10-10 (2) — an outbound slot with no free candidate draws a fresh pool from the book (shared C)
+
+The empty slots found in (1). Every pool a slot redials from was sampled once, when the worker started: 64 addresses of the book's 3,401 dialable. As they entered dial backoff or were held by other legs, slots found no free candidate, and the node ran on 6–8 of its 10–11 outbound legs, logging "no dial candidate is free" (15,517 lines; one per slot per minute) from an hour or two after each restart.
+- **Fix** (`daemon/main.c`): the candidate gates are one function (`mux_candidate_free`: not an anonymity net, not under backoff unless manual, not held by another live leg), and `mux_pick_host` tries the caller's pool first, as before. When the caller's pool has nothing free, it falls back to a second pool sampled fresh from the book (`dl_pool_from_book`, the same uniform sample), which is redrawn at most every 5 minutes (`MUX_RESAMPLE_MS`) and never under `connect=`. The callers' pools are left alone: some are `connect=` lists and anchors, and `mux_out_peer[]` indexes them. A draw logs `[mux] the dial pool has no free candidate: N address(es) sampled fresh from the book`.
+- **Test:** `test_pool_diversity` gains seven checks against the real book: with both pool hosts under backoff a fresh, allowed address is picked from one draw; an exhausted fresh pool dials nothing and is not redrawn inside the interval; after the interval a second draw gives a free address; a host another live leg holds is never picked; under `connect=` nothing is drawn. With the fallback disabled, five fail.
+- **Full suite:** 425 PASS, 11 SKIP, 14 N/A, 0 FAIL.
+
 ## 2026-10-10 (1) — `sync_failing` counted closed legs; signet retired
 
 - **Signet:** stopped and its launch agent (`com.bmc.signet`) disabled at the user's request; `~/bmc_signet` and the plist are left in place. Deploys now go to mainnet only.
 - **`sync_failing` in the heartbeat:** it never cleared. It read 1–4, mostly 2–3, for all 127 heartbeats of a two-hour run in which no leg was closed for `sync-failed-3x`, and it never exceeded the number of empty slots. The count is legs with a nonzero failing streak, and neither `leg_close_ours` nor `leg_close_theirs` reset the streak; only a good pass or the next peer in the slot did. A leg closed for another reason after a failing pass or two left its count in an empty slot, and three slots that no dial candidate could fill carried it for hours. **Fix:** both closes reset the slot's streak, and the heartbeat counts connected legs only (`legs_sync_failing`). **Test:** `test_pass_silence_strike` gains four checks (a close by either side clears the slot; a stale count in an empty slot is not reported); without the fix all four fail.
-- **Found, not fixed:** why those slots stay empty. The worker samples 64 addresses from the book once at start (3,401 dialable) and redials only from them. As they enter dial backoff or are held by other legs, slots find no free candidate ("no dial candidate is free", 15,517 lines in the log) and the node runs with 6–8 of its 10–11 outbound peers. Core picks each outbound from its whole table.
+- **Found here, fixed in (2):** why those slots stay empty. The worker samples 64 addresses from the book once at start (3,401 dialable) and redials only from them. As they enter dial backoff or are held by other legs, slots find no free candidate ("no dial candidate is free", 15,517 lines in the log) and the node runs with 6–8 of its 10–11 outbound peers. Core picks each outbound from its whole table.
 - **Full suite:** 425 PASS, 11 SKIP, 14 N/A, 0 FAIL.
 
 ## 2026-10-09 (3) — the worker's own long accept holds now name their steps (shared C, logging only)
