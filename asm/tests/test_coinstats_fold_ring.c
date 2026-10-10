@@ -19,6 +19,8 @@
  *      a paused worker by RING+50 records; the worker resyncs, counts the
  *      loss in csi_lapped, and INVALIDATES (coinstats.dat gone) -- a lost
  *      record is a wrong digest, never a silently wrong answer;
+ *   3a. (2026-10-10) a burst of 200,000 records into a paused worker with the
+ *      wait bound at 0 finds room every time (the 64k ring overran);
  *   4. negative control: no status block -> inline folding of the same
  *      records, same digest as the worker's; csi_worker_start refuses.
  *   5. (2026-09-19) a SIGTERM to the WORKER does not end it. systemd's
@@ -241,6 +243,22 @@ int main(void){
       long r = csi_rpc_run(1, &o, msg, sizeof msg);
       ck("unpaused: the same call waits for the watermark and serves 502", r == 1 && o.height == 502 && st->csi_folded_height == 502);
       ck("txouts grew by the one add", o.txouts == tx + 1); }
+
+    printf("\n== 3a: the ring holds a burst of heavy blocks (2026-10-10) ==\n");
+    /* 200,000 records, ten heavy blocks' worth (an add per output and a
+     * remove per input), into a paused worker with the wait bound at 0: a
+     * push that finds no room overruns at once. The 64k ring overran here;
+     * at 700k in run 47 the worker was 36% busy while the connect thread
+     * slept on a full ring. */
+    csi_test_ring_pause(1);
+    csi_test_set_push_wait_ms(0);
+    { unsigned long long ov0 = csi_test_push_overruns(); coin_t X;
+      for (int i = 0; i < 200000; i++){ mk_coin(&X, 900000 + i, 25); csi_on_add(X.txid, X.idx, X.val, X.h, X.cb, X.spk, X.slen); }
+      ck("200,000 records into a paused worker: no push found the ring full", csi_test_push_overruns() == ov0);
+      printf("      ring %d entries, overruns %llu\n", RPC_CSI_RING, csi_test_push_overruns() - ov0); }
+    csi_test_set_push_wait_ms(60000);
+    csi_test_ring_pause(0);
+    ck("worker drained the burst", wait_drained(st, 30000));
 
     printf("\n== 3: lapping is counted and invalidates ==\n");
     csi_test_ring_pause(1);
