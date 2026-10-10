@@ -190,12 +190,15 @@ typedef struct {
 #define RPC_ZMQ_RING           65536u               /* index entries (a power of two) */
 #define RPC_ZMQ_ARENA          (32ul << 20)         /* staged raw-tx bytes */
 #define RPC_ANN_RING           1024   /* CC-1 announce ring (see ann_ring) */
-/* Coinstats fold ring (see csi_ring): a few blocks' worth of coin records --
- * a heavy block creates/spends ~10k coins, so 64k entries is 5-6 blocks of
- * headroom before the connect thread has to wait for the worker. Entries
- * are 192 bytes (12 MB shared); scripts longer than the inline part spill
- * into continuation entries claimed with the same atomic increment. */
-#define RPC_CSI_RING           65536
+/* Coinstats fold ring (see csi_ring): coin records from the connect thread to
+ * the fold worker. Entries are 192 bytes; scripts longer than the inline part
+ * spill into continuation entries claimed with the same atomic increment.
+ * 2026-10-10: 512k entries (96 MB shared), from 64k (12 MB). At 700k in run 47
+ * the worker was 36% busy over a minute yet the connect thread slept in
+ * ring_wait_room: a run of heavy blocks (~20k records each, an add per output
+ * and a remove per input) filled 64k entries in a few blocks. The worker keeps
+ * up on average; the ring only has to hold the burst. */
+#define RPC_CSI_RING           524288
 #define RPC_IXW_RING           1024     /* the index worker's ring (2026-10-06): heights, a block each */
 #define RPC_CSI_BODY           176
 #define RPC_CSI_HDR            52     /* key36 | value u64 | code u64 */

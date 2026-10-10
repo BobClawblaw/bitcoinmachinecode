@@ -934,13 +934,19 @@ static int ring_wait_room(unsigned long n){
     }
 }
 
+/* A sequence lock per slot: ready = 0, the body, ready = seq + 1; the worker
+ * reads ready, the body, ready again. The order needs release fences here and
+ * acquire fences in the worker, not full barriers (2026-10-10): x86 keeps
+ * stores in order and loads in order, so these are compiler barriers there and
+ * dmb on ARM. The two mfences per record were paid 7.2 billion times a sync
+ * on the connect thread. */
 static void slot_fill(u64 seq, unsigned kind, unsigned slen, const void* body, unsigned blen){
     volatile typeof(g_st->csi_ring[0])* e = &g_st->csi_ring[seq % RPC_CSI_RING];
     e->ready = 0;
-    __sync_synchronize();
+    __atomic_thread_fence(__ATOMIC_RELEASE);
     e->kind = kind; e->slen = slen;
     if (blen) memcpy((void*)e->body, body, blen);
-    __sync_synchronize();
+    __atomic_thread_fence(__ATOMIC_RELEASE);
     e->ready = seq + 1;
 }
 
@@ -1017,9 +1023,10 @@ static void worker_run(u64 cursor, pid_t parent){
         while (cursor < head){
             volatile typeof(st->csi_ring[0])* e = &st->csi_ring[cursor % RPC_CSI_RING];
             if (e->ready != cursor + 1) break;                 /* claimed, not yet filled (or lapped: re-check above) */
+            __atomic_thread_fence(__ATOMIC_ACQUIRE);           /* the body is read after ready (slot_fill) */
             unsigned kind = e->kind, slen = e->slen;
             u8 body[RPC_CSI_BODY]; memcpy(body, (const void*)e->body, RPC_CSI_BODY);
-            __sync_synchronize();
+            __atomic_thread_fence(__ATOMIC_ACQUIRE);           /* ...and before ready is read again */
             if (e->ready != cursor + 1) break;                 /* overwritten under us */
             unsigned long n = 1;
             int coin = (kind == CSI_K_ADD || kind == CSI_K_REMOVE);
@@ -1034,10 +1041,11 @@ static void worker_run(u64 cursor, pid_t parent){
                     for (unsigned long i = 1; i < n && ok; i++){
                         volatile typeof(st->csi_ring[0])* c = &st->csi_ring[(cursor + i) % RPC_CSI_RING];
                         if (c->ready != cursor + i + 1){ ok = 0; break; }
+                        __atomic_thread_fence(__ATOMIC_ACQUIRE);
                         unsigned cl = c->slen;
                         if (c->kind != CSI_K_CONT || cl > RPC_CSI_BODY || off + cl > slen){ ok = -1; break; }
                         memcpy(script + off, (const void*)c->body, cl);
-                        __sync_synchronize();
+                        __atomic_thread_fence(__ATOMIC_ACQUIRE);
                         if (c->ready != cursor + i + 1){ ok = 0; break; }
                         off += cl;
                     }
