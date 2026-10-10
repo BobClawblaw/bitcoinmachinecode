@@ -29,8 +29,9 @@
  *                  since blob_off is only known once the slot has arrived.
  *                  Modelled in C here to size the win; no assembly for it.
  *   - the probe-length histogram of the same query set, computed by a C
- *     mirror of the assembly's hash and walk (utxo_hash: FNV-1a over the
- *     first 8 txid bytes, XOR index, AND mask; linear probe, stride 48,
+ *     mirror of the assembly's hash and walk (utxo_hash: the first 8 txid
+ *     bytes XOR index, times an odd 64-bit constant, bits 32.. AND mask
+ *     (FNV-1a XOR index before 2026-10-10); linear probe, stride 48,
  *     wrap, stop at an empty slot). Every mirrored answer is checked
  *     against utxo_get's; a mismatch is a FAIL, so the histogram describes
  *     the probe the assembly actually made.
@@ -100,9 +101,8 @@ static void key_of(u64 set, u64 i, u8 txid[32], u32* index){
 
 /* ---- C mirror of bitcoin_utxo.asm's hash and probe walk ---- */
 static u64 home_off(const u8* txid, u32 index, u64 mask){
-    u32 h = 0x811c9dc5u;
-    for (int k = 0; k < 8; k++){ h ^= txid[k]; h *= 16777619u; }
-    return (((u64)h ^ (u64)index) & mask) * 48 + 40;
+    u64 q; memcpy(&q, txid, 8);                 /* 2026-10-10: utxo_hash's multiply mix */
+    return ((((q ^ (u64)index) * 0x9E3779B97F4A7C15ULL) >> 32) & mask) * 48 + 40;
 }
 struct walk { int probes; int lines; int straddle; int keycmp; };
 static long mirror_get(const u8* base, u64 mask, const u8* txid, u32 index, struct walk* w){

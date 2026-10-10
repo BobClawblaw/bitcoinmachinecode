@@ -1521,12 +1521,13 @@ static u64 next_pow2_u64(u64 n){
     while (p < n) p <<= 1;
     return p;
 }
+/* 2026-10-10: utxo_hash's mix (bitcoin_utxo.asm) -- the txid's first 8 bytes
+ * ^ the index, times an odd constant, the product's high half. FNV ^ index put
+ * a transaction's outputs in neighbouring slots of these linear-probed sets. */
 static u64 outpoint_hash(const u8 key[36]){
-    u64 h = 0x811c9dc5ULL;
-    for (int i=0;i<8;i++){ h ^= key[i]; h = (h * 16777619ULL) & 0xffffffffULL; }
+    u64 q; memcpy(&q, key, 8);
     u32 idx; memcpy(&idx, key+32, 4);
-    h ^= idx;
-    return h;
+    return ((q ^ idx) * 0x9E3779B97F4A7C15ULL) >> 32;
 }
 /* realloc()s *buf up to need_bytes if it isn't already that big, tracking
  * the arena's real capacity in *cap_bytes separately from whatever a
