@@ -4,6 +4,13 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-10-09 (3) — the worker's own long accept holds now name their steps (shared C, logging only)
+
+In the ten minutes after the f7ce2d72 deploy, the lock log's only long hold was the worker's: `tx_accept_validate_p2p held 1170 ms (waited 0 ms)`. There were eight such lines on 10-09 (1.0–5.8 s), with up to two waiters behind some. Most coincide with my own load on the Mac (the full suite at 23:34–23:35, the `getmempoolentry` timing at 23:41), so some may be a busy CPU stretching an ordinary hold. The log could not say where the time went: script checking runs before the lock, but `mpool_policy_add` and the fee-estimator note named no steps.
+- **Change:** `mpol_add_core` names its stages with `mpol_phase`: `add/standard`, `add/inputs`, `add/dust+feefloors`, `add/conflicts`, `add/limits+cluster`, `add/truc`, `add/diagram`, `add/commit`, `add/rbf_evict`, `add/store+trim`. The three accept entries name `fee_note`. A hold line now reads `tx_accept_validate_p2p ... held N ms: add/standard 0 ms, add/inputs ... ms, ...`. `mp_lock_phase` is a weak no-op when the caller does not hold the lock, so tests that call the policy without it are unaffected.
+- **Not tested directly:** nothing in the suite makes an accept hold the lock past the threshold. The first production line will show the steps.
+- **Full suite:** 425 PASS, 11 SKIP, 14 N/A, 0 FAIL.
+
 ## 2026-10-09 (2) — the pool lock: `getmempoolentry` builds after the lock, and a newcomer no longer jumps the queue (shared C + Mac lock)
 
 Item 24 (verbose `getrawmempool` holding the lock for its JSON build) was already fixed on 2026-10-06. The log after the e9a44c97 restart showed a different shape: 29 wait lines in about an hour, every one behind `getmempoolentry`.

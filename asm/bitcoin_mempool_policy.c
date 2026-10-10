@@ -2425,6 +2425,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
      * the UTXO view. */
     if (vsize_out) *vsize_out = (unsigned long long)vsize;
 
+    mpol_phase("add/standard");
     /* --- standardness (Core IsStandardTx order: before fees) --------------- */
     int n_dust = 0;
     { const char* r = standard_checks(pol, tx, txlen, &meta, prev[0], idx[0], &n_dust);
@@ -2435,6 +2436,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
     if (mpool_get(mp, txid, &(unsigned long){0}) != NULL){
         _mpol_last_reason = "txn-already-in-mempool"; return 0; }
 
+    mpol_phase("add/inputs");
     /* --- fee: resolve inputs (mempool outreg first, then confirmed set) ---- */
     unsigned long long sum_in = 0;
     for (int i=0;i<n_in;i++){
@@ -2452,6 +2454,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
     uint64_t fee = sum_in - meta.sum_out;
     if (fee_out) *fee_out = (unsigned long long)fee;
 
+    mpol_phase("add/dust+feefloors");
     /* ---- ephemeral dust (Core PreCheckEphemeralTx / CheckEphemeralSpends) --
      * Dust is normally refused because it costs more to spend than it is
      * worth, and left in the UTXO set forever. Core carves out one case: dust
@@ -2533,6 +2536,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
             mpol_detail("%llu < %llu", (unsigned long long)eff_fee, (unsigned long long)need);
             _mpol_last_reason = "min relay fee not met"; return 0; } } }
 
+    mpol_phase("add/conflicts");
     /* --- conflicts + RBF (Core ReplacementChecks / classic BIP125) --------- */
     int n_conf = 0;
     uint32_t conf_claimers[MPOL_MAX_IN];
@@ -2616,6 +2620,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
               _mpol_last_reason = "insufficient fee"; return 0; } }
     }
 
+    mpol_phase("add/limits+cluster");
     /* --- ancestor / descendant limits (vsize budgets) ---------------------- */
     uint32_t cap = *(uint32_t*)((char*)st+4);
     mpol_node* t = mpol_nodes_base(st);
@@ -2848,6 +2853,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
      * lacking. The cluster check above is the whole bound. anc_cnt/anc_bytes
      * are still computed: the entry stores them (ancestorcount/-size). */
 
+    mpol_phase("add/truc");
     /* --- BIP431 TRUC topology (Core SingleTRUCChecks) ----------------------
      * Runs for EVERY transaction, not only v3 ones: half of these rules are
      * about what a non-TRUC transaction may not spend. Skipped wholesale
@@ -3033,6 +3039,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
         #undef TRUC_PARENT_IDS_PKG
     }
 
+    mpol_phase("add/diagram");
     /* ---- Core v31.1 ImprovesFeerateDiagram (2026-10-01) -------------------
      * After every eviction is decided (conflicts, their descendants, a TRUC
      * sibling) and every other rule has passed: the replacement must strictly
@@ -3049,6 +3056,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
                      _mpol_last_reason = "replacement-failed"; return 0; }
     }
 
+    mpol_phase("add/commit");
     /* ================= commit ============================================ */
     if (!commit) return 1;
 
@@ -3166,6 +3174,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
         }
     }
 
+    mpol_phase("add/rbf_evict");
     /* 1a. RBF eviction (packages: conflicts + descendants, snapshotted) */
     { int prev_r = g_depart_reason; g_depart_reason = 2 /* MPJ_REPLACED */;
     for (int e=0;e<n_evict;e++){
@@ -3222,6 +3231,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
         }
     }
 
+    mpol_phase("add/store+trim");
     /* 1b. store; on a full pool, TrimToSize by descendant package (Core):
      * evict argmin of max(own, package) feerate WITH its descendants; floor
      * = removed package feerate + incrementalrelayfee. If the incoming tx
