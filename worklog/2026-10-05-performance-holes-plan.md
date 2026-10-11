@@ -1101,3 +1101,29 @@ peer(s) holding none stopped". Test: `test_dlc_header_probe`, a peer
 that answers its probe and never answers the version on its range
 connection; watched to fail with the fix removed (2: the phase waited
 the child's 10 s read timeout, 10.3 s). Stable over 4 runs.
+
+## 2026-10-11 — run 46 in the release report
+
+The release report (§0, §1, §2, §5, §6, §7) and the 10-07 release note
+carry run 46 (main `a79bcdca`; worklog/2026-10-10.md) as the release
+build: 3:17:55 (0.34 of Core #7), the applier 9,691 s (27% ahead), boot
+to block 1 34 s (B12 ranges), heap 8.2 GB mean / 13.3 peak (M2: bmc's on
+the mean, parity on the peak), PSS ceiling 56.3 GB (Core's, 1.6×, the
+mapped run files). Stage report:
+`docs/reports/2026-10-11-run46-vs-core7-stage-report.md` (built with
+`--bmc-log /srv/nvme8tb/bench/run46/debug.log --bmc-start <epoch>`: the
+harness of runs 42–46 writes debug.log beside phase.log, not under
+data/main/, and the script's --bmc-dir default looks only there).
+
+Against "beat Core in every category": every row of §6 is bmc's or
+parity except the PSS ceiling with mapped files counted (1.6×, all of it
+page cache the kernel may drop) and the two disk rows Core kept by
+design (the UTXO set by 2 GB, the undo files carrying spent scripts). A
+smaller PSS ceiling would mean mapping fewer run files at once (a
+tighter merge budget, M3's knob) at the cost of the lookups that #417
+just made cheap; not taken for this release.
+
+Still open from this plan, none costing a measured run: B9 part 1 (the
+ranking's churn: 69–81 distinct peers per sync), the stall watcher's
+false alarm in the header phase, and the writer-sharing columns (`ckpt`,
+`get`) if the applier is to go under 9,000 s.
