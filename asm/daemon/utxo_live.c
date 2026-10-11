@@ -3862,6 +3862,35 @@ static int ckpt_now(void){
     return 1;
 }
 
+/* ---- B16 (2026-10-11, bmc.dropappends): the blk files behind the applier
+ * The archive is appended in height order (archive_verify.c: monotonic
+ * (file_no, data_pos)), so when the block at h lives in a later file than
+ * the block before it, the earlier file has been read for the last time by
+ * this loop. Its pages were written by the download minutes ago and are
+ * clean or nearly so; sync_file_range finishes the rest and
+ * POSIX_FADV_DONTNEED frees them, once per 128 MB file. Without this the
+ * blk stream (294 GB by block 650,000) sits on the inactive list and
+ * evicts the UTXO run pages the pread lookups read (see undo_log.c for the
+ * measurement). A block the archive placed out of order costs one disk read
+ * of its own bytes and nothing else. */
+static unsigned long long g_stat_blk_drops;
+unsigned long long utxo_live_blk_drop_count(void){ return g_stat_blk_drops; }
+static void blk_drop_behind(void* st, long h){
+    static unsigned last_file = ~0u;
+    u64 meta[3];
+    if (store_get_at(st, (u64)h, meta) != 1) return;
+    unsigned f = (unsigned)meta[2];
+    if (f == last_file) return;
+    if (last_file != ~0u && f > last_file){
+        int fd = store_rd_fd(st, last_file);
+        if (fd >= 0){
+            syscall(SYS_sync_file_range, fd, (off_t)0, (off_t)0, 1 | 2 | 4);   /* WAIT_BEFORE | WRITE | WAIT_AFTER */
+            posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+            g_stat_blk_drops++;
+        }
+    }
+    last_file = f;
+}
 /* ---- Step 1 of UTXO_INLINE_BUILD_PERF_SCOPE (2026-09-06): the bounded call.
  * utxo_live_catchup_bounded(store_buf, max_ms, stop_at_hole) is the SAME
  * per-block loop as utxo_live_catchup (one body, catchup_run, so the
@@ -4007,11 +4036,13 @@ static long catchup_run(void* store_buf, long max_ms, int stop_at_hole){
     const int bench = g_cfg.benchlog && g_tm_on;
     u64 bench_v0[TM_N], bench_p0[TMP_N];
     undo_set_split_timing(bench);
+    { extern void undo_set_drop_appends(int); undo_set_drop_appends(g_cfg.drop_appends); }   /* B16: the undo stream */
     for (long h = g_applied_height + 1; h <= tip; h++){
         if (bench){ memcpy(bench_v0, g_tm_total, sizeof bench_v0); memcpy(bench_p0, g_tmp_total, sizeof bench_p0); }
         u64 tm_r0 = tm_now();
         long len = store_read_at(store_buf, h, blockbuf, sizeof blockbuf);
         tm_lap(TM_READ, tm_r0);
+        if (len >= 81 && g_cfg.drop_appends) blk_drop_behind(store_buf, h);   /* B16: the blk file the applier just left, out of the page cache */
         if (len < 81) {
             if (stop_at_hole) {
                 /* the contiguous prefix ends here: the helpers have not
