@@ -132,3 +132,41 @@ design (ours carry the spent scripts for the address history).
   #404. B13, the stall rule banning on a second stall, is #405. Neither has
   been measured on a benchmark yet. See
   `releases/2026-10-07-the-descriptor-outage-and-the-header-leader.md`.
+
+## Addendum, 2026-10-11: run 46 is the release build
+
+The four days after this note landed #402–#417 (the descriptor leak, B13,
+M2, M3, B14, the B12 header ranges, the frozen copy's pages, the Bloom
+sizing) and five more benchmark syncs. Run 46 (main `a79bcdca`, 10-09/10)
+replaces run 41 in every row of the release report, and production has
+run `deploy-20261010a`, the same build by size and strings, since 10-10
+04:28Z with no restart.
+
+| genesis to every index at the tip | Core v31.1 rerun #7 | bmc run 41 | bmc run 46 | run 46 / Core |
+|---|---|---|---|---|
+| headers → first block | 0:45 | 0:48 | 0:34 | 0.76 |
+| 100,000 | 2:06 | 1:35 | 1:22 | 0.65 |
+| 200,000 | 4:44 | 2:55 | 2:35 | 0.55 |
+| 500,000 | 1:43:30 | 44:25 | 40:49 | 0.39 |
+| 900,000 | 8:13:37 | 3:10:02 | 2:44:26 | 0.33 |
+| **every index at the tip** | **9:50:04** | **3:48:22** | **3:17:55** | **0.34** |
+| CPU time, all processes | 13 h 15 m | 7 h 39 m | 7 h 13 m | 0.54 |
+| the applier's own time (thread-seconds) | 13,340 | 11,842 | 9,691 | 0.73 |
+| heap (anonymous), mean / peak | 10.0 / 12.0 GB | 15.3 / 32.2 GB | 8.2 / 13.3 GB | 0.82 / 1.11 |
+| PSS with mapped files, mean / peak | 17.6 / 34.3 GB | 39.9 / 75.6 GB | 34.1 / 56.3 GB | 1.9 / 1.6 |
+| UTXO set | muhash at 970,333 | identical at 970,364 | identical at 970,710 | — |
+
+The memory category this note gave to Core is split now: the heap row is
+bmc's on the mean and parity on the peak, because `dbcache` is the whole
+UTXO heap since M2 (#407) and the forked children no longer copy the
+memtable. What Core keeps is the PSS ceiling with mapped files counted,
+1.6×: the UTXO run files bmc maps (22.5 GB at IBD end), which the kernel
+caches and may drop. The applier's 2,151 s between run 41 and run 46 are
+the lookups (4,607 → 2,870 s, each flush run's Bloom filter sized to its
+records instead of capped at 4 MiB, #417) and the freezes (99 → 30 s, the
+frozen copy keeping its pages, #416); the header phase's 14 s are the
+headers in 19 parallel ranges from four peers (B12, #410). The full
+tables, the per-segment stage report
+(`docs/reports/2026-10-11-run46-vs-core7-stage-report.md`) and the
+runs between are in the release report and
+`releases/2026-10-08-the-heap-the-merge-budget-and-header-ranges.md`.
