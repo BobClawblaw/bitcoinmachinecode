@@ -90,22 +90,30 @@ utxo_init:
     ret
 
 ; utxo_hash(rdi=txid, rsi=index, rdx=mask) -> rax = slot offset (bytes, from +40)
-; FNV-1a over txid first 8 bytes XOR index folded to mask.
+; The txid's first 8 bytes XOR the index, multiplied by a 64-bit odd constant;
+; the slot is the product's bits 32.. under the mask (2026-10-10).
+;
+; It was FNV-1a over those 8 bytes XOR the index, masked: a txid's outputs
+; landed in neighbouring slots (index 0..n flips only the low bits), so a
+; transaction's outputs made one run of full slots, and linear probing walks
+; runs. The diagnostic sync of 2026-10-10 measured a delete's backward shift
+; scanning 10.8 slots per hit over 575k-793k and a delete costing 190 ns in the
+; memtable. The multiply carries the index into every bit above it, so
+; neighbouring indices land far apart. The txid needs no hashing of its own
+; (it is a SHA-256d); the byte loop it replaced was a 3-cycle-latency chain of
+; eight multiplies.
+;
+; Nothing persists a slot position (the checkpoint and the WAL hold records,
+; reload re-puts them; the frozen copy and the writer probe with this same
+; function). Touches rax/r8/r9 only; utxo_prefetch relies on that.
+UTXO_HASH_MUL equ 0x9E3779B97F4A7C15
 utxo_hash:
-    mov  r8, 0x811c9dc5
-    xor  ecx, ecx
-.hl:
-    cmp  ecx, 8
-    jae  .hdone
-    movzx r9, byte [rdi+rcx]
-    xor  r8d, r9d
-    imul r8d, r8d, 16777619
-    inc  ecx
-    jmp  .hl
-.hdone:
-    ; fold index in
-    mov  r9, rsi
+    mov  r8, [rdi]
+    mov  r9d, esi                ; the index, zero-extended: callers pass it in esi
     xor  r8, r9
+    mov  rax, UTXO_HASH_MUL
+    imul r8, rax
+    shr  r8, 32
     and  r8, rdx
     imul r8, r8, 48
     lea  rax, [r8+40]
@@ -550,20 +558,14 @@ utxo_del:
     cmp  ecx, 0xFFFFFFFF
     je   .bs_done                 ; genuine empty: hole fully propagated, stop
     mov  rbx, rax                 ; rbx = &slot[j] (persists across the call)
-    push rbx
-    push r13
-    push r14
-    lea  rdi, [rbx+8]              ; txid ptr = slot[j]'s stored txid
-    mov  esi, ecx                   ; index = slot[j]'s stored index
-    mov  rdx, r15                    ; mask
-    call utxo_hash                    ; rax = byte offset of slot[j]'s home slot
-    pop  r14
-    pop  r13
-    pop  rbx
-    sub  rax, 40
-    xor  edx, edx
-    mov  ecx, 48
-    div  ecx                          ; rax = k (0-based home slot index)
+    ; k = slot[j]'s home slot index: utxo_hash's arithmetic inline, as a slot
+    ; index (2026-10-10; it was a call, then *48 and a div to undo the *48).
+    mov  rax, [rbx+8]                 ; slot[j]'s txid, first 8 bytes
+    xor  rax, rcx                     ; ^ its index (ecx, zero-extended)
+    mov  rdx, UTXO_HASH_MUL
+    imul rax, rdx
+    shr  rax, 32
+    and  rax, r15                     ; rax = k (0-based home slot index)
     ; is i within [k, j) walking forward from k, modulo capacity? i.e. is
     ; the gap on slot[j]'s own probe path from its home to where it sits?
     mov  rcx, r13
@@ -616,8 +618,20 @@ utxo_count:
 ; -----------------------------------------------------------------
 ; small helpers (local)
 ; memcmp_asm(a, b, n) -> 0 equal / nonzero differ
+; 2026-10-10: eight bytes a compare while eight remain, then the byte loop
+; (it was the byte loop alone; the 32-byte txid compare of every probe hit).
 memcmp_asm:
     push rcx
+.mq:
+    cmp  rdx, 8
+    jb   .ml
+    mov  rax, [rdi]
+    cmp  rax, [rsi]
+    jne  .mne
+    add  rdi, 8
+    add  rsi, 8
+    sub  rdx, 8
+    jmp  .mq
 .ml:
     test rdx, rdx
     jz   .meq
@@ -639,20 +653,13 @@ memcmp_asm:
     ret
 
 ; memcpy_asm(dst, src, n)
+; 2026-10-10: rep movsb (FSRM) for the per-byte loop; rcx/rsi/rdi preserved
+; as before, rax no longer touched.
 memcpy_asm:
     push rcx
     push rsi
     push rdi
-.yl:
-    test rcx, rcx
-    jz   .ydone
-    mov  al, [rsi]
-    mov  [rdi], al
-    inc  rdi
-    inc  rsi
-    dec  rcx
-    jmp  .yl
-.ydone:
+    rep  movsb
     pop  rdi
     pop  rsi
     pop  rcx

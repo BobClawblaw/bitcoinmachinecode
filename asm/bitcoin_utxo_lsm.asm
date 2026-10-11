@@ -395,18 +395,17 @@ mac_fl_drain:
 
 ; ============================================================================
 
-; mac_memcpy(dst=rdi, src=rsi, n=rdx) -- preserves nothing special, trivial
+; mac_memcpy(dst=rdi, src=rsi, n=rdx) -- rdi, rsi, rdx and rcx come back
+; unchanged, as the per-byte loop it replaced (2026-10-10) left them; rep movsb
+; (FSRM) is a few cycles for the 32-48 byte keys and slots it mostly copies.
 mac_memcpy:
     push rcx
-    xor  ecx, ecx
-.ml:
-    cmp  rcx, rdx
-    jae  .md
-    mov  al, [rsi+rcx]
-    mov  [rdi+rcx], al
-    inc  rcx
-    jmp  .ml
-.md:
+    push rsi
+    push rdi
+    mov  rcx, rdx
+    rep  movsb
+    pop  rdi
+    pop  rsi
     pop  rcx
     ret
 
@@ -648,19 +647,17 @@ mac_tomb_probe_raw:
     mov  r12, rsi                    ; mask
     mov  r10, rdx                    ; tomb_buf base
     mov  rsi, rcx                    ; key
-    mov  r8, 0x811c9dc5
-    xor  ecx, ecx
-.hp_hl:
-    cmp  ecx, 8
-    jae  .hp_hdone
-    movzx eax, byte [rsi+rcx]
-    xor  r8d, eax
-    imul r8d, r8d, 16777619
-    inc  ecx
-    jmp  .hp_hl
-.hp_hdone:
+    ; utxo_hash's mix (bitcoin_utxo.asm, 2026-10-10): the txid's first 8
+    ; bytes ^ the index, times an odd 64-bit constant, bits 32.. under the
+    ; mask. FNV ^ index put a transaction's spent outputs in neighbouring
+    ; slots; the diagnostic sync measured 1-6 probes a call, each a random
+    ; read of tomb_buf. The set is rebuilt from tomb_buf, never persisted.
+    mov  r8, [rsi]
     mov  eax, [rsi+32]              ; vout index
     xor  r8, rax
+    mov  rax, 0x9E3779B97F4A7C15
+    imul r8, rax
+    shr  r8, 32
     and  r8, r12                     ; mask -> starting probe index
 .hp_probe:
     lea  rbx, [r9 + r8*8]                  ; &slot
