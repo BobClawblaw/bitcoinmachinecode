@@ -3600,6 +3600,7 @@ int utxo_live_init(const char* dir){
     u64 manifest_cap       = UTXO_LIVE_MANIFEST_CAP;
 
     long ustruct = utxo_struct_size(slots);
+    { extern void lsm_mm_set_reads(int); lsm_mm_set_reads(g_cfg.lsm_reads_pread); }   /* bmc.lsmreads (2026-10-11): records by pread, the run files out of the PSS */
     if (g_cfg.memtable_anon){                       /* B11: anonymous table and blob, the files kept (see mmap_anon_kept_file) */
         g_utxo_table = mmap_anon_kept_file("utxo_lsm_table.map", (u64)ustruct, 1);
     } else {
