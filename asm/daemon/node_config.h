@@ -161,6 +161,7 @@ typedef struct {
      * either way (as Core's do); only the lines are gated. */
     int  benchlog;
     int  async_flush;            /* bmc.asyncflush (plan B3, 2026-10-06): the UTXO memtable flush runs in a forked writer off the applier; 0 = inline, as before */
+    int  lsm_reads_pread;        /* bmc.lsmreads=pread (2026-10-11): the UTXO run lookups read records with pread() instead of through the mapping, so the run files stay page cache and leave the PSS; mmap (0) = the mapped fast path */
     int  memtable_anon;          /* bmc.memtableanon (plan B11, 2026-10-07): the live memtable's table and blob in anonymous huge-page memory, the files kept at their sizes with the table's header page shared; 0 = MAP_SHARED file mappings, as before */
     int  esplora_port;            /* bmc.esploraport: the Esplora facade listener (0 = off) */
     char esplora_bind[64];        /* bmc.esplorabind: its address (default 127.0.0.1) */

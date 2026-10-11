@@ -1127,3 +1127,48 @@ Still open from this plan, none costing a measured run: B9 part 1 (the
 ranking's churn: 69–81 distinct peers per sync), the stall watcher's
 false alarm in the header phase, and the writer-sharing columns (`ckpt`,
 `get`) if the applier is to go under 9,000 s.
+
+### B15. The run files out of the PSS: records by pread (built 10-11, `bmc.lsmreads=pread`)
+
+The one §6 row Core kept after run 46 is PSS with mapped files counted
+(56.3 against 34.3 GB at the peak, 34.1 against 17.6 on the mean). The
+peak is the worker's run mappings the minute before a full compaction:
+46 generation runs plus the 12.9 GB base run, ~49 GB of files, nearly
+every page touched by the random lookups and so in the page tables and
+counted. Core reads its chainstate through LevelDB's `pread`; its page
+cache is outside its PSS. The compaction child reads with `read()` and
+writes with `write()` and holds none of it (checked in the asm:
+`utxo_lsm_compact_range` streams through 256 KB read buffers).
+
+Change (`asm/utxo_lsm_mm.c`): with `bmc.lsmreads=pread` the header,
+the Bloom filter and the sparse index are still read from the mapping
+(a few MB per run, touched on every lookup anyway; the mapping is
+`MADV_RANDOM` so they do not fault records in around them) and the
+RECORDS are read with `pread()` into a per-thread window: 4 KB first (a
+sparse stride is 64 records), re-read at the record, larger, when a
+record or its script runs past the end (`rec_at`, the one accessor; in
+mmap mode it is the mapping). One syscall per run a lookup reaches, no
+page-table entry for the records. Every hand-off to the asm is counted
+now (the scan's `LSM_MM_FALLBACK` returns were not). The config key,
+the README row, the sample conf; `utxo_live_init` sets the mode.
+
+Test `tests/test_lsm_reads_pread` (in the gate): six runs of 4,000
+records with 100-byte and 5,000-byte scripts and 300 tombstones; the
+three paths (pread, mmap, asm) agree on every key and 2,000 absent
+keys; pread mode makes pread() calls and mmap mode none; the big
+records are read in the window with no fallback; a thread that looked
+up 2,000 random keys in pread mode has 16% of its run mappings
+resident (header, Bloom, sparse) against 100% in mmap mode. Reverts:
+the pread branch reading the mapping → the pread-count and residency
+checks fail; the window re-read removed → 200 fallbacks (the no-fallback
+check fails). `tests/bench_lsm_get` on its synthetic set: 4.77M against
+3.23M lookups/s, +0.1 µs a lookup.
+
+Cost estimate for a sync: ~1.9 billion spent inputs, one pread for the
+run that holds the coin plus one per false positive (sized filters,
+~1%), ~0.5–1 µs each → 1,000–2,000 s on an applier that leads Core #7
+by 3,649 s. Expected: the PSS peak ~15 GB (the heap plus the mapped
+filters and sparse indexes), the mean under Core's 17.6 GB. Run 49
+measures it with the sampler; the default flips to pread if the
+applier stays ahead of Core's 13,340 s and the sync under run 46's
+3:17:55 plus the measured get cost.
