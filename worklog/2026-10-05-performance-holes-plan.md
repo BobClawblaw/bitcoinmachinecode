@@ -1127,3 +1127,101 @@ Still open from this plan, none costing a measured run: B9 part 1 (the
 ranking's churn: 69–81 distinct peers per sync), the stall watcher's
 false alarm in the header phase, and the writer-sharing columns (`ckpt`,
 `get`) if the applier is to go under 9,000 s.
+
+### B15. The run files out of the PSS: records by pread (built 10-11, `bmc.lsmreads=pread`)
+
+The one §6 row Core kept after run 46 is PSS with mapped files counted
+(56.3 against 34.3 GB at the peak, 34.1 against 17.6 on the mean). The
+peak is the worker's run mappings the minute before a full compaction:
+46 generation runs plus the 12.9 GB base run, ~49 GB of files, nearly
+every page touched by the random lookups and so in the page tables and
+counted. Core reads its chainstate through LevelDB's `pread`; its page
+cache is outside its PSS. The compaction child reads with `read()` and
+writes with `write()` and holds none of it (checked in the asm:
+`utxo_lsm_compact_range` streams through 256 KB read buffers).
+
+Change (`asm/utxo_lsm_mm.c`): with `bmc.lsmreads=pread` the header,
+the Bloom filter and the sparse index are still read from the mapping
+(a few MB per run, touched on every lookup anyway; the mapping is
+`MADV_RANDOM` so they do not fault records in around them) and the
+RECORDS are read with `pread()` into a per-thread window: 4 KB first (a
+sparse stride is 64 records), re-read at the record, larger, when a
+record or its script runs past the end (`rec_at`, the one accessor; in
+mmap mode it is the mapping). One syscall per run a lookup reaches, no
+page-table entry for the records. Every hand-off to the asm is counted
+now (the scan's `LSM_MM_FALLBACK` returns were not). The config key,
+the README row, the sample conf; `utxo_live_init` sets the mode.
+
+Test `tests/test_lsm_reads_pread` (in the gate): six runs of 4,000
+records with 100-byte and 5,000-byte scripts and 300 tombstones; the
+three paths (pread, mmap, asm) agree on every key and 2,000 absent
+keys; pread mode makes pread() calls and mmap mode none; the big
+records are read in the window with no fallback; a thread that looked
+up 2,000 random keys in pread mode has 16% of its run mappings
+resident (header, Bloom, sparse) against 100% in mmap mode. Reverts:
+the pread branch reading the mapping → the pread-count and residency
+checks fail; the window re-read removed → 200 fallbacks (the no-fallback
+check fails). `tests/bench_lsm_get` on its synthetic set: 4.77M against
+3.23M lookups/s, +0.1 µs a lookup.
+
+Cost estimate for a sync: ~1.9 billion spent inputs, one pread for the
+run that holds the coin plus one per false positive (sized filters,
+~1%), ~0.5–1 µs each → 1,000–2,000 s on an applier that leads Core #7
+by 3,649 s. Expected: the PSS peak ~15 GB (the heap plus the mapped
+filters and sparse indexes), the mean under Core's 17.6 GB. Run 49
+measures it with the sampler; the default flips to pread if the
+applier stays ahead of Core's 13,340 s and the sync under run 46's
+3:17:55 plus the measured get cost.
+
+**Run 49 at block 650,000 (10-11, read while it ran, from the logs
+and `/proc` only):** the PSS row flips -- 9.9 GB PSS with a 8.0 GB
+heap at +2 h against run 46's 49.7 GB (peak so far 16.3 against 57.6)
+-- and the get column is 4x run 46's to the same height: 3,824 s
+against 931 s (the applier 6,350 against 3,443). The estimate above
+assumed the run pages stay in the page cache; they do not. The blk and
+rev streams (294 + 104 GB by block 650,000) go through the same page
+cache, every page of them referenced once, and `/proc/meminfo` shows
+where that leaves the kernel: `Active(file)` 1.3 GB, `Inactive(file)`
+50 GB. A pread'd run page is referenced once too, so it is evicted
+with the stream behind it; a mapped page is referenced through the
+page table and the reclaim keeps it (and counts it). mincore over the
+run files at block 650,000: 30.9 of 40.5 GB resident, the older
+generation runs at 43–65%, the 4.3 GB base run at 67%; the worker's
+`read_bytes` 212 GB in two hours -- every miss a 4 KB NVMe read in the
+get column. CPU is lower than run 46's at the same point (7,796
+against 11,429 s): the applier is waiting on the disk, not computing.
+The run runs to its end for the whole-run figures of the pread
+configuration (the PSS peak at the compaction edge, the ready time);
+the fix is B16.
+
+### B16. The append streams out of the page cache (built 10-11, `bmc.dropappends=1`)
+
+The streams have no second reader in the sync: a rev file is read by a
+reorg or an index backfill, a blk file by the applier once, minutes
+after the download wrote it, and by nothing else until a peer asks for
+the block. Dropping them behind their last reader leaves the inactive
+list to the run files and the indexes (~20 GB per 650,000 blocks
+instead of 400).
+
+`asm/daemon/undo_log.c`: every 16 MB of the current rev file
+(`undo_commit`, after the END record), `sync_file_range(WRITE)` on the
+step just completed, `sync_file_range(WAIT_BEFORE|WRITE|WAIT_AFTER)` +
+`POSIX_FADV_DONTNEED` on the step before it (its writeback was started
+a step ago, so the wait is normally nothing; DONTNEED frees no dirty
+page, hence the order), and the whole old file when the writer rolls
+to the next. `asm/daemon/utxo_live.c` (`blk_drop_behind`): when the
+block at h lives in a later blk file than the block before it, the
+earlier file is finished (the archive is appended in height order,
+`archive_verify.c`) and is written back and dropped whole, once per
+128 MB. Both are off at `bmc.dropappends=0` (the default until a run
+says otherwise); the config line prints `dropappends=`.
+
+Test `tests/test_drop_appends` (in the gate): a 40 MB rev stream with
+the knob off is ≥ 90% resident (the control); with the knob on, writing
+to 100 MB leaves the first 64 MB ≤ 2% resident; past the 128 MB roll
+the old file is ≤ 2% resident whole; `undo_load` reads the records back
+intact at every phase. Residency by mincore(2) on a private mapping.
+Run 50: `bmc.lsmreads=pread` + `bmc.dropappends=1`, the sampler
+beside it; the pass mark is the applier under run 46's 9,691 s plus
+the pread syscall cost (the bench's +0.1 µs a lookup, ~400 s) with
+the PSS peak under Core's 34.3 GB.

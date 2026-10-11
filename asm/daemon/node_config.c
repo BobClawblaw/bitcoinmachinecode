@@ -63,7 +63,7 @@ node_config_t g_cfg = {
     .par                   = 0,      /* Core -par default: auto              */
     .dial_rate_limit       = 0,      /* bmc.dialratelimit: off unless set */
     .download_rate_limit_kbps = 0,   /* bmc.downloadratelimit: off unless set */
-    .coinstatshist_repair = 1, .coinstatshist_workers = 0, .benchlog = 0, .async_flush = 1, .memtable_anon = 1, .esplora_port = 0, .esplora_bind = "127.0.0.1",
+    .coinstatshist_repair = 1, .coinstatshist_workers = 0, .benchlog = 0, .async_flush = 1, .memtable_anon = 1, .lsm_reads_pread = 0, .drop_appends = 0, .esplora_port = 0, .esplora_bind = "127.0.0.1",
     .upload_rate_limit_kbps = 0,     /* bmc.uploadratelimit: off unless set */
     .catchup_workers       = 10,     /* bmc.catchupworkers: peers downloading at once. Core's preferred-download set:
                                       * MAX_OUTBOUND_FULL_RELAY_CONNECTIONS 8 + MAX_BLOCK_RELAY_ONLY_CONNECTIONS 2
@@ -385,7 +385,7 @@ static void set_defaults(void){
     g_cfg.connect_timeout_ms    = 5000;     /* Core's -timeout default */
     g_cfg.peer_timeout_s        = 60;       /* Core's -peertimeout default */
     g_cfg.port                  = 8333;
-    g_cfg.coinstatshist_repair = 1; g_cfg.coinstatshist_workers = 0; g_cfg.benchlog = 0; g_cfg.async_flush = 1; g_cfg.memtable_anon = 1; g_cfg.esplora_port = 0; snprintf(g_cfg.esplora_bind, sizeof g_cfg.esplora_bind, "127.0.0.1");
+    g_cfg.coinstatshist_repair = 1; g_cfg.coinstatshist_workers = 0; g_cfg.benchlog = 0; g_cfg.async_flush = 1; g_cfg.memtable_anon = 1; g_cfg.lsm_reads_pread = 0; g_cfg.drop_appends = 0; g_cfg.esplora_port = 0; snprintf(g_cfg.esplora_bind, sizeof g_cfg.esplora_bind, "127.0.0.1");
     g_cfg.port_explicit         = 0;
     snprintf(g_cfg.chain, sizeof g_cfg.chain, "main");
     g_cfg.listen                = 1;
@@ -794,6 +794,12 @@ long node_config_load(const char* path){
             g_cfg.async_flush = IV?1:0; applied++; }
         else if(!strcmp(key,"bmc.memtableanon")){   /* EXTENSION (2026-10-07, plan B11): the live memtable in anonymous huge-page memory; 0 = file mappings */
             g_cfg.memtable_anon = IV?1:0; applied++; }
+        else if(!strcmp(key,"bmc.lsmreads")){   /* EXTENSION (2026-10-11): how the UTXO run lookups read records -- mmap (the mapped fast path) or pread (the run files stay page cache, out of the PSS) */
+            if(!strcmp(val,"pread"))     { g_cfg.lsm_reads_pread = 1; applied++; }
+            else if(!strcmp(val,"mmap")) { g_cfg.lsm_reads_pread = 0; applied++; }
+            else { fprintf(stderr,"[config] bmc.lsmreads=%s: expected mmap or pread -- ignoring\n", val); bad++; } }
+        else if(!strcmp(key,"bmc.dropappends")){   /* EXTENSION (2026-10-11, plan B16): drop the blk/rev append streams from the page cache behind the applier; 0 = leave them */
+            g_cfg.drop_appends = IV?1:0; applied++; }
         else if(!strcmp(key,"bmc.esploraport")){   /* EXTENSION: the Esplora facade (rpc_esplora.c), 0 = off */
             t=clamp_int(IV,0,65535,key,&bad); if(t>=0){g_cfg.esplora_port=t;applied++;} }
         else if(!strcmp(key,"bmc.esplorabind")){
@@ -1392,9 +1398,9 @@ void node_config_log(void){
             g_cfg.min_usable_peers, g_cfg.maxpool, g_cfg.dlc_chunk_blocks, g_cfg.dl_shape_core ? "core" : "bmc", g_cfg.dlc_roll_below);
     fprintf(stderr,"[config] addr : max_per_response=%d max_per_netgroup=%d\n",
             g_cfg.addr_max_per_response, g_cfg.addr_max_per_netgroup);
-    fprintf(stderr,"[config] utxo : dbcache=%dMB -> bulk_slots=2^%d bulk_blob=%dMB bulk_gap=%ld compact_at=%d asyncflush=%d memtableanon=%d\n",
+    fprintf(stderr,"[config] utxo : dbcache=%dMB -> bulk_slots=2^%d bulk_blob=%dMB bulk_gap=%ld compact_at=%d asyncflush=%d memtableanon=%d lsmreads=%s dropappends=%d\n",
             g_cfg.dbcache_mb, g_cfg.utxo_bulk_slots_log2, g_cfg.utxo_bulk_blob_mb,
-            g_cfg.utxo_bulk_gap_blocks, g_cfg.utxo_compact_threshold, g_cfg.async_flush, g_cfg.memtable_anon);
+            g_cfg.utxo_bulk_gap_blocks, g_cfg.utxo_compact_threshold, g_cfg.async_flush, g_cfg.memtable_anon, g_cfg.lsm_reads_pread ? "pread" : "mmap", g_cfg.drop_appends);
     fprintf(stderr,"[config] pool : maxmempool=%ldMB mempoolexpiry=%ldh maxuploadtarget=%ldMB\n",
             g_cfg.maxmempool_mb, g_cfg.mempoolexpiry_h, g_cfg.maxuploadtarget_mb);
     fprintf(stderr,"[config] mpol : minrelay=%ld inc=%ld sat/vB, anc=%ld/%ldkvB desc=%ld/%ldkvB fullrbf=%d\n",

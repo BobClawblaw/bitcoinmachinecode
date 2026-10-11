@@ -522,7 +522,21 @@ the kernel keeps them cached and are the kernel's to drop (Core's
 equivalent, its chainstate's page cache, is outside its PSS; its cgroup
 peak with page cache was 76 GB). The honest row for the release: heap,
 bmc's on the mean and parity on the peak; PSS ceiling, Core's by 1.6×,
-all of the excess reclaimable file pages.
+all of the excess reclaimable file pages. Why that row does not move
+with a knob: the peak (56.3 GB at 00:41Z) is the minute before a full
+compaction, when the worker maps 46 generation runs plus the compacted
+run (~49 GB of files, nearly all of it touched by the random lookups
+and so counted) and the compaction child, which reads with `read()`
+and writes with `write()`, has none of it in its own PSS; compacting
+sooner (`bmc.utxocompactthreshold`, ×4 in bulk mode; the run budget of
+35% of RAM) lowers the peak toward the floor set by the compacted run
+itself, 12.9 GB fully resident because every page of it is a lookup
+target, plus the heap — about 30 GB at best, and at the price of
+rewriting the base run every few minutes. The lever that would take
+the row is a `pread` path for the base run's lookups, as LevelDB reads,
+which moves those pages out of PSS and into the same page cache Core's
+chainstate lives in; it is slower than the mapped fast path and is not
+in this release.
 
 ## 6. Verdict, category by category
 
