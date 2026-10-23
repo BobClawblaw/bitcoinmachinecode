@@ -41,6 +41,9 @@ class CTViolation(SymError):
 # primitive layer: values are int (concrete, already reduced mod 2^w) or z3
 # --------------------------------------------------------------------------
 FORCE_Z3 = [False]
+UNINIT_READS = [0]
+STACK_LO, STACK_HI = 0x7fe0000000, 0x7ff0000000
+UNDEF_N = [0]
 
 
 def isc(v):
@@ -356,6 +359,13 @@ class Mem:
             return v
         s = self.img.static_byte(a)
         if s is None:
+            if STACK_LO <= a < STACK_HI:
+                # never-written stack: an arbitrary value (a fresh symbol), so
+                # any result that depended on it would fail its proof
+                UNINIT_READS[0] += 1
+                v = z3.BitVec('uninit_%x' % a, 8)
+                self.b[a] = v
+                return v
             raise SymError('read of uninitialised memory at %#x' % a)
         return s
 
@@ -453,6 +463,8 @@ class Machine:
         self.trace_mnems = set()
         self.write_log = None             # list of (addr, n) when set
         self.alg = alg                    # linform.Alg: the algebraic shadow (optional)
+        self.ct_allow = {}                # addr -> forced direction (see branch())
+        self.ct_forced = []
 
     # ---------------- operands
     def reg_read(self, st, name):
@@ -483,8 +495,9 @@ class Machine:
             st.regs[base] = p_zext(v, 32, 64)
         else:                   # 8/16-bit writes merge
             old = st.regs[base]
-            if old is None:
-                raise SymError('partial write to undefined %s' % base)
+            if old is None:              # the untouched upper bits are unknown: a fresh symbol
+                UNDEF_N[0] += 1
+                old = z3.BitVec('undef_%s_%d' % (base, UNDEF_N[0]), 64)
             hi = p_extract(old, 63, w)
             st.regs[base] = p_concat(hi, v, 64 - w, w)
 
@@ -615,6 +628,9 @@ class Machine:
         if isc(x) and isc(y) and not FORCE_Z3[0]:
             p = x * y
             return p >> 64, p & M64
+        if self.product_mode == 'fresh':          # CT runs: values are irrelevant, keep terms small
+            self.nprod += 1
+            return z3.BitVec('fh%d' % self.nprod, 64), z3.BitVec('fl%d' % self.nprod, 64)
         if isc(x) or isc(y) or z3.is_bv_value(z3.simplify(bv(x, 64))) or z3.is_bv_value(z3.simplify(bv(y, 64))) \
                 or self.product_mode == 'exact':
             p = exact_product(x, y)
@@ -692,7 +708,12 @@ class Machine:
             st.rip = fallthrough
             return None
         if self.mode == 'ct':
-            raise CTViolation('symbolic branch at %#x: %s' % (st.rip, sc))
+            allow = getattr(self, 'ct_allow', {})
+            if st.rip in allow:      # a documented data-dependent branch, forced to its proved direction
+                self.ct_forced.append(st.rip)
+                st.rip = target if allow[st.rip] else fallthrough
+                return None
+            raise CTViolation('symbolic branch at %#x: %s' % (st.rip, str(sc)[:200]))
         out = []
         for c, t in ((sc, target), (z3.Not(sc), fallthrough)):
             s2 = st.copy()
@@ -714,7 +735,10 @@ class Machine:
         mn = parts[0]
         rest = parts[1] if len(parts) > 1 else ''
         if mn in ('rep', 'repz', 'repe') and rest.startswith('movs'):
-            mn, rest = 'rep_' + rest.split()[0], ''
+            if rest.startswith('movsq') or 'QWORD PTR es:[rdi]' in rest:
+                mn, rest = 'rep_movsq', ''
+            else:
+                raise SymError('rep %s not modelled' % rest)
         if mn == 'cs' or mn == 'ds':
             parts = rest.split(None, 1)
             mn = parts[0]
@@ -1047,7 +1071,10 @@ class Machine:
         elif mn in ('vpxor', 'vpaddd', 'vpcmpeqd'):
             d, a_, b_ = ops
             w = SUBREG[d[2]][1] if d[0] == 'r' else 256
-            a, b = R(a_, w), R(b_, w)
+            if mn == 'vpxor' and a_ == b_:
+                a = b = None                      # zero idiom: the old value is not read
+            else:
+                a, b = R(a_, w), R(b_, w)
             if mn == 'vpxor':
                 r = lift(0, w) if a_ == b_ else p_xor(a, b, w)
             else:
