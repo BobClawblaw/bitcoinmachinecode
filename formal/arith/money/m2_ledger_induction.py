@@ -34,8 +34,8 @@ Lemmas (each printed PROVED when its negation is unsat):
 Then each mutation listed in MUTANTS must make its lemma SAT.
 """
 import sys
-from z3 import (BitVec, BitVecVal, Int, Solver, ULE, ULT, UGT, And, Or, Not,
-                Implies, If, sat, unsat, ZeroExt, BV2Int)
+from z3 import (BitVec, BitVecVal, Int, Solver, ULE, ULT, UGT, UGE, And, Or, Not,
+                Implies, If, sat, unsat, ZeroExt)
 
 MAX = 2100000000000000
 W = 64
@@ -64,25 +64,39 @@ def check(name, assumptions, goal, expect="unsat"):
     return ok and vr == sat
 
 
+# "Mathematical" values are 128-bit zero-extensions: no sum here can reach
+# 2^128, so 128-bit arithmetic on them is exact integer arithmetic (pure
+# bit-vector reasoning, which z3 decides quickly; BV2Int did not finish).
+X = 128
+
+
+def Z(e):
+    return ZeroExt(X - W, e)
+
+
+def zv(v):
+    return BitVecVal(v, X)
+
+
 def in_step(mut=None):
-    # state before one input: Core's nValueIn (int64), its bad flag, bmc's u64 p
+    # one input. Core: nValueIn (int64), bad flag; bmc: u64 accumulator p;
+    # P = the true running sum.
     nV = BitVec("nValueIn", W); bad = BitVec("bad", 1); p = BitVec("p", W)
-    P = Int("P"); coin = BitVec("coin", W)
+    P = BitVec("P", X); coin = BitVec("coin", W)
     A = [
         ULE(coin, bv(MAX)),                                  # A-UTXO
-        P >= 0, P + MAX < 2**64,                             # stays inside u64 (IN-WIDTH)
-        BV2Int(p) == P,
-        (bad == 1) == (P > MAX),
-        Implies(bad == 0, BV2Int(nV) == P),                  # Core's sum while still ok
+        ULT(P + zv(MAX), zv(2**64)),                         # stays inside u64 (IN-WIDTH)
+        Z(p) == P,
+        (bad == 1) == UGT(P, zv(MAX)),
+        Implies(bad == 0, Z(nV) == P),                       # Core's sum while still ok
     ]
     lim = bv(MAX + 1) if mut == "in-limit" else bv(MAX)
-    # Core: only runs while not bad; C1 (signed compares on int64, values >= 0 here)
-    nV2 = nV + coin
+    nV2 = nV + coin                                          # C1 (values >= 0, so unsigned compare == signed)
     core_rej = And(bad == 0, Or(UGT(coin, lim), UGT(nV2, lim)))
     bad2 = If(Or(bad == 1, core_rej), BitVecVal(1, 1), BitVecVal(0, 1))
     p2 = p + coin                                            # tx_verify.c accumulator
-    P2 = P + BV2Int(coin)
-    G = And(BV2Int(p2) == P2, (bad2 == 1) == (P2 > MAX), Implies(bad2 == 0, BV2Int(nV2) == P2))
+    P2 = P + Z(coin)
+    G = And(Z(p2) == P2, (bad2 == 1) == UGT(P2, zv(MAX)), Implies(bad2 == 0, Z(nV2) == P2))
     return A, G
 
 
@@ -90,36 +104,35 @@ def tx_step(mut=None):
     fb = BitVec("fees_bmc", W); fc = BitVec("nFees_core", W)
     S = BitVec("in_sum", W); out = BitVec("value_out", W)
     A = [ULE(fb, bv(MAX)), fb == fc, ULE(out, bv(MAX))]     # relation + M1
-    # bmc B1..B4 (u64)
     lim = bv(MAX)
-    b1 = UGT(S, lim)
-    b2 = ULT(S, out) if mut != "belowout-le" else ULE(S, out)
-    fb2 = fb + (S - out)
-    b4 = UGT(fb2, lim) if mut != "fee-limit" else UGT(fb2, bv(MAX + 1))
+    b1 = UGT(S, lim)                                         # B1
     if mut == "no-b1":
-        b1 = BitVecVal(0, 1) == 1
+        b1 = False
+    b2 = ULT(S, out) if mut != "belowout-le" else ULE(S, out)   # B2
+    fb2 = fb + (S - out)                                     # B3
+    b4 = UGT(fb2, lim) if mut != "fee-limit" else UGT(fb2, bv(MAX + 1))   # B4
     bmc_rej = Or(b1, b2, b4)
-    # Core C1 verdict from IN-STEP (S == true sum, S <= MAX iff accepted), C2..C4 on int64
-    from z3 import BV2Int as I
-    c1 = I(S) > MAX
-    c2 = I(S) < I(out)
-    fee = I(S) - I(out)
-    c3 = Or(fee < 0, fee > MAX)
-    nf = I(fc) + fee
-    c4 = Or(nf < 0, nf > MAX)
-    core_rej = Or(c1, c2, c3, c4)
-    G = And(bmc_rej == core_rej, Implies(Not(core_rej), And(I(fb2) == nf, nf >= 0, nf <= MAX)))
+    # Core on exact integers (signed int64 values are all in [0, 2^63) here
+    # except where noted): C1 verdict from IN-STEP, C2, C3, C4.
+    c1 = UGT(Z(S), zv(MAX))
+    c2 = ULT(Z(S), Z(out))
+    fee = Z(S) - Z(out)                                      # only used when not c2: >= 0
+    c3 = UGT(fee, zv(MAX))
+    nf = Z(fc) + fee
+    c4 = UGT(nf, zv(MAX))
+    core_rej = Or(c1, c2, And(Not(c2), c3), And(Not(c2), c4))
+    G = And(bmc_rej == core_rej, Implies(Not(core_rej), And(Z(fb2) == nf, ULE(nf, zv(MAX)))))
     return A, G
 
 
 def cb_cap(mut=None):
     fees = BitVec("fees", W); sub = BitVec("subsidy", W); cb = BitVec("cb_out", W)
     A = [ULE(fees, bv(MAX)), ULE(sub, bv(5000000000)), ULE(cb, bv(MAX))]
-    cap = sub + fees
-    bmc_rej = UGT(cb, cap) if mut != "cb-ge" else ULE(cb, cap)
-    from z3 import BV2Int as I
-    core_rej = I(cb) > I(fees) + I(sub)
-    G = And(bmc_rej == core_rej, I(cap) == I(fees) + I(sub), I(fees) + I(sub) < 2**63)
+    cap = sub + fees                                         # B5, u64
+    bmc_rej = UGT(cb, cap) if mut != "cb-ge" else UGE(cb, cap)
+    true = Z(fees) + Z(sub)                                  # C5, exact
+    core_rej = UGT(Z(cb), true)
+    G = And(bmc_rej == core_rej, Z(cap) == true, ULT(true, zv(2**63)))
     return A, G
 
 

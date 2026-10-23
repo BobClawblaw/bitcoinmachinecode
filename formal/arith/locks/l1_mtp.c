@@ -12,10 +12,17 @@
  * sort algorithm). Comparison is in int64 on Core's side (GetBlockTime()
  * widens the uint32 nTime), u32 on bmc's -- the same order for these values.
  *
- * COMPLETE for the window: every height h >= 0 (so n = min(11, h+1),
- * including the short chains near genesis), every 32-bit time. The only
- * loops are the 11-entry window and the insertion sort (unwind 12, with
- * unwinding assertions). */
+ * Coverage: every height h >= 0 (so n = min(11, h+1), including the short
+ * chains near genesis). run.sh runs one window size per CBMC call (-DWIN).
+ * For WIN <= 8 every 32-bit time is free. For WIN 9..11 full width did not
+ * close in 500 s, so those runs take -DRANKS: times in [0, 15]. That is
+ * complete by order-isomorphism: val_mtp only copies times and compares
+ * them with `>` (no arithmetic on them; read the 20-line function), so its
+ * output on any input x is g(output on rank(x)) for the order embedding g
+ * from ranks back to x; 16 values hold the ranks of 11 times; and the Core
+ * spec (order statistic) commutes with g the same way. The only loops are
+ * the 11-entry window and the insertion sort (unwind 12, with unwinding
+ * assertions). */
 #include <stdint.h>
 #include <string.h>
 #include "../lib/nondet.h"
@@ -38,8 +45,16 @@ static int powr_hdr_from_store(void* ctx, long k, u8 hdr[80]){
 int main(void){
     g_h = nondet_long();
     ASSUME(g_h >= 0 && g_h <= 0x7fffffffL);          /* Core's int nHeight */
-    for (int i = 0; i < 11; i++) g_t[i] = nondet_u32();
+    for (int i = 0; i < 11; i++){
+        g_t[i] = nondet_u32();
+#ifdef RANKS
+        ASSUME(g_t[i] < 16);   /* order-isomorphic representatives, see header */
+#endif
+    }
     int n = g_h + 1 < 11 ? (int)(g_h + 1) : 11;     /* Core: i < 11 && pindex */
+#ifdef WIN
+    ASSUME(n == WIN);    /* one window size per run: run.sh covers WIN = 1..11 */
+#endif
 
     u32 r = 0;
     int ok = val_mtp(g_h, &r);
