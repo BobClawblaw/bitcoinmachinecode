@@ -3935,6 +3935,20 @@ long utxo_live_catchup_bounded(void* store_buf, long max_ms, int stop_at_hole){
  * consensus failure -- it is a not-ready archive -- so it stops the pass like
  * a hole and the next pass retries. One pread of a cached page per block. */
 #define UTXO_ARCH_RETRY 4       /* fresh re-reads of one height before the pass gives up */
+/* P2P-1 (audit 2026-10-23): a mismatch that outlives the re-reads pass after
+ * pass is not a stale reader. A writer that filed one block's body under
+ * another block's hash (the keep-up pass did, until that fix) leaves an
+ * archive this loop can never get past: it stopped at that height, "it
+ * retries", forever, across restarts -- index.dat is durable. After
+ * UTXO_ARCH_STUCK_PASSES passes giving up at the same height, the bytes are
+ * dropped the way a MUTATED block's are (the mutated hook: the archive back
+ * to h-1, nothing marked, the delivering peer scored) so the next fetch
+ * delivers the block the headers name. */
+#define UTXO_ARCH_STUCK_PASSES 3
+static long g_arch_stuck_h = -1;
+static int  g_arch_stuck_passes = 0;
+static unsigned long long g_arch_dropped = 0;
+unsigned long long utxo_live_archive_mismatch_drops(void){ return g_arch_dropped; }
 static unsigned long long g_arch_mismatch = 0;
 unsigned long long utxo_live_archive_mismatches(void){ return g_arch_mismatch; }
 /* Opened per call, NOT cached in a static: a cached descriptor outlives the
@@ -4055,6 +4069,20 @@ static long catchup_run(void* store_buf, long max_ms, int stop_at_hole){
                       h--;                            /* re-read this height with fresh handles */
                       continue;
                   }
+                  if (h == g_arch_stuck_h) g_arch_stuck_passes++; else { g_arch_stuck_h = h; g_arch_stuck_passes = 1; }
+                  if (g_arch_stuck_passes >= UTXO_ARCH_STUCK_PASSES && g_mutated_fn && !g_halted){
+                      fprintf(stderr, "[utxo_live] archive body at height %ld is not the block its index records, across %d passes "
+                                      "of fresh re-reads: dropping it (the archive back to %ld, nothing marked) so the next fetch "
+                                      "delivers the block the headers name (mismatch #%llu)\n",
+                              h, g_arch_stuck_passes, h - 1, (unsigned long long)g_arch_mismatch);
+                      g_arch_stuck_h = -1; g_arch_stuck_passes = 0;
+                      if (g_mutated_fn(store_buf, h, want32, "archive body is not the block its index records") == 1){
+                          g_arch_dropped++;
+                          g_last_stop_reason = UTXO_STOP_FAIL;
+                          store_reload(store_buf);          /* the archive was truncated to h-1 under us */
+                          break;
+                      }
+                  }
                   fprintf(stderr, "[utxo_live] archive not ready at height %ld after %d fresh re-reads: the body is not the "
                                   "block the index records -- stopping this pass, it retries (mismatch #%llu)\n",
                           h, UTXO_ARCH_RETRY, (unsigned long long)g_arch_mismatch);
@@ -4062,6 +4090,7 @@ static long catchup_run(void* store_buf, long max_ms, int stop_at_hole){
                   break;
               }
               arch_retry = 0;
+              if (h == g_arch_stuck_h){ g_arch_stuck_h = -1; g_arch_stuck_passes = 0; }
           } }
         if (!apply_block_at(blockbuf, (u64)len, h)) {
             /* a MUTATED block (Core BLOCK_MUTATED): the bytes are dropped and
