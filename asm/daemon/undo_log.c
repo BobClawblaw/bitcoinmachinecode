@@ -44,6 +44,8 @@ typedef unsigned long long u64;
 static int  g_undo_fd = -1;          /* the current rev file, O_APPEND */
 static long g_undo_fd_height = -1;   /* the height whose run is being written */
 static unsigned g_undo_file = 0;     /* its file number */
+/* ST2-4: the rev files written since the last undo_sync (lo > hi: none) */
+static unsigned g_undo_dirty_lo = 1, g_undo_dirty_hi = 0;
 void undo_close_current(void){
     if (g_undo_fd >= 0) close(g_undo_fd);
     g_undo_fd = -1; g_undo_fd_height = -1;
@@ -77,7 +79,43 @@ static int undo_fd_for(long height){
     int fd = open(name, O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (fd < 0) return -1;
     g_undo_fd = fd; g_undo_fd_height = height; g_undo_file = file;
+    if (g_undo_dirty_lo > g_undo_dirty_hi){ g_undo_dirty_lo = g_undo_dirty_hi = file; }
+    else { if (file < g_undo_dirty_lo) g_undo_dirty_lo = file; if (file > g_undo_dirty_hi) g_undo_dirty_hi = file; }
     return fd;
+}
+
+/* ST2-4 (audit 2026-10-23): make the undo store durable. The checkpoint
+ * (utxo_live.c persist_applied_height) fsyncs the WAL and then records the
+ * applied height; the undo runs and their undo.idx slots were never synced
+ * at all, so a power loss could keep WAL ops (the spends) whose undo was
+ * lost -- and the ghost guard, which finds an unconfirmed block only through
+ * undo_exists(h), would then not see it, and a reorg could not disconnect a
+ * checkpointed block. Called by the checkpoint BEFORE its WAL fsync: every
+ * rev file written since the last call (one, or two across a rotation), then
+ * undo.idx. 0 ok (also: no undo store yet), -1 an fdatasync failed. */
+long undo_sync(void){
+    if (g_undo_dirty_lo <= g_undo_dirty_hi){
+        for (unsigned f = g_undo_dirty_lo; ; f++){
+            char name[32]; us_rev_name(name, f);
+            int fd = (f == g_undo_file && g_undo_fd >= 0) ? g_undo_fd : open(name, O_RDONLY | O_CLOEXEC);
+            if (fd >= 0){
+                int r = fdatasync(fd);
+                if (fd != g_undo_fd) close(fd);
+                if (r != 0) return -1;
+            }
+            if (f == g_undo_dirty_hi) break;
+        }
+    }
+    int ifd = open(UNDO_IDX_FILE, O_RDONLY | O_CLOEXEC);
+    if (ifd >= 0){
+        int r = fdatasync(ifd);
+        close(ifd);
+        if (r != 0) return -1;
+    }
+    /* the file still being appended to stays dirty for the next call */
+    if (g_undo_fd >= 0){ g_undo_dirty_lo = g_undo_dirty_hi = g_undo_file; }
+    else { g_undo_dirty_lo = 1; g_undo_dirty_hi = 0; }
+    return 0;
 }
 int undo_exists(long height){ return us_exists(height); }
 /* close block `height`'s run with the END marker (creating the run if the
