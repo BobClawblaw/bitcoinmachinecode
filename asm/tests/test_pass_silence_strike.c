@@ -19,6 +19,11 @@
  * socket down) -- so a probe does not start while no leg has heard anything
  * for PROBE_SILENCE_MS (300 ms here). reorg_probe_host_silent is the gate.
  *
+ * 7./8. (P2P-1/2/3, audit 2026-10-23): a pass that failed on the peer's
+ * misbehaviour (where=12 an invalid header, where=14 bogus compact-block
+ * indexes) scores it and closes the leg at once, and a pushed cmpctblock
+ * whose header has no PoW is refused, and scored, before any reconstruction.
+ *
  * pass_fail_bookkeeping lives beside main(), so this includes that TU
  * (renaming its main), as tests/test_dial_budget.c does.
  */
@@ -132,6 +137,52 @@ int main(void){
     ck("probe gate: one leg just received data -> the probe may run", reorg_probe_host_silent() == 0);
     leg_shut(0); leg_shut(1); leg_shut(2);
     ck("probe gate: no legs at all -> not 'silent' (nothing to judge by)", reorg_probe_host_silent() == 0);
+
+    /* ---- 7. P2P-1/P2P-3 (2026-10-23): a pass that failed on the peer's
+     * misbehaviour -- a header Core refuses (where=12) or bogus compact-block
+     * indexes (where=14) -- scores the peer and closes the leg at once, as
+     * Core's Misbehaving disconnects; not a strike out of three ---- */
+    g_node_status = calloc(1, sizeof *g_node_status);
+    if (!g_node_status){ perror("calloc"); return 2; }
+    mux_n_out = 2;
+    leg_open(0, "198.51.100.20:8333"); leg_open(1, "198.51.100.21:8333");
+    pass_fail_bookkeeping(0, 0, 12, 0.3);
+    ck("where=12 (an invalid header): ONE pass closes the leg", mux_out_fd[0] < 0);
+    ck("...and the peer is scored to a ban (Core: Misbehaving)", ctl_is_banned("198.51.100.20") == 1);
+    leg_shut(0);
+    leg_open(0, "198.51.100.22:8333");
+    pass_fail_bookkeeping(0, 0, 14, 0.3);
+    ck("where=14 (an invalid compact block): ONE pass closes the leg", mux_out_fd[0] < 0);
+    ck("...and the peer is scored to a ban", ctl_is_banned("198.51.100.22") == 1);
+    leg_shut(0);
+    /* where=11 (only blocks we did not ask for) and 13 (time-too-new) are not
+     * misbehaviour: an ordinary strike, nobody scored */
+    leg_open(0, "198.51.100.23:8333");
+    if (write(srv_fd[1], "q", 1) != 1){ perror("write"); return 2; }
+    nap_ms(20);
+    pass_fail_bookkeeping(0, 0, 11, 0.3); pass_fail_bookkeeping(0, 0, 13, 0.3);
+    ck("where=11 and where=13: the leg stays, two strikes", mux_out_fd[0] >= 0 && g_sync_fail_streak[0] == 2);
+    ck("...and nobody is banned", ctl_is_banned("198.51.100.23") == 0);
+    leg_shut(0); leg_shut(1);
+
+    /* ---- 8. P2P-2: an unsolicited cmpctblock whose header has no PoW is
+     * refused before any reconstruction, and the peer scored (Core:
+     * CheckBlockHeader high-hash -> BLOCK_INVALID_HEADER -> Misbehaving) ---- */
+    mux_n_out = 1;
+    leg_open(0, "198.51.100.24:8333");
+    { unsigned char pl[90]; memset(pl, 0, sizeof pl);
+      pl[0] = 0x20;                                                  /* version */
+      pl[72] = 0xff; pl[73] = 0xff; pl[74] = 0x00; pl[75] = 0x1d;    /* nBits 0x1d00ffff: difficulty 1 */
+      unsigned nonce = 0;                                            /* a nonce that misses the target */
+      for (;; nonce++){ memcpy(pl + 76, &nonce, 4); if (!pow_check(pl)) break; }
+      unsigned long r0, n0, f0; cmpct_recv_stats(&r0, &n0, &f0);
+      long rc = leg_on_cmpctblock(mux_out_fd[0], pl, sizeof pl);
+      unsigned long r1, n1, f1; cmpct_recv_stats(&r1, &n1, &f1);
+      ck("a high-hash compact block header: refused (-1)", rc == -1);
+      ck("...before the reconstruction (nothing assembled, requested or fallen back)", r1 == r0 && n1 == n0 && f1 == f0 && !g_push_pending);
+      ck("...and the peer is scored to a ban", ctl_is_banned("198.51.100.24") == 1); }
+    leg_shut(0);
+    free(g_node_status); g_node_status = NULL;
 
     close(g_lfd);
     printf("\n%s (%d checks, %d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", checks, fails);

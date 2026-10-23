@@ -65,7 +65,7 @@ int main(void){
     ok(n == 0 && writes == 1 && !strcmp(cap_cmd, "getblocktxn"), "pending: one getblocktxn sent");
     ok(cap_n == 32 + 1 + 2 && !memcmp(cap, bh, 32) && cap[32] == 2 && cap[33] == 2 && cap[34] == 1, "getblocktxn: blockhash, count 2, differential indexes [2, +1 -> 4]");
     { const unsigned char* txs[2] = { tx[2], tx[4] }; long lens[2] = { (long)tl[2], (long)tl[4] }; static unsigned char bt[8192]; long btl = p2p_blocktxn_build(bt, bh, txs, lens, 2);
-      writes = 0; n = cmpct_recv_blocktxn(9, bt, (unsigned long)btl, out, sizeof out);
+      writes = 0; n = cmpct_recv_blocktxn(9, bt, (unsigned long)btl, out, sizeof out, bh);
       ok(n == (long)bo && !memcmp(out, blk, bo) && writes == 0, "blocktxn fills the two gaps: block byte-identical, nothing more sent"); }
     printf("== row 5 (2026-09-10): the block's accounting and the classifier ==\n");
     { extern void cmpct_recv_last_block(unsigned long*, unsigned long*, unsigned long*, unsigned long*, unsigned long*, unsigned long cls[5]);
@@ -76,7 +76,7 @@ int main(void){
       cmpct_recv_set_classifier(cls_stub);
       writes = 0; cmpct_recv_cmpctblock(9, mp, cb, (unsigned long)cl, out, sizeof out, bh);
       { const unsigned char* txs2[2] = { tx[2], tx[4] }; long lens2[2] = { (long)tl[2], (long)tl[4] }; static unsigned char bt2[8192]; long btl2 = p2p_blocktxn_build(bt2, bh, txs2, lens2, 2);
-        n = cmpct_recv_blocktxn(9, bt2, (unsigned long)btl2, out, sizeof out); }
+        n = cmpct_recv_blocktxn(9, bt2, (unsigned long)btl2, out, sizeof out, bh); }
       cmpct_recv_last_block(&ntx_, &pool_, &pre_, &miss_, &mb_, cls_);
       ok(n > 0 && cls_stub_calls == 2 && cls_[1] == 2 && cls_[0] == 0, "with a classifier: called once per fetched tx, and their class is counted (2 announced)");
       cmpct_recv_set_classifier(0); }
@@ -86,7 +86,7 @@ int main(void){
     { unsigned char cb2[8192]; memcpy(cb2, cb, (size_t)cl); cb2[cl-1] ^= 0xff;   /* corrupt the coinbase's last byte: tx_parse still ok? we corrupt the prefilled count instead */
       writes = 0; cmpct_recv_cmpctblock(9, mp, cb, (unsigned long)cl, out, sizeof out, bh);   /* re-arm state (2 missing) */
       unsigned char bt[64]; memcpy(bt, bh, 32); bt[32] = 1;   /* wrong count */
-      writes = 0; n = cmpct_recv_blocktxn(9, bt, 33, out, sizeof out); ok(n == 0 && writes == 1 && !strcmp(cap_cmd, "getdata"), "a blocktxn with the wrong count falls back to a full getdata"); }
+      writes = 0; n = cmpct_recv_blocktxn(9, bt, 33, out, sizeof out, bh); ok(n == 0 && writes == 1 && !strcmp(cap_cmd, "getdata"), "a blocktxn with the wrong count falls back to a full getdata"); }
     unsigned long r, need, fb; cmpct_recv_stats(&r, &need, &fb); ok(r == 3 && need >= 3 && fb == 2, "stats: 3 reconstructed (the row 5 scenario reconstructed once more), getblocktxn needed, 2 fallbacks");
     printf("== a reconstruction that is not the block: the witness commitment (Core FillBlock -> CheckBlock; mainnet 968824, 2026-09-27) ==\n");
     { extern void merkle_root(unsigned char out[32], unsigned char* hashes, unsigned long n);
@@ -132,7 +132,7 @@ int main(void){
       writes = 0; n = cmpct_recv_cmpctblock(9, mp2, cb3, (unsigned long)cl3, out2, sizeof out2, bh2);
       ok(n == 0 && writes == 1 && !strcmp(cap_cmd, "getblocktxn"), "with t1 missing: getblocktxn first");
       { const unsigned char* txs[1] = { t1 }; long lens[1] = { (long)t1l }; static unsigned char bt[8192]; long btl = p2p_blocktxn_build(bt, bh2, txs, lens, 1);
-        writes = 0; n = cmpct_recv_blocktxn(9, bt, (unsigned long)btl, out2, sizeof out2);
+        writes = 0; n = cmpct_recv_blocktxn(9, bt, (unsigned long)btl, out2, sizeof out2, bh2);
         ok(n == 0 && writes == 1 && !strcmp(cap_cmd, "getdata") && cap[4] == 0x40, "the blocktxn completes a mutated block: not returned, the full block requested"); }
       free(mp2); }
     printf("== the inventory type we request with ==\n");
@@ -209,6 +209,47 @@ int main(void){
       ok(b.n == 0 && b.writes == 1 && !strcmp(b.cmd, "getblocktxn") && b.msg_n == 34 && b.msg[32] == 1 && b.msg[33] == 2, "tx 2 is treated as missing: getblocktxn for index 2 alone");
       ok(run_same(&a, &b), "the memset build says the same");
       free(p); }
+    printf("== P2P-1 (2026-10-23): a blocktxn completes only the reconstruction its caller is waiting for ==\n");
+    { unsigned char id[32]; sha256d(id, tx[2], tl[2]); mpool_del(mp, id); sha256d(id, tx[4], tl[4]); mpool_del(mp, id); }   /* tx2 and tx4 missing */
+      writes = 0; n = cmpct_recv_cmpctblock(9, mp, cb, (unsigned long)cl, out, sizeof out, bh);
+      ok(n == 0 && !strcmp(cap_cmd, "getblocktxn"), "a reconstruction of block bh is pending (getblocktxn sent)");
+      { const unsigned char* txs[2] = { tx[2], tx[4] }; long lens[2] = { (long)tl[2], (long)tl[4] }; static unsigned char bt[8192]; long btl = p2p_blocktxn_build(bt, bh, txs, lens, 2);
+        unsigned char other_want[32]; memset(other_want, 0x5c, 32);
+        writes = 0; n = cmpct_recv_blocktxn(9, bt, (unsigned long)btl, out, sizeof out, other_want);
+        ok(n == -1 && writes == 0, "a caller waiting for another block: the pending one is NOT completed under its name (-1, nothing sent)");
+        writes = 0; n = cmpct_recv_blocktxn(9, bt, (unsigned long)btl, out, sizeof out, bh);
+        ok(n == (long)bo && !memcmp(out, blk, bo), "...and the caller waiting for bh still gets it"); }
+    printf("== P2P-3 (2026-10-23): Core's index rules for a cmpctblock ==\n");
+    { static unsigned char pc[8192]; unsigned long po;
+      /* header || nonce || nshort || short ids || npre || (index, tx)... */
+      #define PC_HEAD() do{ memcpy(pc, blk, 80); memset(pc + 80, 0x33, 8); po = 88; }while(0)
+      #define PC_SID(v) do{ for (int q_ = 0; q_ < 6; q_++) pc[po++] = (unsigned char)((v) >> (8*q_)); }while(0)
+      #define PC_CS9(v) do{ unsigned long long v_ = (v); pc[po++] = 0xff; for (int q_ = 0; q_ < 8; q_++) pc[po++] = (unsigned char)(v_ >> (8*q_)); }while(0)
+      #define PC_TX(i) do{ memcpy(pc + po, tx[i], tl[i]); po += tl[i]; }while(0)
+      PC_HEAD(); pc[po++] = 0; pc[po++] = 0;
+      writes = 0; n = cmpct_recv_cmpctblock(9, mp, pc, po, out, sizeof out, bh);
+      ok(n == CMPCT_INVALID && writes == 0, "no short ids and no prefilled: READ_STATUS_INVALID (-2, score), nothing sent");
+      PC_HEAD(); pc[po++] = 2; PC_SID(0x111111); PC_SID(0x222222); pc[po++] = 1; pc[po++] = 3; PC_TX(1);
+      writes = 0; n = cmpct_recv_cmpctblock(9, mp, pc, po, out, sizeof out, bh);
+      ok(n == CMPCT_INVALID && writes == 0, "a prefilled index past every position the short ids can fill (3 > 2 + 0): INVALID, not a full-block fallback");
+      PC_HEAD(); pc[po++] = 1; PC_SID(0x111111); pc[po++] = 2; pc[po++] = 0; PC_TX(1); pc[po++] = 2; PC_TX(3);
+      writes = 0; n = cmpct_recv_cmpctblock(9, mp, pc, po, out, sizeof out, bh);
+      ok(n == CMPCT_INVALID && writes == 0, "the second prefilled past the end (0, then +3 -> 3 > 1 + 1): INVALID");
+      PC_HEAD(); pc[po++] = 1; PC_SID(0x111111); pc[po++] = 2; pc[po++] = 1; PC_TX(1); PC_CS9(0xfffffffffffffffeULL); PC_TX(3);
+      writes = 0; n = cmpct_recv_cmpctblock(9, mp, pc, po, out, sizeof out, bh);
+      ok(n == 0 && writes == 1 && !strcmp(cap_cmd, "getdata") && cap[4] == 0x40,
+         "a differential index over 16 bits (it wrapped the running index onto slot 0): does not deserialize -- the full block, never a getblocktxn");
+      PC_HEAD(); PC_CS9(0x2aaaaaaaaaaaaaabULL); PC_SID(0x111111); pc[po++] = 1; pc[po++] = 0; PC_TX(1);
+      writes = 0; n = cmpct_recv_cmpctblock(9, mp, pc, po, out, sizeof out, bh);
+      ok(n == 0 && writes == 1 && !strcmp(cap_cmd, "getdata"), "a short-id count whose x6 wraps to 2: refused before the multiply (the full block)");
+      PC_HEAD(); pc[po++] = 2; PC_SID(0x111111); PC_SID(0x222222); pc[po++] = 1; pc[po++] = 2; PC_TX(1);
+      writes = 0; n = cmpct_recv_cmpctblock(9, mp, pc, po, out, sizeof out, bh);
+      ok(n == 0 && writes == 1 && !strcmp(cap_cmd, "getblocktxn"), "control: a prefilled index at the last position (2 <= 2 + 0) is valid -- the short ids are fetched");
+      #undef PC_HEAD
+      #undef PC_SID
+      #undef PC_CS9
+      #undef PC_TX
+    }
     printf("== negative control: receive disabled (the pre-CC-2 node) ==\n");
     cmpct_recv_set_enabled(0); writes = 0;
     ok(cmpct_getdata_type(1) == 0x40000002u, "control: every block is requested in full");

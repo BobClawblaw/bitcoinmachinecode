@@ -104,40 +104,82 @@ static int sv_mtp(void* st, long h, unsigned int* out){
     return 1;
 }
 
+/* The contextual rules for a header at our tip + 1 (Core
+ * ContextualCheckBlockHeader): 1 accept, 0 reject with *reason set to Core's
+ * string, or "mtp-unreadable" when our own archive could not supply the
+ * median-time-past window. Unarmed: 1, so every hermetic suite behaves
+ * exactly as before. */
+static int ctx_check(void* st, const unsigned char* hdr80, long* height_out, const char** reason){
+    *reason = "?";
+    long tip = (long)*(int*)((char*)st + 24);   /* the tip height, read the way daemon/reorg.c's store_tip does */
+    long height = tip + 1;
+    *height_out = height;
+    if (!g_sv_rules_on || height < 1) return 1;  /* unarmed, or an empty store: this is the first block */
+    if (pow_check_bits(height, hdr80, sv_hdr_at, st,
+                       g_sv_no_rt, g_sv_mindiff, g_sv_bip94, g_sv_lim) != 1){
+        *reason = "bad-diffbits"; return 0; }
+    unsigned int mtp = 0;
+    if (!sv_mtp(st, tip, &mtp)){ *reason = "mtp-unreadable"; return 0; }
+    unsigned char bh[32]; memset(bh, 0, 32);
+    unsigned long long flags = script_flags_for_block((unsigned long long)height, bh);
+    return hdr_contextual_ok(height, hdr80, (unsigned long)mtp, (long)time(0),
+                             flags, g_sv_bip34_h, reason);
+}
+
 /* serve_block_ctx_ok(st, hdr80) -> 1 accept / 0 reject.
  * Called from bitcoin_serve.asm once the block is known to extend our tip,
  * so its height is the tip's + 1. Returns 1 unchanged when the rules are not
  * armed, so every hermetic serve suite behaves exactly as before. */
 int serve_block_ctx_ok(void* st, const unsigned char* hdr80){
     if (!g_sv_rules_on || !st) return 1;
-    /* the tip height, read the way daemon/reorg.c's store_tip does */
-    long tip = (long)*(int*)((char*)st + 24);
-    long height = tip + 1;
-    if (height < 1) return 1;            /* empty store: this is the first block */
-
-    int pr = pow_check_bits(height, hdr80, sv_hdr_at, st,
-                            g_sv_no_rt, g_sv_mindiff, g_sv_bip94, g_sv_lim);
-    if (pr != 1){
-        fprintf(stderr, "[serve] inbound block at height %ld REJECTED: bad-diffbits "
-                        "(not appended)\n", height);
-        return 0;
-    }
-
-    unsigned int mtp = 0;
-    if (!sv_mtp(st, tip, &mtp)){
+    long height; const char* reason;
+    if (ctx_check(st, hdr80, &height, &reason)) return 1;
+    if (!strcmp(reason, "mtp-unreadable"))
         fprintf(stderr, "[serve] inbound block at height %ld REJECTED: median-time-past "
                         "window unreadable (not appended)\n", height);
-        return 0;
-    }
-
-    unsigned char bh[32]; memset(bh, 0, 32);
-    unsigned long long flags = script_flags_for_block((unsigned long long)height, bh);
-    const char* reason = "?";
-    if (!hdr_contextual_ok(height, hdr80, (unsigned long)mtp, (long)time(0),
-                           flags, g_sv_bip34_h, &reason)){
+    else
         fprintf(stderr, "[serve] inbound block at height %ld REJECTED: %s (not appended)\n",
                 height, reason);
-        return 0;
+    return 0;
+}
+
+/* P2P-1 / P2P-2 (audit 2026-10-23): Core's header acceptance -- CheckBlockHeader
+ * (PoW against the header's own nBits) and ContextualCheckBlockHeader -- for a
+ * header offered at our tip + 1 by an outbound leg: the keep-up pass's block
+ * before it is appended (bitcoind.asm node_sync_multi, through
+ * g_block_ctx_hook), and a pushed cmpctblock before any reconstruction work.
+ *
+ *   HDR_ACCEPT (1)       accept
+ *   HDR_PUNISH (12)      a header Core refuses as BLOCK_INVALID_HEADER --
+ *                        high-hash, bad-diffbits, time-too-old, bad-version:
+ *                        Core's MaybePunishNodeForBlock calls Misbehaving
+ *   HDR_REFUSE (13)      refused, but not the peer's fault: time-too-new
+ *                        (BLOCK_TIME_FUTURE, never punished) or our own
+ *                        archive could not supply the context
+ *
+ * The values are node_sync_multi's fail codes (where=12 / where=13), so the
+ * pass's bookkeeping can tell them apart. A header whose parent is not our
+ * tip has no context here; it is accepted, and idxscan_append_locked refuses
+ * it as not-tip-linked. */
+int hdr_accept_check(void* st, const unsigned char* hdr80){
+    extern int pow_check(const unsigned char hdr[80]);
+    if (!st || !hdr80) return 13;
+    if (!pow_check(hdr80)){
+        fprintf(stderr, "[sync] header refused: high-hash (its PoW does not meet its own nBits)\n");
+        return 12;
     }
-    return 1;
+    long tip = (long)*(int*)((char*)st + 24);
+    if (tip >= 0){
+        u8 tiphdr[80], tiph[32];
+        extern void block_hash(unsigned char out[32], const unsigned char hdr[80]);
+        if (!sv_hdr_at(st, tip, tiphdr)) return 13;
+        block_hash(tiph, tiphdr);
+        if (memcmp(hdr80 + 4, tiph, 32) != 0) return 1;
+    }
+    long height; const char* reason;
+    if (ctx_check(st, hdr80, &height, &reason)) return 1;
+    int punish = strcmp(reason, "time-too-new") != 0 && strcmp(reason, "mtp-unreadable") != 0;
+    fprintf(stderr, "[sync] header for height %ld refused: %s%s\n", height, reason,
+            punish ? " (Core: an invalid header, the peer is misbehaving)" : " (not the peer's fault: no score)");
+    return punish ? 12 : 13;
 }
