@@ -100,7 +100,11 @@ DEL_SIZE  equ 44              ; DEL record fully fixed size (unchanged -- DEL
 IDX_HDR   equ 20              ; utxo.idx header: magic(4)+log_off(8)+n(8)
 
 logname: db "utxo.dat",0
-WALBUF_CAP equ 1048576
+; 32 MB since STO-A (2026-10-23): every drain is preceded by the durable
+; prefix (utxo_live.c: archive + undo fdatasyncs), so the buffer size is the
+; prefix rate. At 1 MB a late-chain block (0.5-1 MB of WAL) drained once a
+; block; at 32 MB a drain carries tens of blocks (bench_utxo_apply_sync).
+WALBUF_CAP equ 33554432
 idxname: db "utxo.idx",0
 idxtmp:  db "utxo.idx.tmp",0   ; the checkpoint is written here and renamed over utxo.idx (2026-09-01)
 
@@ -183,13 +187,14 @@ mac_read_exact:
 ;   path roughly in half (this was a measured bottleneck: ~2 syscalls per
 ;   utxo_store_put, up to 3.78B times across a full-archive replay).
 ; ============================================================================
-;   BUFFERED (2026-09-01): records are appended to a 1 MB process-wide
-;   buffer (wal_buf) and land in the file in one write(2) per drain -- the
+;   BUFFERED (2026-09-01): records are appended to a process-wide buffer
+;   (wal_buf, WALBUF_CAP) and land in the file in one write(2) per drain -- the
 ;   per-record write() was ~6% of the live replay's CPU (mac_wr_log + the
 ;   kernel's write path). log_len is the LOGICAL length (file + buffered
 ;   bytes) at all times -- the lesson of the same day's sparse-offset bug.
-;   Drains: utxo_store_wal_drain (exported; the apply loop calls it after
-;   every block), and implicitly before a checkpoint (utxo_store_sync), a
+;   Drains: utxo_store_wal_drain (exported; utxo_live's checkpoint and undo
+;   discard call it -- the per-block call is gone since STO-A, 2026-10-23),
+;   a full buffer, and implicitly before a checkpoint (utxo_store_sync), a
 ;   reload (which measures the file), a flush (which truncates the file),
 ;   a close, and whenever a DIFFERENT store's fd wants the buffer. A crash
 ;   can therefore lose only the not-yet-drained SUFFIX of the op stream --
@@ -233,6 +238,10 @@ mac_wr_log:
     test rax, rax
     jnz  .wf
     mov  rdi, [r12]
+    call mac_wal_predrain            ; these bytes reach the file now: the same pre-drain step first
+    test rax, rax
+    jnz  .wf
+    mov  rdi, [r12]
     mov  rsi, r13
     mov  rdx, r14
     mov  eax, 1            ; write
@@ -249,8 +258,22 @@ mac_wr_log:
 ; mac_wal_drain_fd(fd=rdi) -> rax 0 / -1: write every buffered byte to fd.
 ; Loops over short writes; on an error the unwritten tail is moved to the
 ; front of the buffer so a retry writes exactly the bytes that never landed.
-; Clobbers rax rcx rdx rsi rdi r8-r11 only.
+; Clobbers rax rcx rdx rsi rdi r8-r11 (and, through the pre-drain hook, the
+; SSE registers, as any C call does) only.
+;
+; STO-A (formal/storage, 2026-10-23): with bytes pending, the pre-drain hook
+; runs first and the drain fails without writing if it fails. Once write(2)
+; returns, the kernel may put these bytes on the disk at any moment, before
+; or after anything else in the page cache; the hook (utxo_live.c's
+; live_durable_prefix) is where the undo and the archive records the bytes
+; depend on are made durable first, in Core's FlushStateToDisk order.
 mac_wal_drain_fd:
+    cmp  qword [rel wal_fill], 0
+    je   .wd_go
+    call mac_wal_predrain            ; preserves rdi
+    test rax, rax
+    jnz  .wd_hookfail
+.wd_go:
     mov  r8, rdi
     lea  r9, [rel wal_buf]
     mov  r10, [rel wal_fill]
@@ -279,9 +302,59 @@ mac_wal_drain_fd:
     mov  [rel wal_fill], r10
     mov  rax, -1
     ret
+.wd_hookfail:
+    mov  rax, -1
+    ret
 mac_wal_drain_fd_pending:            ; drain to whichever fd owns the pending bytes
     mov  rdi, [rel wal_fd]
     jmp  mac_wal_drain_fd
+
+; mac_wal_predrain() -> rax 0 / -1: call the pre-drain hook (C, SysV) if one
+; is set. Preserves rdi; clobbers what a C call clobbers. Not reentrant: a
+; drain from inside the hook (the hook never writes the WAL) skips it.
+mac_wal_predrain:
+    mov  rax, [rel wal_predrain_hook]
+    test rax, rax
+    jz   .pd_none
+    cmp  qword [rel wal_in_predrain], 0
+    jne  .pd_none
+    push rbp
+    mov  rbp, rsp
+    push rdi
+    and  rsp, -16                    ; the callers' stack parity varies: align for C
+    mov  qword [rel wal_in_predrain], 1
+    call rax
+    mov  qword [rel wal_in_predrain], 0
+    mov  rdi, [rbp-8]
+    mov  rsp, rbp
+    pop  rbp
+    test rax, rax
+    jnz  .pd_fail
+.pd_none:
+    xor  eax, eax
+    ret
+.pd_fail:
+    mov  rax, -1
+    ret
+
+; utxo_store_forget_buffer() -- drop the buffered bytes without writing them.
+; For a forked child (utxo_live registers it with pthread_atfork): the buffer
+; it inherited is its parent's, and the parent lands it. Since STO-A the
+; buffer holds many blocks most of the time, so a child that drains for any
+; reason (a reload of its own store drains first) would otherwise append the
+; parent's records to the parent's WAL through the shared file offset, and
+; the parent would write them again.
+global utxo_store_forget_buffer
+utxo_store_forget_buffer:
+    mov  qword [rel wal_fill], 0
+    ret
+
+; utxo_store_set_predrain_hook(long (*fn)(void)) -- 0 clears it. fn returns
+; 0 to let the drain go ahead, nonzero to fail it (the bytes stay buffered).
+global utxo_store_set_predrain_hook
+utxo_store_set_predrain_hook:
+    mov  [rel wal_predrain_hook], rdi
+    ret
 
 ; ============================================================================
 ; utxo_store_wal_drain(st) -> 0 ok / -1 write error. Lands the buffered WAL
@@ -987,6 +1060,50 @@ utxo_store_reload:
     mov  qword [r12+24], 0
     mov  qword [r12+32], 0
 .replay:
+    ; ---- (3b) STO-E (formal/storage, 2026-10-23): the WAL ends BELOW log_off.
+    ; utxo.idx names log_off only once the generation below it is in a run,
+    ; so the missing bytes are retired ones, but a log_len taken from the
+    ; physical size would put every new record below log_off, where no
+    ; reload ever reads it. The async flush now fsyncs the WAL before it
+    ; names a log_off; this is the defence for a file system that still
+    ; loses that length: the WAL is extended to log_off, so the write
+    ; position and the replay start agree. The extension is one zero byte
+    ; written at log_off-1 -- a retired byte no replay reads -- and never an
+    ; ftruncate: a reader's reload (tx_accept's snapshot opens the WAL
+    ; read-write) racing the writer must not be able to cut it. A read-only
+    ; store (idx_fd -1) writes nothing and needs no heal. The size is then
+    ; measured again, which also parks the fd at the end for mac_wr_log.
+    ; utxo_store_logoff_healed records the gap for the caller's log line.
+    mov  rax, [r12+24]
+    cmp  rax, rbx
+    jbe  .lo_ok
+    cmp  qword [r12+8], -1
+    je   .lo_ok
+    mov  qword [rbp-0x158], 0   ; a zero byte (the slot is the loop's, set before its first use)
+    mov  rdi, [r12]
+    lea  rsi, [rbp-0x158]
+    mov  edx, 1
+    mov  r10, [r12+24]
+    dec  r10
+    mov  eax, 18            ; pwrite64
+    syscall
+    cmp  rax, 1
+    jne  .fail
+    mov  rdi, [r12]
+    xor  esi, esi
+    mov  edx, 2
+    mov  eax, 8             ; lseek(SEEK_END)
+    syscall
+    test rax, rax
+    jl   .fail
+    cmp  rax, [r12+24]
+    jb   .fail
+    mov  rcx, [r12+24]
+    sub  rcx, rbx
+    mov  [rel utxo_store_logoff_healed], rcx
+    mov  rbx, rax
+    mov  [r12+16], rax
+.lo_ok:
     ; ---- (4) replay WAL tail from ckpt_log_off to log_len ----
     mov  rax, [r12+24]
     mov  [rbp-0x150], rax   ; consumed-offset counter
@@ -1209,3 +1326,11 @@ section .bss
 wal_buf:   resb WALBUF_CAP      ; buffered WAL bytes not yet written (see mac_wr_log)
 wal_fill:  resq 1               ; bytes valid in wal_buf
 wal_fd:    resq 1               ; the log fd those bytes belong to
+wal_predrain_hook: resq 1       ; long (*)(void), called before buffered bytes are written (STO-A)
+wal_in_predrain:   resq 1       ; set while the hook runs
+global utxo_store_logoff_healed
+utxo_store_logoff_healed: resq 1 ; STO-E: bytes the last reload extended the WAL by (0: none)
+
+section .rodata
+global utxo_store_walbuf_cap
+utxo_store_walbuf_cap: dq WALBUF_CAP   ; for tests that fill the buffer
