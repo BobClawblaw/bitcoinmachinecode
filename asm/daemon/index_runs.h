@@ -55,6 +55,12 @@ typedef struct {
     int rec, sparse;               /* record and sparse-entry sizes, bytes */
     irun_t r[IRS_MAX_RUNS];        /* sorted by (from, to) */
     int n;
+    /* ST2-2: runs whose range lies inside another run's (a merge's inputs
+     * left behind by a crash between its rename and its unlinks). Not
+     * mapped and not in r[]: their records are already in the wider run.
+     * Kept so the merger can unlink them and a rescan need not reopen them. */
+    irun_t sup[IRS_MAX_RUNS];
+    int nsup;
     time_t last_scan;
     long dir_mtime_s, dir_mtime_ns;
 } irunset_t;

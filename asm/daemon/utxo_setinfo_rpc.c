@@ -19,6 +19,9 @@
  *   - munmaps everything it mapped: the tool's process exits, this one
  *     serves the next request.
  */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE                 /* renameat2 / RENAME_NOREPLACE */
+#endif
 #define main usi_tool_main          /* keep the tool's main() out of the link */
 #include "utxo_setinfo.c"
 #undef main
@@ -286,8 +289,31 @@ static void usi_dump_cb(void* ctxv, const u8 key36[36], u64 value, u64 code,
     c->coins++;
 }
 
-/* 1 ok / 0 busy / -1 error. hash_at(height, out32_wire) supplies the base
- * block hash for the header (the RPC layer owns the height->hash index). */
+/* 1 ok / 0 busy / -1 error / -2 refused as Core refuses (RPC_INVALID_PARAMETER:
+ * the path exists, or its temp file cannot be created). hash_at(height,
+ * out32_wire) supplies the base block hash for the header (the RPC layer owns
+ * the height->hash index). `path` is the file to create; the RPC layer
+ * resolves it against the datadir first (rpc_chain.c, as Core's AbsPathJoin).
+ *
+ * ST2-3 (audit 2026-10-23): this wrote "<path>.tmp" with fopen("wb") and
+ * renamed it over `path` -- no existence check, following symlinks, relative
+ * to the chain directory -- so `dumptxoutset utxo_manifest.dat` replaced the
+ * live chainstate's manifest. Core v31.1 (rpc/blockchain.cpp dumptxoutset)
+ * refuses a path that exists and writes "<path>.incomplete" before renaming.
+ * Same here, and stricter on the two races Core leaves open: the temp file is
+ * created O_EXCL|O_NOFOLLOW (never through a planted symlink or over an
+ * existing file), and the final rename will not replace a file that appeared
+ * meanwhile. */
+static int usi_rename_noreplace(const char* from, const char* to){
+#ifdef RENAME_NOREPLACE
+    if (renameat2(AT_FDCWD, from, AT_FDCWD, to, RENAME_NOREPLACE) == 0) return 0;
+    if (errno != EINVAL && errno != ENOSYS) return -1;
+#endif
+    /* a filesystem without RENAME_NOREPLACE: link() refuses an existing name too */
+    if (link(from, to) != 0) return -1;
+    unlink(from);
+    return 0;
+}
 long utxo_dump_rpc_run(const char* path,
                        int (*hash_at)(long height, unsigned char out[32]),
                        long* out_height, unsigned long long* out_coins,
@@ -304,11 +330,15 @@ long utxo_dump_rpc_run(const char* path,
      * fingerprint does not see; the closing rename happens after the final
      * fingerprint. */
     char pretmp[1024];
-    if (snprintf(pretmp, sizeof pretmp, "%s.tmp", path) >= (int)sizeof pretmp){
+    if (snprintf(pretmp, sizeof pretmp, "%s.incomplete", path) >= (int)sizeof pretmp){
         MSG("path too long"); return -1; }
-    { FILE* pf = fopen(pretmp, "wb");
-      if (!pf){ MSG("cannot open %s for writing", pretmp); return -1; }
-      fclose(pf); }
+    { struct stat ex;
+      if (lstat(path, &ex) == 0){
+          MSG("%s already exists. If you are sure this is what you want, move it out of the way first", path);
+          return -2; } }
+    { int pfd = open(pretmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
+      if (pfd < 0){ MSG("Couldn't open file %s for writing.", pretmp); return -2; }
+      close(pfd); }
     if (!fingerprint_take(&fp0)){ unlink(pretmp); MSG("fingerprint failed"); return -1; }
     sleep_ms(1500);
     if (!fingerprint_take(&fp1)){ unlink(pretmp); MSG("fingerprint failed"); return -1; }
@@ -356,7 +386,9 @@ long utxo_dump_rpc_run(const char* path,
     if (utxo_lsm_reload_ro(&lst, u) < 0){ MSG("utxo_lsm_reload_ro failed"); goto done; }
 
     snprintf(tmp, sizeof tmp, "%s", pretmp);       /* created above, pre-fingerprint */
-    f = fopen(tmp, "wb");
+    { int tfd = open(tmp, O_WRONLY | O_TRUNC | O_NOFOLLOW | O_CLOEXEC);   /* the file we made, not a swapped-in link */
+      f = tfd >= 0 ? fdopen(tfd, "wb") : NULL;
+      if (!f && tfd >= 0) close(tfd); }
     if (!f){ MSG("cannot open %s for writing", tmp); goto done; }
     { unsigned char zeros[51]; memset(zeros, 0, sizeof zeros);
       if (fwrite(zeros, 1, 51, f) != 51){ MSG("short write"); goto done; } }
@@ -381,7 +413,10 @@ long utxo_dump_rpc_run(const char* path,
           MSG("short write on the header"); goto done; } }
     if (fclose(f) != 0){ f = NULL; MSG("close failed"); goto done; }
     f = NULL;
-    if (rename(tmp, path) != 0){ MSG("rename to %s failed", path); goto done; }
+    if (usi_rename_noreplace(tmp, path) != 0){
+        if (errno == EEXIST){ MSG("%s already exists. If you are sure this is what you want, move it out of the way first", path); rc = -2; }
+        else MSG("rename to %s failed: %s", path, strerror(errno));
+        goto done; }
     tmp[0] = 0;
     *out_height = height;
     *out_coins = ctx.coins;

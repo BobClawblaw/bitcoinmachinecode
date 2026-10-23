@@ -88,6 +88,7 @@ extern long undo_capture_and_del(void* lst, void* u, long height,
 extern long undo_discard(long height);
 extern int  undo_exists(long height);         /* 2026-09-08: an index entry in the packed store */
 extern long undo_commit(long height);         /* closes the block's run with the END marker */
+extern long undo_sync(void);                  /* ST2-4: fdatasync the rev files written since the last call + undo.idx */
 extern long undo_migrate_legacy(void);        /* folds pre-09-08 undo_<h>.dat files into the store */
 extern long undo_prune_from(long from_height, long tip_height, long window, long max_scan);
 /* utxo_walk.h supplies u8/u32/u64 but not u16 (undo records carry a u16
@@ -631,6 +632,7 @@ static int compact_start_async(long height, const char* why){
         g_cmp_fallbacks++;
         fprintf(stderr, "[utxo_live] fork for background compaction failed (%s) -- compacting inline\n", strerror(errno));
         long cr = utxo_lsm_compact_range(&g_utxo_lst, (unsigned long)lo, (unsigned long)k);
+        lsm_mm_invalidate_all();                 /* ST2-9: its unlinked inputs leave every thread's mapping cache */
         fprintf(stderr, "[utxo_live] %s compact at height %ld: manifest_n=%lu -> result=%ld\n", why, height, (unsigned long)g_utxo_lst.manifest_n, cr);
         return 1;
     }
@@ -1277,6 +1279,21 @@ static int persist_applied_height(long h){
      * driven by utxo_live_ckpt_due (a block batch and a time bound), so this
      * costs one flush per batch on a path that already does three fsyncs
      * (tmp file, and the directory) plus a rename. */
+    /* ---- ST2-4 (audit 2026-10-23): the undo store first. The ghost guard
+     * (utxo_live_recover_partial_block) finds a block applied past the
+     * checkpoint only through undo_exists(h), and a reorg disconnects from
+     * the undo runs -- neither was ever fsynced, so the fsync below could
+     * make a batch's spends durable while their undo stayed in the page
+     * cache. Undo before WAL, at the checkpoint only: one or two fdatasyncs
+     * per checkpoint (every 1,024 blocks or 60 s in bulk mode), not per
+     * block. A WAL page the kernel writes back on its own between two
+     * checkpoints is not ordered by this; see the commit for that window. */
+    if (g_undo_enabled && undo_sync() != 0){
+        fprintf(stderr, "[utxo_live] fdatasync of the undo store before checkpoint failed: %s "
+                        "-- refusing to record an applied height its undo may not back\n",
+                strerror(errno));
+        return 0;
+    }
     if (g_utxo_lst.log_fd >= 0 && fsync((int)g_utxo_lst.log_fd) != 0){
         fprintf(stderr, "[utxo_live] fsync WAL before checkpoint failed: %s "
                         "-- refusing to record an applied height the data may not back\n",
@@ -3899,6 +3916,7 @@ int utxo_live_init(const char* dir){
         long lo = 0; int ob = 0; long k = compact_pick_now(&lo, &ob);
         if (k == 0) break;
         long cr = utxo_lsm_compact_range(&g_utxo_lst, (unsigned long)lo, (unsigned long)k);
+        lsm_mm_invalidate_all();                 /* ST2-9: as after every inline compaction */
         fprintf(stderr, "[utxo_live] init: pre-catchup compact manifest_n=%lu -> %lu (result=%ld)\n",
                 (unsigned long)before, (unsigned long)g_utxo_lst.manifest_n, cr);
         if (g_utxo_lst.manifest_n >= before) break; /* no progress -- stop rather than loop */
@@ -4535,6 +4553,12 @@ long utxo_live_recover(void){
         u64 before = g_utxo_lst.manifest_n;
         if (before < 2) break;
         long cr = utxo_lsm_compact(&g_utxo_lst);
+        /* ST2-9 (audit 2026-10-23): the compaction unlinked its inputs, but
+         * every thread's run-mapping cache (utxo_lsm_mm.c) still held them,
+         * pinning their disk space until each slot happened to be evicted.
+         * The background adopt (compact_poll) bumps the cache epoch after
+         * its unlinks; the inline paths did not. */
+        lsm_mm_invalidate_all();
         fprintf(stderr, "[utxo_live] recover: compact manifest_n=%lu -> %lu (result=%ld)\n",
                 (unsigned long)before, (unsigned long)g_utxo_lst.manifest_n, cr);
         if (g_utxo_lst.manifest_n >= before) break;   /* no progress -- stop */
