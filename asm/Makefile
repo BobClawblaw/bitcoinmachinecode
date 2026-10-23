@@ -300,6 +300,12 @@ asm: $(OBJS)
 	$(NASM) $(NASMFLAGS) -o $@ $<
 # safegcd_var.inc is the shared body of sc_inv_var and fe_inv_var.
 secp256k1_scalar.o secp256k1_fe.o: safegcd_var.inc
+# The other %include'd sources. Without these an edit to one leaves a stale
+# object that still links, and the tests run the old code.
+secp256k1_point.o secp256k1_point_ct.o: secp256k1_fe_inline.inc
+secp256k1_point.o: g_comb_table.inc
+bitcoin_bip39.o: wordlist.inc
+bitcoin_script_flags.o: script_flags_consts.inc
 
 # bitcoind.asm and bitcoin_p2p.asm %include version.inc (the single source of
 # truth), so they MUST rebuild when it changes -- otherwise a version bump
