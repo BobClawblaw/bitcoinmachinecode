@@ -104,6 +104,8 @@ extern void utxo_live_test_set_apply_lag(long lag);
 extern int  utxo_live_test_compact_nowait(void);
 extern int  utxo_live_test_compact_pid(void);
 extern void* utxo_live_test_lst(void);
+extern int  utxo_live_halted(void);
+extern long utxo_live_public_tip(void* store_buf, long live);
 extern long utxo_lsm_compact_range(void* lst, unsigned long lo, unsigned long k);
 extern long utxo_live_lsm_get(const u8 txid_wire[32], unsigned int vout, u64* value, unsigned long* height,
                               unsigned long* is_coinbase, const u8** script, unsigned long* slen);
@@ -653,6 +655,46 @@ static int sc_runcreate_merge(int control){
 
 /* ---- the runner: each scenario in its own process (the seccomp filter and
  * the recorder are per scenario) ---- */
+/* M: a manifest that names a missing run. 0..150 applied and flushed to a
+ * run, 151..153 archived and not applied, so the stored tip (153) and the
+ * applied height (150) tell a halted boot from an untracked one. */
+static void p1_onerun(void* a){
+    (void)a; boot();
+    append(0, 150);
+    long r = utxo_live_catchup(store_buf);
+    long f = utxo_live_flush_now();
+    append(151, 153);
+    printf("  p1: catch-up 0..150 -> %ld, flush -> %ld; 151..153 archived, not applied; %d run file(s)\n", r, f, count_runs());
+    utxo_live_close();
+}
+static void p2_boot_only(void* a){
+    (void)a;
+    memset(store_buf, 0, sizeof store_buf);
+    utxo_live_test_force_sizing(0);
+    store_init(store_buf); store_reload(store_buf);
+    int r = utxo_live_init(".");
+    long tip = utxo_live_public_tip(store_buf, r == 1);
+    printf("  p2: utxo_live_init -> %d; halted %d; public tip %ld\n", r, utxo_live_halted(), tip);
+    FILE* f = fopen("result.txt", "w"); if (f){ fprintf(f, "%d %d %ld 0\n", r, utxo_live_halted(), tip); fclose(f); }
+}
+static int sc_missingrun(int control){
+    char live[640], img[640], snap[640]; paths("missingrun", control, live, img, snap);
+    if (run(live, p1_onerun, 0) != 0) return 0;
+    if (chdir(live) != 0) return 0;
+    if (count_runs() < 1){ printf("  no run file to remove\n"); return 0; }
+    if (!control){
+        DIR* d = opendir("."); struct dirent* e; char gone[300] = "";
+        while (d && (e = readdir(d))) if (!strncmp(e->d_name, "utxo_run_", 9)){ snprintf(gone, sizeof gone, "%s", e->d_name); break; }
+        if (d) closedir(d);
+        if (!gone[0] || unlink(gone) != 0) return 0;
+        printf("  removed %s\n", gone);
+    }
+    run(live, p2_boot_only, 0);
+    long v[4]; if (read_res(live, v)) return 0;
+    return control ? (v[0] == 1 && v[1] == 0 && v[2] == 150)
+                   : (v[0] == 0 && v[1] == 1 && v[2] == 150);
+}
+
 static int g_which, g_ctl;
 static int scenario(void){
     switch (g_which){
@@ -674,6 +716,7 @@ static int scenario(void){
     case 15: return sc_runcreate(0, g_ctl);
     case 16: return sc_runcreate_merge(g_ctl);
     case 17: return sc_sweep(g_ctl);
+    case 18: return sc_missingrun(g_ctl);
     }
     return 0;
 }
@@ -686,13 +729,13 @@ int main(int argc, char** argv){
                                    "STO-A4 ghostchain", "STO-E logoff", "STO-C1 archive", "STO-C2 archive-nosync",
                                    "STO-A fork", "STO-D1 dirpub", "STO-D2 dirretire", "STO-D3 dirmerge",
                                    "STO-D4 opendot", "STO-D5 dirckpt", "STO-W1 runcreate", "STO-W2 runcreate-inline",
-                                   "STO-W3 runcreate-merge", "STO-W4 sweep" };
+                                   "STO-W3 runcreate-merge", "STO-W4 sweep", "STO-M missingrun" };
     int only = argc > 1 ? atoi(argv[1]) : -1;
     int failures = 0;
-    for (int w = 0; w < 18; w++){
+    for (int w = 0; w < 19; w++){
         if (only >= 0 && w != only) continue;
         for (int c = 0; c <= 1; c++){
-            printf("--- %s%s\n", names[w], c ? (w == 8 ? " (control: the bytes were pending)" : " (control: the lost write kept)") : "");
+            printf("--- %s%s\n", names[w], c ? (w == 8 ? " (control: the bytes were pending)" : w == 18 ? " (control: the run kept)" : " (control: the lost write kept)") : "");
             g_which = w; g_ctl = c;
             fflush(stdout);
             pid_t p = fork();

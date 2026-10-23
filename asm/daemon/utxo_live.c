@@ -497,6 +497,18 @@ static int manifest_names(u64 run_no){
     for (u64 i = 0; i < g_utxo_lst.manifest_n; i++){ u64 r; memcpy(&r, e + i*16 + 8, 8); if (r == run_no) return 1; }
     return 0;
 }
+/* the first run the reloaded manifest names that is not a regular file in
+ * the store directory, or -1 if every one is there */
+static long manifest_missing_run(void){
+    const unsigned char* e = (const unsigned char*)g_utxo_lst.manifest_buf;
+    for (u64 i = 0; i < g_utxo_lst.manifest_n; i++){
+        u64 r; memcpy(&r, e + i*16 + 8, 8);
+        char n[64]; snprintf(n, sizeof n, "utxo_run_%06u.dat", (unsigned)r);
+        struct stat sb;
+        if (stat(n, &sb) != 0 || !S_ISREG(sb.st_mode)) return (long)r;
+    }
+    return -1;
+}
 static unsigned long g_cmp_deferred = 0;   /* merges deferred because the apply was behind (2026-09-09) */
 static void compact_adopt(int st){
     struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -4099,6 +4111,29 @@ int utxo_live_init(const char* dir){
                 (unsigned)UTXO_LIVE_MANIFEST_CAP);
         return 0;
     }
+    /* A manifest that names a run file which is not there (deleted, or a
+     * create lost to a power cut on a file system without the STO-W
+     * directory fsync) reloads fine: the runs are opened by name on lookup.
+     * Booting on it would answer every lookup that reaches that run with an
+     * error, and the next compaction or flush would publish a manifest that
+     * drops it. Core refuses to start on a damaged coins database; so does
+     * this. HALTED, not merely failed: a failed init alone is the untracked
+     * mode, whose public tip is the stored tip (utxo_live_public_tip), so
+     * the node would advertise blocks it never connected. Halted keeps the
+     * public and RPC tips at the persisted applied height and nothing is
+     * applied (main gates the catch-up on a successful init). */
+    { long mr = manifest_missing_run();
+      if (mr >= 0){
+          g_applied_height = read_applied_height();
+          g_halted = 1;
+          fprintf(stderr,
+              "[utxo_live] FATAL: utxo_manifest.dat names utxo_run_%06u.dat, which is not in %s "
+              "(%lu run(s) named). The coin set is incomplete. Refusing to start.\n"
+              "[utxo_live]   Fix: restore the run file from a backup, or rebuild the chainstate "
+              "(-reindex-chainstate).\n",
+              (unsigned)mr, dir, (unsigned long)g_utxo_lst.manifest_n);
+          return 0;
+      } }
     if (g_fz_table){
         /* plan B3: from here a threshold crossing freezes and forks instead
          * of flushing inline. The unretired generations start at the
