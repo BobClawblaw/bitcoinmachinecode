@@ -208,6 +208,8 @@ s_plen:   dq 0
 s_fh:     dq 0
 s_ghstop: dq -1        ; NET-8: hashStop height for getheaders, -1 = absent/unknown
 s_gbstop: times 32 db 0 ; getblocks: the hashStop hash itself (wire order)
+s_gbcont: times 32 db 0 ; getblocks: Core's m_continuation_block (wire order)
+s_gbcont_set: dq 0      ; 1 while s_gbcont holds one (per connection)
 s_cmd:    times 16 db 0
 s_cnt:    dq 0
 s_nf:     dq 0        ; notfound entries accumulated for THIS getdata
@@ -372,6 +374,7 @@ node_serve_loop:
     ; send the peer OUR `feefilter` (advertise min-relay-feerate so it skips
     ; low-fee relay to us). This is the outbound feefilter leg.
     mov  qword [s_shdr], 0
+    mov  qword [s_gbcont_set], 0   ; no getblocks continuation yet
     mov  qword [s_peerfee], 0
     mov  byte [s_feesent], 0
     mov  byte [s_addrsent], 0
@@ -1109,7 +1112,7 @@ node_serve_loop:
     call p2p_write
     mov  rbx, [s_ptr]
     add  qword [s_served], 1
-    jmp  .gd_next
+    jmp  .gd_cont
     ; ---- serve a full block (type 2) ----
 .gd_block:
     ; hash at rbx+4; idx_get(ht_idx, hash, &fh)
@@ -1198,7 +1201,7 @@ node_serve_loop:
     call p2p_write
     mov  rbx, [s_ptr]
     add  qword [s_served], 1
-    jmp  .gd_next
+    jmp  .gd_cont
 .gdb_send_full:
     mov  r8d, eax           ; block length (p2p_write arg5 = r8)
     ; p2p_write(fd,"block",5,sb_buf,len)
@@ -1211,6 +1214,38 @@ node_serve_loop:
     mov  rbx, [s_ptr]
     ; served++
     add  qword [s_served], 1
+    mov  rbx, [s_ptr]
+.gd_cont:
+    ; ---- the getblocks continuation (Core ProcessGetBlockData,
+    ; net_processing.cpp 2480-2492): a block was just sent; if it is the one
+    ; the last 500-entry getblocks stopped at, send inv(MSG_BLOCK, connected
+    ; tip) immediately -- "even if redundant", and right after the block --
+    ; then forget it. Every served block form reaches here (full, stripped,
+    ; compact), as every form reaches that code in Core.
+    cmp  qword [s_gbcont_set], 0
+    je   .gd_next
+    mov  rbx, [s_ptr]
+    mov  rax, [rbx+4]
+    cmp  rax, [s_gbcont]
+    jne  .gd_next
+    mov  rax, [rbx+12]
+    cmp  rax, [s_gbcont + 8]
+    jne  .gd_next
+    mov  rax, [rbx+20]
+    cmp  rax, [s_gbcont + 16]
+    jne  .gd_next
+    mov  rax, [rbx+28]
+    cmp  rax, [s_gbcont + 24]
+    jne  .gd_next
+    mov  qword [s_gbcont_set], 0
+    ; node_announce_tip(fd, st, ht_idx, use_headers=0): the inv form whatever
+    ; sendheaders said, as Core's is. It reloads sb_buf/hp_buf, both free
+    ; here (the block is sent; the next entry reloads sb_buf).
+    mov  rdi, r12
+    mov  rsi, [s_st]
+    mov  rdx, [s_htidx]
+    xor  ecx, ecx
+    call node_announce_tip
     mov  rbx, [s_ptr]
     jmp  .gd_next
 
@@ -1622,6 +1657,25 @@ node_serve_loop:
     mov  rax, [s_n]
     inc  rax
     mov  [s_n], rax
+    ; The 500th entry: Core (GETBLOCKS, `if (--nLimit <= 0)`) remembers it as
+    ; the peer's m_continuation_block and stops. When the peer later asks for
+    ; that block, .gd_cont sends inv(tip) right after it, which is what makes
+    ; an old-style getblocks sync ask for the next batch. Without it the peer
+    ; stalls after the first 500. Set only at the limit; a shorter reply
+    ; leaves an earlier continuation in place, as Core's does.
+    cmp  rax, 500
+    jb   .gbl_next
+    mov  rax, [sb_buf + 0x200000]
+    mov  [s_gbcont], rax
+    mov  rax, [sb_buf + 0x200000 + 8]
+    mov  [s_gbcont + 8], rax
+    mov  rax, [sb_buf + 0x200000 + 16]
+    mov  [s_gbcont + 16], rax
+    mov  rax, [sb_buf + 0x200000 + 24]
+    mov  [s_gbcont + 24], rax
+    mov  qword [s_gbcont_set], 1
+    jmp  .gb_done
+.gbl_next:
     mov  rax, [s_fh]
     inc  rax
     mov  [s_fh], rax

@@ -157,6 +157,20 @@ static void send_getblocks(int fd, const unsigned char (*loc)[32], int n, const 
     p2p_write(fd, "getblocks", 9, req, build_locator(loc, n, stop));
 }
 
+static void send_getdata(int fd, unsigned type, const unsigned char* hash){
+    unsigned char gd[37]; gd[0] = 1; put_u32(gd + 1, type); memcpy(gd + 5, hash, 32);
+    p2p_write(fd, "getdata", 7, gd, sizeof gd);
+}
+/* the reply to a getdata for block h: [the block (in `form`), inv(tip)?] */
+static int got_block_then(const char* form, int h, int want_tipinv){
+    if (nrx < 1 || strcmp(rx[0].cmd, form)) return 0;
+    if (!strcmp(form, "block") && (rx[0].len != (unsigned)blen[h] || memcmp(rx[0].p, blk[h], rx[0].len))) return 0;
+    if (!strcmp(form, "cmpctblock") && (rx[0].len < 80 || memcmp(rx[0].p, blk[h], 80))) return 0;
+    if (!want_tipinv) return nrx == 1;
+    unsigned off;
+    return nrx == 2 && !strcmp(rx[1].cmd, "inv") && vec_count(&rx[1], &off) == 1 && inv_height(&rx[1], 0) == TIP;
+}
+
 int main(void){
     tt_isolate();
     setbuf(stdout, NULL);
@@ -234,6 +248,60 @@ int main(void){
       send_getblocks(fd, (const unsigned char (*)[32])loc, 1, 0);
       pong = reply(fd);
       cki("empty: a locator at our tip sends no inv", pong && count_cmd("inv") == 0, 1);
+      peer_close(fd); }
+
+    /* ---- the continuation inv (Core's m_continuation_block) ----
+     * A getblocks that stops at the 500 limit remembers the 500th block;
+     * when the peer asks for exactly that block, Core sends inv(MSG_BLOCK,
+     * tip) right after it and forgets it (ProcessGetBlockData). That inv is
+     * what makes an old-style getblocks sync ask for the next batch. The
+     * handler never sent it. Locator [genesis]: the reply is 1..500. Each
+     * block form the getdata path serves is covered: MSG_BLOCK (stripped),
+     * MSG_WITNESS_BLOCK (full) and MSG_CMPCT_BLOCK. */
+    { static const struct { unsigned type; const char* form; const char* name; } F[] = {
+          { 2,          "block",      "MSG_BLOCK" },
+          { 0x40000002, "block",      "MSG_WITNESS_BLOCK" },
+          { 4,          "cmpctblock", "MSG_CMPCT_BLOCK" } };
+      for (unsigned k = 0; k < sizeof F / sizeof F[0]; k++){
+          int fd = peer_open();
+          char lbl[200];
+          if (F[k].type == 4){                     /* BIP152 v2, low-bandwidth */
+              unsigned char sc[9]; sc[0] = 0; put_u64(sc + 1, 2);
+              p2p_write(fd, "sendcmpct", 9, sc, 9);
+          }
+          unsigned char loc[1][32]; memcpy(loc[0], bhash[0], 32);
+          send_getblocks(fd, (const unsigned char (*)[32])loc, 1, 0);
+          int pong = reply(fd);
+          snprintf(lbl, sizeof lbl, "continuation (%s): getblocks from genesis announces 1..500", F[k].name);
+          cki(lbl, pong && count_cmd("inv") == 1 && inv_is_range(first_cmd("inv"), 1, 500), 1);
+          send_getdata(fd, F[k].type, bhash[499]);
+          pong = reply(fd);
+          snprintf(lbl, sizeof lbl, "continuation (%s): getdata block 499 -> the block, no inv", F[k].name);
+          cki(lbl, pong && got_block_then(F[k].form, 499, 0), 1);
+          send_getdata(fd, F[k].type, bhash[500]);
+          pong = reply(fd);
+          snprintf(lbl, sizeof lbl, "continuation (%s): getdata block 500 -> the block, then inv(tip %d)", F[k].name, TIP);
+          cki(lbl, pong && got_block_then(F[k].form, 500, 1), 1);
+          send_getdata(fd, F[k].type, bhash[500]);
+          pong = reply(fd);
+          snprintf(lbl, sizeof lbl, "continuation (%s): block 500 again -> no inv (it was forgotten)", F[k].name);
+          cki(lbl, pong && got_block_then(F[k].form, 500, 0), 1);
+          peer_close(fd);
+      } }
+    /* a reply below the limit sets no continuation: locator [block 100]
+     * announces 101..519 (419); neither its last block nor block 500 is
+     * followed by an inv */
+    { int fd = peer_open();
+      unsigned char loc[1][32]; memcpy(loc[0], bhash[100], 32);
+      send_getblocks(fd, (const unsigned char (*)[32])loc, 1, 0);
+      int pong = reply(fd);
+      cki("continuation: getblocks from 100 announces 101..519", pong && inv_is_range(first_cmd("inv"), 101, TIP - 100), 1);
+      send_getdata(fd, 2, bhash[TIP]);
+      pong = reply(fd);
+      cki("continuation: below the limit, its last block is not followed by an inv", pong && got_block_then("block", TIP, 0), 1);
+      send_getdata(fd, 2, bhash[500]);
+      pong = reply(fd);
+      cki("continuation: below the limit, block 500 is not followed by an inv", pong && got_block_then("block", 500, 0), 1);
       peer_close(fd); }
 
     close(ls);
