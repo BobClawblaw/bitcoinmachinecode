@@ -84,6 +84,15 @@ typedef unsigned int  u32;
 #define ZP_MAX_SUBS      32
 #define ZP_MAX_FILTERS   16
 #define ZP_FILTER_LEN    64
+/* RPC-27 (audit 2026-10-23): a subscriber that has not finished the ZMTP
+ * handshake (greeting + READY) this many seconds after connecting is
+ * dropped. Without it, 32 idle TCP connections per endpoint held every slot
+ * and real subscribers were turned away. 30 s is libzmq's ZMQ_HANDSHAKE_IVL
+ * default, which Core's publisher inherits. */
+#define ZP_HANDSHAKE_S   30
+static long g_zp_handshake_s = ZP_HANDSHAKE_S;
+void zmqpub_set_handshake_ivl_for_test(long secs){ g_zp_handshake_s = secs; }
+static long zp_now_s(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (long)t.tv_sec; }
 
 /* One published message, framed for the wire ONCE and shared by every
  * subscriber queue holding it: a 2 MB rawblock sent to five subscribers is
@@ -99,6 +108,7 @@ typedef struct {
 typedef struct {
     int  fd;
     int  state;          /* 0 = awaiting greeting, 1 = awaiting READY, 2 = live */
+    long since;          /* CLOCK_MONOTONIC second it connected: the handshake deadline (RPC-27) */
     u8   inbuf[512];
     int  inlen;
     u8   filter[ZP_MAX_FILTERS][ZP_FILTER_LEN];
@@ -474,7 +484,40 @@ static void zp_consume(zp_sub* s){
 /* Accept new subscribers and service their handshakes. Cheap and
  * non-blocking; called from the worker loop. */
 /* Caller must hold g_lock. */
+/* compact away closed subscribers, releasing what they had queued */
+static void zp_compact(zp_endpoint* e){
+    int w = 0;
+    for (int k = 0; k < e->nsubs; k++){
+        zp_sub* s = &e->subs[k];
+        if (s->fd >= 0){ if (w != k) e->subs[w] = *s; w++; continue; }
+        if (s->drop_total)
+            fprintf(stderr, "[zmq] subscriber on %s disconnected; %lu message(s) had "
+                            "been dropped for it\n", e->addr, s->drop_total);
+        zp_queue_free(s);
+    }
+    /* the vacated tail holds copies of moved queue pointers: clear it so
+     * nothing can ever free one of those queues twice */
+    for (int k = w; k < e->nsubs; k++){ memset(&e->subs[k], 0, sizeof e->subs[k]); e->subs[k].fd = -1; }
+    e->nsubs = w;
+}
+/* RPC-27: drop the subscribers still handshaking past the deadline, and
+ * free their slots before anything new is accepted */
+static void zp_expire_locked(void){
+    long now = zp_now_s();
+    for (int i = 0; i < g_nep; i++){
+        zp_endpoint* e = &g_ep[i]; int n = 0;
+        for (int k = 0; k < e->nsubs; k++){
+            zp_sub* s = &e->subs[k];
+            if (s->fd >= 0 && s->state != 2 && now - s->since >= g_zp_handshake_s){ close(s->fd); s->fd = -1; n++; }
+        }
+        if (n){
+            fprintf(stderr, "[zmq] %d connection(s) on %s did not finish the handshake in %ld s; dropped\n", n, e->addr, g_zp_handshake_s);
+            zp_compact(e);
+        }
+    }
+}
 static void zp_poll_locked(void){
+    zp_expire_locked();
     for (int i = 0; i < g_nep; i++){
         zp_endpoint* e = &g_ep[i];
         for (;;){
@@ -490,7 +533,7 @@ static void zp_poll_locked(void){
             setsockopt(c, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one);   /* Core: ZMQ_TCP_KEEPALIVE=1 */
             zp_sub* s = &e->subs[e->nsubs++];
             memset(s, 0, sizeof *s);
-            s->fd = c;
+            s->fd = c; s->since = zp_now_s();
             zp_send_greeting(c);
             fprintf(stderr, "[zmq] subscriber connected on %s (%d total)\n", e->addr, e->nsubs);
         }
@@ -506,20 +549,7 @@ static void zp_poll_locked(void){
             }
             if (s->fd >= 0 && s->qn) zp_flush(s);
         }
-        /* compact away closed subscribers, releasing what they had queued */
-        int w = 0;
-        for (int k = 0; k < e->nsubs; k++){
-            zp_sub* s = &e->subs[k];
-            if (s->fd >= 0){ if (w != k) e->subs[w] = *s; w++; continue; }
-            if (s->drop_total)
-                fprintf(stderr, "[zmq] subscriber on %s disconnected; %lu message(s) had "
-                                "been dropped for it\n", e->addr, s->drop_total);
-            zp_queue_free(s);
-        }
-        /* the vacated tail holds copies of moved queue pointers: clear it so
-         * nothing can ever free one of those queues twice */
-        for (int k = w; k < e->nsubs; k++){ memset(&e->subs[k], 0, sizeof e->subs[k]); e->subs[k].fd = -1; }
-        e->nsubs = w;
+        zp_compact(e);
     }
 }
 
@@ -567,6 +597,9 @@ static void* zp_thread_main(void* arg){
             uint64_t v; ssize_t rd = read(g_wake_fd, &v, sizeof v); (void)rd;
         }
         if (r > 0) zmqpub_poll();
+        else if (r == 0){                     /* quiet: only the handshake deadline can be due */
+            pthread_mutex_lock(&g_lock); zp_expire_locked(); pthread_mutex_unlock(&g_lock);
+        }
     }
     return NULL;
 }
