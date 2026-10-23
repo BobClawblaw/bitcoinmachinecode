@@ -61,7 +61,7 @@ diverge X-MPD-delta mpd.c "$D/mempool_persist.c" "arithmetic overflow on unsigne
 # @noconv: the time fields are int64 stored as u64 (the record format)
 proof  P-MPJ        mpj.c "$D/mempool_journal.c" "@nouov @noconv --unwind 9 --unwindset pread.0:65,mpj_recent.0:4,mpj_lookup.0:4,memcmp.0:33"
 mutant M-MPJ-cap    mpj.c "$D/mempool_journal.c" 's|filecap > ((uint64_t)sb.st_size - MPJ_HDR_BYTES) / MPJ_REC_BYTES|filecap > ((uint64_t)sb.st_size) / MPJ_REC_BYTES|' "mapping no longer than the file" "@nouov @noconv --unwind 9 --unwindset pread.0:65,mpj_recent.0:4,mpj_lookup.0:4,memcmp.0:33"
-mutant M-MPJ-wrap   mpj.c "$D/mempool_journal.c" 's/if (seq == 1) break;                   \/\* unsigned: do not wrap below 1 \*\//(void)0;/' "unwinding assertion" "@nouov @noconv --unwind 9 --unwindset pread.0:65,mpj_recent.0:4,mpj_lookup.0:4,memcmp.0:33"
+mutant M-MPJ-wrap   mpj.c "$D/mempool_journal.c" 's/    if (next <= 1) return 0;/    (void)0;/' "unwinding assertion" "@nouov @noconv --unwind 9 --unwindset pread.0:65,mpj_recent.0:4,mpj_lookup.0:4,memcmp.0:33"
 diverge X-MPJ-stats mpj.c "$D/mempool_journal.c" "unwinding assertion loop 0" "@nouov -DFP_STATS --unwindset mpj_stats.0:4,pread.0:65,mpj_recent.0:4,mpj_lookup.0:4 --unwind 9"
 
 # ---------------------------------------------------------------- RPC: JSON body
