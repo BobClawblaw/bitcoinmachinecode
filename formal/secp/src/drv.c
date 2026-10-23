@@ -12,10 +12,11 @@ typedef uint64_t u64;
 typedef void (*f3)(u64 *, const u64 *, const u64 *);
 typedef void (*f2)(u64 *, const u64 *);
 extern void fe_add(u64*, const u64*, const u64*), fe_sub(u64*, const u64*, const u64*), fe_mul(u64*, const u64*, const u64*);
-extern void fe_sqr(u64*, const u64*), fe_inv(u64*, const u64*), fe_pow_sqrt(u64*, const u64*), fe_inv_var(u64*, const u64*);
+extern void fe_sqr(u64*, const u64*), fe_inv(u64*, const u64*), fe_pow_sqrt(u64*, const u64*);
+extern int fe_inv_var(u64*, const u64*), sc_inv_var(u64*, const u64*);
 extern void w_fe_addm(u64*, const u64*, const u64*), w_fe_subm(u64*, const u64*, const u64*), w_fe_dbl(u64*, const u64*);
 extern void sc_add(u64*, const u64*, const u64*), sc_sub(u64*, const u64*, const u64*), sc_mul(u64*, const u64*, const u64*);
-extern void sc_sqr(u64*, const u64*), sc_inv(u64*, const u64*), sc_inv_var(u64*, const u64*), sc_half_ct(u64*, const u64*);
+extern void sc_sqr(u64*, const u64*), sc_inv(u64*, const u64*), sc_half_ct(u64*, const u64*);
 extern void sc_mul_512(u64 r[8], const u64*, const u64*);
 extern int sc_split_lambda(u64 r1[4], u64 r2[4], const u64 k[4]);
 extern int scalar_small_nonzero(const unsigned char k[32]);
@@ -39,8 +40,8 @@ static const struct { const char *n; f3 f; } F3[] = {
     {"fe_add", fe_add}, {"fe_sub", fe_sub}, {"fe_mul", fe_mul}, {"w_fe_addm", w_fe_addm}, {"w_fe_subm", w_fe_subm},
     {"sc_add", sc_add}, {"sc_sub", sc_sub}, {"sc_mul", sc_mul}, {0, 0}};
 static const struct { const char *n; f2 f; } F2[] = {
-    {"fe_sqr", fe_sqr}, {"fe_inv", fe_inv}, {"fe_pow_sqrt", fe_pow_sqrt}, {"fe_inv_var", fe_inv_var}, {"w_fe_dbl", w_fe_dbl},
-    {"sc_sqr", sc_sqr}, {"sc_inv", sc_inv}, {"sc_inv_var", sc_inv_var}, {"sc_half_ct", sc_half_ct}, {"reduce_n", reduce_n}, {0, 0}};
+    {"fe_sqr", fe_sqr}, {"fe_inv", fe_inv}, {"fe_pow_sqrt", fe_pow_sqrt}, {"w_fe_dbl", w_fe_dbl},
+    {"sc_sqr", sc_sqr}, {"sc_inv", sc_inv}, {"sc_half_ct", sc_half_ct}, {"reduce_n", reduce_n}, {0, 0}};
 
 int main(void){
     static char line[1 << 16];
@@ -60,6 +61,10 @@ int main(void){
             for (int i = 0; i < 32; i++) k[i] = (unsigned char)(a[3 - i / 8] >> (8 * (7 - i % 8)));
             printf("%d", scalar_small_nonzero(k)); }
         else if (!strcmp(tok[0], "ecdsa_in_range")){ rd(a, tok[1]); printf("%d", ecdsa_in_range(NULL, a)); }
+        else if (!strcmp(tok[0], "fe_inv_var") || !strcmp(tok[0], "sc_inv_var")){
+            rd(a, tok[1]); memset(r, 0xAA, 32);       /* documented: r untouched when a == 0 mod m */
+            int ok = tok[0][0] == 'f' ? fe_inv_var(r, a) : sc_inv_var(r, a);
+            pr(r); printf(" %d", ok); }
         else if (!strcmp(tok[0], "cneg_n")){ rd(a, tok[1]); cneg_n(r, a, atoi(tok[2])); pr(r); }
         else if (!strcmp(tok[0], "fe_is_zero")){ rd(a, tok[1]); printf("%d", fe_is_zero(a)); }
         else if (!strcmp(tok[0], "fe_equal")){ rd(a, tok[1]); rd(b, tok[2]); printf("%d", fe_equal(a, b)); }

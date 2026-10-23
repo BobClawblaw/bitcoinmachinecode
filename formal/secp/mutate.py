@@ -69,6 +69,14 @@ def run_one(mid, f, line, old, new, sel, what, log):
             lines[ln - 1] = lines[ln - 1].replace(old, new, 1)
         open(p, 'w').write('\n'.join(lines))
         os.utime(p, None)
+        # force a full rebuild: the Makefile does not list every %include (e.g.
+        # secp256k1_fe_inline.inc), so a stale object could otherwise hide the mutant
+        for o in ('secp256k1_fe', 'secp256k1_scalar', 'secp256k1_scalar_c', 'secp256k1_point', 'secp256k1_point_ct',
+                  'secp256k1_glv_c', 'secp256k1_ecdsa', 'bitcoin_keys', 'bip340_sign', 'crypto_fe_sqrt'):
+            try:
+                os.unlink(os.path.join(sasm, o + '.o'))
+            except FileNotFoundError:
+                pass
         env = dict(os.environ, ASM=sasm, B=os.path.join(tmp, 'build'))
         b = subprocess.run(['bash', os.path.join(HERE, 'build.sh')], env=env, capture_output=True, text=True)
         log.write('== %s build rc=%d\n%s%s\n' % (mid, b.returncode, b.stdout[-2000:], b.stderr[-2000:]))
@@ -79,7 +87,13 @@ def run_one(mid, f, line, old, new, sel, what, log):
         log.write(r.stdout + r.stderr + '\n')
         caught = [l.strip() for l in r.stdout.splitlines() if l.startswith('  NOT PROVED')]
         if r.returncode != 0 and caught:
-            return 'CAUGHT', caught[0][:240]
+            # is the mutant really wrong on concrete inputs? (CT mutants keep the values right)
+            dv = subprocess.run(LIM + ['900', PY, os.path.join(HERE, 'diff.py')], cwd=HERE, capture_output=True,
+                                text=True, env=dict(env, LIFT='0', NRAND='40'))
+            log.write(dv.stdout + '\n')
+            nd = [l.split()[1] for l in dv.stdout.splitlines() if l.startswith('DIFF ') and 'FAIL' in l]
+            return 'CAUGHT', '%s | real mutated code wrong on concrete vectors: %s' % (
+                caught[0][:200], ','.join(nd) if nd else 'none (values unchanged)')
         return 'NOT-CAUGHT', r.stdout.strip().splitlines()[-1:] if r.stdout else r.stderr[-300:]
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

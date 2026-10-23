@@ -87,13 +87,13 @@ SPECS = {
     'fe_sqr': (1, lambda a: True, lambda a: hx(a * a % P)),
     'fe_inv': (1, lambda a: True, lambda a: hx(pow(a, P - 2, P))),
     'fe_pow_sqrt': (1, lambda a: True, lambda a: hx(pow(a, (P + 1) // 4, P))),
-    'fe_inv_var': (1, lambda a: a < P, lambda a: hx(pow(a, P - 2, P))),
+    'fe_inv_var': (1, lambda a: True, lambda a: ('%s 0' % ('aa' * 32)) if a % P == 0 else '%s 1' % h(pow(a, P - 2, P))),
     'sc_add': (2, lambda a, b: a < N and b < N, lambda a, b: hx((a + b) % N)),
     'sc_sub': (2, lambda a, b: a < N and b < N, lambda a, b: hx((a - b) % N)),
     'sc_mul': (2, lambda a, b: True, lambda a, b: hx(a * b % N)),
     'sc_sqr': (1, lambda a: True, lambda a: hx(a * a % N)),
     'sc_inv': (1, lambda a: True, lambda a: hx(pow(a, N - 2, N))),
-    'sc_inv_var': (1, lambda a: a < N, lambda a: hx(pow(a, N - 2, N))),
+    'sc_inv_var': (1, lambda a: True, lambda a: ('%s 0' % ('aa' * 32)) if a % N == 0 else '%s 1' % h(pow(a, N - 2, N))),
     'sc_half_ct': (1, lambda a: a < N, lambda a: hx(a * ((N + 1) // 2) % N)),
     'sc_mul_512': (2, lambda a, b: True, lambda a, b: '%0128x' % (a * b)),
     'reduce_n': (1, lambda a: True, lambda a: hx(a % N)),
@@ -178,6 +178,9 @@ def main():
     print('DIFF %-22s %6d batches  %s' % ('sc_inv_batch', len(groups), 'OK' if not bad else 'FAIL %d' % bad))
     fails += bad
     # (2)/(3) the lifter against the real code
+    if os.environ.get('LIFT', '1') == '0':
+        print('DIFF-TOTAL failures=%d' % fails)
+        return 1 if fails else 0
     img = Cm.image()
     lf = 0
     nlift = 0
