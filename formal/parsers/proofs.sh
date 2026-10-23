@@ -36,8 +36,8 @@ mutant M-BW-commit  bw.c "$D/block_witness.c" 's/if (v >= 38 \&\& p\[0\]==0x6a/i
 # intentional narrowings; the clock is bounded to 2001..2100 by the stub
 proof  P-ADDR1      addr.c "$D/addr_ingest.c" "@noconv -DFP_N=64 --unwind 10 --unwindset memcmp.0:17"
 proof  P-ADDRV2     addr.c "$D/addr_ingest.c" "@noconv -DFP_V2 -DFP_N=64 --unwind 10 --unwindset memcmp.0:17"
-mutant M-ADDR1-max  addr.c "$D/addr_ingest.c" 's/if(cnt > 1000){ AI_VIOL(q); return 0; }               \/\* Core: MAX_ADDR_TO_SEND/if(cnt > 1001){ AI_VIOL(q); return 0; }               \/* Core: MAX_ADDR_TO_SEND/' "count over 1000" "@noconv -DFP_N=64 --unwind 10 --unwindset memcmp.0:17"
-mutant M-ADDR1-fit  addr.c "$D/addr_ingest.c" 's/if(base+k\*30+30>plen) break;/if(base+k*30+29>plen) break;/' "" "@noconv -DFP_N=64 --unwind 10 --unwindset memcmp.0:17"
+mutant M-ADDRV2-max addr.c "$D/addr_ingest.c" 's/if(cnt > 1000){ AI_VIOL(q); return 0; }               \/\* Core: MAX_ADDR_TO_SEND/if(cnt > 1001){ AI_VIOL(q); return 0; }               \/* Core: MAX_ADDR_TO_SEND/' "count over 1000" "@noconv -DFP_V2 -DFP_N=64 --unwind 10 --unwindset memcmp.0:17"
+mutant M-ADDR1-fit  addr.c "$D/addr_ingest.c" 's/if(base+k\*30+30>plen) break;/(void)0;/;s/(pl\[0\]==0xfe?5:9))/(pl[0]==0xfe?5:10))/' "" "@noconv -DFP_N=64 --unwind 10 --unwindset memcmp.0:17"
 mutanth M-ADDRV2-len addr.c "$D/addr_ingest.c" "$D/netaddr.c" 's/if (o + al + 2 > len) return -1;/if (o + al > len) return -1;/' "" "@noconv -DFP_V2 -DFP_N=64 --unwind 10 --unwindset memcmp.0:17"
 diverge X-ADDR1-core  addr.c "$D/addr_ingest.c" "CORE: addresses taken only from a payload Core deserializes" "@noconv -DFP_N=64 --unwind 10 --unwindset memcmp.0:17"
 diverge X-ADDRV2-core addr.c "$D/addr_ingest.c" "CORE: addresses taken only from a payload Core deserializes" "@noconv -DFP_V2 -DFP_N=64 --unwind 10 --unwindset memcmp.0:17"
@@ -62,11 +62,17 @@ mutant M-MPJ-wrap   mpj.c "$D/mempool_journal.c" 's/if (seq == 1) break;        
 diverge X-MPJ-stats mpj.c "$D/mempool_journal.c" "unwinding assertion loop 0" "@nouov -DFP_STATS --unwindset mpj_stats.0:4,pread.0:65,mpj_recent.0:4,mpj_lookup.0:4 --unwind 9"
 
 # ---------------------------------------------------------------- RPC: JSON body
-proof  P-JSON       json.c "$A/rpc_json.c" "-DFP_N=6 --unwind 8"
-proofm P-JSONDEPTH  json.c "$A/rpc_json.c" 's/#define RJ_MAX_DEPTH 512/#define RJ_MAX_DEPTH 2/' "-DFP_N=6 -DFP_DEPTH --unwind 8"
-mutant M-JSON-depth json.c "$A/rpc_json.c" 's/#define RJ_MAX_DEPTH 512/#define RJ_MAX_DEPTH 2/;s/++c->depth > RJ_MAX_DEPTH/++c->depth > RJ_MAX_DEPTH + 1/' "nesting within" "-DFP_N=6 -DFP_DEPTH --unwind 8"
-mutant M-JSON-leak  json.c "$A/rpc_json.c" 's/if (c->err) { xfree(key); rj_free(o); return NULL; }/if (c->err) { xfree(key); return NULL; }/' "memory-leak" "-DFP_N=6 --unwind 8"
-mutant M-JSON-ctl   json.c "$A/rpc_json.c" 's/if (c->end - c->p < 5) { c->err = 1; break; }/if (c->end - c->p < 4) { c->err = 1; break; }/' "dereference failure" "-DFP_N=6 --unwind 8"
+# OPEN: symbolic execution of the recursive descent did not finish inside
+# 300-900 s even at a 3-byte body, unwind 3, no arena; kept, not run.
+# MODEL CHANGE: the per-request arena's first chunk (RJ_ARENA_CHUNK, 256 KiB)
+# lowered to 64 bytes in a scratch copy, so chunk chaining is reached and the
+# arrays stay inside the memory cap. P-JSONDEPTH also lowers RJ_MAX_DEPTH to 2.
+RJ_M='s/#define RJ_ARENA_CHUNK (256u << 10)/#define RJ_ARENA_CHUNK 64u/'
+#OPEN proofm P-JSON       json.c "$A/rpc_json.c" "$RJ_M" "@noconv -DFP_STUB_PRINTF -DFP_N=4 --unwind 5"
+#OPEN proofm P-JSONDEPTH  json.c "$A/rpc_json.c" "$RJ_M;s/#define RJ_MAX_DEPTH 512/#define RJ_MAX_DEPTH 2/" "@noconv -DFP_STUB_PRINTF -DFP_N=4 -DFP_DEPTH --unwind 5"
+#OPEN mutant M-JSON-depth json.c "$A/rpc_json.c" "$RJ_M;s/#define RJ_MAX_DEPTH 512/#define RJ_MAX_DEPTH 2/;s/++c->depth > RJ_MAX_DEPTH/++c->depth > RJ_MAX_DEPTH + 1/" "nesting within" "@noconv -DFP_STUB_PRINTF -DFP_N=4 -DFP_DEPTH --unwind 5"
+#OPEN mutant M-JSON-leak  json.c "$A/rpc_json.c" "$RJ_M;s/if (c->err) { xfree(key); rj_free(o); return NULL; }/if (c->err) { xfree(key); return NULL; }/" "memory-leak" "@noconv -DFP_STUB_PRINTF -DFP_N=4 --unwind 5"
+#OPEN mutant M-JSON-ctl   json.c "$A/rpc_json.c" "$RJ_M;s/if (c->end - c->p < 5) { c->err = 1; break; }/if (c->end - c->p < 4) { c->err = 1; break; }/" "dereference failure" "@noconv -DFP_STUB_PRINTF -DFP_N=6 --unwind 7"
 
 # ---------------------------------------------------------------- disk: undo runs (rev*.dat + undo.idx)
 # OPEN: none of these closed inside the 8 GB cap and 600 s, even reduced to

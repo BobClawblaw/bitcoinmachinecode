@@ -6,8 +6,8 @@
  *   - memory safety, and no leak once the caller frees the tree and ends the
  *     arena (--memory-leak-check), on success and on every error path,
  *   - a successful parse consumed the whole body (trailing junk refused),
- *   - the tree it returns can be serialised by rj_write into a buffer of any
- *     size without overrunning it,
+ *   - FP_WRITE: the tree it returns can be serialised by rj_write into a
+ *     buffer of any size without overrunning it (not run: over the cap),
  *   - FP_DEPTH: with RJ_MAX_DEPTH lowered to 2 in a scratch copy (a model
  *     change, stated), nesting deeper than the limit is refused, so the
  *     recursion depth is bounded by RJ_MAX_DEPTH + 1 frames. */
@@ -27,18 +27,24 @@ static int depth(const rj_val* v){
 int main(void){
     size_t len = nondet_size(); ASSUME(len <= FP_N);
     char* s = (char*)nd_buf(len);
-    int arena = nondet_int() & 1;
+#ifdef FP_ARENA
+    int arena = 1;
+#else
+    int arena = 0;
+#endif
     if (arena) rj_arena_begin();
     rj_val* v = rj_parse(s, len);
     if (v){
 #ifdef FP_DEPTH
         CHECK(depth(v) <= RJ_MAX_DEPTH, "nesting within RJ_MAX_DEPTH");
 #endif
+#ifdef FP_WRITE
         long cap = nondet_long(); ASSUME(cap >= 0 && cap <= 24);
         char* out = (char*)nd_buf((size_t)cap);
         long w = rj_write(out, cap, v, nondet_int() & 1);
         CHECK(w >= 0 && (cap == 0 || out[w < cap ? w : cap - 1] == 0), "rj_write NUL-terminates within cap");
         free(out);
+#endif
     }
     rj_free(v);
     if (arena) rj_arena_end();
