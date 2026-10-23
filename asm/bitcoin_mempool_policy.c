@@ -303,7 +303,19 @@ typedef struct {
                                   parent's own acceptance -- there is nowhere
                                   else to read it from at child time without
                                   re-parsing the parent out of the pool. */
+    /* MPL-3 (audit 2026-10-23): the node's cluster's LAST chunk, cached.
+     * worst_chunk used to re-linearize every cluster in the pool on every
+     * call; now a cluster is linearized again only when something in it
+     * changed. ck_flags == 0 means "stale": every insert starts stale, and
+     * every removal marks the survivors next to it (see MPOL_CK_*). All
+     * members of a cluster carry the same ck_fee/ck_size/ck_cid. */
+    uint64_t ck_fee, ck_size;  /* the last chunk's fee and size */
+    uint32_t ck_cid;           /* which computation filled it: one per cluster */
+    uint32_t ck_flags;         /* MPOL_CK_* */
 } mpol_node;
+#define MPOL_CK_VALID   1u     /* ck_* describe this node's cluster as it is */
+#define MPOL_CK_INLAST  2u     /* this node is a member of that last chunk */
+#define MPOL_CK_NONE    4u     /* the cluster yields no chunk (skipped, as before) */
 
 #define MPOL_MAGIC 0x504F4C59u
 #define MPOL_HDR   96u
@@ -596,13 +608,25 @@ static void mpol_seq_flush(void){
 /* public API                                                                 */
 /* ========================================================================== */
 
-size_t mpool_policy_state_size(unsigned n){
-    return MPOL_HDR + (size_t)4*n + (size_t)n*sizeof(mpol_out)
+/* MPL-3/4/6: 64 bytes after the indices -- the graph generation (+0, bumped
+ * by every change to the parent links, so a process's children index knows
+ * when another process changed the graph) and the chunk-cache id counter
+ * (+8). Appended, so every existing base pointer keeps its arithmetic. */
+#define MPOL_TAIL 64u
+static size_t mpol_state_base_size(unsigned n){
+    return (MPOL_HDR + (size_t)4*n + (size_t)n*sizeof(mpol_out)
            + (size_t)n*sizeof(mpol_claim) + (size_t)n*sizeof(mpol_node)
            + (size_t)mpol_ovf_nblocks_for(n) * MPOL_OVF_SLOTS * sizeof(uint32_t)
            /* MEM-12: three chained indices -- head[nbuckets] + next[n] each */
-           + 3u * ((size_t)mpol_nbuckets_for(n) + (size_t)n) * sizeof(uint32_t);
+           + 3u * ((size_t)mpol_nbuckets_for(n) + (size_t)n) * sizeof(uint32_t)
+           + 7u) & ~(size_t)7;                  /* the tail holds a uint64_t */
 }
+size_t mpool_policy_state_size(unsigned n){ return mpol_state_base_size(n) + MPOL_TAIL; }
+static uint64_t* mpol_gen_ptr(void* st){
+    return (uint64_t*)((char*)st + mpol_state_base_size(*(uint32_t*)((char*)st+4)));
+}
+static uint32_t* mpol_cid_ptr(void* st){ return (uint32_t*)(mpol_gen_ptr(st) + 1); }
+static void mpol_cx_forget(void* st);
 
 void mpool_policy_state_init(void* st, unsigned n){
     memset(st, 0, mpool_policy_state_size(n));
@@ -622,6 +646,14 @@ void mpool_policy_state_init(void* st, unsigned n){
       memset(mpol_node_head(st), 0xFF, (size_t)(nb + n) * sizeof(uint32_t));
       memset(mpol_out_head(st),  0xFF, (size_t)(nb + n) * sizeof(uint32_t));
       memset(mpol_clm_head(st),  0xFF, (size_t)(nb + n) * sizeof(uint32_t)); }
+    /* MPL-3/4/6: a fresh graph generation. Not 0: a re-initialised state
+     * (daemon/reorg.c rebuilds the pool this way) must not look like the
+     * graph a process indexed before, so the generation starts from a value
+     * no earlier state of this region had. */
+    { static uint64_t salt;
+      struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+      *mpol_gen_ptr(st) = ((uint64_t)ts.tv_sec << 32) ^ (uint64_t)ts.tv_nsec ^ (++salt << 48) ^ 1u; }
+    mpol_cx_forget(st);
 }
 
 void mpool_policy_init(mpol_cfg* pol, uint64_t relay_fee_rate,
@@ -1053,6 +1085,10 @@ static const char* standard_checks(const mpol_cfg* pol, const unsigned char* tx,
 /* ========================================================================== */
 /* graph lookups                                                              */
 /* ========================================================================== */
+/* MPL-3/4/6 test counters: linearizations run, whole-pool children-index
+ * builds, neighbour checks made by the cluster-limit walk, and cached
+ * worst-chunk answers that fell back to the full scan */
+static unsigned long long g_cx_builds, g_ck_relin, g_cl_bfs_steps, g_ck_fallback;
 static int find_node(void* st, const unsigned char txid[32]){
     mpol_node* t = mpol_nodes_base(st);
     uint32_t n = *(uint32_t*)((char*)st+16);
@@ -1088,6 +1124,7 @@ static int mpol_children_build(void* st, uint32_t n,
     uint32_t* chld = (uint32_t*)malloc((size_t)(edges ? edges : 1) * sizeof *chld);
     if (!head || !nxt || !chld){ free(head); free(nxt); free(chld); return 0; }
     for (uint32_t i = 0; i < n; i++) head[i] = MPOL_IDX_NONE;
+    g_cx_builds++;                                /* whole-pool passes (MPL-6 test counter) */
     uint32_t e = 0;
     for (uint32_t ii = n; ii > 0; ii--){          /* descending: walks come out ascending */
         uint32_t i = ii - 1;
@@ -1099,6 +1136,118 @@ static int mpol_children_build(void* st, uint32_t n,
     }
     *head_o = head; *nxt_o = nxt; *chld_o = chld;
     return 1;
+}
+
+/* ---- MPL-3/4/6 (audit 2026-10-23): a children index that persists ------
+ *
+ * Three hot paths needed "who spends this node" and each answered it with
+ * a whole-pool pass: worst_chunk rebuilt an edge list over every node on
+ * every eviction, mpol_replacement_improves rebuilt one per replacement
+ * candidate, and the cluster-limit walk in admission scanned all n nodes per
+ * popped node (64 pops x 1M nodes per child transaction at full sizing).
+ *
+ * This index is the same shape as mpol_children_build's, kept between calls:
+ * head[i] is node i's first child edge, nxt[] chains them, chld[] holds the
+ * child. It is PER PROCESS (the policy state is MAP_SHARED, and putting
+ * mutable edge lists in it would cost tens of MB of shared memory), and
+ * it is tied to the shared graph generation (mpol_gen_ptr): every change to
+ * the parent links bumps that counter, so a process whose index was built
+ * against an older graph -- because another process accepted or removed a
+ * transaction -- sees the mismatch and rebuilds. An insert made by THIS
+ * process extends its own index in place (the common case: the download
+ * worker accepting relayed transactions); a removal bumps the generation and
+ * the next user rebuilds, at O(n + edges) -- the same order as remove_node,
+ * which sweeps the node array itself.
+ *
+ * Edge ORDER is pinned: the rebuild walks nodes ascending and pushes each
+ * edge onto its parent's list, so a list yields children in DESCENDING index
+ * order -- exactly the lists worst_chunk used to build, which matters because
+ * the cluster walk's visiting order feeds the linearization, and eviction
+ * must choose the same chunks it chose before. An insert gets the highest
+ * index, so pushing its edges keeps that order. */
+static struct {
+    void*     st;
+    uint64_t  gen;
+    uint32_t  n;                /* nodes covered; 0 with st == NULL = none */
+    uint32_t *head, head_cap;
+    uint32_t *nxt, *chld, ne, ecap;
+} g_cx;
+static void mpol_cx_forget(void* st){ if (g_cx.st == st){ g_cx.st = NULL; g_cx.n = 0; } }
+static int mpol_cx_grow_head(uint32_t want){
+    if (want <= g_cx.head_cap) return 1;
+    uint32_t c = g_cx.head_cap ? g_cx.head_cap : 1024;
+    while (c < want){ if (c > 0x80000000u){ c = want; break; } c *= 2; }
+    uint32_t* h = realloc(g_cx.head, (size_t)c * sizeof *h);
+    if (!h) return 0;
+    g_cx.head = h; g_cx.head_cap = c;
+    return 1;
+}
+static int mpol_cx_grow_edges(uint64_t want){
+    if (want <= g_cx.ecap) return 1;
+    if (want > 0xFFFFFFF0u) return 0;
+    uint64_t c = g_cx.ecap ? g_cx.ecap : 1024;
+    while (c < want) c *= 2;
+    if (c > 0xFFFFFFF0u) c = want;
+    uint32_t* a = realloc(g_cx.nxt,  (size_t)c * sizeof *a);
+    if (a) g_cx.nxt = a;
+    uint32_t* b = realloc(g_cx.chld, (size_t)c * sizeof *b);
+    if (b) g_cx.chld = b;
+    if (!a || !b) return 0;
+    g_cx.ecap = (uint32_t)c;
+    return 1;
+}
+/* The graph changed in a way this process did not mirror: everyone rebuilds. */
+static void mpol_cx_touch(void* st){ (*mpol_gen_ptr(st))++; }
+/* 1 with g_cx current for st, 0 if it could not be built (out of memory). */
+static int mpol_cx_get(void* st){
+    uint32_t n = *(uint32_t*)((char*)st+16);
+    if (g_cx.st == st && g_cx.gen == *mpol_gen_ptr(st) && g_cx.n == n) return 1;
+    g_cx.st = NULL;
+    mpol_node* t = mpol_nodes_base(st);
+    uint64_t edges = 0;
+    for (uint32_t i = 0; i < n; i++) edges += t[i].n_parents;
+    if (!mpol_cx_grow_head(n ? n : 1) || !mpol_cx_grow_edges(edges ? edges : 1)) return 0;
+    for (uint32_t i = 0; i < n; i++) g_cx.head[i] = MPOL_IDX_NONE;
+    uint32_t e = 0;
+    for (uint32_t i = 0; i < n; i++)
+        for (uint32_t k = 0; k < t[i].n_parents; k++){
+            uint32_t pp = mpol_par_at(st, &t[i], k);
+            if (pp == 0xFFFFFFFFu || pp >= n) continue;
+            g_cx.chld[e] = i; g_cx.nxt[e] = g_cx.head[pp]; g_cx.head[pp] = e; e++;
+        }
+    g_cx.ne = e; g_cx.n = n; g_cx.gen = *mpol_gen_ptr(st); g_cx.st = st;
+    g_cx_builds++;
+    return 1;
+}
+/* Node `idx` was just appended (the count already includes it). */
+static void mpol_cx_inserted(void* st, uint32_t idx){
+    mpol_node* t = mpol_nodes_base(st);
+    uint64_t* gen = mpol_gen_ptr(st);
+    int mirror = g_cx.st == st && g_cx.gen == *gen && g_cx.n == idx &&
+                 mpol_cx_grow_head(idx + 1) &&
+                 mpol_cx_grow_edges((uint64_t)g_cx.ne + t[idx].n_parents);
+    (*gen)++;
+    if (!mirror){ g_cx.st = NULL; return; }
+    g_cx.head[idx] = MPOL_IDX_NONE;
+    for (uint32_t k = 0; k < t[idx].n_parents; k++){
+        uint32_t pp = mpol_par_at(st, &t[idx], k);
+        if (pp == 0xFFFFFFFFu || pp >= idx) continue;
+        uint32_t e = g_cx.ne++;
+        g_cx.chld[e] = idx; g_cx.nxt[e] = g_cx.head[pp]; g_cx.head[pp] = e;
+    }
+    g_cx.n = idx + 1; g_cx.gen = *gen;
+}
+/* the next value of the shared visit stamp (st+20) over the shared mark
+ * array (st+MPOL_HDR); on wrap the marks are cleared, so an old mark can
+ * never equal a new stamp */
+static uint32_t mpol_stamp_next(void* st){
+    uint32_t s = *(uint32_t*)((char*)st+20) + 1;
+    if (s == 0xFFFFFFFFu || s == 0){
+        memset((char*)st + MPOL_HDR, 0, (size_t)4 * *(uint32_t*)((char*)st+4));
+        s = 1;
+    }
+    *(uint32_t*)((char*)st+20) = s;
+    return s;
 }
 
 /* How many distinct clusters (connected components over parent links) the
@@ -1329,6 +1478,14 @@ static void remove_node(void* st, void* mp, int ci){
      * path is re-labelled CONFLICTED before it gets here */
     mpol_seq_removed(ct, g_depart_reason == 1 /* MPJ_MINED */);
     decr_ancestors(st, ci, (uint32_t)t[ci].size, t[ci].fee);
+    /* MPL-3: every cluster this removal changes contains a neighbour of the
+     * departing node, so marking its parents here and its children in the
+     * sweep below is enough for the chunk cache to recompute them all */
+    for (uint32_t k = 0; k < t[ci].n_parents; k++){
+        uint32_t pp = mpol_par_at(st, &t[ci], k);
+        if (pp < *nptr) t[pp].ck_flags = 0;
+    }
+    mpol_cx_touch(st);
     mpool_del(mp, ct);
     { uint64_t* pb = (uint64_t*)((char*)st+64);
       if (*pb >= t[ci].raw_len) *pb -= t[ci].raw_len; else *pb = 0; }
@@ -1367,7 +1524,8 @@ static void remove_node(void* st, void* mp, int ci){
       for (uint32_t j=0;j<n;j++)
           for (uint32_t k=0;k<t[j].n_parents;k++)
               if (mpol_par_at(st, &t[j], k)==(uint32_t)ci){
-                  mpol_par_set(st, &t[j], k, 0xFFFFFFFFu); orphaned++; } }
+                  mpol_par_set(st, &t[j], k, 0xFFFFFFFFu); orphaned++;
+                  t[j].ck_flags = 0; } }                 /* MPL-3 */
     /* MEM-3: hand this node's overflow block back BEFORE the slot is
      * overwritten by the swap below, or the block leaks and the pool bleeds
      * away one entry per removal until it is exhausted -- at which point
@@ -1382,6 +1540,11 @@ static void remove_node(void* st, void* mp, int ci){
     if (last != (uint32_t)ci) mpol_node_idx_unlink(st, last);
     t[ci] = t[last];
     (*nptr)--;
+    /* MPL-3: the node that moved keeps its cluster but not its index. The
+     * cluster walk's member order follows indices, and where two chunkings
+     * tie that order decides between them, so recompute the cluster too:
+     * the cache must say exactly what a fresh walk would */
+    if ((uint32_t)ci != last) t[ci].ck_flags = 0;
     if (last != (uint32_t)ci) mpol_node_idx_link(st, (uint32_t)ci);
     if ((uint32_t)ci != last){
         uint32_t n = *nptr;
@@ -1541,6 +1704,10 @@ static long mpol_remove_marked(void* st, void* mp, uint32_t n){
             g_depart_cb(ct, (unsigned long long)t[i].size, (unsigned long long)t[i].fee, why);
         }
         decr_ancestors(st, (int)i, (uint32_t)t[i].size, t[i].fee);
+        for (uint32_t k = 0; k < t[i].n_parents; k++){   /* MPL-3, as remove_node */
+            uint32_t pp = mpol_par_at(st, &t[i], k);
+            if (pp < n) t[pp].ck_flags = 0;
+        }
         mpool_del(mp, ct);
         { uint64_t* pb = (uint64_t*)((char*)st+64);
           if (*pb >= t[i].raw_len) *pb -= t[i].raw_len; else *pb = 0; }
@@ -1548,6 +1715,7 @@ static long mpol_remove_marked(void* st, void* mp, uint32_t n){
         if (g_forget_cb) g_forget_cb(ct);
     }
     if (!nremoved) return 0;
+    mpol_cx_touch(st);                     /* MPL-3/4/6: the graph is changing */
 
     mpol_phase("rm/claims");
     /* ---- 2. claims: drop those a removed node claimed, keep order ---- */
@@ -1598,7 +1766,7 @@ static long mpol_remove_marked(void* st, void* mp, uint32_t n){
             uint32_t pv = mpol_par_at(st, &t[i], k);
             if (pv == 0xFFFFFFFFu) continue;         /* already cleared */
             uint32_t nv = (pv < n) ? remap[pv] : MPOL_IDX_NONE;
-            if (nv == MPOL_IDX_NONE) orphaned++;
+            if (nv == MPOL_IDX_NONE){ orphaned++; t[i].ck_flags = 0; }   /* MPL-3 */
             mpol_par_set(st, &t[i], k, nv == MPOL_IDX_NONE ? 0xFFFFFFFFu : nv);
         }
     }
@@ -1894,6 +2062,7 @@ static int cluster_last_chunk(void* st, const uint32_t* mem, int n, mpol_chunk* 
             if (cl.m[q].ancestors & ((uint64_t)1 << m)) cl.m[m].descendants |= (uint64_t)1 << q;
 
     int lin[MPC_MAX_CLUSTER]; mpc_chunking ch;
+    g_ck_relin++;                                         /* MPL-3 test counter */
     if (mpc_linearize_optimal(&cl, lin) != 0) return 0;   /* 2026-10-01: was ancestor-score greedy */
     mpc_post_linearize(&cl, lin);
     if (mpc_chunk_linearization(&cl, lin, &ch) != 0 || ch.n == 0) return 0;
@@ -2075,8 +2244,11 @@ static int mpol_replacement_improves(void* st, const unsigned char (*evict)[32],
                                      uint64_t fee, uint64_t vsize){
     mpol_node* t = mpol_nodes_base(st);
     uint32_t nn = *(uint32_t*)((char*)st+16);
-    uint32_t *head = 0, *nxt = 0, *chld = 0;
-    if (!mpol_children_build(st, nn, &head, &nxt, &chld)) return -1;
+    /* MPL-6 (audit 2026-10-23): the persistent children index. This built a
+     * whole-pool one (mpol_children_build, O(n + edges)) for every
+     * replacement CANDIDATE, accepted or not -- so a stream of replacements
+     * that fail the diagram check cost a full pass over the pool each. */
+    if (!mpol_cx_get(st)) return -1;
     int seed_cap = n_evict + n_in, mem_cap = seed_cap * MPC_MAX_CLUSTER + 1;
     uint32_t* seeds = (uint32_t*)malloc((size_t)(seed_cap ? seed_cap : 1) * sizeof *seeds);
     uint32_t* mem = (uint32_t*)malloc((size_t)mem_cap * sizeof *mem);
@@ -2111,12 +2283,20 @@ static int mpol_replacement_improves(void* st, const unsigned char (*evict)[32],
                 if (n_mem >= mem_cap) goto out;
                 mark[pp] = stamp; mem[n_mem++] = pp;
             }
-            for (uint32_t e = head[cur]; e != MPOL_IDX_NONE; e = nxt[e]){
-                uint32_t c = chld[e];
-                if (mark[c] == stamp) continue;
-                if (n_mem >= mem_cap) goto out;
-                mark[c] = stamp; mem[n_mem++] = c;
-            }
+            /* children in ASCENDING index order, as mpol_children_build's
+             * lists gave them (g_cx lists run descending): the member order
+             * feeds the linearization, and the verdict must not move */
+            { uint32_t kid[MPC_MAX_CLUSTER + 1]; int nk = 0;
+              for (uint32_t e = g_cx.head[cur]; e != MPOL_IDX_NONE; e = g_cx.nxt[e]){
+                  if (nk > MPC_MAX_CLUSTER) goto out;          /* more children than a cluster may hold */
+                  kid[nk++] = g_cx.chld[e];
+              }
+              while (nk > 0){
+                  uint32_t c = kid[--nk];
+                  if (mark[c] == stamp) continue;
+                  if (n_mem >= mem_cap) goto out;
+                  mark[c] = stamp; mem[n_mem++] = c;
+              } }
         }
     }
     /* the same members after: evicted ones gone (the new one is added by mpol_chunks_of) */
@@ -2133,7 +2313,6 @@ static int mpol_replacement_improves(void* st, const unsigned char (*evict)[32],
     qsort(ca, (size_t)na, sizeof *ca, mpol_ff_desc);
     rc = mpol_compare_chunks(ca, na, cb, nb) == 1 ? 1 : 0;   /* staging (after) must be strictly better */
 out:
-    free(head); free(nxt); free(chld);
     free(seeds); free(mem); free(after); free(par); free(cb); free(ca);
     return rc;
 }
@@ -2147,8 +2326,12 @@ out:
  * reported chunk is never cheaper than the truth -- which makes a caller
  * using this for an early refusal strictly more permissive, never less.
  * worst_chunk() passes NULL and behaves exactly as before. */
-static int worst_chunk_excl(void* st, mpol_chunk* out,
-                            const unsigned char (*excl)[32], int n_excl){
+/* MPL-3: this is the ORIGINAL algorithm, kept verbatim as the reference the
+ * cached worst_chunk_excl below must agree with (tests compare the two) and
+ * as its fallback for a cluster wider than CHUNK_MAX_CLUSTER, which the
+ * accept path's cluster limit keeps out of the pool in the first place. */
+static int worst_chunk_excl_scan(void* st, mpol_chunk* out,
+                                 const unsigned char (*excl)[32], int n_excl){
     mpol_node* t = mpol_nodes_base(st);
     uint32_t n = *(uint32_t*)((char*)st+16);
     if (n == 0) return 0;
@@ -2251,8 +2434,157 @@ static int worst_chunk_excl(void* st, mpol_chunk* out,
     if (have) *out = best;
     return have;
 }
+/* ---- MPL-3 (audit 2026-10-23): the worst chunk from a per-cluster cache --
+ *
+ * worst_chunk_excl_scan rebuilds the child-edge lists, walks every cluster
+ * and runs the optimal linearization on each, on every call, under the pool
+ * lock -- and the room-making loop calls it once per eviction. With the pool
+ * full of 64-member clusters shaped to make the search work hard (up to ~490
+ * us each) that is seconds per eviction, and an accept at a full pool can
+ * need several.
+ *
+ * Core keeps each cluster's chunks indexed in TxGraph and only re-linearizes
+ * a cluster that changed. Same here: every node carries its cluster's last
+ * chunk (mpol_node.ck_*), an insert or removal marks the clusters it touches
+ * stale, and a call re-linearizes only those. The rest is a pass over the
+ * node array comparing cached feerates.
+ *
+ * The answer is the SAME as the scan's, which is what lets this replace it:
+ *   - a stale cluster is recomputed from its LOWEST-index member, the seed
+ *     the scan would have used, over the same edge lists in the same order
+ *     (mpol_cx_get), so the walk, the linearization and the chunk agree;
+ *   - the scan visits clusters by lowest member index and keeps the first
+ *     strictly-worst one. Walking nodes in index order and keeping the first
+ *     strictly-worst NODE picks the same cluster: a cluster's first node in
+ *     that order is its lowest, and its other members carry the same feerate,
+ *     so they never displace it;
+ *   - `excl` skips the clusters whose last chunk holds an excluded
+ *     transaction, by cache id;
+ *   - the chosen cluster is linearized once more to name its members, and if
+ *     that disagrees with the cache in any way, or anything is too wide, the
+ *     scan answers instead. */
+static int mpol_u32_cmp(const void* a, const void* b){
+    uint32_t x = *(const uint32_t*)a, y = *(const uint32_t*)b;
+    return x < y ? -1 : x > y;
+}
+/* recompute the cluster holding node i; 0 ok, -1 too wide */
+static int mpol_ck_refresh(void* st, uint32_t i){
+    mpol_node* t = mpol_nodes_base(st);
+    uint32_t* mark = (uint32_t*)((char*)st + MPOL_HDR);
+    uint32_t mem[CHUNK_MAX_CLUSTER + 1];
+    int cn = cluster_members(st, i, g_cx.head, g_cx.nxt, g_cx.chld, mark, mpol_stamp_next(st), mem, CHUNK_MAX_CLUSTER);
+    if (cn < 0) return -1;
+    uint32_t rep = i;
+    for (int m = 0; m < cn; m++) if (mem[m] < rep) rep = mem[m];
+    if (rep != i){
+        cn = cluster_members(st, rep, g_cx.head, g_cx.nxt, g_cx.chld, mark, mpol_stamp_next(st), mem, CHUNK_MAX_CLUSTER);
+        if (cn < 0) return -1;
+    }
+    mpol_chunk c;
+    int ok = cluster_last_chunk(st, mem, cn, &c);
+    uint32_t* cidp = mpol_cid_ptr(st);
+    if (++*cidp == 0) ++*cidp;
+    for (int m = 0; m < cn; m++){
+        mpol_node* nd = &t[mem[m]];
+        nd->ck_cid = *cidp;
+        if (!ok){ nd->ck_fee = 0; nd->ck_size = 0; nd->ck_flags = MPOL_CK_VALID | MPOL_CK_NONE; continue; }
+        nd->ck_fee = c.fee; nd->ck_size = c.size; nd->ck_flags = MPOL_CK_VALID;
+    }
+    if (ok) for (int q = 0; q < c.n; q++) t[c.idx[q]].ck_flags |= MPOL_CK_INLAST;
+    return 0;
+}
+static int worst_chunk_excl(void* st, mpol_chunk* out,
+                            const unsigned char (*excl)[32], int n_excl){
+    mpol_node* t = mpol_nodes_base(st);
+    uint32_t n = *(uint32_t*)((char*)st+16);
+    if (n == 0) return 0;
+    if (!mpol_cx_get(st)) return worst_chunk_excl_scan(st, out, excl, n_excl);
+    for (uint32_t i = 0; i < n; i++)
+        if (!(t[i].ck_flags & MPOL_CK_VALID) && mpol_ck_refresh(st, i) < 0)
+            return worst_chunk_excl_scan(st, out, excl, n_excl);
+    uint32_t skip_local[64]; uint32_t* skip = skip_local; int n_skip = 0;
+    if (n_excl > 64){
+        skip = (uint32_t*)malloc((size_t)n_excl * sizeof *skip);
+        if (!skip) return worst_chunk_excl_scan(st, out, excl, n_excl);
+    }
+    for (int e = 0; e < n_excl; e++){
+        int xi = find_node(st, excl[e]);
+        if (xi >= 0 && (t[xi].ck_flags & MPOL_CK_INLAST)) skip[n_skip++] = t[xi].ck_cid;
+    }
+    if (n_skip > 1) qsort(skip, (size_t)n_skip, sizeof *skip, mpol_u32_cmp);
+    int best = -1; uint64_t bf = 0, bs = 1;
+    for (uint32_t i = 0; i < n; i++){
+        if (t[i].ck_flags & MPOL_CK_NONE) continue;
+        if (n_skip && bsearch(&t[i].ck_cid, skip, (size_t)n_skip, sizeof *skip, mpol_u32_cmp)) continue;
+        if (best < 0 || (unsigned __int128)t[i].ck_fee * bs < (unsigned __int128)bf * t[i].ck_size){
+            best = (int)i; bf = t[i].ck_fee; bs = t[i].ck_size;
+        }
+    }
+    if (skip != skip_local) free(skip);
+    if (best < 0) return 0;
+    /* name the members: the chosen node is its cluster's lowest index */
+    uint32_t* mark = (uint32_t*)((char*)st + MPOL_HDR);
+    uint32_t mem[CHUNK_MAX_CLUSTER + 1];
+    int cn = cluster_members(st, (uint32_t)best, g_cx.head, g_cx.nxt, g_cx.chld, mark, mpol_stamp_next(st), mem, CHUNK_MAX_CLUSTER);
+    mpol_chunk c;
+    if (cn < 0 || !cluster_last_chunk(st, mem, cn, &c) || c.fee != bf || c.size != bs){
+        g_ck_fallback++;
+        return worst_chunk_excl_scan(st, out, excl, n_excl);
+    }
+    *out = c;
+    return 1;
+}
 static int worst_chunk(void* st, mpol_chunk* out){
     return worst_chunk_excl(st, out, NULL, 0);
+}
+/* tests: the cached answer (legacy = 0) or the reference scan (legacy = 1),
+ * as txids in chunk order; and the work counters. */
+int mpool_policy_test_worst_chunk(void* st, int legacy, const unsigned char (*excl)[32], int n_excl,
+                                  unsigned char (*txids)[32], int* n_out,
+                                  unsigned long long* fee, unsigned long long* size){
+    mpol_chunk c;
+    int r = legacy ? worst_chunk_excl_scan(st, &c, excl, n_excl) : worst_chunk_excl(st, &c, excl, n_excl);
+    *n_out = 0;
+    if (r != 1) return r;
+    mpol_node* t = mpol_nodes_base(st);
+    for (int q = 0; q < c.n; q++) memcpy(txids[q], t[c.idx[q]].txid, 32);
+    *n_out = c.n; *fee = c.fee; *size = c.size;
+    return 1;
+}
+void mpool_policy_test_counters(unsigned long long* relin, unsigned long long* cx_builds,
+                                unsigned long long* bfs_steps, unsigned long long* fallbacks){
+    if (relin) *relin = g_ck_relin;
+    if (cx_builds) *cx_builds = g_cx_builds;
+    if (bfs_steps) *bfs_steps = g_cl_bfs_steps;
+    if (fallbacks) *fallbacks = g_ck_fallback;
+}
+/* tests: how many nodes marked VALID carry a cache that a fresh computation
+ * of their cluster contradicts -- 0 unless an invalidation was missed. */
+long mpool_policy_test_ck_audit(void* st){
+    mpol_node* t = mpol_nodes_base(st);
+    uint32_t n = *(uint32_t*)((char*)st+16);
+    if (!mpol_cx_get(st)) return -1;
+    uint32_t* mark = (uint32_t*)((char*)st + MPOL_HDR);
+    uint32_t done = mpol_stamp_next(st);
+    long bad = 0;
+    for (uint32_t i = 0; i < n; i++){
+        if (mark[i] == done) continue;
+        uint32_t mem[CHUNK_MAX_CLUSTER + 1];
+        int cn = cluster_members(st, i, g_cx.head, g_cx.nxt, g_cx.chld, mark, done, mem, CHUNK_MAX_CLUSTER);
+        if (cn < 0) return -2;
+        mpol_chunk c; int ok = cluster_last_chunk(st, mem, cn, &c);
+        for (int m = 0; m < cn; m++){
+            const mpol_node* nd = &t[mem[m]];
+            if (!(nd->ck_flags & MPOL_CK_VALID)) continue;
+            int inlast = 0;
+            if (ok) for (int q = 0; q < c.n; q++) if (c.idx[q] == mem[m]) inlast = 1;
+            if (!ok ? !(nd->ck_flags & MPOL_CK_NONE)
+                    : ((nd->ck_flags & MPOL_CK_NONE) || nd->ck_fee != c.fee || nd->ck_size != c.size ||
+                       !!(nd->ck_flags & MPOL_CK_INLAST) != inlast || nd->ck_cid != t[mem[0]].ck_cid))
+                bad++;
+        }
+    }
+    return bad;
 }
 
 /* ========================================================================== */
@@ -2693,21 +3025,45 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
             if (nseen >= CLUSTER_LIMIT){ too_big = 1; break; }
             seen[nseen++] = pi; bfs[sp++] = pi; cl_bytes += t[pi].size;
         }
+        /* MPL-4 (audit 2026-10-23): a popped node's neighbours come from its
+         * own parent list and the children index. This loop used to test
+         * all nn nodes for a link to each popped node -- 64 pops over a
+         * million-entry pool per child transaction, about a quarter of a
+         * second under the pool lock. The walk visits the same set (only
+         * the order differs, and the verdict depends only on the set), so
+         * the limits answer exactly as before. Without an index (out of
+         * memory) it falls back to the scan. */
+        int have_cx = mpol_cx_get(st);
+        #define MPOL_CL_VISIT(ix) do { uint32_t _i = (ix); \
+            if (_i >= nn || MPOL_CL_EVICTED(_i)) break;   /* gone, or leaves the pool if this tx is accepted */ \
+            int _dup = 0; \
+            for (int _q = 0; _q < nseen; _q++) if (seen[_q] == _i){ _dup = 1; break; } \
+            if (_dup) break; \
+            if (nseen >= CLUSTER_LIMIT){ too_big = 1; break; } \
+            seen[nseen++] = _i; bfs[sp++] = _i; cl_bytes += t[_i].size; } while (0)
         while (sp > 0 && !too_big){
             uint32_t cur = bfs[--sp];
+            if (have_cx){
+                for (uint32_t k = 0; k < t[cur].n_parents && !too_big; k++){
+                    g_cl_bfs_steps++;
+                    MPOL_CL_VISIT(mpol_par_at(st, &t[cur], k));
+                }
+                for (uint32_t e = g_cx.head[cur]; e != MPOL_IDX_NONE && !too_big; e = g_cx.nxt[e]){
+                    g_cl_bfs_steps++;
+                    MPOL_CL_VISIT(g_cx.chld[e]);
+                }
+                continue;
+            }
             for (uint32_t i = 0; i < nn && !too_big; i++){
+                g_cl_bfs_steps++;
                 int linked = 0;
                 for (uint32_t k = 0; k < t[i].n_parents; k++) if (mpol_par_at(st, &t[i], k) == cur){ linked = 1; break; }
                 if (!linked) for (uint32_t k = 0; k < t[cur].n_parents; k++) if (mpol_par_at(st, &t[cur], k) == i){ linked = 1; break; }
                 if (!linked) continue;
-                if (MPOL_CL_EVICTED(i)) continue;        /* leaves the pool if this tx is accepted */
-                int dup = 0;
-                for (int q = 0; q < nseen; q++) if (seen[q] == i){ dup = 1; break; }
-                if (dup) continue;
-                if (nseen >= CLUSTER_LIMIT){ too_big = 1; break; }
-                seen[nseen++] = (uint32_t)i; bfs[sp++] = (uint32_t)i; cl_bytes += t[i].size;
+                MPOL_CL_VISIT(i);
             }
         }
+        #undef MPOL_CL_VISIT
         if (too_big || (uint64_t)nseen + 1 > cl_count_limit || cl_bytes + vsize > cl_size_limit){
             _mpol_last_reason = "too-large-cluster"; return 0;
         }
@@ -3256,6 +3612,10 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
         t2[myidx].desc_cnt = 1;
         t2[myidx].desc_bytes = (uint32_t)vsize;
         t2[myidx].version = meta.version;
+        /* MPL-3: the slot may hold a departed node's bytes; the newcomer's
+         * cluster has not been chunked yet */
+        t2[myidx].ck_fee = 0; t2[myidx].ck_size = 0;
+        t2[myidx].ck_cid = 0; t2[myidx].ck_flags = 0;
         /* MEM-3: reserve an overflow block BEFORE recording anything. The
          * slot was memset to zero by state_init, so povf must be set to
          * MPOL_OVF_NONE explicitly -- 0 is a valid block index. On
@@ -3284,6 +3644,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
                                                          * count, so the slot
                                                          * is live when the
                                                          * chain names it */
+        mpol_cx_inserted(st, myidx);                    /* MPL-3/4/6 */
         for (uint32_t k=0;k<n_anc;k++){
             t2[anc_list[k]].desc_cnt++;
             t2[anc_list[k]].desc_bytes += (uint32_t)vsize;

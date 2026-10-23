@@ -589,7 +589,7 @@ node_serve_loop:
     cmp  byte [tx_dv_ok], 1
     jne  .inv_next           ; no validation this connection: nothing to accept it into
     cmp  r9d, 1
-    jne  .inv_txann_req      ; a wtxid cannot be looked up by txid: just ask
+    jne  .inv_txann_rej      ; a wtxid cannot be looked up in the pool by txid -- but it IS what the reject filter holds
     ; already in the pool? mpool_get(mp_cur, hash, &s_fh)
     mov  [s_ptr], rbx
     mov  rdi, [mp_cur]
@@ -612,6 +612,12 @@ node_serve_loop:
     ; The filter holds FINAL verdicts only: a fee-only failure stays
     ; re-announceable, because a CPFP child can overturn it. It is shared
     ; across serve children, so one child's refusal spares all of them.
+    ;
+    ; MPL-1 (audit 2026-10-23): refusals are filed by WTXID (Core's
+    ; MempoolRejectedTx), so a MSG_WTX announcement is checked here too; a
+    ; MSG_TX one matches only a transaction without a witness, whose txid IS
+    ; its wtxid -- the same answer Core's AlreadyHaveTx gives.
+.inv_txann_rej:
     mov  [s_ptr], rbx
     lea  rdi, [rbx+4]
     call serve_reject_has
@@ -619,6 +625,9 @@ node_serve_loop:
     test eax, eax
     jnz  .inv_next           ; already refused: do not fetch it again
 .inv_txann_req:
+    ; the entry's type again: r9 is caller-saved, and the calls above
+    ; clobbered it
+    mov  r9d, [rbx]
     ; getdata: [1][type][hash]; MSG_TX is asked for as MSG_WITNESS_TX (0x40000001),
     ; MSG_WTX echoed (the getdata carries the wtxid)
     mov  byte  [src_buf], 1

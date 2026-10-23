@@ -288,25 +288,43 @@ static long long txr_now_ms(void);      /* defined with the orphan pool below */
 #define TXR_RECON_MAX      64
 #define TXR_RECON_TTL_MS   120000
 #define TXR_RECON_REFETCH  2            /* ring bypasses granted per entry */
-typedef struct { u8 txid[32]; int used; int refetch; long long t_ms; } txr_recon_t;
+typedef struct { u8 txid[32], wtxid[32]; int used; int refetch; long long t_ms, gen; } txr_recon_t;
 static txr_recon_t txr_recon[TXR_RECON_MAX];
 static long txr_recon_n, txr_1p1c_ok, txr_1p1c_fail;   /* counters for the caller's log */
+/* the shared recent-rejects filter's block generation: Core resets both
+ * reject filters on every tip change, and so does this set's "do not
+ * validate it alone again" (MPL-2) */
+extern long long serve_rejects_generation(void) __attribute__((weak));
+static long long txr_block_gen(void){ return serve_rejects_generation ? serve_rejects_generation() : 0; }
 
-static void txr_recon_add(const u8 txid[32]){
+static void txr_recon_add(const u8 txid[32], const u8 wtxid[32]){
     long long now = txr_now_ms();
     int oldest = 0;
     for (int i = 0; i < TXR_RECON_MAX; i++){
         if (txr_recon[i].used && !memcmp(txr_recon[i].txid, txid, 32)){
+            memcpy(txr_recon[i].wtxid, wtxid, 32); txr_recon[i].gen = txr_block_gen();
             txr_recon[i].t_ms = now; txr_recon[i].refetch = TXR_RECON_REFETCH; return; }
         if (!txr_recon[i].used){ oldest = i; goto place; }
         if (txr_recon[i].t_ms < txr_recon[oldest].t_ms) oldest = i;
     }
 place:
     memcpy(txr_recon[oldest].txid, txid, 32);
+    memcpy(txr_recon[oldest].wtxid, wtxid, 32);
     txr_recon[oldest].used = 1;
     txr_recon[oldest].refetch = TXR_RECON_REFETCH;
     txr_recon[oldest].t_ms = now;
+    txr_recon[oldest].gen = txr_block_gen();
     txr_recon_n++;
+}
+/* MPL-2: this exact transaction (by wtxid) failed on fee alone since the
+ * last block -- Core's m_lazy_recent_rejects_reconsiderable: it is not
+ * validated by itself again, only offered with a child as a package */
+static int txr_recon_holds(const u8 wtxid[32]){
+    long long now = txr_now_ms(), gen = txr_block_gen();
+    for (int i = 0; i < TXR_RECON_MAX; i++)
+        if (txr_recon[i].used && !memcmp(txr_recon[i].wtxid, wtxid, 32))
+            return now - txr_recon[i].t_ms <= TXR_RECON_TTL_MS && txr_recon[i].gen == gen;
+    return 0;
 }
 
 /* is this txid a fee-only reject worth re-fetching? consumes one bypass */
@@ -335,8 +353,9 @@ static void txr_recon_expire(void){
  * with its parent still in flight -- Core parks these in its orphanage and
  * resolves them when the parent lands; without one, every such child is a
  * "missing-inputs" reject and a re-fetch cycle. This pool is deliberately
- * small and disposable: bounded count and bytes, oldest-evicted, 120 s
- * expiry -- an orphan that cannot be resolved quickly will be re-announced
+ * small and disposable: bounded count and bytes, evicted from the peer using
+ * the most (MPL-5, below), 5-minute expiry -- an orphan that cannot be
+ * resolved quickly will be re-announced
  * by the network anyway. Parents are requested immediately on the same leg
  * (MSG_WITNESS_TX, same reasoning as every other fetch here). On every
  * accepted transaction the pool is re-swept, so multi-level chains resolve
@@ -349,14 +368,24 @@ static void txr_recon_expire(void){
 #define TXR_ORPHAN_MAX       2048
 #define TXR_ORPHAN_BYTES     (8u << 20)
 #define TXR_ORPHAN_TTL_MS    300000    /* 5 min: deep chains resolve slower than 2 min; 2048 slots absorb the residency */
-#define TXR_ORPHAN_PARENTS   8          /* parent txids remembered per orphan */
 typedef struct {
     u8* buf; u32 len;
-    u8 txid[32];
-    u8 parent[TXR_ORPHAN_PARENTS][32]; u32 nparent;
+    u8 txid[32], wtxid[32];
+    /* MPL-7 (audit 2026-10-23): EVERY distinct parent, as Core's
+     * GetUniqueParents, sorted for lookup. This kept the first 8 -- and the
+     * parser stepped over each scriptSig one byte short, so in fact only the
+     * first parent was recorded right -- and a child was never retried when
+     * a parent it had not recorded arrived. */
+    u8 (*parent)[32]; u32 nparent;
+    int peer;                  /* MPL-5: who sent it (txr_peer_key) */
     long long t_ms;
 } txr_orphan_t;
 static txr_orphan_t txr_orph[TXR_ORPHAN_MAX];
+
+/* MPL-5: one key per peer. An outbound leg is its fd; a transaction handed
+ * over by an inbound serve child is keyed by that child's announce slot, in a
+ * range no fd can take. */
+static int txr_peer_key(int fd, int src_slot){ return fd >= 0 ? fd : -2 - src_slot; }
 
 /* ---- orphan mirror for getorphantxs --------------------------------------
  * This pool is process-local to the download worker and is touched from one
@@ -669,88 +698,161 @@ static unsigned long txr_varint(const u8* p, const u8* end, unsigned* consumed){
     return 0;
 }
 
-/* first TXR_ORPHAN_PARENTS distinct parent txids of a raw tx */
-static u32 txr_tx_parents(const u8* tx, unsigned long len, u8 out[][32], u32 cap){
+/* every distinct parent txid of a raw tx (MPL-7), sorted, in a malloc'd
+ * array the caller frees: as many as the transaction has inputs, which the
+ * size cap on what is parked bounds */
+static int txr_h32_cmp(const void* a, const void* b){ return memcmp(a, b, 32); }
+static u32 txr_tx_parents(const u8* tx, unsigned long len, u8 (**out)[32]){
+    *out = 0;
     const u8* p = tx + 4; const u8* end = tx + len;
     if (len < 10) return 0;
     if (p + 2 <= end && p[0] == 0x00 && p[1] == 0x01) p += 2;
     unsigned cc; unsigned long nin = txr_varint(p, end, &cc);
-    if (!cc) return 0;
+    if (!cc || !nin) return 0;
     p += cc;
+    if (nin > len / 41) nin = len / 41;                /* an input is at least 41 bytes */
+    u8 (*v)[32] = malloc((nin ? nin : 1) * 32);
+    if (!v) return 0;
     u32 n = 0;
     for (unsigned long i = 0; i < nin && p + 36 <= end; i++){
-        int dup = 0;
-        for (u32 k = 0; k < n; k++) if (!memcmp(out[k], p, 32)) { dup = 1; break; }
-        if (!dup && n < cap){ memcpy(out[n], p, 32); n++; }
+        memcpy(v[n++], p, 32);
         p += 36;
-        unsigned long sl = txr_varint(p, end, &cc); if (!cc) return n;
-        if ((unsigned long)(end - p) < sl + 4) return n;
-        p += sl + 4;
+        /* past the scriptSig's length prefix too: stepping only sl + 4 left
+         * every later input read one prefix-width early, so only the FIRST
+         * parent of a multi-input orphan was ever recorded right */
+        unsigned long sl = txr_varint(p, end, &cc); if (!cc) break;
+        if ((unsigned long)(end - p) < cc + sl + 4) break;
+        p += cc + sl + 4;
     }
+    if (n > 1){
+        qsort(v, n, 32, txr_h32_cmp);
+        u32 w = 1;
+        for (u32 i = 1; i < n; i++) if (memcmp(v[i], v[w-1], 32)) memcpy(v[w++], v[i], 32);
+        n = w;
+    }
+    if (!n){ free(v); return 0; }
+    *out = v;
     return n;
+}
+static int txr_orphan_names(const txr_orphan_t* o, const u8 parent[32]){
+    return o->nparent && bsearch(parent, o->parent, o->nparent, 32, txr_h32_cmp) != 0;
 }
 
 static void txr_orphan_free(txr_orphan_t* o){
     txr_orph_gen++;
     if (o->buf){ free(o->buf); txr_orph_bytes -= o->len; }
+    free(o->parent);
     memset(o, 0, sizeof *o);
 }
 
-static void txr_orphan_add(const u8 txid[32], const u8* tx, unsigned long len){
+/* ---- MPL-5 (audit 2026-10-23): eviction charges the peer using the most --
+ *
+ * The pool was global and oldest-first, so one peer sending orphans as fast
+ * as it liked flushed everyone else's: every honest child waiting for its
+ * parent was evicted by the flood. Core v31's TxOrphanage gives each peer an
+ * equal share of the global limits and, when they are exceeded, evicts the
+ * OLDEST orphan of the peer with the highest DoS score -- its usage over its
+ * share, the worse of count and bytes -- so a peer inside its share is never
+ * evicted by another's flood. Same rule here over this pool's limits
+ * (TXR_ORPHAN_MAX entries, TXR_ORPHAN_BYTES bytes), the share being the
+ * limit over the number of peers holding orphans. The newcomer counts
+ * towards its own peer; when that peer is the worst and holds nothing older,
+ * the newcomer itself is what does not fit. Ties go to the larger key, as
+ * Core's go to the more recent peer.
+ *
+ * Simplification against Core: one announcer per orphan (the first to send
+ * it), and no preference for keeping reconsiderable orphans. */
+typedef struct { int peer; int idx; } txr_peer_idx_t;
+static int txr_peer_idx_cmp(const void* a, const void* b){
+    const txr_peer_idx_t* x = a; const txr_peer_idx_t* y = b;
+    if (x->peer != y->peer) return x->peer < y->peer ? -1 : 1;
+    return x->idx < y->idx ? -1 : x->idx > y->idx;
+}
+/* the slot to evict, or -1 when the newcomer is the one to refuse */
+static int txr_orphan_victim(int new_peer, unsigned long new_len){
+    static txr_peer_idx_t v[TXR_ORPHAN_MAX + 1];
+    int nv = 0;
+    for (int i = 0; i < TXR_ORPHAN_MAX; i++) if (txr_orph[i].buf){ v[nv].peer = txr_orph[i].peer; v[nv].idx = i; nv++; }
+    v[nv].peer = new_peer; v[nv].idx = -1; nv++;
+    qsort(v, (size_t)nv, sizeof *v, txr_peer_idx_cmp);
+    unsigned long long best_key = 0; int best_peer = 0, have = 0;
+    for (int a = 0; a < nv; ){
+        int b = a; unsigned long long cnt = 0, bytes = 0;
+        while (b < nv && v[b].peer == v[a].peer){
+            cnt++; bytes += v[b].idx >= 0 ? txr_orph[v[b].idx].len : new_len; b++;
+        }
+        /* max(cnt / MAX, bytes / BYTES), compared over the common denominator */
+        unsigned long long kc = cnt * (unsigned long long)TXR_ORPHAN_BYTES,
+                           kb = bytes * (unsigned long long)TXR_ORPHAN_MAX;
+        unsigned long long key = kc > kb ? kc : kb;
+        if (!have || key > best_key || (key == best_key && v[a].peer > best_peer)){
+            best_key = key; best_peer = v[a].peer; have = 1; }
+        a = b;
+    }
+    int victim = -1; long long oldest = 0;
+    for (int i = 0; i < TXR_ORPHAN_MAX; i++)
+        if (txr_orph[i].buf && txr_orph[i].peer == best_peer &&
+            (victim < 0 || txr_orph[i].t_ms < oldest)){ victim = i; oldest = txr_orph[i].t_ms; }
+    return victim;
+}
+
+static void txr_orphan_add(const u8 txid[32], const u8 wtxid[32], const u8* tx, unsigned long len, int peer){
     txr_orph_gen++;
     if (len == 0 || len > (TXR_ORPHAN_BYTES / 4)) return;   /* one tx may not hog the pool */
     for (int i = 0; i < TXR_ORPHAN_MAX; i++)
         if (txr_orph[i].buf && !memcmp(txr_orph[i].txid, txid, 32)) return;   /* already parked */
-    /* pick a free slot, else evict the oldest; evict oldest until the byte
-     * budget fits too */
+    /* a free slot inside the byte budget, else evict from the peer with the
+     * highest score until there is one */
     for (;;){
-        int slot = -1; long long oldest = 0; int oldi = -1;
-        for (int i = 0; i < TXR_ORPHAN_MAX; i++){
-            if (!txr_orph[i].buf){ slot = i; break; }
-            if (oldi < 0 || txr_orph[i].t_ms < oldest){ oldest = txr_orph[i].t_ms; oldi = i; }
-        }
+        int slot = -1;
+        for (int i = 0; i < TXR_ORPHAN_MAX; i++) if (!txr_orph[i].buf){ slot = i; break; }
         if (slot >= 0 && txr_orph_bytes + len <= TXR_ORPHAN_BYTES){
             txr_orphan_t* o = &txr_orph[slot];
             o->buf = malloc(len);
             if (!o->buf){ memset(o, 0, sizeof *o); return; }
             memcpy(o->buf, tx, len); o->len = (u32)len;
-            memcpy(o->txid, txid, 32);
-            o->nparent = txr_tx_parents(tx, len, o->parent, TXR_ORPHAN_PARENTS);
+            memcpy(o->txid, txid, 32); memcpy(o->wtxid, wtxid, 32);
+            o->nparent = txr_tx_parents(tx, len, &o->parent);
+            o->peer = peer;
             o->t_ms = txr_now_ms();
             txr_orph_bytes += (u32)len;
             txr_orph_parked++;
             return;
         }
-        if (oldi < 0) return;
-        txr_orphan_free(&txr_orph[oldi]); txr_orph_dropped++; txr_drop_evict++;
+        int victim = txr_orphan_victim(peer, len);
+        if (victim < 0){ txr_orph_dropped++; txr_drop_evict++; return; }   /* the newcomer is over its share */
+        txr_orphan_free(&txr_orph[victim]); txr_orph_dropped++; txr_drop_evict++;
     }
 }
 
-/* retry every orphan that lists `accepted` as a parent; cascade until a
- * sweep makes no progress (bounded by the pool size, in practice 1-2). */
+/* Retry every orphan that names `accepted` as a parent, and then the
+ * children of whatever that let in, until nothing new is accepted.
+ *
+ * MPL-7 (audit 2026-10-23): a WORKLIST of newly accepted txids, as Core's
+ * per-peer orphan work set (AddChildrenToWorkSet). The sweep used to stop at
+ * the first child it accepted and restart with want = that child, so the
+ * accepted parent's OTHER children were never tried. Each orphan is accepted
+ * at most once, so the list is bounded by the pool. */
 static long txr_orphan_resolve(void* mp, const u8 accepted[32]){
     static u8 scratch2[2000*81 + 8];
+    static u8 work[TXR_ORPHAN_MAX + 1][32];
+    unsigned wn = 0, wh = 0;
     long got = 0;
-    int progress = 1;
-    u8 want[32]; memcpy(want, accepted, 32);
-    while (progress){
-        progress = 0;
+    memcpy(work[wn++], accepted, 32);
+    while (wh < wn){
+        u8 want[32]; memcpy(want, work[wh++], 32);
         for (int i = 0; i < TXR_ORPHAN_MAX; i++){
             txr_orphan_t* o = &txr_orph[i];
-            if (!o->buf) continue;
-            int hit = 0;
-            for (u32 k = 0; k < o->nparent; k++) if (!memcmp(o->parent[k], want, 32)) { hit = 1; break; }
-            if (!hit) continue;
+            if (!o->buf || !txr_orphan_names(o, want)) continue;
             u8 id[32];
             long rr = -26;
             if (tx_txid(id, o->buf, o->len, scratch2, sizeof scratch2) == 1 &&
                 (rr = tx_accept_validate_p2p(mp, id, o->buf, o->len)) == 1){
                 got++; txr_orph_resolved++;
                 txr_ann_add(id, -1);           /* cascaded accepts announce everywhere */
-                memcpy(want, id, 32);          /* this accept may unlock ITS children */
+                if (wn < TXR_ORPHAN_MAX + 1) memcpy(work[wn++], id, 32);   /* its children next */
                 txr_orphan_free(o);
-                progress = 1;
-                break;                          /* restart the sweep with the new parent */
+                continue;
             }
             /* still unresolvable (another parent missing, or a real reject):
              * leave it for the TTL; a definitive non-missing reject frees it.
@@ -782,8 +884,11 @@ static long txr_orphan_resolve(void* mp, const u8 accepted[32]){
  * well-formedness check, the same overlay, the same two passes, and the
  * same fee context that submitpackage runs. A package off the wire and a
  * package off the RPC socket must not be able to disagree. */
+/* *child_class: what the child's own verdict was when the package failed --
+ * -26 a final refusal, -28 fee only (or the package's aggregate floor), -25
+ * missing inputs, 0 not learned (the parent failed first, or a later step) */
 static int txr_submit_1p1c(void* mp, const u8* parent, unsigned long plen,
-                           const u8* child, unsigned long clen){
+                           const u8* child, unsigned long clen, int* child_class){
     const u8* txs[2]  = { parent, child };
     unsigned long lens[2] = { plen, clen };
     u8 txids[64];
@@ -791,6 +896,7 @@ static int txr_submit_1p1c(void* mp, const u8* parent, unsigned long plen,
     const char* why = "";
     int rbf = -1;
 
+    *child_class = 0;
     if (!mpol_package_well_formed(txs, lens, 2, txids, vsz, &why)) return 0;
 
     /* pass 1: dry run under the overlay, to learn the real fees. The overlay
@@ -809,7 +915,10 @@ static int txr_submit_1p1c(void* mp, const u8* parent, unsigned long plen,
          * the UTXO view), so it only stands in when the policy layer was
          * never reached -- and that member is not counted below anyway. */
         if (rc == 1 || txacc_fee_reconsiderable(r)){ tot_fee += fee; tot_vsize += (avs ? avs : vsz[i]); }
-        else { all_ok = 0; break; }     /* not something a package can rescue */
+        else { all_ok = 0;              /* not something a package can rescue */
+               if (i == 1) *child_class = rc == -25 ? -25 : -26;
+               break; }
+        if (i == 1 && rc != 1) *child_class = -28;
     }
     txacc_package_overlay(NULL, NULL, NULL, 0);
     mpol_package_context(NULL, NULL, NULL, 0);
@@ -821,7 +930,8 @@ static int txr_submit_1p1c(void* mp, const u8* parent, unsigned long plen,
      * (PackageRBFChecks). Without this the commit priced the parent's
      * replacement on its own fee and refused it. */
     { char why[320];
-      if (!txacc_package_floor_check(tot_fee, tot_vsize, why, sizeof why)) return 0;
+      if (!txacc_package_floor_check(tot_fee, tot_vsize, why, sizeof why)){ *child_class = -28; return 0; }
+      *child_class = 0;                 /* past the floor, a failure is not the child's own verdict */
       rbf = txacc_package_rbf_check(txs, lens, txids, 2, tot_fee, tot_vsize, pfee, pvs, why, sizeof why);
       if (rbf == 0) return 0; }
 
@@ -863,33 +973,83 @@ static int txr_submit_1p1c(void* mp, const u8* parent, unsigned long plen,
     return committed;
 }
 
-/* A parent has just been rejected for fee alone. If some parked orphan
- * names it as a parent, that orphan is the child the package needs; try
- * each such child until one package sticks. Returns transactions accepted
- * (2 on success -- both members entered the mempool). */
-static long txr_try_1p1c(void* mp, const u8 parent_txid[32],
-                         const u8* parent, unsigned long plen){
+/* ---- MPL-2 (audit 2026-10-23): one package per parent arrival, never the
+ * same one twice ------------------------------------------------------------
+ *
+ * Each arrival of a fee-rejected parent ran a full test of EVERY parked
+ * orphan naming it, and a child that failed was left parked for the 5-minute
+ * TTL -- so re-sending one cheap parent re-verified the same invalid children
+ * over and over (fee-only parents are deliberately kept out of the reject
+ * filter, so nothing stopped the re-sends either).
+ *
+ * Core (TxDownloadManagerImpl::Find1P1CPackage, ProcessPackageResult):
+ *   - a parent in the reconsiderable filter is not validated alone again;
+ *     its arrival only looks for a child (txr_take_tx);
+ *   - ONE candidate per arrival: a child from the same peer, newest first --
+ *     here, the same peer's children first, then any, newest first;
+ *   - never a package that already failed (MempoolRejectedPackage), nor a
+ *     child in the reject filter;
+ *   - a child that fails inside the package leaves the orphanage unless it
+ *     is still missing inputs, and its verdict is recorded: a final one in
+ *     the reject filter, a fee-only one as reconsiderable.
+ * So every (parent, child) pair is tried at most once per block. */
+#define TXR_PKGFAIL_MAX 512
+static struct { u8 p8[8], c8[8]; long long gen; } txr_pkgfail[TXR_PKGFAIL_MAX];
+static unsigned txr_pkgfail_w;
+static long txr_1p1c_tries;               /* package attempts, for tests */
+long txrelay_1p1c_attempts(void){ return txr_1p1c_tries; }
+static int txr_pkgfail_has(const u8 pw[32], const u8 cw[32]){
+    long long gen = txr_block_gen();
+    for (unsigned i = 0; i < TXR_PKGFAIL_MAX; i++)
+        if (txr_pkgfail[i].gen == gen && !memcmp(txr_pkgfail[i].p8, pw, 8) && !memcmp(txr_pkgfail[i].c8, cw, 8))
+            return 1;
+    return 0;
+}
+static void txr_pkgfail_note(const u8 pw[32], const u8 cw[32]){
+    unsigned i = txr_pkgfail_w++ % TXR_PKGFAIL_MAX;
+    memcpy(txr_pkgfail[i].p8, pw, 8); memcpy(txr_pkgfail[i].c8, cw, 8);
+    txr_pkgfail[i].gen = txr_block_gen();
+}
+extern int  serve_reject_has(const unsigned char txid[32]) __attribute__((weak));
+extern void serve_reject_note(const unsigned char txid[32]) __attribute__((weak));
+/* A parent has just been rejected for fee alone, or arrived again after
+ * such a rejection. Returns transactions accepted (2 + cascade on success). */
+static long txr_try_1p1c(void* mp, const u8 parent_txid[32], const u8 parent_wtxid[32],
+                         const u8* parent, unsigned long plen, int peer){
+    int pick = -1, pick_same = 0; long long pick_t = 0;
     for (int i = 0; i < TXR_ORPHAN_MAX; i++){
         txr_orphan_t* o = &txr_orph[i];
-        if (!o->buf) continue;
-        int hit = 0;
-        for (u32 k = 0; k < o->nparent; k++)
-            if (!memcmp(o->parent[k], parent_txid, 32)) { hit = 1; break; }
-        if (!hit) continue;
-        if (txr_submit_1p1c(mp, parent, plen, o->buf, o->len)){
-            u8 cid[32]; memcpy(cid, o->txid, 32);
-            txr_orphan_free(o);
-            txr_orph_resolved++;
-            /* the CHILD is what a grandchild names as its parent, so the
-             * cascade sweep has to run on the child's txid, not the
-             * parent's -- sweeping the parent would find nothing. */
-            return 2 + txr_orphan_resolve(mp, cid);
-        }
+        if (!o->buf || !txr_orphan_names(o, parent_txid)) continue;
+        if (txr_pkgfail_has(parent_wtxid, o->wtxid)) continue;
+        if (serve_reject_has && serve_reject_has(o->wtxid)) continue;
+        int same = o->peer == peer;
+        if (pick < 0 || same > pick_same || (same == pick_same && o->t_ms > pick_t)){
+            pick = i; pick_same = same; pick_t = o->t_ms; }
+    }
+    if (pick < 0) return 0;
+    txr_orphan_t* o = &txr_orph[pick];
+    int cclass = 0;
+    txr_1p1c_tries++;
+    if (txr_submit_1p1c(mp, parent, plen, o->buf, o->len, &cclass)){
+        u8 cid[32]; memcpy(cid, o->txid, 32);
+        txr_orphan_free(o);
+        txr_orph_resolved++;
+        /* the CHILD is what a grandchild names as its parent, so the
+         * cascade sweep has to run on the child's txid, not the
+         * parent's -- sweeping the parent would find nothing. */
+        return 2 + txr_orphan_resolve(mp, cid);
+    }
+    txr_pkgfail_note(parent_wtxid, o->wtxid);
+    if (cclass == -26){
+        if (serve_reject_note) serve_reject_note(o->wtxid);
+        txr_orphan_free(o); txr_orph_dropped++; txr_drop_reject++;
+    } else if (cclass == -28){
+        txr_recon_add(o->txid, o->wtxid);
+        txr_orphan_free(o); txr_orph_dropped++; txr_drop_reject++;
     }
     return 0;
 }
 
-static long txr_orphan_resolve(void* mp, const u8 accepted[32]);
 #define txr_orphan_resolve_ann(mp, id, fd) txr_orphan_resolve((mp), (id))
 
 static void txr_orphan_expire(void){
@@ -1067,8 +1227,17 @@ typedef struct {
     u8  nfd, tries, inflight, used, ntried;
     int req_fd;                 /* where the in-flight request went */
     int tried_fd[6];            /* every fd this entry was ever requested from */
+    int owner;                  /* MPL-5: the peer whose announcement or orphan created it */
     long long t_req, t_seen;
 } txr_want_t;
+/* MPL-5 (audit 2026-10-23): one peer's share of the want table. Every inv
+ * entry and every parent an orphan names takes a slot, and a full table
+ * evicted the globally oldest -- so one peer announcing (or parking orphans
+ * with many parents) as fast as it liked pushed everyone else's pending
+ * requests out. Core bounds what it tracks per peer (TxRequestTracker,
+ * MAX_PEER_TX_ANNOUNCEMENTS). Here a peer at its share recycles its OWN
+ * oldest entry, and a full table evicts from the peer holding the most. */
+#define TXR_WANT_PEER_MAX (TXR_WANT_MAX / 4)
 static txr_want_t txr_want_tab[TXR_WANT_MAX];
 static long long txr_req_retry_ms = TXR_REQ_RETRY_MS_DEF;
 static long long txr_retry_last;            /* driver throttle (below) */
@@ -1132,21 +1301,48 @@ static void txr_want_forget(txr_want_t* w){
 static void txr_want_clear(const u8* h){
     txr_want_forget(txr_want_find(h));
 }
+static int txr_cur_owner = -1;            /* the owner of an fd < 0 note (set by txr_take_tx) */
+static int txr_want_slot_for(int owner){
+    /* one pass: a free slot, the owner's own count and oldest entry */
+    int free_slot = -1, own_n = 0, own_old = -1;
+    for (int i = 0; i < TXR_WANT_MAX; i++){
+        const txr_want_t* e = &txr_want_tab[i];
+        if (!e->used){ if (free_slot < 0) free_slot = i; continue; }
+        if (e->owner != owner) continue;
+        own_n++;
+        if (own_old < 0 || e->t_seen < txr_want_tab[own_old].t_seen) own_old = i;
+    }
+    if (own_n >= TXR_WANT_PEER_MAX) return own_old;          /* at its share: its own oldest goes */
+    if (free_slot >= 0) return free_slot;
+    /* full: the oldest entry of the peer holding the most */
+    static struct { int owner, n, oldest; } tally[64];
+    int nt = 0, worst = -1;
+    for (int i = 0; i < TXR_WANT_MAX; i++){
+        const txr_want_t* e = &txr_want_tab[i];
+        int t = 0; while (t < nt && tally[t].owner != e->owner) t++;
+        if (t == nt){
+            if (nt == 64){ t = -1; }
+            else { tally[nt].owner = e->owner; tally[nt].n = 0; tally[nt].oldest = i; nt++; }
+        }
+        if (t < 0) continue;                                  /* more owners than tallied: counted out */
+        tally[t].n++;
+        if (e->t_seen < txr_want_tab[tally[t].oldest].t_seen) tally[t].oldest = i;
+    }
+    for (int t = 0; t < nt; t++) if (worst < 0 || tally[t].n > tally[worst].n) worst = t;
+    return worst >= 0 ? tally[worst].oldest : 0;
+}
 static void txr_want_note(const u8* h, u32 rtype, int fd, int requested){
     txr_want_t* w = txr_want_find(h);
     if (!w){
-        int slot = -1; long long oldest = 0;
-        for (int i = 0; i < TXR_WANT_MAX; i++){
-            if (!txr_want_tab[i].used){ slot = i; break; }
-            if (slot < 0 || txr_want_tab[i].t_seen < oldest || i == 0){ if (i == 0 || txr_want_tab[i].t_seen < oldest){ oldest = txr_want_tab[i].t_seen; slot = i; } }
-        }
+        int owner = fd >= 0 ? fd : txr_cur_owner;
+        int slot = txr_want_slot_for(owner);
         w = &txr_want_tab[slot];
         /* MEM-9: unlink the evicted entry's key before its bytes are
          * replaced, and link the new one after. Which slot is chosen is
          * unchanged -- this only keeps the index honest about it. */
         if (w->used) txr_want_unlink(slot);
         memset(w, 0, sizeof *w);
-        memcpy(w->hash, h, 32); w->rtype = rtype; w->used = 1;
+        memcpy(w->hash, h, 32); w->rtype = rtype; w->used = 1; w->owner = owner;
         txr_want_link(slot);
     }
     w->t_seen = txr_now_ms();
@@ -1346,7 +1542,7 @@ int txrelay_classify_missing(const unsigned char* tx, unsigned long len){
     u8 txid[32], wtxid[32];
     if (len < 60 || tx_txid(txid, tx, len, scratch, sizeof scratch) != 1) return 0;
     { extern void sha256d(u8 out[32], const void* p, unsigned long n); sha256d(wtxid, tx, len); }
-    if (serve_reject_has && serve_reject_has(txid)) return 4;
+    if (serve_reject_has && (serve_reject_has(wtxid) || serve_reject_has(txid))) return 4;   /* MPL-1: refusals are filed by wtxid */
     for (int i = 0; i < TXR_ORPHAN_MAX; i++) if (txr_orph[i].buf && !memcmp(txr_orph[i].txid, txid, 32)) return 3;
     txr_want_t* w = txr_want_find(txid); if (!w) w = txr_want_find(wtxid);
     if (txr_ring_has(txid) || txr_ring_has(wtxid) || (w && w->inflight)) return 2;
@@ -1387,19 +1583,34 @@ long txrelay_poll_block_only_leg(int fd){
  * (src_slot), which is what keeps it from being announced back to the peer
  * that sent it. *outstanding counts getdata entries written on fd. */
 extern void txann_set_my_slot(int slot) __attribute__((weak));
+static long txr_rej_filtered;              /* MPL-1: copies dropped by the reject filter */
+long txrelay_reject_filtered_count(void){ return txr_rej_filtered; }
 static long txr_take_tx(void* mp, const u8* pl, unsigned long plen, int fd, int src_slot, int* outstanding){
     static u8 scratch[2000*81 + 8];      /* worker is single-threaded */
     long accepted = 0;
-    u8 txid[32];
+    u8 txid[32], wtxid[32];
     if (plen < 60 || tx_txid(txid, pl, plen, scratch, sizeof scratch) != 1) return 0;
     { extern void sha256d(u8 out[32], const void* p, unsigned long n);
-      u8 wtxid[32]; sha256d(wtxid, pl, plen);       /* BIP339 announcements key by this */
+      sha256d(wtxid, pl, plen);                     /* BIP339 announcements key by this */
       txr_want_clear(txid); txr_want_clear(wtxid); }
+    int peer = txr_peer_key(fd, src_slot);
+    /* MPL-1 (audit 2026-10-23): a transaction we already refused is dropped
+     * before anything else is spent on it, requested or not -- Core's
+     * ReceivedTx (AlreadyHaveTx on the wtxid against the recent-rejects
+     * filter). Only the request path consulted the filter, so pushing the
+     * same invalid transaction unasked cost a full validation every time. By
+     * WTXID, as Core: a txid entry would let a copy with a mangled witness
+     * shut out the valid transaction. */
+    if (serve_reject_has && serve_reject_has(wtxid)){ txr_rej_filtered++; return 0; }
     /* already in the pool (Core AlreadyHaveTx): two inbound peers can both
      * hand over the same tx before the first is accepted, and a duplicate
      * that reaches the policy check costs a full script verify and ends in
      * the recent-rejects filter as "txn-already-in-mempool" */
     { unsigned long have_len; if (mpool_get(mp, txid, &have_len)) return 0; }
+    /* MPL-2: refused on fee alone since the last block -- not validated by
+     * itself again (Core's reconsiderable filter); it can only go in with a
+     * child, as a package */
+    if (txr_recon_holds(wtxid)) return txr_try_1p1c(mp, txid, wtxid, pl, plen, peer);
     /* a handed-off tx is attributed to its inbound peer's slot for the one
      * validation: txann_push records it as the source (no echo to that peer,
      * and CC-3's last_tx_time eviction protection credits the right peer) */
@@ -1413,24 +1624,32 @@ static long txr_take_tx(void* mp, const u8* pl, unsigned long plen, int fd, int 
         if (fd >= 0) txr_ann_add(txid, fd);   /* handed off: txann_worker_drain announces it from the ring */
         accepted += txr_orphan_resolve_ann(mp, txid, fd);   /* cascade waiting children */
     } else if (r == -28){
-        /* fee-only reject -- the one verdict a CPFP child can
-         * overturn. If a child is already parked for this
-         * parent, the two go in together; if not, remember the
-         * parent as reconsiderable so that when a child does
-         * turn up we are allowed to fetch this parent again. */
-        long got = txr_try_1p1c(mp, txid, pl, plen);
-        if (got) accepted += got;
-        else     txr_recon_add(txid);
+        /* fee-only reject -- the one verdict a CPFP child can overturn.
+         * Remembered as reconsiderable (so a child turning up may fetch the
+         * parent again, and the parent is not validated alone again); if a
+         * child is already parked, the two go in together. */
+        txr_recon_add(txid, wtxid);
+        accepted += txr_try_1p1c(mp, txid, wtxid, pl, plen, peer);
     } else if (r == -25){
-        /* missing inputs: ordinary out-of-order relay. Park the
-         * child and fetch its parents from THIS leg right now --
-         * the resolve sweep on the parent's accept finishes the
-         * job. */
-        txr_orphan_add(txid, pl, plen);
-        u8 par[TXR_ORPHAN_PARENTS][32];
-        u32 npar = txr_tx_parents(pl, plen, par, TXR_ORPHAN_PARENTS);
-        static u8 gd[1 + TXR_ORPHAN_PARENTS*36];
+        /* missing inputs: ordinary out-of-order relay. Park the child and
+         * fetch its parents from THIS leg right now -- the resolve sweep on
+         * the parent's accept finishes the job. */
+        u8 (*par)[32] = 0;
+        u32 npar = txr_tx_parents(pl, plen, &par);
+        /* Core (MempoolRejectedTx, fRejectedParents): a parent we already
+         * refused means this child can never be valid -- do not park it, do
+         * not chase its parents, and refuse it by txid AND wtxid (no witness
+         * makes it acceptable) */
+        for (u32 k = 0; k < npar && serve_reject_has; k++)
+            if (serve_reject_has(par[k])){
+                free(par);
+                if (serve_reject_note){ serve_reject_note(txid); serve_reject_note(wtxid); }
+                return 0;
+            }
+        txr_orphan_add(txid, wtxid, pl, plen, peer);
+        static u8 gd[1 + TXR_MAX_REQ*36];
         unsigned want = 0;
+        txr_cur_owner = peer;
         for (u32 k = 0; k < npar; k++){
             unsigned long got_len;
             /* a parent we rejected on fee alone is exactly the
@@ -1449,6 +1668,13 @@ static long txr_take_tx(void* mp, const u8* pl, unsigned long plen, int fd, int 
                   if (w && !w->inflight){ txr_parent_req++; txr_want_failover(w); } }
                 continue;
             }
+            if (want >= TXR_MAX_REQ){
+                /* MPL-7: every parent is chased, not just the first eight;
+                 * past one message's worth they are noted against this leg
+                 * and txr_drain_pending asks for them on its next polls */
+                txr_want_note(par[k], TXR_MSG_WITNESS_TX, fd, 0);
+                continue;
+            }
             u8* o = gd + 1 + want*36;
             o[0] = (u8)(TXR_MSG_WITNESS_TX);       o[1] = 0;
             o[2] = 0; o[3] = (u8)(TXR_MSG_WITNESS_TX >> 24);
@@ -1457,6 +1683,8 @@ static long txr_take_tx(void* mp, const u8* pl, unsigned long plen, int fd, int 
             txr_want_note(par[k], TXR_MSG_WITNESS_TX, fd, 1);
             want++;
         }
+        txr_cur_owner = -1;
+        free(par);
         if (want){
             gd[0] = (u8)want;
             if (p2p_write(fd, "getdata", 7, gd, 1 + want*36) > 0){
@@ -1581,6 +1809,10 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
                 else if (type == TXR_MSG_WTX) req_type = TXR_MSG_WTX;    /* wtxid: the getdata echoes it */
                 else continue;
                 unsigned long got_len;
+                /* MPL-1: Core's AlreadyHaveTx -- an announcement of a hash we
+                 * refused is not requested, nor remembered (by txid this only
+                 * matches a transaction without a witness, as in Core) */
+                if (serve_reject_has && serve_reject_has(e + 4)) continue;
                 txr_want_note(e + 4, req_type, fd, 0);           /* remember the announcer either way */
                 if (want >= TXR_MAX_REQ || outstanding + (int)want >= 100) continue;   /* the caps: noted, requested by the drain later */
                 if (txr_ring_has(e + 4)) continue;     /* recently requested */
