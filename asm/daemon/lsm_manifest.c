@@ -1,5 +1,6 @@
 /* daemon/lsm_manifest.c -- see lsm_manifest.h. */
 #include <stdio.h>
+#include <errno.h>
 #include <string.h>
 #include <stdlib.h>
 #include <fcntl.h>
@@ -61,7 +62,25 @@ uint64_t lsm_manifest_persisted_live_file(const char* path){
 }
 uint64_t lsm_manifest_persisted_live(void){ return lsm_manifest_persisted_live_file(LSM_MANIFEST_FILE); }
 
+int lsm_dir_sync(void){
+    int dfd = open(".", O_RDONLY | O_DIRECTORY);
+    if (dfd < 0) return -1;
+    int r = fsync(dfd), e = errno;
+    close(dfd);
+    if (r != 0){ errno = e; return -1; }
+    return 0;
+}
+
 int lsm_manifest_publish(const struct lsm_state* lst, uint64_t persisted_live){
+    /* STO-W (formal/storage, 2026-10-23): the run files this manifest names
+     * were created since the last directory fsync (the flush writer's run, a
+     * merge child's output). POSIX orders nothing between two name ops of a
+     * directory: without this fsync a power loss could keep the rename below
+     * and lose a run's create, and the manifest would name a missing run
+     * (ext4 commits its journal in order, so the deployment never sees it).
+     * One fsync per publish covers every run created before it. A failure
+     * publishes nothing: the old manifest stays, the new runs are orphans. */
+    if (lsm_dir_sync() != 0) return -1;
     int fd = open(LSM_MANIFEST_PUB, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) return -1;
     unsigned char h[20]; size_t hl;
@@ -74,8 +93,13 @@ int lsm_manifest_publish(const struct lsm_state* lst, uint64_t persisted_live){
     }
     close(fd);
     if (rename(LSM_MANIFEST_PUB, LSM_MANIFEST_FILE) != 0){ unlink(LSM_MANIFEST_PUB); return -1; }
-    int dfd = open(".", O_RDONLY);
-    if (dfd >= 0){ fsync(dfd); close(dfd); }
+    /* STO-D (formal/storage, 2026-10-23): this result was ignored. The rename
+     * is done -- the next process reads the new manifest -- but without the
+     * directory fsync it may not survive a power loss, and the callers' next
+     * steps (retiring the WAL generation, unlinking a merge's inputs) are
+     * safe only once it does. 1 says so; the caller keeps the state those
+     * steps would discard (redo work on the next boot, not a loss). */
+    if (lsm_dir_sync() != 0) return 1;
     return 0;
 }
 
@@ -156,8 +180,11 @@ int lsm_manifest_adopt_child(struct lsm_state* lst, const uint64_t* inputs, int 
     struct lsm_state pubview = *lst;
     pubview.manifest_buf = nb;
     pubview.manifest_n   = total;
-    if (lsm_manifest_publish(&pubview, nbase) != 0){ free(nb); free(c); return -1; }
-    /* Durable on disk. Only now may memory name the merged run. */
+    int pr = lsm_manifest_publish(&pubview, nbase);
+    if (pr < 0){ free(nb); free(c); return -1; }
+    /* On disk (pr = 1: renamed, its durability unknown -- the file names the
+     * merged run either way, so memory must too). Only now may memory name
+     * the merged run. */
     memcpy(lst->manifest_buf, nb, (size_t)total * 16);
     lst->manifest_n = total;
     lst->total_live += heal;
@@ -165,7 +192,7 @@ int lsm_manifest_adopt_child(struct lsm_state* lst, const uint64_t* inputs, int 
     free(nb); free(c);
     unlink(LSM_MANIFEST_CHILD);
     if (new_persisted) *new_persisted = nbase;
-    return 0;
+    return pr;
 }
 
 int lsm_manifest_sweep_orphans(const struct lsm_state* lst){
@@ -175,6 +202,14 @@ int lsm_manifest_sweep_orphans(const struct lsm_state* lst){
     int same = (n == lst->manifest_n) && (n == 0 || memcmp(e, lst->manifest_buf, (size_t)n * 16) == 0);
     free(e);
     if (!same) return -1;
+    /* STO-W (formal/storage, 2026-10-23): the manifest this sweep trusts is
+     * the one a previous process renamed into place, perhaps without a
+     * directory fsync that succeeded (it was SIGKILLed first, or the fsync
+     * failed). POSIX may keep the unlinks below and lose that rename, and the
+     * older manifest would come back naming runs this sweep deleted. The
+     * rename durable first; if that fails, sweep nothing (the orphans only
+     * cost disk space until a boot whose fsync works). */
+    if (lsm_dir_sync() != 0) return -2;
     int gone = 0;
     if (unlink(LSM_MANIFEST_CHILD) == 0) gone++;
     if (unlink(LSM_MANIFEST_PUB) == 0) gone++;
