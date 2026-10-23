@@ -74,4 +74,27 @@ static inline int hdr_contextual_ok(long height, const unsigned char* hdr,
     return 1;
 }
 
+/* CON-8 (audit 2026-10-23): BIP94's timewarp rule, Core
+ * ContextualCheckBlockHeader under consensus.enforce_BIP94 (testnet4; Core's
+ * regtest only with -test=bip94, which this tree does not offer):
+ *   if (nHeight % DifficultyAdjustmentInterval() == 0 &&
+ *       block.GetBlockTime() < pindexPrev->GetBlockTime() - MAX_TIMEWARP)
+ *       -> "time-timewarp-attack"
+ * MAX_TIMEWARP is 600 s; the interval is 2016 on every chain here
+ * (bitcoin_pow_rules.c POW_INTERVAL). Both times are compared as int64, as
+ * Core's GetBlockTime() returns them. prev_hdr = the parent's 80 bytes.
+ * Returns 1 ok (or not enforced), 0 with *reason set. */
+#define HDR_MAX_TIMEWARP 600L
+#define HDR_DIFF_ADJ_INTERVAL 2016L
+static inline int hdr_timewarp_ok(long height, const unsigned char* hdr,
+                                  const unsigned char* prev_hdr, int enforce_bip94,
+                                  const char** reason){
+    if (!enforce_bip94 || height <= 0 || height % HDR_DIFF_ADJ_INTERVAL != 0) return 1;
+    unsigned int t, pt;
+    memcpy(&t,  hdr + 68, 4);
+    memcpy(&pt, prev_hdr + 68, 4);
+    if ((int64_t)t < (int64_t)pt - HDR_MAX_TIMEWARP){ *reason = "time-timewarp-attack"; return 0; }
+    return 1;
+}
+
 #endif /* BMC_HDRRULES_H */

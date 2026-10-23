@@ -630,7 +630,11 @@ static int rg_hdr_at(void* vctx, long h, unsigned char hdr[80]){
  * uses for the retarget window. Returns 0 if the window is not fully
  * readable, and the caller then skips the floor for that header rather than
  * evaluating it against a window that does not exist. */
-static unsigned long rg_mtp_at(void* vctx, long h){
+/* Core's GetMedianTimePast at h: the median of the up-to-11 headers ending
+ * there -- fewer below height 10, exactly as Core's window is (CON-13, audit
+ * 2026-10-23: a short window used to disable the floor). 0 = a header in the
+ * window is unreadable; the caller refuses. */
+static int rg_mtp_at(void* vctx, long h, unsigned long* out){
     unsigned int t[11];
     int n = 0;
     for (long k = h; k > h - 11 && k >= 0; k--){
@@ -638,13 +642,14 @@ static unsigned long rg_mtp_at(void* vctx, long h){
         if (!rg_hdr_at(vctx, k, hdr)) return 0;
         memcpy(&t[n++], hdr + 68, 4);
     }
-    if (n < 11) return 0;
-    for (int a2 = 1; a2 < n; a2++){                    /* insertion sort, n = 11 */
+    if (n == 0) return 0;
+    for (int a2 = 1; a2 < n; a2++){                    /* insertion sort, n <= 11 */
         unsigned int v = t[a2]; int j = a2 - 1;
         while (j >= 0 && t[j] > v){ t[j+1] = t[j]; j--; }
         t[j+1] = v;
     }
-    return (unsigned long)t[n/2];
+    *out = (unsigned long)t[n/2];
+    return 1;
 }
 
 static int g_pure_disconnect = 0;                 /* CC-10: reorg_disconnect_to() */
@@ -725,9 +730,17 @@ long reorg_analyze(void* st, reorg_cand_t* c){
         for (long i = 0; i < c->n; i++){
             long h = c->base_height + 1 + i;
             const char* why = "?";
-            unsigned long pmtp = rg_mtp_at(&x, h - 1);
+            unsigned long pmtp = 0;
+            unsigned char phdr[80];
+            /* CON-13: an unreadable parent window refuses (it used to pass a
+             * 0 floor, i.e. accept the header unevaluated) */
+            if (!rg_mtp_at(&x, h - 1, &pmtp) || !rg_hdr_at(&x, h - 1, phdr)){
+                fprintf(stderr, "[reorg] candidate REJECTED: header %ld (height %ld): the parent's median-time-past window is unreadable\n", i, h);
+                return -1;
+            }
             unsigned long long hflags = script_flags_for_block((unsigned long long)h, c->hash[i]);
-            if (!hdr_contextual_ok(h, c->hdr[i], pmtp, now, hflags, g_rg_bip34_h, &why)){
+            if (!hdr_contextual_ok(h, c->hdr[i], pmtp, now, hflags, g_rg_bip34_h, &why)
+                || !hdr_timewarp_ok(h, c->hdr[i], phdr, g_rg_bip94, &why)){   /* CON-8 */
                 fprintf(stderr, "[reorg] candidate REJECTED: header %ld (height %ld) %s\n", i, h, why);
                 return -1;
             }

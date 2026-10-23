@@ -1236,8 +1236,8 @@ static void restamp_branch(blk_t* b, long n, const u8 prev0[32], unsigned t0){
 
 static void case_reorg_header_rules(void){
     /* 14 base blocks so a candidate at height 15 has a full 11-header window
-     * behind it -- rg_mtp_at returns 0 for a short window and the floor is
-     * then skipped, which would make the time-too-old assertion vacuous. */
+     * behind it (the short window below height 11 has its own case,
+     * case_reorg_short_window_mtp). */
     const long nbase = 14, nlose = 2, nwin = 3;
     build_base(nbase, 0x207fffffu);
     build_branch(lose, nlose, nbase, 0x20000000u, 0x207fffffu);
@@ -1303,6 +1303,53 @@ static void case_reorg_header_rules(void){
            reorg_analyze(store_buf,&c), 2);
     }
 
+    utxo_live_close();
+}
+
+/* CON-13 (audit 2026-10-23): below height 11 Core's GetMedianTimePast is
+ * the median of the ancestors that exist, and time-too-old applies to every
+ * header but genesis. rg_mtp_at returned 0 for a short window, and a 0 floor
+ * disables the rule, so a candidate at height 4 at its parent's MTP was
+ * accepted. */
+static void case_reorg_short_window_mtp(void){
+    const long nbase = 4, nlose = 1, nwin = 2;
+    build_base(nbase, 0x207fffffu);              /* heights 0..3 at 1600000000+h */
+    build_branch(lose, nlose, nbase, 0x20000000u, 0x207fffffu);
+    build_branch(win,  nwin,  nbase, 0x30000000u, 0x207fffffu);
+    unsigned base_t = 1600000000u + (unsigned)nbase;
+    restamp_branch(lose, nlose, base[nbase-1].hash, base_t + 1);
+    harness_open();
+    store_chain(nbase, nlose);
+    reorg_set_header_rules(1000000);
+
+    unsigned good_t = (unsigned)time(NULL) - 3600u;
+    restamp_branch(win, nwin, base[nbase-1].hash, good_t);
+    {
+        static reorg_cand_t c; memset(&c,0,sizeof c);
+        reorg_build_locator(store_buf, &c);
+        cand_from_blocks(&c, win, nwin);
+        ck("CON-13 control: a well-formed candidate at height 4 is accepted",
+           reorg_analyze(store_buf,&c), 2);
+    }
+    /* the first candidate header (height 4) EQUAL to the median of the four
+     * headers below it (1600000000..3 -> 1600000002): time-too-old exactly
+     * at the boundary */
+    { mk_block(&win[0], base[nbase-1].hash, 1600000002u);
+      mk_block(&win[1], win[0].hash, good_t + 1);
+      static reorg_cand_t c; memset(&c,0,sizeof c);
+      reorg_build_locator(store_buf, &c);
+      cand_from_blocks(&c, win, nwin);
+      ck("CON-13 a height-4 header at its short-window MTP is REJECTED time-too-old",
+         reorg_analyze(store_buf,&c), -1); }
+    /* one second above it is fine */
+    { mk_block(&win[0], base[nbase-1].hash, 1600000003u);
+      mk_block(&win[1], win[0].hash, good_t + 1);
+      static reorg_cand_t c; memset(&c,0,sizeof c);
+      reorg_build_locator(store_buf, &c);
+      cand_from_blocks(&c, win, nwin);
+      ck("CON-13 one second above the short-window MTP is accepted",
+         reorg_analyze(store_buf,&c), 2); }
+    reorg_set_header_rules(-1);
     utxo_live_close();
 }
 
@@ -1958,6 +2005,7 @@ int main(void){
     total += run_case("mempool reconcile is WIRED (STO-7)", case_mempool_wired);
     total += run_case("reconcile leaves no ghosts (MEM-8)", case_mempool_ghosts);
     total += run_case("reorg header rules (VAL-5 rest)", case_reorg_header_rules);
+    total += run_case("reorg short-window MTP (CON-13)", case_reorg_short_window_mtp);
     total += run_case("fake peer locator + reorg",      case_fakepeer_locator_and_reorg);
     total += run_case("fake peer handoff (long replacement)", case_fakepeer_handoff);
     total += run_case("fake peer lighter chain retained", case_fakepeer_lighter_retained);
