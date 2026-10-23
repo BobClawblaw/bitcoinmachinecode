@@ -1,0 +1,4 @@
+#!/bin/bash
+# lim SECS CMD...  -- every solver/build runs memory-capped (8G, no swap), niced, time-limited
+secs=$1; shift
+exec systemd-run --user --scope -q -p MemoryMax=8G -p MemorySwapMax=0 -- nice -n15 timeout "$secs" "$@"
