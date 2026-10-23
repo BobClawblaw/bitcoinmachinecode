@@ -3718,7 +3718,9 @@ static void leg_hb_note_block(int k){
 }
 extern long blk_submit_evaluate_ex(const unsigned char*, unsigned long, const unsigned char*, long, int, char*, unsigned long);
 extern long cmpct_recv_cmpctblock(int fd, void* mp, const unsigned char* pl, unsigned long plen, unsigned char* out, unsigned long cap, const unsigned char want[32]);
-extern long cmpct_recv_blocktxn(int fd, const unsigned char* pl, unsigned long plen, unsigned char* out, unsigned long cap);
+extern long cmpct_recv_blocktxn(int fd, const unsigned char* pl, unsigned long plen, unsigned char* out, unsigned long cap, const unsigned char want[32]);
+extern int  hdr_accept_check(void* st, const unsigned char* hdr80);   /* serve_hdrctx.c: 1 accept, 12 punish, 13 refuse unscored */
+extern int  pow_check(const unsigned char hdr[80]);
 static unsigned char g_push_blk[4u << 20];
 static unsigned char g_push_hash[32]; static int g_push_pending = 0, g_push_leg = -1;
 /* a block that arrived through the sweep: on our tip, PoW and consensus
@@ -3745,22 +3747,39 @@ static long dl_store_pushed_block(int k, const unsigned char* blk, unsigned long
     leg_hb_note_block(k);
     return 1;
 }
+/* P2P-2 (audit 2026-10-23): an unsolicited cmpctblock from any outbound leg
+ * went straight to the reconstruction -- a walk of every mempool slot and a
+ * SipHash per entry -- with nothing but "extends our tip" checked first, so
+ * a header with no real work behind it bought a full pool scan. Core
+ * accepts a cmpctblock from any peer too, but only after the header passes
+ * ProcessNewBlockHeaders: PoW (CheckBlockHeader) and the contextual rules
+ * (ContextualCheckBlockHeader: the nBits schedule above all), and a header
+ * that fails them is BLOCK_INVALID_HEADER and the peer is Misbehaving. With
+ * the schedule enforced, a header that reaches the scan costs a real block's
+ * work. Core also calls READ_STATUS_INVALID indexes Misbehaving (P2P-3). A
+ * reconstruction that then fails consensus is NOT scored: Core passes
+ * via_compact_block and exempts it. */
 static long leg_on_cmpctblock(int fd, const unsigned char* pl, unsigned long plen){
     int k = leg_of_fd(fd); if(k < 0 || plen < 88) return -1;
     unsigned char bh[32]; sha256d(bh, pl, 80); g_push_n++;
+    if(!pow_check(pl)){ txr_report_violation_fd(fd, "cmpctblock header: high-hash"); return -1; }
     long h; if(ht_idx && idx_get(ht_idx, bh, &h)){ g_push_skipped_n++; return 0; }
     unsigned char tiph[32];
     if(store_get_tip_hash(store_buf, tiph) != 1 || memcmp(pl + 4, tiph, 32) != 0){ leg_on_block_announce(fd, bh, "a compact block off our tip"); return 0; }   /* behind, or a fork: the pass sorts it out */
+    { int hc = hdr_accept_check(store_buf, pl);
+      if(hc == 12){ txr_report_violation_fd(fd, "cmpctblock header: invalid for its height"); return -1; }
+      if(hc != 1) return 0; }                                           /* time-too-new: refused, not scored (Core BLOCK_TIME_FUTURE) */
     if(!inflight_claim(&g_inflight, bh, k, (long long)time(NULL))) return 0;   /* another leg is fetching it */
     if(g_push_pending){ inflight_release_leg(&g_inflight, g_push_leg); g_push_pending = 0; }   /* an older push never completed */
     long n = cmpct_recv_cmpctblock(fd, txsub_worker_ready() ? txsub_pool() : NULL, pl, plen, g_push_blk, sizeof g_push_blk, bh);
     if(n > 0){ long r = dl_store_pushed_block(k, g_push_blk, (unsigned long)n, bh, "pushed compact block"); inflight_release_leg(&g_inflight, k); return r; }
     if(n == 0){ g_push_pending = 1; g_push_leg = k; memcpy(g_push_hash, bh, 32); return 0; }   /* getblocktxn (or a full-block getdata) is out; the reply comes through the sweep */
+    if(n == CMPCT_INVALID) txr_report_violation_fd(fd, "invalid compact block");
     inflight_release_leg(&g_inflight, k); return -1;
 }
 static long leg_on_blocktxn(int fd, const unsigned char* pl, unsigned long plen){
     int k = leg_of_fd(fd); if(k < 0 || !g_push_pending || k != g_push_leg) return -1;
-    long n = cmpct_recv_blocktxn(fd, pl, plen, g_push_blk, sizeof g_push_blk);
+    long n = cmpct_recv_blocktxn(fd, pl, plen, g_push_blk, sizeof g_push_blk, g_push_hash);
     if(n > 0){ g_push_pending = 0; long r = dl_store_pushed_block(k, g_push_blk, (unsigned long)n, g_push_hash, "pushed compact block + blocktxn"); inflight_release_leg(&g_inflight, k); return r; }
     if(n == 0) return 0;                                                /* the receiver fell back to a full-block getdata: the `block` comes through the sweep */
     g_push_pending = 0; inflight_release_leg(&g_inflight, k); return -1;
@@ -3861,6 +3880,21 @@ static int reorg_probe_host_silent(void){ return legs_heard_within(-1, PROBE_SIL
 static void pass_fail_bookkeeping(int i, long ok, int fail_code, double sync_s){
     anchor_locator(mux_out_loc[i]);
     if(ok == 1){ g_sync_fail_streak[i] = 0; return; }   /* peer had nothing: normal at tip */
+    /* P2P-1/P2P-3 (audit 2026-10-23): the peer sent what Core calls
+     * misbehaviour -- the block it named in its own headers carried a header
+     * Core refuses (where=12: high-hash, bad-diffbits, time-too-old,
+     * bad-version; BLOCK_INVALID_HEADER), or a compact block with bogus
+     * indexes (where=14: READ_STATUS_INVALID). Core's Misbehaving discourages
+     * and disconnects at once; not a strike out of three. In a pass helper
+     * the parent replays this from the report, so the score is taken once. */
+    if((fail_code == 12 || fail_code == 14) && !g_pass_in_child){
+        const char* why = fail_code == 12 ? "invalid block header" : "invalid compact block";
+        if(mux_out_fd[i] >= 0) txr_report_violation_fd(mux_out_fd[i], why);
+        char d[96]; snprintf(d, sizeof d, "%s (where=%d)", why, fail_code);
+        leg_close_ours(i, "misbehaving", d);
+        g_sync_fail_streak[i] = 0;
+        return;
+    }
     if(fail_code == 4 && sync_s < 0.5){   /* EOF before the peer said anything: it hung up */
         leg_close_theirs(i, "EOF on the first read", "(nothing)");
         g_sync_fail_streak[i] = 0;
@@ -9848,6 +9882,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
       g_cmpct_hook_type = (void*)cmpct_getdata_type; g_cmpct_hook_cmpct = (void*)cmpct_recv_cmpctblock; g_cmpct_hook_blocktxn = (void*)cmpct_recv_blocktxn; }
       { extern void* g_cmpct_hook_fallback; extern void cmpct_recv_note_fallback(void); g_cmpct_hook_fallback = (void*)cmpct_recv_note_fallback; }
       { extern void (*txrelay_on_pong)(int, const unsigned char*); txrelay_on_pong = leg_on_pong; inflight_init(&g_inflight); g_block_fetch_hook = (void*)block_fetch_gate; }
+      { extern void* g_block_ctx_hook; g_block_ctx_hook = (void*)hdr_accept_check; }   /* P2P-1: the pass's block passes Core's header rules before it is stored */
       { extern void (*txrelay_on_block_inv)(int, const unsigned char*); extern void (*txrelay_on_headers)(int, const unsigned char*, unsigned long);
         extern long (*txrelay_on_cmpctblock)(int, const unsigned char*, unsigned long); extern long (*txrelay_on_blocktxn)(int, const unsigned char*, unsigned long); extern long (*txrelay_on_block)(int, const unsigned char*, unsigned long);
         txrelay_on_block_inv = leg_on_block_inv; txrelay_on_headers = leg_on_headers; txrelay_on_cmpctblock = leg_on_cmpctblock; txrelay_on_blocktxn = leg_on_blocktxn; txrelay_on_block = leg_on_block;

@@ -214,21 +214,40 @@ long cmpct_recv_cmpctblock(int fd, void* mp, const unsigned char* pl, unsigned l
     if (!g_enabled || plen < 80 + 8 + 1 + 1) return -1;
     unsigned char bh[32]; block_hash(bh, pl); if (memcmp(bh, want, 32) != 0){ if (dbg()) fprintf(stderr, "[cmpct_dbg] not the wanted block (%02x%02x.. vs want %02x%02x..)\n", bh[31], bh[30], want[31], want[30]); return -1; }
     S.active = 1; memcpy(S.hash, bh, 32); memcpy(S.hdr, pl, 80); memcpy(&S.nonce, pl + 80, 8); S.pre_used = 0; S.nmiss = 0;
+    /* P2P-3 (audit 2026-10-23): Core's bounds on the indexes, checked before
+     * any arithmetic that could wrap. CBlockHeaderAndShortTxIDs refuses to
+     * deserialize a tx count over 16 bits ("indexes overflowed 16 bits") or a
+     * prefilled index over 16 bits (COMPACTSIZE into a uint16_t); Core drops
+     * such a message unscored, and here, as for every payload that does not
+     * parse, the block is asked for in full. What
+     * PartiallyDownloadedBlock::InitData calls READ_STATUS_INVALID -- no
+     * transactions at all, or a prefilled index (cumulative) past 0xffff or
+     * past every position the short ids and the prefilled so far can fill --
+     * is a peer sending bogus data, which Core answers with Misbehaving:
+     * CMPCT_INVALID (-2), and the caller scores the peer. Until this, the
+     * running index was a full u64 (idx + d + 1 could wrap onto a position
+     * already filled), nshort * 6 could wrap past the length check, and
+     * nshort + npre could wrap to a small count. */
     unsigned long o = 88; unsigned long long nshort = 0, npre = 0; long c;
     if (!(c = get_cs(pl + o, plen - o, &nshort))) return fallback_full(fd);
     o += (unsigned long)c;
+    if (nshort > 0xffff) return fallback_full(fd);
     if (o + nshort * 6 > plen) return fallback_full(fd);
     const unsigned char* sids = pl + o; o += (unsigned long)nshort * 6;
     if (!(c = get_cs(pl + o, plen - o, &npre))) return fallback_full(fd);
     o += (unsigned long)c;
-    S.ntx = (unsigned long)(nshort + npre); if (S.ntx == 0 || S.ntx > CR_MAX_TX) return fallback_full(fd);
+    if (npre > 0xffff || nshort + npre > 0xffff) return fallback_full(fd);
+    if (nshort + npre == 0){ S.active = 0; return CMPCT_INVALID; }
+    S.ntx = (unsigned long)(nshort + npre); if (S.ntx > CR_MAX_TX) return fallback_full(fd);
     memset(&g_last, 0, sizeof g_last); g_last.ntx = S.ntx; g_last.pre = (unsigned long)npre;
     for (unsigned long i = 0; i < S.ntx; i++) S.ptr[i] = 0;
     /* prefilled: (differential index, tx) -- copy the tx bytes, the payload buffer is reused by the next read */
-    unsigned long idx = 0;
+    long idx = -1;
     for (unsigned long long k = 0; k < npre; k++){
         unsigned long long d; if (!(c = get_cs(pl + o, plen - o, &d))) return fallback_full(fd); o += (unsigned long)c;
-        idx = k ? idx + (unsigned long)d + 1 : (unsigned long)d; if (idx >= S.ntx) return fallback_full(fd);
+        if (d > 0xffff) return fallback_full(fd);                                     /* does not deserialize (uint16_t) */
+        idx += (long)d + 1;                                                            /* Core's lastprefilledindex: no wrap, d <= 0xffff */
+        if (idx > 0xffff || (unsigned long long)idx > nshort + k){ S.active = 0; return CMPCT_INVALID; }
         unsigned char info[64]; if (!tx_parse(info, pl + o, plen - o)) return fallback_full(fd);
         unsigned long tl = (unsigned long)*(unsigned long long*)info; if (S.pre_used + tl > sizeof S.pre) return fallback_full(fd);
         memcpy(S.pre + S.pre_used, pl + o, tl); S.ptr[idx] = S.pre + S.pre_used; S.len[idx] = tl; S.pre_used += tl; o += tl;
@@ -252,9 +271,15 @@ long cmpct_recv_cmpctblock(int fd, void* mp, const unsigned char* pl, unsigned l
     if (dbg()) fprintf(stderr, "[cmpct_dbg] getblocktxn sent: %lu missing of %lu\n", S.nmiss, S.ntx);
     return 0;
 }
-long cmpct_recv_blocktxn(int fd, const unsigned char* pl, unsigned long plen, unsigned char* out, unsigned long cap){
+long cmpct_recv_blocktxn(int fd, const unsigned char* pl, unsigned long plen, unsigned char* out, unsigned long cap, const unsigned char want[32]){
     if (dbg()) fprintf(stderr, "[cmpct_dbg] blocktxn fd=%d plen=%lu active=%d\n", fd, plen, S.active);
     if (!g_enabled || !S.active || plen < 33) return -1;
+    /* P2P-1 (audit 2026-10-23): the reconstruction in S is the one most
+     * recently started in this process, by whichever path -- not necessarily
+     * the block this caller asked for. A blocktxn completing it would hand
+     * the caller another block under its own hash; the caller says which
+     * block it is waiting for, and anything else is not its reply. */
+    if (want && memcmp(S.hash, want, 32) != 0){ if (dbg()) fprintf(stderr, "[cmpct_dbg] the pending reconstruction is not the caller's block\n"); return -1; }
     if (memcmp(pl, S.hash, 32) != 0){ if (dbg()) fprintf(stderr, "[cmpct_dbg] blocktxn for another block\n"); return -1; }
     unsigned long o = 32; unsigned long long n; long c;
     if (!(c = get_cs(pl + o, plen - o, &n)) || n != S.nmiss) return fallback_full(fd);

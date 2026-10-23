@@ -612,7 +612,8 @@ node_sync_multi:
     push r13
     push r14
     push r15
-    sub  rsp, 0x1b18       ; frame: scratch@-0x1308 (cons_verify), block hashes; -0x1b08/-0x1b0c: compact-block fallback flags (2026-09-09)
+    sub  rsp, 0x1b18       ; frame: scratch@-0x1308 (cons_verify), block hashes; -0x1b08/-0x1b0c: compact-block fallback flags (2026-09-09);
+                           ; -0x1b10: count of `block` replies not the one requested, -0x1b40: their hash (P2P-1, 2026-10-23)
                            ; array@-0xae8 (64 x 32B) so headers stay usable even
                            ; after the block receive overwrites buf. 0x1b08==8
                            ; mod16, after 6 pushes -> RSP 0 mod16 at all calls.
@@ -872,6 +873,7 @@ node_sync_multi:
     mov  dword [rbp-0x1b0c], 0    ; no full-block fallback sent for it (yet)
     mov  dword [rbp-0x1b00], 0    ; blk-drain retry counter (separate 4 bytes
                                     ; from the hdr-drain one at -0x1b04)
+    mov  dword [rbp-0x1b10], 0    ; P2P-1: `block` replies that were not the block requested
 .blk_drain:
     mov  rdi, rbx
     lea  rsi, [rbp-0x160]
@@ -923,6 +925,11 @@ node_sync_multi:
     push rax                        ; 7th argument, stack stays 16-aligned
     call r10
     add  rsp, 16
+    cmp  rax, -2                    ; P2P-3: CMPCT_INVALID, Core's READ_STATUS_INVALID
+    jne  .cmpct_valid
+    mov  dword [rel sync_fail_code], 14   ; bogus compact-block indexes: the peer is scored
+    jmp  .fail
+.cmpct_valid:
     cmp  rax, 0
     jle  .blk_drain
     mov  [rbp-0x54], eax
@@ -942,6 +949,7 @@ node_sync_multi:
     mov  edx, [rbp-0x54]
     mov  rcx, r14
     mov  r8d, [rbp-0x48]
+    lea  r9, [rbp-0xa0]             ; P2P-1: the block this pass asked for
     call r10
     cmp  rax, 0
     jle  .blk_drain
@@ -971,6 +979,53 @@ node_sync_multi:
     call p2p_write
     jmp  .blk_drain
 .have_block:
+    ; ---- P2P-1 (audit 2026-10-23): is this the block we asked for? ----
+    ; [rbp-0xa0] is the hash of the header the peer's own `headers` reply
+    ; named, and it is the hash the block is filed under below. Until this
+    ; check, whatever `block` came back was stored under it: idxscan_append_
+    ; locked asks only that the body extend our tip, and cons_verify checks
+    ; PoW against the body's OWN nBits -- so a block at the easiest target
+    ; became index hash X over body Y, and the applier, which compares the
+    ; two, stopped at that height for good. A `block` that is not the one
+    ; requested is passed over like any other unrelated message (a reply to
+    ; an earlier getdata on this socket, from the sweep, is legitimate); a
+    ; peer that sends nothing but such blocks ends the pass (where=11).
+    ; A payload too short to hold a header is a bad block, as cons_verify
+    ; would have said.
+    cmp  dword [rbp-0x54], 81
+    jb   .verify_failed
+    lea  rdi, [rbp-0x1b40]        ; 32-byte scratch at the frame's floor
+    mov  rsi, r14
+    call block_hash
+    lea  rdi, [rbp-0x1b40]
+    lea  rsi, [rbp-0xa0]
+    mov  ecx, 32
+    repe cmpsb
+    je   .is_requested
+    mov  dword [rbp-0x1b08], 0    ; whatever path assembled it, it is not ours
+    inc  dword [rbp-0x1b10]
+    cmp  dword [rbp-0x1b10], 16
+    jb   .blk_drain
+    mov  dword [rel sync_fail_code], 11
+    jmp  .fail
+.is_requested:
+    ; ---- P2P-1: Core's header acceptance before any of the body's work ----
+    ; g_block_ctx_hook(st, hdr80) -> 1 accept, else the fail code: 12 a header
+    ; Core refuses as invalid (bad-diffbits, time-too-old, bad-version,
+    ; high-hash: the peer is scored), 13 refused but not the peer's fault
+    ; (time-too-new). The daemon installs hdr_accept_check (serve_hdrctx.c);
+    ; NULL (the hermetic suites) skips it.
+    mov  rax, [rel g_block_ctx_hook]
+    test rax, rax
+    jz   .ctx_ok
+    mov  rdi, r12
+    mov  rsi, r14
+    call rax
+    cmp  eax, 1
+    je   .ctx_ok
+    mov  dword [rel sync_fail_code], eax
+    jmp  .fail
+.ctx_ok:
     ; ---- validate ----
     mov  rdi, r14
     mov  esi, [rbp-0x54]
@@ -2401,11 +2456,13 @@ g_cmpct_hook_type:      dq 0      ; unsigned (*)(int leg_negotiated)
 global g_cmpct_hook_cmpct
 g_cmpct_hook_cmpct:     dq 0      ; long (*)(fd, mp, pl, plen, out, cap, want32)
 global g_cmpct_hook_blocktxn
-g_cmpct_hook_blocktxn:  dq 0      ; long (*)(fd, pl, plen, out, cap)
+g_cmpct_hook_blocktxn:  dq 0      ; long (*)(fd, pl, plen, out, cap, want_hash) -- want: P2P-1
 global g_cmpct_hook_fallback
 g_cmpct_hook_fallback:  dq 0      ; void (*)(void): count a full-block fallback (2026-09-09)
 global g_block_fetch_hook
 g_block_fetch_hook:     dq 0      ; long (*)(const u8 hash[32]): 0 = another leg is fetching it, end the pass (2026-09-09)
+global g_block_ctx_hook
+g_block_ctx_hook:       dq 0      ; int (*)(void* st, const u8 hdr80[80]): 1 accept, else node_sync_multi's fail code (P2P-1, 2026-10-23)
 
 section .rodata
 _version: db "version",0
