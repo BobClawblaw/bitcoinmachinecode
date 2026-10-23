@@ -429,8 +429,8 @@ int main(void){
     if (g_cfg.logtimestamps==0 && g_cfg.logtimemicros==1 && g_cfg.logthreadnames==1 && g_cfg.logsourcelocations==1 && g_cfg.shrinkdebugfile==0)
         printf("PASS: logging options parsed\n");
     else { printf("FAIL: logging options\n"); failures++; }
-    if (g_cfg.rpcthreads==4 && g_cfg.rpcworkqueue==8 && g_cfg.rpcservertimeout==5 && g_cfg.n_rpcwhitelist==1 && g_cfg.rpcwhitelistdefault==0 && g_cfg.rpccookieperms==1)
-        printf("PASS: rpc server options; a whitelist without ':' refused\n");
+    if (g_cfg.rpcthreads==4 && g_cfg.rpcworkqueue==8 && g_cfg.rpcservertimeout==5 && g_cfg.n_rpcwhitelist==2 && g_cfg.rpcwhitelistdefault==0 && g_cfg.rpccookieperms==1)
+        printf("PASS: rpc server options; a whitelist without ':' kept (Core: that user may call nothing -- CFG-2)\n");
     else { printf("FAIL: rpc options (%d %d %d n=%d d=%d p=%d)\n", g_cfg.rpcthreads, g_cfg.rpcworkqueue, g_cfg.rpcservertimeout, g_cfg.n_rpcwhitelist, g_cfg.rpcwhitelistdefault, g_cfg.rpccookieperms); failures++; }
     /* v31.1 (2026-10-01): the cluster limits are their own options; they used
      * to be copied onto the ancestor/descendant limits, a different rule */
@@ -826,6 +826,22 @@ int main(void){
     wr("cfg6_e.conf", "regtest=1\n[regtest]\nchain=main\n");
     node_config_load("cfg6_e.conf");
     CK(!node_config_error() && !strcmp(g_cfg.chain, "regtest"), "CFG-6: a chain= inside a section does not switch the chain\n");
+    /* ---- CFG-2: every rpcwhitelist entry is kept -- no ':' (Core: an
+     * empty list), more than 16, longer than 511 bytes. Dropped entries
+     * left no whitelist at all, which lets every user call everything. */
+    { static char big[8192]; int o = 0;
+      o += snprintf(big + o, sizeof big - o, "rpcwhitelist=nobody\n");
+      for (int i = 0; i < 20; i++) o += snprintf(big + o, sizeof big - o, "rpcwhitelist=u%d:help\n", i);
+      o += snprintf(big + o, sizeof big - o, "rpcwhitelist=long:help");
+      for (int i = 0; i < 60; i++) o += snprintf(big + o, sizeof big - o, ",nosuchmethod%02d", i);
+      o += snprintf(big + o, sizeof big - o, "\n");
+      wr("cfg2.conf", big);
+      node_config_load("cfg2.conf");
+      CK(!node_config_error() && g_cfg.n_rpcwhitelist == 22 && !strcmp(g_cfg.rpcwhitelist[0], "nobody")
+         && strlen(g_cfg.rpcwhitelist[21]) > 600,
+         "CFG-2: all 22 rpcwhitelist entries kept, the bare user and the 600+-byte one included (n=%d)\n", g_cfg.n_rpcwhitelist);
+      node_config_load("/nonexistent/reset.conf");
+      CK(g_cfg.n_rpcwhitelist == 0 && g_cfg.rpcwhitelist == NULL, "CFG-2: a fresh load frees the list\n"); }
     node_config_load("/nonexistent/reset.conf");
 #undef CK
 

@@ -12106,9 +12106,15 @@ extern long mpool_policy_entry_info(void*, const unsigned char*, struct mp_entry
     cfg.threads = g_cfg.rpcthreads; cfg.workqueue = g_cfg.rpcworkqueue; cfg.timeout_s = g_cfg.rpcservertimeout;
     rpc_cookie_set_perms(g_cfg.rpccookieperms);
     rpc_whitelist_clear();
+    /* CFG-2 (audit 2026-10-23): a refused entry is FATAL, like a bad
+     * rpcallowip above. It used to be logged and skipped, and with every
+     * entry skipped no whitelist existed at all -- every user could call
+     * every method, the opposite of what the operator configured. */
     for(int wi = 0; wi < g_cfg.n_rpcwhitelist; wi++)
-        if(!rpc_whitelist_add(g_cfg.rpcwhitelist[wi]))
-            fprintf(stderr,"[rpc] rpcwhitelist=%s rejected (expected <user>:<rpc1>,<rpc2>,...)\n", g_cfg.rpcwhitelist[wi]);
+        if(!rpc_whitelist_add(g_cfg.rpcwhitelist[wi])){
+            fprintf(stderr,"[rpc] FATAL: rpcwhitelist=%s could not be applied -- refusing to start\n", g_cfg.rpcwhitelist[wi]);
+            exit(1);
+        }
     rpc_whitelist_set_default(g_cfg.rpcwhitelistdefault);
     if(g_cfg.n_rpcwhitelist)
         fprintf(stderr,"[rpc] %d rpcwhitelist entr%s; users without one may call %s\n", g_cfg.n_rpcwhitelist,

@@ -322,7 +322,7 @@ typedef struct {
     int  rpcthreads;                /* default 16 (>= 1)  */
     int  rpcworkqueue;              /* default 64 (>= 1)  */
     int  rpcservertimeout;          /* default 30 s (>= 1) */
-    char rpcwhitelist[16][512];     /* -rpcwhitelist=<user>:<m1>,<m2> (repeatable) */
+    char** rpcwhitelist;            /* -rpcwhitelist=<user>[:<m1>,<m2>] (repeatable, heap, no cap: CFG-2) */
     int  n_rpcwhitelist;
     int  rpcwhitelistdefault;       /* -1 = unset (Core: 1 when any whitelist exists) */
     int  rpccookieperms;            /* 0 owner (0600), 1 group (0640), 2 all (0644) */

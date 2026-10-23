@@ -171,6 +171,50 @@ int main(void){
     ck("an unconfigured server still answers 200", status_of() == 200);
     stop(s);
 
+    /* ---- CFG-2 (audit 2026-10-23): entries the server used to REFUSE ----
+     * A refused entry left g_wl_n at 0 when it was the only one, which is
+     * "no whitelist" -- every user unrestricted. Core refuses none of these. */
+    printf("== 3e. CFG-2: \"user\" with no ':' is an empty list (Core) ==\n");
+    s = spawn("bitcoin", NULL, NULL, NULL, &port);
+    ck("server up", port > 0); if (port <= 0) return 1;
+    post(req, sizeof req, port, "bitcoin", "bitcoin", "help"); raw_exchange(port, req);
+    ck("CFG-2: rpcwhitelist=bitcoin lets bitcoin call nothing (403)", status_of() == 403);
+    stop(s);
+    printf("== 3f. CFG-2: a 70-byte user name is a real entry ==\n");
+    s = spawn("a0123456789012345678901234567890123456789012345678901234567890123456789:getblockcount", NULL, NULL, NULL, &port);
+    ck("server up", port > 0); if (port <= 0) return 1;
+    post(req, sizeof req, port, "bitcoin", "bitcoin", "help"); raw_exchange(port, req);
+    ck("CFG-2: the long-named entry exists, so an unlisted user is refused (403)", status_of() == 403);
+    stop(s);
+    printf("== 3g. CFG-2: a method list over 448 bytes is applied ==\n");
+    { static char wl[2048]; int o = snprintf(wl, sizeof wl, "bitcoin:getblockcount");
+      for (int i = 0; i < 60; i++) o += snprintf(wl + o, sizeof wl - o, ",nosuchmethod%02d", i);
+      snprintf(wl + o, sizeof wl - o, ",help");
+      s = spawn(wl, NULL, NULL, NULL, &port); }
+    ck("server up", port > 0); if (port <= 0) return 1;
+    post(req, sizeof req, port, "bitcoin", "bitcoin", "getnewaddress"); raw_exchange(port, req);
+    ck("CFG-2: an unlisted method is refused (403) under a long list", status_of() == 403);
+    post(req, sizeof req, port, "bitcoin", "bitcoin", "help"); raw_exchange(port, req);
+    ck("CFG-2: the last method of the long list is allowed (200)", status_of() == 200);
+    stop(s);
+    printf("== 3h. CFG-2: the list splits on ',' and ' ' as Core's does ==\n");
+    s = spawn("bitcoin:getblockcount, help", NULL, NULL, NULL, &port);
+    ck("server up", port > 0); if (port <= 0) return 1;
+    post(req, sizeof req, port, "bitcoin", "bitcoin", "help"); raw_exchange(port, req);
+    ck("CFG-2: \"getblockcount, help\" lists help (200)", status_of() == 200);
+    stop(s);
+    printf("== 3i. CFG-2: no-colon after a list changes nothing; before one, empties it ==\n");
+    s = spawn("bitcoin:help;bitcoin", NULL, NULL, NULL, &port);
+    ck("server up", port > 0); if (port <= 0) return 1;
+    post(req, sizeof req, port, "bitcoin", "bitcoin", "help"); raw_exchange(port, req);
+    ck("CFG-2: list then bare user: help still allowed (200)", status_of() == 200);
+    stop(s);
+    s = spawn("bitcoin;bitcoin:help", NULL, NULL, NULL, &port);
+    ck("server up", port > 0); if (port <= 0) return 1;
+    post(req, sizeof req, port, "bitcoin", "bitcoin", "help"); raw_exchange(port, req);
+    ck("CFG-2: bare user then list: the intersection is empty (403)", status_of() == 403);
+    stop(s);
+
     printf("== 4. a 2-thread pool with a 4-deep queue serves a burst ==\n");
     s = spawn(NULL, NULL, "2", "4", &port);
     ck("server up", port > 0); if (port <= 0) return 1;

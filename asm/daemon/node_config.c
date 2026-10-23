@@ -308,7 +308,9 @@ static void set_defaults(void){
     g_cfg.txreconciliation = 0;
     g_cfg.logips = 0; g_cfg.logtimestamps = 1; g_cfg.logtimemicros = 0; g_cfg.logthreadnames = 0;
     g_cfg.logsourcelocations = 0; g_cfg.shrinkdebugfile = 1; g_cfg.printtoconsole = 0; g_cfg.loglevel[0] = 0;
-    g_cfg.rest = 0; g_cfg.rpcthreads = 4; g_cfg.rpcworkqueue = 64; g_cfg.rpcservertimeout = 30; g_cfg.n_rpcwhitelist = 0;   /* Core: DEFAULT_HTTP_THREADS 4, DEFAULT_HTTP_WORKQUEUE 64, DEFAULT_HTTP_SERVER_TIMEOUT 30 (was 16 threads until 2026-09-08) */
+    g_cfg.rest = 0; g_cfg.rpcthreads = 4; g_cfg.rpcworkqueue = 64; g_cfg.rpcservertimeout = 30;
+    for (int i = 0; i < g_cfg.n_rpcwhitelist; i++) free(g_cfg.rpcwhitelist[i]);
+    free(g_cfg.rpcwhitelist); g_cfg.rpcwhitelist = NULL; g_cfg.n_rpcwhitelist = 0;   /* Core: DEFAULT_HTTP_THREADS 4, DEFAULT_HTTP_WORKQUEUE 64, DEFAULT_HTTP_SERVER_TIMEOUT 30 (was 16 threads until 2026-09-08) */
     g_cfg.rpcwhitelistdefault = -1; g_cfg.rpccookieperms = 0;
     g_cfg.limitclustercount = 64; g_cfg.limitclustersize_kvb = 101;
     g_cfg.checkblockindex = 0; g_cfg.checkmempool = 0; g_cfg.checkaddrman = 0; g_cfg.capturemessages = 0;
@@ -1397,10 +1399,21 @@ long node_config_load(const char* path){
         else if(!strcmp(key,"rpcservertimeout")){
             t=clamp_int(IV,1,86400,key,&bad); if(t>=0){ g_cfg.rpcservertimeout=t; applied++; } }
         else if(!strcmp(key,"rpcwhitelist")){
-            if(!strchr(val,':')){ fprintf(stderr,"[config] rpcwhitelist=%s: expected <user>:<rpc1>,<rpc2>,... -- ignoring\n", val); bad++; }
-            else if(g_cfg.n_rpcwhitelist >= 16){ fprintf(stderr,"[config] rpcwhitelist: at most 16 entries -- ignoring %s\n", val); bad++; }
-            else if(strlen(val) > 511){ fprintf(stderr,"[config] rpcwhitelist entry too long -- ignoring\n"); bad++; }
-            else { snprintf(g_cfg.rpcwhitelist[g_cfg.n_rpcwhitelist++], 512, "%s", val); applied++; } }
+            /* CFG-2 (audit 2026-10-23): every entry is kept, as Core keeps
+             * them. An entry without ':' was dropped here ("expected
+             * <user>:..."), and over 16 entries or 511 bytes were too; Core
+             * reads "user" alone as an empty list (that user may call
+             * nothing) and has no limits. Dropping entries is fail-OPEN:
+             * with none left, no whitelist exists and every user may call
+             * every method. */
+            char** nw = realloc(g_cfg.rpcwhitelist, (size_t)(g_cfg.n_rpcwhitelist + 1) * sizeof *nw);
+            char* dup = nw ? strdup(val) : NULL;
+            if(nw) g_cfg.rpcwhitelist = nw;
+            if(!dup){
+                cfg_fail(path, lineno, "out of memory reading rpcwhitelist", NULL, NULL);
+                free(gl); fclose(f); return -1;
+            }
+            g_cfg.rpcwhitelist[g_cfg.n_rpcwhitelist++] = dup; applied++; }
         else if(!strcmp(key,"rpcwhitelistdefault")){ g_cfg.rpcwhitelistdefault = IV?1:0; applied++; }
         else if(!strcmp(key,"rpccookieperms")){
             if(!strcmp(val,"owner")) g_cfg.rpccookieperms = 0;
