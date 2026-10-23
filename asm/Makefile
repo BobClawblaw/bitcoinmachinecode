@@ -871,12 +871,13 @@ tests/test_undo_ckpt_sync: $(UNDOCKPTSRCS) daemon/utxo_walk.h $(REORGOBJS) $(TES
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -Wall -o $@ $(UNDOCKPTSRCS) $(REORGOBJS) -lpthread
 tests/test_utxo_recover_gate: $(RECOVERGATESRCS) daemon/utxo_walk.h $(REORGOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -Wall -o $@ $(RECOVERGATESRCS) $(REORGOBJS) -lpthread
-# test_sto_crash -- STO-A/B/C/E (formal/storage, 2026-10-23): crash
-# consistency under SIGKILL and power loss. The formal model's crash driver
-# turned around: a seccomp trap records what each fsync/fdatasync makes
-# durable (tests/durable_image.h), and every scenario's power-loss image (or
-# SIGKILL) must recover to the right set; each has a control that keeps the
-# lost write.
+# test_sto_crash -- STO-A/B/C/E and STO-D/W (formal/storage, 2026-10-23):
+# crash consistency under SIGKILL and power loss. The formal model's crash
+# driver turned around: a seccomp trap records what each fsync/fdatasync makes
+# durable (tests/durable_image.h; D/W on its weak, POSIX-only file system,
+# with injected directory-fsync and open(".") failures), and every scenario's
+# power-loss image (or SIGKILL) must recover to the right set; each has a
+# control that keeps the lost write.
 STOCRASHSRCS := $(patsubst tests/test_utxo_ghost_resume.c,tests/test_sto_crash.c,$(GHOSTRESUMESRCS))
 # bench_utxo_apply_sync -- not a gate test: the applier's syncs per 1,000 blocks
 # on a synthetic busy chain (count them with strace -c; see the file's header).

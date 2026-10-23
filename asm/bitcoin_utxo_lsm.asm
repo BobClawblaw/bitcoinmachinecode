@@ -484,6 +484,31 @@ mac_fsync2:
     syscall
     ret
 
+; mac_dirsync() -> rax: 0 = the working directory (the chain directory) is
+; fsynced, negative = its open or its fsync failed. STO-D/STO-W (formal/storage,
+; 2026-10-23): a failed open used to skip the fsync silently. Clobbers rax, rcx,
+; rdx, rdi, rsi, r11; no call, no stack operand.
+mac_dirsync:
+    push rbx
+    lea  rdi, [rel dot_name]
+    xor  esi, esi
+    mov  eax, 2
+    syscall
+    test rax, rax
+    js   .ret
+    mov  rbx, rax
+    mov  rdi, rax
+    mov  eax, 74
+    syscall
+    mov  rdx, rax
+    mov  rdi, rbx
+    mov  eax, 3
+    syscall
+    mov  rax, rdx
+.ret:
+    pop  rbx
+    ret
+
 ; mac_cmp_key(p=rdi, q=rsi) -> eax: 0 = p<q, 1 = p==q, 2 = p>q (36-byte unsigned)
 ; Clobbers rax, rdx. Does NOT preserve rdi/rsi/rcx/rdx -- checked all 6 call
 ; sites, none rely on that (each reloads rdi/rsi fresh before calling, and the
@@ -3206,6 +3231,15 @@ mac_flush:
     test rax, rax
     jz   .fl_finish_reset            ; every tombstone was shadowed by a live key: nothing written
 
+    ; STO-W (formal/storage, 2026-10-23): the run's create durable before the
+    ; manifest rename that names it. POSIX orders nothing between two name ops
+    ; of one directory (ext4's journal does): a power loss could keep the
+    ; rename and lose the create, a manifest naming a missing run. A failure
+    ; fails the flush before anything names the run (an orphan for the sweep).
+    call mac_dirsync
+    test rax, rax
+    js   .fl_err
+
     ; ---- append to in-memory manifest, advance next_gen/next_run_no ----
     mov  rax, [r12+120]
     cmp  rax, [r12+112]
@@ -3275,21 +3309,11 @@ mac_flush:
 
     ; ST2-1: and a failed directory fsync fails the flush BEFORE the WAL
     ; reset below: the rename may not be durable, so the WAL stays the copy
-    ; of this generation (a reload replays it over the old manifest)
-    lea  rdi, [rel dot_name]
-    xor  esi, esi
-    mov  eax, 2
-    syscall
+    ; of this generation (a reload replays it over the old manifest). STO-D:
+    ; so does a failed open of the directory, which skipped the fsync and
+    ; went on to the reset.
+    call mac_dirsync
     test rax, rax
-    jl   .fl_finish_reset
-    mov  rbx, rax
-    mov  rdi, rbx
-    call mac_fsync2
-    mov  rdx, rax
-    mov  rdi, rbx
-    mov  eax, 3
-    syscall
-    test rdx, rdx
     js   .fl_err
 
 .fl_finish_reset:
@@ -5135,6 +5159,16 @@ utxo_lsm_compact:
     test rdx, rdx
     js   .cc_err
 
+    ; STO-W (formal/storage, 2026-10-23): the merged run's create durable
+    ; before the manifest rename below names it (as in mac_flush). Deferred
+    ; publish: the parent's lsm_manifest_publish makes it durable instead.
+    cmp  qword [rel mac_compact_defer_publish], 0
+    jne  .cc_pre_dirsync_done
+    call mac_dirsync
+    test rax, rax
+    js   .cc_err
+.cc_pre_dirsync_done:
+
     ; ---- write the merged (OLDEST surviving generation) entry FIRST, at
     ;      index 0, then shift the surviving (newer, un-merged) entries
     ;      down to start right after it -- the array must stay strictly
@@ -5324,20 +5358,11 @@ utxo_lsm_compact:
     test rax, rax
     jl   .cc_err_close
 
-    lea  rdi, [rel dot_name]
-    xor  esi, esi
-    mov  eax, 2
-    syscall
+    ; ST2-1: a failed dir fsync keeps the inputs (the rename may not be
+    ; durable, the old manifest may come back naming them). STO-D: so does a
+    ; failed open of the directory, which skipped the fsync and unlinked them.
+    call mac_dirsync
     test rax, rax
-    jl   .cc_dirsync_skip
-    mov  rbx, rax
-    mov  rdi, rbx
-    call mac_fsync2                         ; ST2-1: a failed dir fsync keeps
-    mov  rdx, rax                           ; the inputs (the rename may not
-    mov  rdi, rbx                           ; be durable, the old manifest
-    mov  eax, 3                             ; may come back naming them)
-    syscall
-    test rdx, rdx
     js   .cc_err
 .cc_dirsync_skip:
 
