@@ -53,6 +53,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/syscall.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <signal.h>
@@ -452,6 +453,13 @@ static void repair_spawn(long to, long long now){
     if (pid == 0){
         setpriority(PRIO_PROCESS, 0, 10);                 /* best-effort I/O follows the nice value */
         setenv("BMC_CHAIN", g_rep.chain, 1);
+        /* HST-4 (audit 2026-10-23): the builder is a separate program that
+         * opens what it needs by path; it inherited every descriptor of the
+         * worker (store files, peer sockets, the datadir .lock), and held
+         * the lock for as long as it ran. Closed here as notify.c does. */
+        { long maxfd = sysconf(_SC_OPEN_MAX); if (maxfd < 0 || maxfd > 65536) maxfd = 65536;
+          if (syscall(SYS_close_range, 3U, ~0U, 0U) != 0)
+              for (long fd = 3; fd < maxfd; fd++) close((int)fd); }
         execl(g_rep.builder, "bmc_build_coinstats_hist", g_rep.chaindir, to_s, w_s, (char*)0);
         fprintf(stderr, "[coinstats] repair: exec %s failed (%s)\n", g_rep.builder, strerror(errno));
         _exit(127);

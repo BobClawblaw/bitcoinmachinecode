@@ -128,28 +128,56 @@ static pthread_mutex_t g_q_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_q_cond = PTHREAD_COND_INITIALIZER;
 static pthread_t g_workers[256]; static int g_n_workers;
 
-/* ---- -rpcwhitelist / -rpcwhitelistdefault ---- */
-#define RPC_WL_MAX 16
-static struct { char user[64]; char methods[448]; } g_wl[RPC_WL_MAX];
+/* ---- -rpcwhitelist / -rpcwhitelistdefault ----
+ * CFG-2 (audit 2026-10-23): entries are heap strings with no length or
+ * count cap. A user name of 64+ bytes or a method list of 448+ was refused
+ * here, the daemon only logged the refusal, and when every entry was
+ * refused g_wl_n stayed 0 -- which reads as "no whitelist configured", so
+ * Core's implied rpcwhitelistdefault=1 never engaged and every user could
+ * call everything. Core has no such limits (httprpc.cpp InitRPCAuthentication
+ * keeps a std::set per user). Core's rules, all kept:
+ *   - "user" with no ':' gives that user an EMPTY list -- may call nothing --
+ *     when it is the user's first entry, and changes nothing after one;
+ *   - the method list splits on ',' AND ' ' (SplitString(.., ", ")), so
+ *     "user:getblock, help" lists help, not " help";
+ *   - several entries for one user intersect. */
+typedef struct { char* user; char* methods; } rpc_wl_ent;
+static rpc_wl_ent* g_wl; static int g_wl_cap;
 static int g_wl_n; static int g_wl_default = -1;
 int rpc_whitelist_add(const char* spec){
     if (!spec) return 0;
     const char* c = strchr(spec, ':');
-    if (!c || c == spec || g_wl_n >= RPC_WL_MAX || (size_t)(c - spec) >= 64 || strlen(c + 1) >= 448) return 0;
-    memcpy(g_wl[g_wl_n].user, spec, (size_t)(c - spec)); g_wl[g_wl_n].user[c - spec] = 0;
-    snprintf(g_wl[g_wl_n].methods, sizeof g_wl[g_wl_n].methods, "%s", c + 1);
+    size_t ul = c ? (size_t)(c - spec) : strlen(spec);
+    if (!c){
+        /* no list: an empty one for a new user, nothing for a known one */
+        for (int i = 0; i < g_wl_n; i++)
+            if (strlen(g_wl[i].user) == ul && !memcmp(g_wl[i].user, spec, ul)) return 1;
+    }
+    if (g_wl_n == g_wl_cap){
+        int nc = g_wl_cap ? g_wl_cap * 2 : 16;
+        rpc_wl_ent* ne = realloc(g_wl, (size_t)nc * sizeof *ne);
+        if (!ne) return 0;
+        g_wl = ne; g_wl_cap = nc;
+    }
+    char* u = strndup(spec, ul);
+    char* m = strdup(c ? c + 1 : "");
+    if (!u || !m){ free(u); free(m); return 0; }
+    g_wl[g_wl_n].user = u; g_wl[g_wl_n].methods = m;
     g_wl_n++;
     return 1;
 }
 void rpc_whitelist_set_default(int d){ g_wl_default = d; }
-void rpc_whitelist_clear(void){ g_wl_n = 0; g_wl_default = -1; }
+void rpc_whitelist_clear(void){
+    for (int i = 0; i < g_wl_n; i++){ free(g_wl[i].user); free(g_wl[i].methods); }
+    g_wl_n = 0; g_wl_default = -1;
+}
 static int wl_entry_has(const char* list, const char* method){
     size_t ml = strlen(method);
+    if (!ml) return 0;
     for (const char* p = list; p && *p; ){
-        const char* e = strchr(p, ',');
-        size_t n = e ? (size_t)(e - p) : strlen(p);
+        size_t n = strcspn(p, ", ");
         if (n == ml && !memcmp(p, method, ml)) return 1;
-        p = e ? e + 1 : NULL;
+        p = p[n] ? p + n + 1 : NULL;
     }
     return 0;
 }

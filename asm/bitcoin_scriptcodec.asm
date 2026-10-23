@@ -31,7 +31,7 @@
 ; this file's globals, not bitcoin_interp.asm's/bitcoin_sighash.asm's (which
 ; were converted first and are NOT the source of that race). See those two
 ; files' matching header notes for the full TLS_ADDR/.tbss rationale.
-    section .tbss alloc noexec nowrite tls align=16
+    section .tbss nobits alloc noexec write tls align=16
 global elem_tmp0, elem_tmp1, elem_tmp2, elem_tmp3
 elem_tmp0:  resb ELEM_SIZE
 elem_tmp1:  resb ELEM_SIZE
