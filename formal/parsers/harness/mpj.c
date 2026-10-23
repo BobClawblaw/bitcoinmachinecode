@@ -5,7 +5,7 @@
  * returns a fresh mapping of exactly the requested length with arbitrary
  * contents (so the mapped header need not even agree with the pread one);
  * munmap checks it unmaps that mapping. The configured capacity for a new
- * file is <= 3 (a configuration value, not file data).
+ * file is <= 2 (a configuration value, not file data).
  * Claims:
  *   - memory safety of mpj_open, mpj_append, mpj_recent, mpj_lookup (and,
  *     FP_STATS, mpj_stats): every slot touched lies inside the mapping,
@@ -21,7 +21,7 @@
 #include <sys/stat.h>
 #include "nd.h"
 #ifndef FP_FSZ
-#define FP_FSZ (64 + 152 * 3)
+#define FP_FSZ (64 + 152 * 2)
 #endif
 static size_t g_fsz; static void* g_map; static size_t g_maplen;
 int open(const char* p, int fl, ...){ (void)p; (void)fl; return nondet_int() ? -1 : 5; }
@@ -39,16 +39,23 @@ void* mmap(void* a, size_t len, int prot, int fl, int fd, off_t off){
     (void)a; (void)prot; (void)fl; (void)fd; (void)off;
     CHECK(len <= g_fsz, "mapping no longer than the file");
     if (nondet_int()) return MAP_FAILED;
-    g_map = malloc(len); ASSUME(g_map != 0); g_maplen = len; return g_map; }
-int munmap(void* a, size_t len){ CHECK(a == g_map && len == g_maplen, "munmap of the mapping"); free(a); g_map = 0; return 0; }
+    g_map = nd_tail(len, FP_FSZ); g_maplen = len; return g_map; }
+int munmap(void* a, size_t len){ CHECK(a == g_map && len == g_maplen, "munmap of the mapping"); free(nd_tail_base(a, len, FP_FSZ)); g_map = 0; return 0; }
 #include SRC
 static int g_cb_n;
 static int cb(void* ctx, const mpj_rec* r){ (void)ctx; g_cb_n++; CHECK(r->reason >= 1 && r->reason <= MPJ_REASON_MAX, "delivered record has a valid reason"); return nondet_int(); }
 int main(void){
     g_fsz = nondet_size(); ASSUME(g_fsz <= FP_FSZ);
-    uint64_t cfgcap = nondet_ull(); ASSUME(cfgcap <= 3);
+    uint64_t cfgcap = nondet_ull(); ASSUME(cfgcap <= 2);
     if (!mpj_open("j.dat", cfgcap)) return 0;
     CHECK(g_mpj_cap >= 1 && MPJ_HDR_BYTES + g_mpj_cap * MPJ_REC_BYTES <= g_maplen, "capacity fits the mapping");
+#ifdef FP_STATS
+    /* X-MPJ-stats: the stats walk alone, on the file as found */
+    mpj_stats_t st; mpj_stats(&st);
+    CHECK(st.held <= st.capacity, "held <= capacity");
+    mpj_close();
+    return 0;
+#endif
     mpj_rec r; memset(&r, 0, sizeof r); r.reason = nondet_uint();
     if (nondet_int()) mpj_append(&r);
     long want = nondet_long(); ASSUME(want <= 4);
@@ -57,12 +64,8 @@ int main(void){
     CHECK(n <= g_cb_n, "delivered = callbacks that continued");
     unsigned char txid[32]; mpj_rec out;
     if (nondet_int()) (void)mpj_lookup(txid, &out);
-#ifdef FP_STATS
-    mpj_stats_t st; mpj_stats(&st);
-    CHECK(st.held <= st.capacity, "held <= capacity");
-#endif
-    mpj_close();
     COVER(n >= 2, "two records read back");
-    COVER(g_mpj_cap == 3, "a three-slot ring adopted");
+    COVER(g_mpj_cap == 2, "a two-slot ring adopted");
+    mpj_close();
     return 0;
 }

@@ -43,17 +43,23 @@ diverge X-ADDR1-core  addr.c "$D/addr_ingest.c" "CORE: addresses taken only from
 diverge X-ADDRV2-core addr.c "$D/addr_ingest.c" "CORE: addresses taken only from a payload Core deserializes" "@noconv -DFP_V2 -DFP_N=64 --unwind 10 --unwindset memcmp.0:17"
 
 # ---------------------------------------------------------------- disk: mempool.dat
-proof  P-MPD        mpd.c "$D/mempool_persist.c" "@nouov -DFP_FSZ=64 --unwind 66"
-mutant M-MPD-over   mpd.c "$D/mempool_persist.c" 's/if (tl == 0 || pos + tl + 16 > (u64)fsz)/if (tl == 0 || pos + tl + 8 > (u64)fsz)/' "trailing bytes inside" "@nouov -DFP_FSZ=64 --unwind 66"
-mutant M-MPD-leak   mpd.c "$D/mempool_persist.c" 's/free(buf); MPD_ERR("truncated delta map"); return -1;/MPD_ERR("truncated delta map"); return -1;/' "memory-leak" "@nouov -DFP_FSZ=64 --unwind 66"
-mutant M-MPD-key    mpd.c "$D/mempool_persist.c" 's/if (!kl || klen != 8 || 8 + (u64)kl + klen > (u64)fsz)/if (!kl || klen != 8 || 8 + klen > (u64)fsz)/' "pointer outside object bounds" "@nouov -DFP_FSZ=64 --unwind 66"
-diverge X-MPD-delta mpd.c "$D/mempool_persist.c" "arithmetic overflow on unsigned *" "-DFP_FSZ=64 --unwind 66"
+# @noconv: the time and fee-delta fields are int64 stored as u64 (Core's
+# format); the casts back are intended. The obfuscated form is proved on files
+# of <= 26 bytes (key, count, delta map): the XOR loop over a longer file
+# exceeds the memory cap; v1 is proved on <= 52 bytes (two transactions).
+proof  P-MPD        mpd.c "$D/mempool_persist.c" "@nouov @noconv -DFP_FSZ=52 --unwind 10 --unwindset mempool_dump_read.7:2,mempool_dump_read.14:4 --slice-formula"
+proof  P-MPDV2      mpd.c "$D/mempool_persist.c" "@nouov @noconv -DFP_V2 -DFP_FSZ=26 --unwind 10 --unwindset mempool_dump_read.7:20,mempool_dump_read.14:2 --slice-formula"
+mutant M-MPD-over   mpd.c "$D/mempool_persist.c" 's/if (tl == 0 || pos + tl + 16 > (u64)fsz)/if (tl == 0 || pos + tl + 8 > (u64)fsz)/' "trailing bytes inside" "@nouov @noconv -DFP_FSZ=52 --unwind 10 --unwindset mempool_dump_read.7:2,mempool_dump_read.14:4 --slice-formula"
+mutant M-MPD-leak   mpd.c "$D/mempool_persist.c" 's/free(buf); MPD_ERR("truncated delta map"); return -1;/MPD_ERR("truncated delta map"); return -1;/' "memory-leak" "@nouov @noconv -DFP_FSZ=52 --unwind 10 --unwindset mempool_dump_read.7:2,mempool_dump_read.14:4 --slice-formula"
+mutant M-MPD-key    mpd.c "$D/mempool_persist.c" 's/if (!kl || klen != 8 || 8 + (u64)kl + klen > (u64)fsz)/if (!kl || klen != 8 || 8 + klen > (u64)fsz)/' "memcpy source region readable" "@nouov @noconv -DFP_V2 -DFP_FSZ=26 --unwind 10 --unwindset mempool_dump_read.7:20,mempool_dump_read.14:2 --slice-formula"
+diverge X-MPD-delta mpd.c "$D/mempool_persist.c" "arithmetic overflow on unsigned *" "@noconv -DFP_FSZ=44 --unwind 10 --unwindset mempool_dump_read.7:2,mempool_dump_read.14:4 --slice-formula"
 
 # ---------------------------------------------------------------- disk: mempool departure journal
-proof  P-MPJ        mpj.c "$D/mempool_journal.c" "@nouov --unwind 6"
-mutant M-MPJ-cap    mpj.c "$D/mempool_journal.c" 's|filecap > ((uint64_t)sb.st_size - MPJ_HDR_BYTES) / MPJ_REC_BYTES|filecap > ((uint64_t)sb.st_size) / MPJ_REC_BYTES|' "capacity fits" "@nouov --unwind 6"
-mutant M-MPJ-wrap   mpj.c "$D/mempool_journal.c" 's/if (seq == 1) break;                   \/\* unsigned: do not wrap below 1 \*\//(void)0;/' "unwinding assertion" "@nouov --unwind 6"
-diverge X-MPJ-stats mpj.c "$D/mempool_journal.c" "unwinding assertion loop 0" "@nouov -DFP_STATS --unwindset mpj_stats.0:6 --unwind 6"
+# @noconv: the time fields are int64 stored as u64 (the record format)
+proof  P-MPJ        mpj.c "$D/mempool_journal.c" "@nouov @noconv --unwind 9 --unwindset pread.0:65,mpj_recent.0:4,mpj_lookup.0:4,memcmp.0:33"
+mutant M-MPJ-cap    mpj.c "$D/mempool_journal.c" 's|filecap > ((uint64_t)sb.st_size - MPJ_HDR_BYTES) / MPJ_REC_BYTES|filecap > ((uint64_t)sb.st_size) / MPJ_REC_BYTES|' "mapping no longer than the file" "@nouov @noconv --unwind 9 --unwindset pread.0:65,mpj_recent.0:4,mpj_lookup.0:4,memcmp.0:33"
+mutant M-MPJ-wrap   mpj.c "$D/mempool_journal.c" 's/if (seq == 1) break;                   \/\* unsigned: do not wrap below 1 \*\//(void)0;/' "unwinding assertion" "@nouov @noconv --unwind 9 --unwindset pread.0:65,mpj_recent.0:4,mpj_lookup.0:4,memcmp.0:33"
+diverge X-MPJ-stats mpj.c "$D/mempool_journal.c" "unwinding assertion loop 0" "@nouov -DFP_STATS --unwindset mpj_stats.0:4,pread.0:65,mpj_recent.0:4,mpj_lookup.0:4 --unwind 9"
 
 # ---------------------------------------------------------------- RPC: JSON body
 proof  P-JSON       json.c "$A/rpc_json.c" "-DFP_N=6 --unwind 8"

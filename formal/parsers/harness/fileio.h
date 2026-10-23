@@ -6,6 +6,7 @@
 #ifndef FP_FILEIO_H
 #define FP_FILEIO_H
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -22,7 +23,7 @@ int fseek(FILE* f, long off, int wh){ (void)f; if (nondet_int()) return -1;
 long ftell(FILE* f){ (void)f; return (long)g_fpos; }
 void rewind(FILE* f){ (void)f; g_fpos = 0; }
 size_t fread(void* b, size_t sz, size_t n, FILE* f){
-    (void)f; CHECK(sz == 0 || n <= ((size_t)-1) / sz, "fread size product fits");
+    (void)f; CHECK(sz == 0 || n <= SIZE_MAX / sz, "fread size product fits");
     size_t want = sz * n; CHECK(__CPROVER_w_ok(b, want), "fread buffer writable");
     size_t left = g_fpos <= g_fsz ? g_fsz - g_fpos : 0;
     size_t got = want <= left ? want : left;

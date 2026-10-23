@@ -15,7 +15,7 @@ FILTER="${1:-}"
 TIMEOUT="${FP_TIMEOUT:-1800}"       # seconds per CBMC run
 CHECKS="--bounds-check --pointer-check --signed-overflow-check --unsigned-overflow-check \
 --pointer-overflow-check --conversion-check --div-by-zero-check --memory-leak-check \
---float-overflow-check --nan-check --unwinding-assertions"
+--float-overflow-check --nan-check --unwinding-assertions --object-bits 12"
 A="$ROOT/asm"; D="$ROOT/asm/daemon"
 fails=0; t_all=$(date +%s)
 
@@ -33,7 +33,7 @@ cap(){
   done
   while pgrep -x cbmc >/dev/null; do sleep 5; done        # one CBMC process at a time
 
-  systemd-run --user --scope -q -p MemoryMax="$MEMCAP" -p MemorySwapMax=0 -- nice -n15 timeout "$TIMEOUT" "$@"
+  flock "$LOG/.cbmc.lock" systemd-run --user --scope -q -p MemoryMax="$MEMCAP" -p MemorySwapMax=0 -- nice -n15 timeout "$TIMEOUT" "$@"
 }
 systemd-run --user --scope -q -p MemoryMax=64M -p MemorySwapMax=0 -- true || { echo "run.sh: systemd-run --user --scope is required" >&2; exit 2; }
 
@@ -67,7 +67,7 @@ proof(){
   cap "$CBMC" "$h" -I"$HERE/harness" -I"$(dirname "$src")" -DSRC="\"$src\"" $(chk "$args") $(cleanargs "$args") > "$LOG/$name.log" 2>&1
   local ok=0; verified "$LOG/$name.log" "$args" && ok=1
   local t1=$(date +%s)
-  cap "$CBMC" "$h" -I"$HERE/harness" -I"$(dirname "$src")" -DSRC="\"$src\"" -DFP_COVER --cover cover $(cleanargs "$args") > "$LOG/$name.cover.log" 2>&1
+  cap "$CBMC" "$h" -I"$HERE/harness" -I"$(dirname "$src")" -DSRC="\"$src\"" -DFP_COVER --cover cover --object-bits 12 $(cleanargs "$args") > "$LOG/$name.cover.log" 2>&1
   local cov; cov=$(grep -o '\*\* [0-9]* of [0-9]* covered' "$LOG/$name.cover.log" | tail -1)
   local covok=0; [[ "$cov" =~ \*\*\ ([0-9]+)\ of\ ([0-9]+)\ covered ]] && [ "${BASH_REMATCH[1]}" = "${BASH_REMATCH[2]}" ] && [ "${BASH_REMATCH[2]}" != 0 ] && covok=1
   local t2=$(date +%s)
