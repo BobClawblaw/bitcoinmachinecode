@@ -16,6 +16,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/wait.h>
+#include <time.h>
 #include "test_tmpdir.h"
 
 extern long node_handshake(int fd);
@@ -389,6 +390,23 @@ int main(void){
       send_getheaders(fd, 0, 0, 0);
       pong = reply(fd);
       cki("empty getheaders locator, all-zero stop: no reply", pong && nrx == 0, 1);
+      peer_close(fd); }
+
+    /* ---- no stall after a getheaders ----
+     * The handler logs each getheaders through node_log_event to the loop's
+     * log fd, -1 here as in every serve harness. fd_write_all polled it
+     * first, and poll(2) ignores a negative fd, so it waited its whole 10 s
+     * timeout before failing: the next message was answered 10 s late. */
+    { int fd = peer_open();
+      unsigned char loc[1][32]; memcpy(loc[0], bhash[3], 32);
+      struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+      send_getheaders(fd, (const unsigned char (*)[32])loc, 1, 0);
+      int pong = reply(fd);
+      clock_gettime(CLOCK_MONOTONIC, &t1);
+      long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+      printf("      getheaders + ping answered in %ld ms\n", ms);
+      cki("no stall: a getheaders and the ping after it are answered within 2 s (log fd -1)",
+          pong && count_cmd("headers") == 1 && ms < 2000, 1);
       peer_close(fd); }
 
     close(ls);

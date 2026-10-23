@@ -303,11 +303,11 @@ int main(void){
                 p2p_write(fd, kinds[kd], (unsigned)strlen(kinds[kd]), m, (unsigned)mp);
                 uint64_t nonce = 0x46314c4f43000000ull + (uint64_t)(kd * 2 + canon);
                 int answered = 0, served_from4 = 0, got_pong = 0;
-                /* The serve loop answers the next message about 10 s after
-                 * it has served a getheaders (measured here; the NET-8 resync
-                 * above runs into it too), past this socket's 8 s receive
-                 * timeout: up to three timeouts are waited through before the
-                 * case gives up on its pong. */
+                /* Up to three receive timeouts are waited through before the
+                 * case gives up on its pong. (The serve loop used to answer
+                 * 10 s late after a getheaders, past the 8 s timeout: its log
+                 * write to fd -1 sat out fd_write_all's poll. Fixed
+                 * 2026-10-23; tests/test_getblocks pins it.) */
                 p2p_write(fd, "ping", 4, &nonce, 8);
                 int timeouts = 0;
                 for (int k = 0; k < 64; k++){
