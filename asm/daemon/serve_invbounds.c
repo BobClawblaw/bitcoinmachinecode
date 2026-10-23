@@ -83,7 +83,8 @@ int serve_inv_bounds(const unsigned char* pl, long plen,
  *
  * Core's FindForkInGlobalIndex walks every locator entry and serves from the
  * first one on the active chain, falling back to genesis only when none
- * matches, and honours hashStop.
+ * matches -- so an unknown locator is served from height 1, the block after
+ * genesis, not from genesis itself -- and honours hashStop.
  *
  * Payload: version(4) | CompactSize(count) | count*32 locator | 32 stop.
  *
@@ -147,7 +148,11 @@ int serve_locator_from(const unsigned char* pl, unsigned long plen, void* htidx,
     if (n > 101) return -1;
 
     /* first locator entry we know wins, in the order the peer sent them --
-     * they run newest-first, so this is the most recent common block */
+     * they run newest-first, so this is the most recent common block. None
+     * known: FindForkInGlobalIndex returns genesis (validation.cpp 127-143)
+     * and both handlers serve from its successor, height 1. This said 0 and
+     * sent genesis, which no peer lacks (2026-10-23). */
+    *out_from = 1;
     for (unsigned long long i = 0; i < n; i++){
         long h = 0;
         if (idx_get(htidx, pl + p + i * 32u, &h) == 1){ *out_from = h + 1; break; }

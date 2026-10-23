@@ -352,6 +352,26 @@ int main(void){
           peer_close(fd);
       } }
 
+    /* ---- no locator entry known: served from height 1 ----
+     * Core's FindForkInGlobalIndex returns genesis when no entry is on the
+     * active chain (validation.cpp 127-143), and both handlers start at its
+     * successor. bmc started at 0 and sent genesis first, a block every peer
+     * has. An empty getblocks locator is the same case in Core. */
+    { int fd = peer_open();
+      unsigned char loc[2][32]; memset(loc[0], 0xab, 32); memset(loc[1], 0xac, 32);
+      send_getblocks(fd, (const unsigned char (*)[32])loc, 2, 0);
+      int pong = reply(fd);
+      cki("unknown locator: getblocks announces 1..500", pong && inv_is_range(first_cmd("inv"), 1, 500), 1);
+      send_getblocks(fd, (const unsigned char (*)[32])loc, 0, 0);
+      pong = reply(fd);
+      cki("empty locator: getblocks announces 1..500", pong && inv_is_range(first_cmd("inv"), 1, 500), 1);
+      send_getheaders(fd, (const unsigned char (*)[32])loc, 2, 0);
+      pong = reply(fd);
+      const msg_t* m = first_cmd("headers"); unsigned off = 0; long n = vec_count(m, &off);
+      cki("unknown locator: getheaders serves 1..519 (first header is block 1's)",
+          pong && n == TIP && m->len >= off + 81 && !memcmp(m->p + off, blk[1], 80), 1);
+      peer_close(fd); }
+
     close(ls);
     printf("\n%s (%d failures)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED", failures);
     return failures ? 1 : 0;
