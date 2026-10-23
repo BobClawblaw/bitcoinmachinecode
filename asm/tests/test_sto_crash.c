@@ -104,6 +104,8 @@ extern void utxo_live_test_set_apply_lag(long lag);
 extern int  utxo_live_test_compact_nowait(void);
 extern int  utxo_live_test_compact_pid(void);
 extern void* utxo_live_test_lst(void);
+extern int  utxo_live_halted(void);
+extern long utxo_live_public_tip(void* store_buf, long live);
 extern long utxo_lsm_compact_range(void* lst, unsigned long lo, unsigned long k);
 extern long utxo_live_lsm_get(const u8 txid_wire[32], unsigned int vout, u64* value, unsigned long* height,
                               unsigned long* is_coinbase, const u8** script, unsigned long* slen);
@@ -118,7 +120,7 @@ long mempool_resolve_confirmed_utxo(void* u, const u8 txid[32], unsigned long in
 /* ---- the chain (built once in the parent; pure data) ---- */
 static void put32(u8* p, u32 v){ p[0]=(u8)v; p[1]=(u8)(v>>8); p[2]=(u8)(v>>16); p[3]=(u8)(v>>24); }
 static void put64(u8* p, u64 v){ for(int i=0;i<8;i++) p[i]=(u8)(v>>(8*i)); }
-static u8 g_scr[1<<12];
+static u8 g_scr[1<<14];
 static long mk_coinbase(u8* q0, u32 tag){
     u8* q = q0;
     put32(q,1); q+=4; *q++ = 1; memset(q,0,32); q+=32; put32(q,0xffffffffu); q+=4;
@@ -653,6 +655,115 @@ static int sc_runcreate_merge(int control){
 
 /* ---- the runner: each scenario in its own process (the seccomp filter and
  * the recorder are per scenario) ---- */
+/* M: a manifest that names a missing run. 0..150 applied and flushed to a
+ * run, 151..153 archived and not applied, so the stored tip (153) and the
+ * applied height (150) tell a halted boot from an untracked one. */
+static void p1_onerun(void* a){
+    (void)a; boot();
+    append(0, 150);
+    long r = utxo_live_catchup(store_buf);
+    long f = utxo_live_flush_now();
+    append(151, 153);
+    printf("  p1: catch-up 0..150 -> %ld, flush -> %ld; 151..153 archived, not applied; %d run file(s)\n", r, f, count_runs());
+    utxo_live_close();
+}
+static void p2_boot_only(void* a){
+    (void)a;
+    memset(store_buf, 0, sizeof store_buf);
+    utxo_live_test_force_sizing(0);
+    store_init(store_buf); store_reload(store_buf);
+    int r = utxo_live_init(".");
+    long tip = utxo_live_public_tip(store_buf, r == 1);
+    printf("  p2: utxo_live_init -> %d; halted %d; public tip %ld\n", r, utxo_live_halted(), tip);
+    FILE* f = fopen("result.txt", "w"); if (f){ fprintf(f, "%d %d %ld 0\n", r, utxo_live_halted(), tip); fclose(f); }
+}
+static int sc_missingrun(int control){
+    char live[640], img[640], snap[640]; paths("missingrun", control, live, img, snap);
+    if (run(live, p1_onerun, 0) != 0) return 0;
+    if (chdir(live) != 0) return 0;
+    if (count_runs() < 1){ printf("  no run file to remove\n"); return 0; }
+    if (!control){
+        DIR* d = opendir("."); struct dirent* e; char gone[300] = "";
+        while (d && (e = readdir(d))) if (!strncmp(e->d_name, "utxo_run_", 9)){ snprintf(gone, sizeof gone, "%s", e->d_name); break; }
+        if (d) closedir(d);
+        if (!gone[0] || unlink(gone) != 0) return 0;
+        printf("  removed %s\n", gone);
+    }
+    run(live, p2_boot_only, 0);
+    long v[4]; if (read_res(live, v)) return 0;
+    return control ? (v[0] == 1 && v[1] == 0 && v[2] == 150)
+                   : (v[0] == 0 && v[1] == 1 && v[2] == 150);
+}
+
+/* UTX-6: the manifest's magic is overwritten, so the reload fails; the
+ * boot must halt with the tip at the applied height (150), not the stored
+ * one (153) */
+static int sc_badmanifest(int control){
+    char live[640], img[640], snap[640]; paths("badmanifest", control, live, img, snap);
+    if (run(live, p1_onerun, 0) != 0) return 0;
+    if (chdir(live) != 0) return 0;
+    if (!control){
+        int fd = open("utxo_manifest.dat", O_WRONLY);
+        if (fd < 0 || pwrite(fd, "XXXX", 4, 0) != 4){ if (fd >= 0) close(fd); return 0; }
+        close(fd);
+        printf("  overwrote utxo_manifest.dat's magic\n");
+    }
+    run(live, p2_boot_only, 0);
+    long v[4]; if (read_res(live, v)) return 0;
+    return control ? (v[0] == 1 && v[1] == 0 && v[2] == 150)
+                   : (v[0] == 0 && v[1] == 1 && v[2] == 150);
+}
+
+/* UTX-2: a WAL tail larger than the steady-state memtable. 160 blocks of a
+ * 500-output coinbase (80,000 coins) applied under the bulk memtable, no
+ * checkpoint and no flush, the WAL drained to the file; the boot with the
+ * steady-state memtable (2^16 slots) cannot hold the replay. Nothing was
+ * checkpointed, so a halted boot's tip is -1 and an untracked one's is the
+ * stored tip, 159. The control writes 100 blocks (50,000 coins), which fit. */
+#define BIG_N   160
+#define BIG_OUT 500
+static u8   g_big[BIG_N][BIG_OUT * 10 + 200]; static long g_big_len[BIG_N]; static u8 g_big_hash[BIG_N][32];
+static void build_big_chain(void){
+    u8 prev[32]; memset(prev, 0, 32);
+    static u8 cb[BIG_OUT * 10 + 100];
+    for (int h = 0; h < BIG_N; h++){
+        u8* q = cb;
+        put32(q,1); q+=4; *q++ = 1; memset(q,0,32); q+=32; put32(q,0xffffffffu); q+=4;
+        *q++ = 4; put32(q, 0x40000000u | (u32)h); q+=4; put32(q,0xffffffffu); q+=4;
+        *q++ = 0xfd; *q++ = (u8)(BIG_OUT & 0xff); *q++ = (u8)(BIG_OUT >> 8);
+        for (int o = 0; o < BIG_OUT; o++){ put64(q, 1000); q+=8; *q++ = 1; *q++ = 0x51; }
+        put32(q,0); q+=4;
+        long cbl = q - cb; u8 cbt[32];
+        tx_txid(cbt, cb, (unsigned long)cbl, g_scr, sizeof g_scr);
+        g_big_len[h] = finish(g_big[h], g_big_hash[h], prev, cbt, 1600000000u + (u32)h, cb, cbl, 1);
+        memcpy(prev, g_big_hash[h], 32);
+    }
+}
+static void p1_bigwal(void* a){
+    int n = *(int*)a;
+    memset(store_buf, 0, sizeof store_buf);
+    utxo_live_test_force_sizing(1);
+    store_init(store_buf); store_reload(store_buf);
+    if (utxo_live_init(".") != 1){ printf("  utxo_live_init failed\n"); _exit(9); }
+    for (int h = 0; h < n; h++){
+        if (store_append(store_buf, g_big_hash[h], g_big[h], g_big_len[h]) != h){ printf("  append %d failed\n", h); _exit(9); }
+        if (utxo_live_apply_block(g_big[h], (u64)g_big_len[h], h) != 1){ printf("  apply %d failed\n", h); _exit(9); }
+    }
+    long d = utxo_live_test_wal_drain();
+    printf("  p1: applied 0..%d under the bulk memtable (%ld coins), no checkpoint; WAL drained -> %ld; %d run file(s)\n",
+           n - 1, utxo_live_count(), d, count_runs());
+}
+static int sc_bigwal(int control){
+    char live[640], img[640], snap[640]; paths("bigwal", control, live, img, snap);
+    build_big_chain();
+    int n = control ? 100 : BIG_N;
+    if (run(live, p1_bigwal, &n) != 0) return 0;
+    run(live, p2_boot_only, 0);
+    long v[4]; if (read_res(live, v)) return 0;
+    return control ? (v[0] == 1 && v[1] == 0)
+                   : (v[0] == 0 && v[1] == 1 && v[2] == -1);
+}
+
 static int g_which, g_ctl;
 static int scenario(void){
     switch (g_which){
@@ -674,6 +785,9 @@ static int scenario(void){
     case 15: return sc_runcreate(0, g_ctl);
     case 16: return sc_runcreate_merge(g_ctl);
     case 17: return sc_sweep(g_ctl);
+    case 18: return sc_missingrun(g_ctl);
+    case 19: return sc_badmanifest(g_ctl);
+    case 20: return sc_bigwal(g_ctl);
     }
     return 0;
 }
@@ -686,13 +800,14 @@ int main(int argc, char** argv){
                                    "STO-A4 ghostchain", "STO-E logoff", "STO-C1 archive", "STO-C2 archive-nosync",
                                    "STO-A fork", "STO-D1 dirpub", "STO-D2 dirretire", "STO-D3 dirmerge",
                                    "STO-D4 opendot", "STO-D5 dirckpt", "STO-W1 runcreate", "STO-W2 runcreate-inline",
-                                   "STO-W3 runcreate-merge", "STO-W4 sweep" };
+                                   "STO-W3 runcreate-merge", "STO-W4 sweep", "STO-M missingrun",
+                                   "UTX-6 badmanifest", "UTX-2 bigwal" };
     int only = argc > 1 ? atoi(argv[1]) : -1;
     int failures = 0;
-    for (int w = 0; w < 18; w++){
+    for (int w = 0; w < 21; w++){
         if (only >= 0 && w != only) continue;
         for (int c = 0; c <= 1; c++){
-            printf("--- %s%s\n", names[w], c ? (w == 8 ? " (control: the bytes were pending)" : " (control: the lost write kept)") : "");
+            printf("--- %s%s\n", names[w], c ? (w == 8 ? " (control: the bytes were pending)" : w == 18 ? " (control: the run kept)" : w == 19 ? " (control: the manifest kept)" : w == 20 ? " (control: a tail that fits)" : " (control: the lost write kept)") : "");
             g_which = w; g_ctl = c;
             fflush(stdout);
             pid_t p = fork();
