@@ -698,6 +698,15 @@ extern __thread long g_txv_immature_depth;          /* daemon/tx_verify.c */
 
 /* the pre-script policy gate; returns NULL ok / reason. Also parks the sigop
  * cost for the policy layer's bytespersigop-adjusted feerate. */
+/* The sigop cost txacc_prechecks parked for the policy layer. mpol_add_core
+ * reads AND clears it on every call, so a path that runs the policy TEST
+ * before the commit (Core's order, below) must park it again for the add --
+ * otherwise the committed entry is priced at its plain vsize. */
+static unsigned long long g_txacc_sigops_parked;
+static void txacc_rearm_sigops(void){
+    extern void mpool_policy_set_pending_sigops(unsigned long long);
+    mpool_policy_set_pending_sigops(g_txacc_sigops_parked);
+}
 static const char* txacc_prechecks(void* mp_area, const u8* tx, unsigned long txlen){
     extern void mpool_policy_set_pending_sigops(unsigned long long);
     long lc = txacc_legacy_sigops(tx, txlen);
@@ -715,9 +724,15 @@ static const char* txacc_prechecks(void* mp_area, const u8* tx, unsigned long tx
         const char* wr = txacc_witness_standard(mp_area, tx, txlen);
         if (wr) return wr;
     }
-    mpool_policy_set_pending_sigops(sc > 0 ? (unsigned long long)sc : 0ULL);
+    g_txacc_sigops_parked = sc > 0 ? (unsigned long long)sc : 0ULL;
+    mpool_policy_set_pending_sigops(g_txacc_sigops_parked);
     return 0;
 }
+/* How many times the script verifier has run in this process: the expensive
+ * step, which the relay path must not repeat for a transaction it already
+ * refused (MPL-1). Read by tests. */
+static long g_txacc_script_runs;
+long txacc_script_verify_count(void){ return g_txacc_script_runs; }
 /* One entry for all three accept paths. Returns 1 ok, else 0 with *rout. */
 static int txacc_script_verify(void* mp_area, const u8* tx, unsigned long txlen,
                                const char** rout){
@@ -730,6 +745,7 @@ static int txacc_script_verify(void* mp_area, const u8* tx, unsigned long txlen,
     long nh = g_next_height > 0 ? g_next_height : (1L << 30);
     static __thread const char* r;
     r = 0;
+    __sync_fetch_and_add(&g_txacc_script_runs, 1);
     if (tx_verify_mempool(tx, (u64)txlen, nh, (txv_resolve_fn)txacc_resolve_verify,
                           mp_area, &r) == 1)
         return 1;
@@ -1011,6 +1027,16 @@ long tx_accept_validate(void* mp_area, const u8 txid[32], const u8* tx, unsigned
  * Returns 1 queued or accepted, 0 dropped. */
 long tx_accept_serve_tx(void* mp_area, const u8 txid[32], const u8* tx, unsigned long txlen, long dv_ok){
     extern int txho_push(const unsigned char*, unsigned long, int) __attribute__((weak));
+    /* MPL-1 (audit 2026-10-23): an inbound peer's `tx` is checked against the
+     * shared recent-rejects filter BEFORE it is queued, asked for or not
+     * (Core's ReceivedTx, by wtxid). The filter was only consulted before we
+     * sent a getdata, so the same refused transaction pushed unasked went
+     * through the queue and a full validation every time. */
+    { extern int serve_reject_has(const u8*) __attribute__((weak));
+      if (serve_reject_has){
+          u8 wtxid[32]; sha256d(wtxid, tx, txlen);
+          if (serve_reject_has(wtxid)) return 0;
+      } }
     if (txho_push){
         int q = txho_push(tx, txlen, txann_my_slot());
         if (q >= 0) return q;
@@ -1098,14 +1124,67 @@ int txacc_package_rbf_check(const u8* const* txs, const unsigned long* lens, con
  * rescuable, kept in one place here. Collapsing them into -26, as this used
  * to, is what made 1p1c relay impossible: the drain could not tell a parent
  * worth re-submitting inside a package from one worth discarding. */
+/* MPL-1 (audit 2026-10-23): what a refusal records, as Core's
+ * MempoolRejectedTx does. The WTXID goes into the shared recent-rejects
+ * filter -- never the txid of a transaction with a witness, because a third
+ * party can attach a bad witness to someone else's valid transaction: the
+ * txid is the same, and a txid entry would then keep the valid one from ever
+ * being fetched or accepted. For a transaction without a witness the two are
+ * the same hash. */
+static void txacc_reject_note(const u8* tx, unsigned long txlen){
+    extern void serve_reject_note(const u8*) __attribute__((weak));
+    if (!serve_reject_note) return;
+    u8 wtxid[32]; sha256d(wtxid, tx, txlen);
+    serve_reject_note(wtxid);
+}
+static long txacc_rpc_inputs(void* mp_area, const u8* tx, unsigned long txlen, char* reason, unsigned long rcap);
+/* MPL-8: the missing-inputs CLASS (-25) is the one reason Core reports as
+ * TX_MISSING_INPUTS, "bad-txns-inputs-missingorspent". These matchers used
+ * strstr(r, "missing"), which also caught "missing-ephemeral-spends" -- a
+ * policy refusal Core answers with -26. */
+static int txacc_reason_missing(const char* r){
+    return r && (!strcmp(r, "bad-txns-inputs-missingorspent") || strstr(r, "inputs-spent"));
+}
+/* tests: the RPC code a policy reason maps to, as the paths below map it */
+long txacc_test_reason_code(const char* r){ return txacc_reason_missing(r) ? -25 : -26; }
+
 long tx_accept_validate_p2p(void* mp_area, const u8 txid[32], const u8* tx,
                             unsigned long txlen){
     if (!g_ready || !g_pol_ready) return -26;
     txacc_log_tick(mp_area);
     if (txacc_recently_confirmed(txid)){ g_alog.known_conf++; return -27; }   /* already in a block: not an orphan */
     void* placeholder_utxo = (void*)1;
+    /* MPL-1 (audit 2026-10-23): Core's stage order, as the RPC paths have had
+     * since 2026-10-03 -- PreChecks (inputs, then fees and the rest of the
+     * policy) BEFORE the script checks. This path verified scripts first, so
+     * a transaction refused on fee or policy still cost a full signature
+     * check every time it was offered; now the cheap verdicts come first and
+     * the scripts run only for a transaction that would otherwise be
+     * accepted. Every final refusal is recorded (txacc_reject_note) so the
+     * next copy is dropped before any of this runs (daemon/tx_relay.c,
+     * bitcoin_serve.asm). Not recorded: -25 (the orphan class: valid the
+     * moment its parent arrives) and -28 (fee-only: a CPFP child can
+     * overturn it). No peer is scored for an invalid transaction, as in Core
+     * v31, which no longer punishes one. */
     { const char* pre = txacc_prechecks(mp_area, tx, txlen);
-      if (pre){ g_alog.rej_policy++; return -26; } }
+      if (pre){ g_alog.rej_policy++; txacc_reject_note(tx, txlen); return -26; } }
+    { long ri = txacc_rpc_inputs(mp_area, tx, txlen, NULL, 0);
+      if (ri == -25){ g_alog.rej_missing++; return -25; }                    /* the orphan class */
+      if (ri){ g_alog.rej_invalid++; txacc_reject_note(tx, txlen); return -26; } }
+    { extern long mpool_policy_test(void*, void*, void*, const unsigned char*, unsigned long,
+                                    const unsigned char*, void*, unsigned long long*, unsigned long long*);
+      mp_lock_at(__func__);
+      long pt = mpool_policy_test(g_pol, g_pol_state, mp_area, tx, txlen, txid, placeholder_utxo, NULL, NULL);
+      if (pt != 1) snprintf(g_txacc_detail, sizeof g_txacc_detail, "%s", mpool_policy_detail(g_pol));   /* under the lock */
+      mp_unlock();
+      if (pt != 1){
+          g_alog.rej_policy++;
+          const char* r = mpool_policy_reason(g_pol);
+          if (r && txacc_fee_reconsiderable(r)) return -28;
+          if (r && !strcmp(r, "bad-txns-inputs-missingorspent")) return -25;   /* a parent left since the inputs check */
+          txacc_reject_note(tx, txlen);
+          return -26;
+      } }
     {
         const char* r = 0;
         if (!txacc_script_verify(mp_area, tx, txlen, &r)){
@@ -1114,15 +1193,13 @@ long tx_accept_validate_p2p(void* mp_area, const u8 txid[32], const u8* tx,
             snprintf(g_alog.last_invalid, sizeof g_alog.last_invalid, "%s", r ? r : "?");
             /* MEM-10: a script failure is FINAL -- no descendant makes an
              * invalid parent valid -- and it is the expensive verdict, the
-             * one an attacker wants recomputed. Missing inputs (-25) are NOT
-             * recorded: that transaction becomes valid the moment its parent
-             * arrives, and the orphan pool exists to re-try it. */
-            { extern void serve_reject_note(const u8*) __attribute__((weak));
-              if (serve_reject_note) serve_reject_note(txid); }
+             * one an attacker wants recomputed. */
+            txacc_reject_note(tx, txlen);
             return -26;
         }
     }
     mp_lock_at(__func__);
+    txacc_rearm_sigops();                          /* the policy test consumed it */
     long padd = mpool_policy_add(g_pol, g_pol_state, mp_area, tx, txlen, txid, placeholder_utxo);
     if (padd != 1) snprintf(g_txacc_detail, sizeof g_txacc_detail, "%s", mpool_policy_detail(g_pol));   /* under the lock */
     if (padd == 1) txacc_fee_note(txid);           /* fee estimation, under the same lock */
@@ -1131,13 +1208,12 @@ long tx_accept_validate_p2p(void* mp_area, const u8 txid[32], const u8* tx,
         g_alog.rej_policy++;
         const char* r = mpool_policy_reason(g_pol);
         if (r && txacc_fee_reconsiderable(r)) return -28;
-        /* MEM-10: remember the refusal so the next announcement of this txid
-         * costs nothing. Deliberately NOT for the -28 class above: Core keeps
+        /* MEM-10: remember the refusal so the next announcement costs
+         * nothing. Deliberately NOT for the -28 class above: Core keeps
          * fee-only failures in a separate filter because a CPFP child can
          * overturn them, and suppressing their re-announcement would break
          * the 1p1c relay this file goes to some trouble to support. */
-        { extern void serve_reject_note(const u8*) __attribute__((weak));
-          if (serve_reject_note) serve_reject_note(txid); }
+        txacc_reject_note(tx, txlen);
         return -26;
     }
     g_alog.acc++;
@@ -1161,7 +1237,7 @@ long tx_accept_validate_p2p(void* mp_area, const u8 txid[32], const u8* tx,
  * where Core says "min relay fee not met". The inputs stage here, the
  * policy test after it; the caller verifies scripts last. Returns 0 to
  * continue, or the RPC code with reason (and g_txacc_detail) set. The p2p
- * paths keep scripts first: one policy pass per relayed transaction. */
+ * path runs the same order since MPL-1 (2026-10-23). */
 static long txacc_rpc_inputs(void* mp_area, const u8* tx, unsigned long txlen, char* reason, unsigned long rcap){
     extern int tx_verify_mempool_inputs(const u8*, u64, long, txv_resolve_fn, void*, const char**);
     long nh = g_next_height > 0 ? g_next_height : (1L << 30);
@@ -1199,7 +1275,7 @@ long tx_accept_validate_reason(void* mp_area, const u8 txid[32], const u8* tx,
           const char* r = mpool_policy_reason(g_pol);
           if (reason && rcap) snprintf(reason, rcap, "%s", r ? r : "policy rejected");
           if (r && strstr(r, "already")) return -27;
-          if (r && (strstr(r, "missing") || strstr(r, "inputs-spent"))) return -25;
+          if (txacc_reason_missing(r)) return -25;
           return -26;
       } }
     {
@@ -1211,7 +1287,7 @@ long tx_accept_validate_reason(void* mp_area, const u8 txid[32], const u8* tx,
              * deploy `h` -- it read like a meltdown while the reload ended
              * "5007 accepted, 0 rejected"). One line per 5 s; the 30 s
              * summary carries the count. Real invalidity stays per-tx. */
-            if (r && (strstr(r, "missing") || strstr(r, "inputs-spent"))){
+            if (txacc_reason_missing(r)){
                 /* no per-event line at all: with steady mainnet churn the
                  * 5s mute still guaranteed a line every 5 seconds forever
                  * (2026-08-31, operator: "wtf is that spam"). The 30s
@@ -1223,6 +1299,7 @@ long tx_accept_validate_reason(void* mp_area, const u8 txid[32], const u8* tx,
         }
     }
     mp_lock_at(__func__);
+    txacc_rearm_sigops();                          /* the policy test above consumed it */
     long padd = mpool_policy_add(g_pol, g_pol_state, mp_area, tx, txlen, txid, placeholder_utxo);
     if (padd != 1) snprintf(g_txacc_detail, sizeof g_txacc_detail, "%s", mpool_policy_detail(g_pol));   /* under the lock */
     if (padd == 1) txacc_fee_note(txid);           /* fee estimation, under the same lock */
@@ -1238,7 +1315,7 @@ long tx_accept_validate_reason(void* mp_area, const u8 txid[32], const u8* tx,
               pol_last = now; pol_muted = 1;
           } }
         if (r && strstr(r, "already")) return -27;
-        if (r && (strstr(r, "missing") || strstr(r, "inputs-spent"))) return -25;
+        if (txacc_reason_missing(r)) return -25;
         return -26;
     }
     txacc_note_sigops(mp_area, txid, tx, txlen);
@@ -1284,14 +1361,14 @@ long tx_accept_test_reason(void* mp_area, const u8 txid[32], const u8* tx,
         const char* r = mpool_policy_reason(g_pol);
         if (reason && rcap) snprintf(reason, rcap, "%s", r ? r : "policy rejected");
         if (r && strstr(r, "already")) return -27;
-        if (r && (strstr(r, "missing") || strstr(r, "inputs-spent"))) return -25;
+        if (txacc_reason_missing(r)) return -25;
         return -26;
     }
     {
         const char* r = 0;
         if (!txacc_script_verify(mp_area, tx, txlen, &r)){
             if (reason && rcap) snprintf(reason, rcap, "%s", r ? r : "mandatory-script-verify-flag-failed");
-            if (r && (strstr(r, "missing") || strstr(r, "inputs-spent"))) return -25;
+            if (txacc_reason_missing(r)) return -25;
             return -26;
         }
     }
