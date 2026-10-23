@@ -11924,7 +11924,7 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
           } else {
               fprintf(stderr, "[rpc] encrypted wallet adopted (locked -- use walletpassphrase)\n");
           }
-          memset(boot_pass, 0, sizeof boot_pass);
+          secure_zero(boot_pass, sizeof boot_pass);   /* CRY-3: a memset of a dead local is deleted at -O2 */
       } else {
     { extern int wallet_store_load(const char*, char*, int, char*, int);
       extern long wallet_mnemonic_seed(unsigned char seed[64], const char* mn,
@@ -11956,7 +11956,12 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
                               "(encrypted? set BMC_WALLET_PASS or walletpassfile=)\n", cand[wi]);
           }
           break;
-      } } } }
+      }
+      /* CRY-3 (audit 2026-10-23): the passphrase stayed in this static for
+       * the life of the process; the copy the provider needs is
+       * g_wallet_bip39pass, which encryptwallet wipes. */
+      secure_zero(wpass, sizeof wpass);
+      secure_zero(mn, sizeof mn); } } }
     /* Hand the RPC layer the SHARED mempool (allocated pre-fork by
      * mempool_configure, written by the worker + inbound children) so
      * getrawmempool/getmempoolinfo report the real pool. All-null when the

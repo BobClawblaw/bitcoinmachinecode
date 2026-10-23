@@ -19,6 +19,7 @@
  * CBC uses PKCS#7 padding, matching Core's EVP_aes_256_cbc default.
  */
 #include <string.h>
+#include "daemon/secure_zero.h"   /* CRY-3: the round keys and state are wiped */
 
 typedef unsigned char u8;
 
@@ -78,15 +79,18 @@ static void key_expand(const u8 key[32], u8 rk[(NR+1)*16]){
     }
 }
 
+/* CRY-3 (audit 2026-10-23): the expanded key rk[240] begins with the key
+ * itself, and the block functions left it -- with the cipher state -- in a
+ * dead stack frame after every call. Each function now wipes its round keys
+ * and state with secure_zero before returning. */
 void aes256_encrypt_block(const u8 key[32], const u8 in[16], u8 out[16]){
     u8 rk[(NR+1)*16]; key_expand(key, rk);
     u8 s[16]; memcpy(s, in, 16);
+    u8 a[16], b[16];
     for (int i = 0; i < 16; i++) s[i] ^= rk[i];                          /* AddRoundKey 0 */
     for (int r = 1; r <= NR; r++){
-        u8 a[16];
         for (int i = 0; i < 16; i++) a[i] = SBOX[s[i]];                  /* SubBytes */
         /* ShiftRows (row = i%4, col = i/4; state is column-major) */
-        u8 b[16];
         for (int c = 0; c < 4; c++) for (int row = 0; row < 4; row++)
             b[c*4 + row] = a[((c + row) % 4)*4 + row];
         if (r < NR){
@@ -102,19 +106,20 @@ void aes256_encrypt_block(const u8 key[32], const u8 in[16], u8 out[16]){
         for (int i = 0; i < 16; i++) s[i] = b[i] ^ rk[r*16 + i];         /* AddRoundKey r */
     }
     memcpy(out, s, 16);
+    secure_zero(rk, sizeof rk); secure_zero(s, sizeof s);
+    secure_zero(a, sizeof a); secure_zero(b, sizeof b);
 }
 
 void aes256_decrypt_block(const u8 key[32], const u8 in[16], u8 out[16]){
     if (!g_isbox_ready) build_isbox();
     u8 rk[(NR+1)*16]; key_expand(key, rk);
     u8 s[16]; memcpy(s, in, 16);
+    u8 a[16], b[16];
     for (int i = 0; i < 16; i++) s[i] ^= rk[NR*16 + i];                  /* AddRoundKey NR */
     for (int r = NR - 1; r >= 0; r--){
         /* InvShiftRows */
-        u8 b[16];
         for (int c = 0; c < 4; c++) for (int row = 0; row < 4; row++)
             b[c*4 + row] = s[((c - row + 4) % 4)*4 + row];
-        u8 a[16];
         for (int i = 0; i < 16; i++) a[i] = ISBOX[b[i]];                 /* InvSubBytes */
         for (int i = 0; i < 16; i++) a[i] ^= rk[r*16 + i];               /* AddRoundKey r */
         if (r > 0){
@@ -130,6 +135,8 @@ void aes256_decrypt_block(const u8 key[32], const u8 in[16], u8 out[16]){
         memcpy(s, a, 16);
     }
     memcpy(out, s, 16);
+    secure_zero(rk, sizeof rk); secure_zero(s, sizeof s);
+    secure_zero(a, sizeof a); secure_zero(b, sizeof b);
 }
 
 /* CBC + PKCS#7. Encrypt output = ceil((inlen+1)/16)*16. Returns length
@@ -140,9 +147,9 @@ long aes256_cbc_encrypt(const u8 key[32], const u8 iv[16],
     if (cap < padded) return -1;
     u8 pad = (u8)(padded - inlen);
     u8 prev[16]; memcpy(prev, iv, 16);
+    u8 blk[16];
     long o = 0;
     for (long off = 0; off < padded; off += 16){
-        u8 blk[16];
         for (int i = 0; i < 16; i++){
             long idx = off + i;
             u8 b = idx < inlen ? in[idx] : pad;
@@ -152,6 +159,7 @@ long aes256_cbc_encrypt(const u8 key[32], const u8 iv[16],
         memcpy(prev, out + o, 16);
         o += 16;
     }
+    secure_zero(blk, sizeof blk);           /* plaintext XOR the previous ciphertext */
     return o;
 }
 
@@ -161,12 +169,13 @@ long aes256_cbc_decrypt(const u8 key[32], const u8 iv[16],
                         const u8* in, long inlen, u8* out, long cap){
     if (inlen <= 0 || inlen % 16 != 0 || cap < inlen) return -1;
     u8 prev[16]; memcpy(prev, iv, 16);
+    u8 blk[16];
     for (long off = 0; off < inlen; off += 16){
-        u8 blk[16];
         aes256_decrypt_block(key, in + off, blk);
         for (int i = 0; i < 16; i++) out[off + i] = blk[i] ^ prev[i];
         memcpy(prev, in + off, 16);
     }
+    secure_zero(blk, sizeof blk);
     u8 pad = out[inlen - 1];
     if (pad < 1 || pad > 16) return -1;
     for (int i = 0; i < pad; i++) if (out[inlen - 1 - i] != pad) return -1;

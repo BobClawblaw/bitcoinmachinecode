@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include "daemon/secure_zero.h"   /* CRY-3: the signer wipes its secrets */
 
 /* ---------------- verified asm primitives (declared, resolved at link) ------ */
 extern void scalar_to_pubkey(unsigned char pub[33], const unsigned char k[32]);
@@ -195,6 +196,7 @@ int wallet_ecdsa_sign(uint64_t out_r[4], uint64_t out_s[4],
     unsigned char seed[64], kbe[32];
     uint64_t k[4], d[4], z[4], R[12];
     uint64_t z2[4], zi[4], px[4], r[4], rd[4], zrd[4];
+    int ok = 0;
 
     /* deterministic nonce: k = sha256d(z || priv) */
     memcpy(seed, z_be, 32);
@@ -225,7 +227,7 @@ int wallet_ecdsa_sign(uint64_t out_r[4], uint64_t out_s[4],
      * nonce is sha256d output, so this is ~2^-256 -- but an unchecked zero
      * would produce a garbage signature rather than a refusal, and refusing
      * is free. */
-    if ((k[0] | k[1] | k[2] | k[3]) == 0) return 0;
+    if ((k[0] | k[1] | k[2] | k[3]) == 0) goto out;
 
     /* R = k*G (Jacobian 12 limbs) -- CONSTANT TIME in k (FINDING 1) */
     point_scalar_mul_gen_ct(R, k);
@@ -255,8 +257,8 @@ int wallet_ecdsa_sign(uint64_t out_r[4], uint64_t out_s[4],
     /* CRY-7: r == 0 or s == 0 is not a valid ECDSA signature -- Core's
      * verifier rejects both, so emitting one would produce a transaction that
      * cannot be spent. Each is ~2^-256; the check is two ORs. */
-    if ((r[0] | r[1] | r[2] | r[3]) == 0) return 0;
-    if ((out_s[0] | out_s[1] | out_s[2] | out_s[3]) == 0) return 0;
+    if ((r[0] | r[1] | r[2] | r[3]) == 0) goto out;
+    if ((out_s[0] | out_s[1] | out_s[2] | out_s[3]) == 0) goto out;
 
     /* low-S normalization: if s > n/2 then s = n - s */
     if (limb_cmp(out_s, N_HALF) > 0) {
@@ -267,7 +269,17 @@ int wallet_ecdsa_sign(uint64_t out_r[4], uint64_t out_s[4],
             out_s[i] = s;
         }
     }
-    return 1;
+    ok = 1;
+out:
+    /* CRY-3 (audit 2026-10-23): seed holds the private key, kbe/k the nonce
+     * (and k its inverse), d the key, rd and zrd r*d and z + r*d -- any one
+     * of the nonce values with the public signature yields d. All were left
+     * in the dead frame. */
+    secure_zero(seed, sizeof seed); secure_zero(kbe, sizeof kbe);
+    secure_zero(k, sizeof k); secure_zero(d, sizeof d);
+    secure_zero(rd, sizeof rd); secure_zero(zrd, sizeof zrd);
+    secure_zero(R, sizeof R);
+    return ok;
 }
 
 /* --- DER + tx assembly helpers --- */

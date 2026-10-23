@@ -1750,8 +1750,8 @@ tests/test_bip39_passbound: tests/test_bip39_passbound.c $(BIP39OBJS)
 tests/test_sha512_thread_stress: tests/test_sha512_thread_stress.c sha512.o bitcoin_hmac.o
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_sha512_thread_stress.c sha512.o bitcoin_hmac.o -lpthread
 
-tests/test_secret_wipe: tests/test_secret_wipe.c daemon/wallet_crypter.c daemon/secure_zero.h bitcoin_aes.c $(BIP39OBJS)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -I daemon -o $@ tests/test_secret_wipe.c daemon/wallet_crypter.c bitcoin_aes.c $(BIP39OBJS)
+tests/test_secret_wipe: tests/test_secret_wipe.c daemon/wallet_crypter.c daemon/secure_zero.h bitcoin_aes.c wallet_core.c bip340_sign.c $(WALLETPRIMS)
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -I daemon -o $@ tests/test_secret_wipe.c daemon/wallet_crypter.c bitcoin_aes.c wallet_core.c bip340_sign.c $(WALLETPRIMS)
 
 # regenerate the BIP39 vectors from the independent Python oracle
 tests/bip39_vec.h: validation/gen_bip39_vectors.py
