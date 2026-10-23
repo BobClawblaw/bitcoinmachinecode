@@ -29,6 +29,22 @@ static int read_raw(const char* path, unsigned char** ents, uint64_t* n, uint64_
     fclose(f);
     return 0;
 }
+/* formal/parsers F7 (2026-10-23): next_gen / next_run_no are 1 + the largest
+ * gen / run number in the manifest, so an entry of 2^64 - 1 has no successor:
+ * `g + 1` wrapped to 0 and left the counter below it, and the next flush could
+ * write a run no newer than an existing one -- breaking the newest-wins order
+ * the lookups and the compaction tie-break rely on. Saturating cannot help
+ * (UINT64_MAX is not greater than an entry of UINT64_MAX), so such a manifest
+ * is refused as corrupt: nothing this node writes comes near 2^64 runs. The
+ * boot reader (bitcoin_utxo_lsm.asm .rl_mscan) refuses it the same way, and a
+ * refused manifest halts the boot (UTX-6). 1 = every entry has a successor. */
+static int ents_have_successor(const unsigned char* e, uint64_t n){
+    for (uint64_t i = 0; i < n; i++){
+        uint64_t g, r; memcpy(&g, e + i*16, 8); memcpy(&r, e + i*16 + 8, 8);
+        if (g == UINT64_MAX || r == UINT64_MAX) return 0;
+    }
+    return 1;
+}
 static void advance_counters(struct lsm_state* lst){
     const unsigned char* e = (const unsigned char*)lst->manifest_buf;
     for (uint64_t i = 0; i < lst->manifest_n; i++){
@@ -41,6 +57,7 @@ int lsm_manifest_read_file(const char* path, struct lsm_state* lst, uint64_t* pe
     unsigned char* ents; uint64_t n, live;
     if (read_raw(path, &ents, &n, &live) != 0) return -1;
     if (n > lst->manifest_cap){ free(ents); return -1; }
+    if (!ents_have_successor(ents, n)){ free(ents); return -1; }   /* F7 */
     memcpy(lst->manifest_buf, ents, (size_t)n * 16);
     free(ents);
     lst->manifest_n = n;
@@ -116,6 +133,7 @@ int lsm_manifest_adopt_child(struct lsm_state* lst, const uint64_t* inputs, int 
     unsigned char* c; uint64_t cn, cbase;
     if (read_raw(LSM_MANIFEST_CHILD, &c, &cn, &cbase) != 0) return -1;
     if (cn < 1){ free(c); return -1; }
+    if (!ents_have_successor(c, cn)){ free(c); return -1; }          /* F7: before anything is published */
     const unsigned char* cur = (const unsigned char*)lst->manifest_buf;
     /* the child's manifest = [merged] + the non-input runs it saw at fork:
      * the merged run is the one child entry we do not know; every other

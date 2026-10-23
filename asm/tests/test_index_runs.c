@@ -131,6 +131,33 @@ int main(void){
     write_run(n2, c, nc, 2000, 2499, 0); irs_dirty(&s); irs_refresh(&s);
     ck("...and found again when it is back", s.n == 3);
 
+    /* formal/parsers F4: the header checks must not wrap. irs_open_run
+     * compared so + ns*16 with the size and 48 + n*20 with so in 64 bits:
+     * nsparse 2^60 (16 * 2^60 == 0 mod 2^64) and n = 1 + 2^62 (20n == 20
+     * mod 2^64) both passed on a 68-byte file, and a lookup then searched
+     * 2^60 sparse samples or 2^62 records of it. Exactly the confirmation
+     * driver's input, then the honest 68- and 84-byte runs that must still
+     * open. Files named outside the run pattern, so the set never sees them. */
+    { struct { const char* what; unsigned long long n, so, ns; long size; int want; } cs[] = {
+        { "nsparse 2^60 on a 68-byte run (16*2^60 wraps to 0)",  1, 68, 1ULL << 60, 68, 0 },
+        { "n = 1 + 2^62 on a 68-byte run (20n wraps to 20)",     1 + (1ULL << 62), 68, 0, 68, 0 },
+        { "sparse_off past the end of the file",                 1, 68 + 20, 0, 68, 0 },
+        { "sparse_off inside the header",                        0, 40, 0, 68, 0 },
+        { "(control) one record, no samples: 68 bytes",          1, 68, 0, 68, 1 },
+        { "(control) one record, one sample: 84 bytes",          1, 68, 1, 84, 1 } };
+      for (unsigned k = 0; k < sizeof cs / sizeof cs[0]; k++){
+          unsigned char f[84]; memset(f, 0, sizeof f);
+          memcpy(f, "BMCTXIDX", 8); put64(f + 8, cs[k].n); put64(f + 16, cs[k].so); put64(f + 24, cs[k].ns);
+          put32(f + 32, 10); put32(f + 36, 10);
+          FILE* o = fopen("f4run.bin", "wb"); fwrite(f, 1, (size_t)cs[k].size, o); fclose(o);
+          irun_t r; memset(&r, 0, sizeof r); snprintf(r.path, sizeof r.path, "%s", "f4run.bin");
+          int ok = irs_open_run(&s, &r);
+          char l[200]; snprintf(l, sizeof l, "F4 %s: %s", cs[k].what, cs[k].want ? "opens" : "refused");
+          ck(l, ok == cs[k].want);
+          if (ok) irs_close_run(&r);
+      }
+      unlink("f4run.bin"); }
+
     /* the merger: one file, the union range, every record, builder order */
     unlink("txindex.r000003000-000003999.dat");
     /* ST2-2: keep copies of the inputs, to put back after the merge as a

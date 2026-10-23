@@ -171,6 +171,57 @@ int main(void){
                              && !strcmp(got, "block") && blen == big && !memcmp(body, p, big));
         free(p); }
 
+      printf("== formal/parsers F3: a long message type Core refuses is dropped ==\n");
+      /* Core's V2Transport::GetMessageType: 12 type bytes, printable ASCII
+       * (0x20..0x7f) up to the first NUL, NUL after it. Anything else -- and a
+       * long encoding shorter than 12 bytes -- is no type; GetReceivedMessage
+       * rejects that one message and the session goes on. The transport used
+       * to deliver a control byte or a byte above 0x7f as part of the type,
+       * cut a type at its first NUL whatever followed, and end the session on
+       * a short one. Each packet is built by hand (send_message cannot spell
+       * these) and encrypted with A's cipher; after each, a valid message must
+       * still arrive, so a session ended by the bad one fails the case too. */
+      { static const struct { unsigned char ty[12]; int n; const char* what; } bad[] = {
+            { { 0x01,'p','i','n','g' }, 12, "a control byte (01 'ping')" },
+            { { 'p','i',0xff,'n','g' }, 12, "a byte above 0x7f ('pi' ff 'ng')" },
+            { { 0x1f,'x' },             12, "0x1f, just below the printable range" },
+            { { 'p','i',0,'n','g' },    12, "a non-NUL byte after the first NUL ('pi' 00 'ng')" },
+            { { 'p','i','n','g' },       3, "a long encoding of 3 type bytes, not 12" } };
+        static const struct { unsigned char ty[12]; const char* name; } good[] = {
+            { { 'v','e','r','a','c','k' },                    "verack" },
+            { { 'a',' ','b','~',0x7f },                       "a b~\x7f" },
+            { { 'a','b','c','d','e','f','g','h','i','j','k','l' }, "abcdefghijkl" },
+            { { 'p','i','n','g' },                            "ping" } };   /* a short-id name spelt long */
+        for (unsigned k = 0; k < sizeof bad / sizeof bad[0]; k++){
+            unsigned char contents[1 + 12 + 2], pkt[sizeof contents + BIP324_EXPANSION];
+            unsigned long clen = 1 + (unsigned long)bad[k].n;
+            contents[0] = 0; memcpy(contents + 1, bad[k].ty, (size_t)bad[k].n);
+            if (bad[k].n == 12){ contents[13] = 'x'; contents[14] = 'y'; clen += 2; }
+            bip324_encrypt(&A.cipher, pkt, contents, clen, 0, 0, 0);
+            int fed = bip324_t_feed(&B, pkt, clen + BIP324_EXPANSION);
+            const char* got = 0; const unsigned char* body; unsigned long blen;
+            int r = fed ? bip324_t_next_message(&B, &got, &body, &blen) : -1;
+            char l[160]; snprintf(l, sizeof l, "F3 %s is not delivered (next_message %d)", bad[k].what, r);
+            ck(l, fed && r == 0);
+            int sent = bip324_t_send_message(&A, "inv", (const unsigned char*)"z", 1) && pump(&A, &B);
+            r = sent ? bip324_t_next_message(&B, &got, &body, &blen) : -1;
+            snprintf(l, sizeof l, "F3   ...and the session carries on: the next message arrives");
+            ck(l, r == 1 && !strcmp(got, "inv") && blen == 1);
+        }
+        for (unsigned k = 0; k < sizeof good / sizeof good[0]; k++){
+            unsigned char contents[1 + 12 + 1], pkt[sizeof contents + BIP324_EXPANSION];
+            contents[0] = 0; memcpy(contents + 1, good[k].ty, 12); contents[13] = 'q';
+            bip324_encrypt(&A.cipher, pkt, contents, sizeof contents, 0, 0, 0);
+            const char* got = 0; const unsigned char* body; unsigned long blen;
+            int r = bip324_t_feed(&B, pkt, sizeof pkt) ? bip324_t_next_message(&B, &got, &body, &blen) : -1;
+            char l[160]; snprintf(l, sizeof l, "F3 a valid long type \"%s\" is delivered as itself", good[k].name);
+            ck(l, r == 1 && !strcmp(got, good[k].name) && blen == 1 && body[0] == 'q');
+        }
+        { const char* got = 0; const unsigned char* body; unsigned long blen;
+          int r = bip324_t_send_message(&A, "tx", (const unsigned char*)"t", 1) && pump(&A, &B)
+                  ? bip324_t_next_message(&B, &got, &body, &blen) : -1;
+          ck("F3 a short id (tx) is still delivered", r == 1 && !strcmp(got, "tx")); } }
+
       /* CRY-4: freeing a transport wipes its session keys, not only the
        * ephemeral secret (the struct outlives the call here, so the test can
        * look; in the node the v2_conn is freed straight after) */

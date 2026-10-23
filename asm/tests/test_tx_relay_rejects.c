@@ -176,6 +176,11 @@ static int asks_for(int leg[2], unsigned type, const u8 h[32]){
     return got;
 }
 
+/* formal/parsers F2: the relay leg scores an addr/addrv2 only where Core
+ * does. main.c supplies this hook in the daemon; here it counts. */
+static int g_addr_viol;
+void txr_report_violation_fd(int fd, const char* reason){ (void)fd; (void)reason; g_addr_viol++; }
+
 int main(void){
     tt_isolate();
     setbuf(stdout, NULL);
@@ -367,6 +372,27 @@ int main(void){
     ck("MPL-8 \"missing-ephemeral-spends\" -> -26", txacc_test_reason_code("missing-ephemeral-spends") == -26);
     ck("\"bad-txns-inputs-missingorspent\" -> -25", txacc_test_reason_code("bad-txns-inputs-missingorspent") == -25);
     (void)t3;
+
+    printf("== F2: an addr/addrv2 Core drops whole is not scored; one of > 1000 entries is ==\n");
+    {   /* Core deserializes the vector first (a malformed one throws and is
+         * dropped unscored) and only then calls a vector above
+         * MAX_ADDR_TO_SEND Misbehaving. The leg used to score a count it
+         * could not read and any count above 1000, records or not. */
+        static u8 big[8 + 1001 * 30]; long p = 0;
+        int v0 = g_addr_viol;
+        u8 two[1 + 13]; two[0] = 2;                                         /* count 2, one IPv4 record */
+        memset(two + 1, 0, 13); two[5] = 9; two[6] = 1; two[7] = 4; two[8] = 23; two[9] = 1; two[12] = 0x20; two[13] = 0x8d;
+        p2p_write(A[1], "addrv2", 6, two, sizeof two); txrelay_poll_leg(A[0], mp_area, 20); drain_peer(A[1]);
+        ck("F2 an addrv2 with fewer records than its count is not scored", g_addr_viol == v0);
+        u8 c1001[3] = { 0xfd, 0xe9, 0x03 };                                 /* count 1001, no records */
+        p2p_write(A[1], "addrv2", 6, c1001, 3); txrelay_poll_leg(A[0], mp_area, 20); drain_peer(A[1]);
+        ck("F2 a count of 1001 with no records behind it is not scored (Core: end of data)", g_addr_viol == v0);
+        big[p++] = 0xfd; big[p++] = 0xe9; big[p++] = 0x03;                  /* 1001 well-formed v1 records */
+        for (int i = 0; i < 1001; i++){ u8* r = big + p; memset(r, 0, 30); r[4] = 9; r[22] = 0xff; r[23] = 0xff;
+            r[24] = (u8)(31 + i / 200); r[25] = (u8)(i % 200); r[26] = 1; r[27] = 1; r[28] = 0x20; r[29] = 0x8d; p += 30; }
+        p2p_write(A[1], "addr", 4, big, (unsigned)p); txrelay_poll_leg(A[0], mp_area, 50); drain_peer(A[1]);
+        ck("F2 1001 well-formed records ARE scored, once (Core: Misbehaving \"addr message size\")", g_addr_viol == v0 + 1);
+    }
 
     printf("\n%s (%d failures)\n", g_fails ? "TESTS FAILED" : "ALL TESTS PASSED", g_fails);
     return g_fails ? 1 : 0;

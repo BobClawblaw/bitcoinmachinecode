@@ -116,6 +116,16 @@ int serve_locator_from(const unsigned char* pl, unsigned long plen, void* htidx,
                          n = 0; for (int i=0;i<8;i++) n |= (unsigned long long)pl[p+1+i] << (8*i);
                          p += 9; }
 
+    /* CANONICAL COUNT (formal/parsers F1, 2026-10-23). Core reads the locator
+     * with ReadCompactSize, which throws "non-canonical ReadCompactSize()"
+     * for a value spelled in more bytes than it needs (fd 0100 for 1); the
+     * exception is caught in ProcessMessages and the message is dropped,
+     * unscored. This accepted the long spelling and served from it -- a
+     * fingerprint, and the one parser here that still took one (the inv
+     * bounds above refuse it). Drop it the same way: return 0. */
+    if ((p == 4 + 3 && n < 0xfd) || (p == 4 + 5 && n <= 0xffff) ||
+        (p == 4 + 9 && n <= 0xffffffffULL)) return 0;
+
     /* Core's MAX_LOCATOR_SZ is 101; anything larger is a malformed request.
      * The bound also stops an absurd count from making the walk expensive. */
     if (n > 101) return 0;

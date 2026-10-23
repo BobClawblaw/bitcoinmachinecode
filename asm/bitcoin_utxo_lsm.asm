@@ -3547,11 +3547,15 @@ mac_lsm_reload_impl:
     mov  rdx, [r12+104]
     add  rdx, rcx
     mov  rax, [rdx]              ; this entry's gen
+    cmp  rax, -1                 ; F7: 2^64-1 has no successor (next_gen
+    je   .rl_manifest_wrap       ; = max + 1 below would wrap to 0)
     cmp  rax, [r12+96]
     jbe  .rl_mscan_g
     mov  [r12+96], rax
 .rl_mscan_g:
     mov  rax, [rdx+8]            ; this entry's run_no
+    cmp  rax, -1                 ; F7: likewise for next_run_no
+    je   .rl_manifest_wrap
     cmp  rax, [r12+144]
     jbe  .rl_mscan_r
     mov  [r12+144], rax
@@ -3564,6 +3568,16 @@ mac_lsm_reload_impl:
     inc  qword [r12+96]
     inc  qword [r12+144]
     jmp  .rl_manifest_done
+.rl_manifest_wrap:
+    ; ---- formal/parsers F7 (2026-10-23): an entry whose gen or run_no is
+    ; 2^64-1. next_gen/next_run_no are 1 + the largest seen, and that +1
+    ; wrapped to 0, so the next flush could write a run no newer than an
+    ; existing one -- breaking newest-wins. Saturating cannot restore the
+    ; order (2^64-1 is not greater than 2^64-1) and nothing this node writes
+    ; comes near it: the manifest is corrupt, and reloading it fails like any
+    ; other unreadable manifest (UTX-6, below). The fd was closed at
+    ; .rl_manifest_close; daemon/lsm_manifest.c refuses the same entries.
+    jmp  .rl_fail
 .rl_manifest_bad:
     ; ---- UTX-6: a manifest that EXISTS but cannot be read is a HARD FAILURE.
     ;

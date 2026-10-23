@@ -1531,23 +1531,24 @@ node_serve_loop:
     ; else must be the classic getblocks -> require "lock" at cmd[4..7]
     cmp  dword [s_cmd+4], 0x6b636f6c ; "lock"
     jne  .next
-    ; payload: version(4) count(1) locator-hash(32) stop(32) ; locator at pl+5
-    mov  rax, [s_plen]
-    cmp  rax, 37
-    jb   .gb_from0
-    mov  rdi, [s_htidx]
-    lea  rsi, [pl_buf+5]
-    lea  rdx, [s_fh]
-    call idx_get
-    test rax, rax
-    jz   .gb_from0
-    mov  rax, [s_fh]
-    inc  rax
-    jmp  .gb_havefrom
-.gb_from0:
-    xor  eax, eax
-.gb_havefrom:
-    mov  [s_fh], rax        ; from
+    ; payload: version(4) | CompactSize count | count*32 locator | 32 stop,
+    ; the same CBlockLocator body getheaders carries. formal/parsers F1
+    ; (2026-10-23): this read the first hash at pl+5 whatever the count said
+    ; -- a non-canonical count (fd 0100), a short message or a multi-byte
+    ; count was served from a misread hash or from genesis, where Core's
+    ; ReadCompactSize throws and the message is dropped. serve_locator_from
+    ; parses it as getheaders does (canonical count, <= 101, length checked)
+    ; and walks the whole locator (FindForkInGlobalIndex). rax = 1 ok / 0
+    ; malformed; s_fh = the height to serve from. The stop hash it reports
+    ; is not used here (as before).
+    lea  rdi, [pl_buf]
+    mov  rsi, [s_plen]
+    mov  rdx, [s_htidx]
+    lea  rcx, [s_fh]         ; out_from
+    lea  r8,  [s_ghstop]     ; out_stop (unused by getblocks)
+    call serve_locator_from
+    test eax, eax
+    jz   .next               ; malformed: drop, as getheaders does
     ; tip = the CONNECTED tip (3.1); s_fh is a static, survives the call
     mov  rdi, r14
     call serve_public_tip
