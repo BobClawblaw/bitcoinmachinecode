@@ -872,6 +872,11 @@ tests/test_utxo_recover_gate: $(RECOVERGATESRCS) daemon/utxo_walk.h $(REORGOBJS)
 # SIGKILL) must recover to the right set; each has a control that keeps the
 # lost write.
 STOCRASHSRCS := $(patsubst tests/test_utxo_ghost_resume.c,tests/test_sto_crash.c,$(GHOSTRESUMESRCS))
+# bench_utxo_apply_sync -- not a gate test: the applier's syncs per 1,000 blocks
+# on a synthetic busy chain (count them with strace -c; see the file's header).
+APPLYSYNCSRCS := $(patsubst tests/test_utxo_ghost_resume.c,tests/bench_utxo_apply_sync.c,$(GHOSTRESUMESRCS))
+tests/bench_utxo_apply_sync: $(APPLYSYNCSRCS) daemon/utxo_walk.h $(REORGOBJS)
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -Wall -o $@ $(APPLYSYNCSRCS) $(REORGOBJS) -lpthread
 tests/test_sto_crash: $(STOCRASHSRCS) tests/durable_image.h daemon/utxo_walk.h $(REORGOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -Wall -o $@ $(STOCRASHSRCS) $(REORGOBJS) -lpthread
 
