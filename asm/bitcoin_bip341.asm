@@ -84,7 +84,7 @@ extern ts_tx_seq_export               ; C seam: nSequence of input i
 %define TS_SPK_RUN_CAP (4 << 20)
 %define TS_ANNEX_CAP   ((4 << 20) + 9)
 
-section .tbss alloc noexec nowrite tls align=8
+section .tbss nobits alloc noexec write tls align=8
 global b341_off
 b341_off:  resq 1                     ; u32* offset table (tx_parse)
 global b341_seq

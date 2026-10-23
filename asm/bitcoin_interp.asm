@@ -277,7 +277,7 @@
 ; slots rather than re-deriving them) -- every other reference in this file
 ; was previously a compile-time-constant label; those become a load from
 ; the matching slot instead, same instruction shape, same register usage.
-section .tbss alloc noexec nowrite tls align=16
+section .tbss nobits alloc noexec write tls align=16
 global interp_tmp
 global bool_buf
 global interp_err
@@ -3655,7 +3655,7 @@ interp_checkmultisig:
     pop   r12
     ret
 
-section .tbss alloc noexec nowrite tls align=16
+section .tbss nobits alloc noexec write tls align=16
 global cms_keyrefs
 global cms_sigrefs
 global cms_scstrip0

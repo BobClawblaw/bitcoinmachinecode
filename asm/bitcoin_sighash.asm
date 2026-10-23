@@ -1127,7 +1127,7 @@ cs_needle: db 0xab
 ; .bss global (one shared instance for the whole process), unsafe once
 ; legacy_sighash can be called concurrently from multiple worker threads --
 ; see bitcoin_interp.asm's matching header note for the full rationale.
-section .tbss alloc noexec nowrite tls align=8
+section .tbss nobits alloc noexec write tls align=8
 global legacy_sighash_scfbuf
 legacy_sighash_scfbuf: resb 20000
 

@@ -953,7 +953,7 @@ tests/zmq_realblock_check: tests/zmq_realblock_check.c bitcoin_store.o bitcoin_s
 # LSM reload through BOTH read paths (point lookup + full walk). The tool
 # that made incident #49's nondeterministic slen corruption deterministic.
 daemon/bmc_utxo_probe_one: daemon/utxo_probe_one.c bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_hash.o sha256.o
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ daemon/utxo_probe_one.c bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_hash.o sha256.o -lpthread
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) $(HARDENFLAGS) -o $@ daemon/utxo_probe_one.c bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_hash.o sha256.o -lpthread
 
 # build_addr_index -- offline address->UTXO snapshot from a compacted LSM
 # run (two-pass external sort). The classifier is shared with the live tail
@@ -970,7 +970,7 @@ daemon/bmc_build_block_filters: daemon/build_block_filters.c daemon/bfilter_inde
 # 2026-09-16: sorted index RUNS (daemon/index_runs.h) -- the merger folds a
 # pile of runs into one; the trailing supervisor (index_trail.h) spawns it.
 daemon/bmc_merge_index_runs: daemon/merge_index_runs.c daemon/index_runs.c daemon/index_runs.h
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ daemon/merge_index_runs.c daemon/index_runs.c
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) $(HARDENFLAGS) -o $@ daemon/merge_index_runs.c daemon/index_runs.c
 
 tests/test_index_runs: tests/test_index_runs.c daemon/index_runs.c daemon/index_runs.h daemon/merge_index_runs.c $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_index_runs.c daemon/index_runs.c
@@ -983,7 +983,7 @@ tests/test_index_trail: tests/test_index_trail.c daemon/index_trail.c daemon/ind
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_index_trail.c daemon/index_trail.c daemon/index_runs.c
 
 daemon/bmc_build_tx_index: daemon/build_tx_index.c daemon/txi_format.h bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ daemon/build_tx_index.c bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) $(HARDENFLAGS) -o $@ daemon/build_tx_index.c bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o
 
 # txo-spender index base build (Core -txospenderindex), 2026-09-01
 daemon/bmc_build_txospender_index: daemon/build_txospender_index.c daemon/txosp_format.h bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o
@@ -1023,7 +1023,7 @@ daemon/bmc_build_utxo: daemon/build_utxo.c $(BUILDUTXOOBJS)
 # chainwork_build -- regenerate chainwork.dat from headers.dat (block_work sum).
 # Fixes the post-segwit chainwork.dat corruption; block_work itself is correct.
 daemon/bmc_chainwork_build: daemon/chainwork_build.c bitcoin_chainwork.o
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ daemon/chainwork_build.c bitcoin_chainwork.o
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) $(HARDENFLAGS) -o $@ daemon/chainwork_build.c bitcoin_chainwork.o
 
 # test_truncate_guard_prim -- store_truncate_to must REFUSE an out-of-order
 # archive and leave the block data intact. Asserts on the BLOCK FILES, not
@@ -3017,9 +3017,9 @@ daemon/addr_hist.o: daemon/addr_hist.c daemon/addr_hist_fmt.h
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -c -o $@ daemon/addr_hist.c
 # the address history index builder (offline; see daemon/addr_hist_fmt.h)
 daemon/bmc_build_coinstats_hist: daemon/build_coinstats_hist.c daemon/coinstats_hist_fmt.h bitcoin_store.o bitcoin_store_fast.o bitcoin_hash.o sha256.o bitcoin_tx.o bitcoin_utxo_stats.o bitcoin_muhash.o chacha20_avx2.o
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ daemon/build_coinstats_hist.c bitcoin_store.o bitcoin_store_fast.o bitcoin_hash.o sha256.o bitcoin_tx.o bitcoin_utxo_stats.o bitcoin_muhash.o chacha20_avx2.o
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) $(HARDENFLAGS) -o $@ daemon/build_coinstats_hist.c bitcoin_store.o bitcoin_store_fast.o bitcoin_hash.o sha256.o bitcoin_tx.o bitcoin_utxo_stats.o bitcoin_muhash.o chacha20_avx2.o
 daemon/bmc_build_addr_hist: daemon/build_addr_hist.c daemon/addr_hist_fmt.h daemon/addr_index_fmt.h daemon/undo_log.o $(UTXOLSMOBJS) bitcoin_store.o bitcoin_store_fast.o bitcoin_hash.o sha256.o bitcoin_tx.o
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ daemon/build_addr_hist.c daemon/undo_log.o $(UTXOLSMOBJS) bitcoin_store.o bitcoin_store_fast.o bitcoin_hash.o sha256.o bitcoin_tx.o
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) $(HARDENFLAGS) -o $@ daemon/build_addr_hist.c daemon/undo_log.o $(UTXOLSMOBJS) bitcoin_store.o bitcoin_store_fast.o bitcoin_hash.o sha256.o bitcoin_tx.o
 rest.o: rest.c rest.h rpc_json.h rpc_commands.h
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -c -o $@ rest.c
 rpc_esplora.o: rpc_esplora.c rpc_esplora.h rpc_json.h rpc_node.h rpc_commands.h daemon/addr_hist_fmt.h
@@ -3313,7 +3313,7 @@ tests/test_utxo_snapshot: tests/test_utxo_snapshot.c utxo_snapshot.o utxo_snapsh
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_utxo_snapshot.c utxo_snapshot.o $(USNAP_PUBKEY)
 # the coin-by-coin snapshot diff (2026-10-05): a standalone tool, and its test over the encoder's files
 daemon/bmc_utxo_snapshot_diff: daemon/utxo_snapshot_diff.c
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ daemon/utxo_snapshot_diff.c
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) $(HARDENFLAGS) -o $@ daemon/utxo_snapshot_diff.c
 tests/test_utxo_snapshot_diff: tests/test_utxo_snapshot_diff.c daemon/utxo_snapshot_diff.c utxo_snapshot.o utxo_snapshot.h $(USNAP_PUBKEY) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_utxo_snapshot_diff.c utxo_snapshot.o $(USNAP_PUBKEY)
 
@@ -3612,7 +3612,15 @@ daemon/bmcbitcoind: addrbook.a $(DAEMONSRCS) daemon/archive_reindex.h daemon/utx
 # reason to re-pin: run `fullchain_diff.py` on every toolchain bump.
 # ELF hardening of the built daemon (audit finding 9). Depends on the binary,
 # so it cannot pass against a stale one.
-tests/test_elf_hardening: tests/test_elf_hardening.c daemon/bmcbitcoind
+# HST-6 (audit 2026-10-23): every shipped binary, the helpers the daemon execs
+# and the wallet CLI included -- seven of them were linked without HARDENFLAGS
+# and bmc_wallet_cli had no PT_GNU_RELRO, all unseen while only the daemon was
+# checked. A binary added to the tree belongs in this list.
+HARDENED_BINS := daemon/bmcbitcoind daemon/bmc_cli daemon/bmc_wallet_cli daemon/bmc_rpcd daemon/bmc_pverify \
+                 daemon/bmc_build_utxo daemon/bmc_build_addr_index daemon/bmc_build_block_filters $(RUNTIME_HELPERS) \
+                 daemon/bmc_chainwork_build daemon/bmc_utxo_probe_one daemon/bmc_utxo_snapshot_diff \
+                 daemon/bmc_utxo_setinfo daemon/bmc_utxo_dump_keys daemon/bmc_utxo_repair_del
+tests/test_elf_hardening: tests/test_elf_hardening.c $(HARDENED_BINS)
 	$(CC) $(WARNFLAGS) -O2 -o $@ tests/test_elf_hardening.c
 
 daemon/bmc_pverify: daemon/pverify.c $(CONSOBJS)
@@ -4176,7 +4184,7 @@ tests/test_ephemeral_dust tests/test_mempool_evict tests/test_mempool_chunks tes
 	./tests/test_serve_block_ctx
 	./tests/test_p2p_msgsize
 	./tests/test_wallet_pass
-	./tests/test_elf_hardening
+	./tests/test_elf_hardening $(HARDENED_BINS)
 	./tests/test_keepup
 	./tests/test_p2p_inv
 	./tests/test_bip152
