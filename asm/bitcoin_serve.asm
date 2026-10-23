@@ -1557,7 +1557,7 @@ node_serve_loop:
     mov  [s_cnt], rax
     mov  rax, [s_fh]
     cmp  rax, [s_cnt]
-    ja   .gb_empty
+    ja   .next               ; nothing past the fork point: no inv (see .gb_done)
     ; build inv: reserve 3 bytes for count varint at hp_buf[0..2], entries at
     ; hp_buf[3..]. Each entry = type u32 (2=MSG_BLOCK) + hash32 (wire order).
     mov  qword [s_p], 3
@@ -1627,8 +1627,14 @@ node_serve_loop:
     mov  [s_fh], rax
     jmp  .gbl_loop
 .gb_done:
-    ; emit canonical count varint from [s_n]
+    ; Nothing to announce (the peer is at our tip, or hashStop is the first
+    ; block): Core queues nothing and its SendMessages pushes no inv for an
+    ; empty m_blocks_for_inv_relay, so there is no reply at all. This sent an
+    ; empty inv (count 0) until 2026-10-23.
     mov  rax, [s_n]
+    test rax, rax
+    jz   .next
+    ; emit canonical count varint from [s_n]
     cmp  rax, 253
     jae  .gb_varint16
     ; compact entries from hp_buf+3 down to hp_buf+1, count byte at [0]
@@ -1672,16 +1678,6 @@ node_serve_loop:
     mov  rax, [s_served]
     add  rax, [s_n]
     mov  [s_served], rax
-    jmp  .next
-.gb_empty:
-    ; send empty inv (count 0)
-    mov  byte [hp_buf], 0
-    mov  r8d, 1
-    mov  rdi, r12
-    lea  rsi, [cn_inv]
-    mov  rdx, 3
-    lea  rcx, [hp_buf]
-    call p2p_write
     jmp  .next
 
 .maybe_sendcmpct:

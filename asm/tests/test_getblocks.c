@@ -220,6 +220,22 @@ int main(void){
           peer_close(fd);
       } }
 
+    /* ---- nothing to announce: no inv at all ----
+     * With hashStop = the first block past the fork point, or a locator at
+     * our tip, Core queues nothing, and SendMessages pushes no inv for an
+     * empty m_blocks_for_inv_relay (net_processing.cpp 5965-6092). The
+     * handler sent an empty inv (count 0). */
+    { int fd = peer_open();
+      unsigned char loc[1][32]; memcpy(loc[0], bhash[3], 32);
+      send_getblocks(fd, (const unsigned char (*)[32])loc, 1, bhash[4]);
+      int pong = reply(fd);
+      cki("empty: hashStop = the first block past the fork point sends no inv", pong && count_cmd("inv") == 0, 1);
+      memcpy(loc[0], bhash[TIP], 32);
+      send_getblocks(fd, (const unsigned char (*)[32])loc, 1, 0);
+      pong = reply(fd);
+      cki("empty: a locator at our tip sends no inv", pong && count_cmd("inv") == 0, 1);
+      peer_close(fd); }
+
     close(ls);
     printf("\n%s (%d failures)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED", failures);
     return failures ? 1 : 0;
