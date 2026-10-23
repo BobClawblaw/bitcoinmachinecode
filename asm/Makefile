@@ -228,7 +228,7 @@ daemon/socks5.o: daemon/socks5.c daemon/socks5.h
 	$(CC) $(WARNFLAGS) -O2 -c -o $@ daemon/socks5.c
 daemon/i2psam.o: daemon/i2psam.c daemon/i2psam.h base32.h
 	$(CC) $(WARNFLAGS) -O2 -c -o $@ daemon/i2psam.c
-daemon/torcontrol.o: daemon/torcontrol.c daemon/torcontrol.h daemon/netaddr.h
+daemon/torcontrol.o: daemon/torcontrol.c daemon/torcontrol.h daemon/netaddr.h crypto_hkdf.h
 	$(CC) $(WARNFLAGS) -O2 -c -o $@ daemon/torcontrol.c
 daemon/dialer.o: daemon/dialer.c daemon/dialer.h daemon/socks5.h daemon/i2psam.h daemon/node_config.h daemon/net6.h
 	$(CC) $(WARNFLAGS) -O2 -c -o $@ daemon/dialer.c
@@ -1185,8 +1185,8 @@ tests/test_hdr_lowwork: tests/test_hdr_lowwork.c daemon/hdr_lowwork.c daemon/hdr
 # torcontrol.cpp formats)
 tests/test_socks5: tests/test_socks5.c daemon/socks5.c daemon/socks5.h bitcoin_net.o bitcoin_hash.o sha256.o
 	$(CC) $(WARNFLAGS) -O2 -o $@ tests/test_socks5.c daemon/socks5.c bitcoin_net.o bitcoin_hash.o sha256.o
-tests/test_torcontrol: tests/test_torcontrol.c daemon/torcontrol.c daemon/torcontrol.h bitcoin_net.o bitcoin_hash.o sha256.o addrbook.a $(TEST_TMPDIR_H)
-	$(CC) $(WARNFLAGS) -O2 -o $@ tests/test_torcontrol.c daemon/torcontrol.c bitcoin_net.o bitcoin_hash.o sha256.o addrbook.a
+tests/test_torcontrol: tests/test_torcontrol.c daemon/torcontrol.c daemon/torcontrol.h crypto_hkdf.o bitcoin_net.o bitcoin_hash.o sha256.o addrbook.a $(TEST_TMPDIR_H)
+	$(CC) $(WARNFLAGS) -O2 -o $@ tests/test_torcontrol.c daemon/torcontrol.c crypto_hkdf.o bitcoin_net.o bitcoin_hash.o sha256.o addrbook.a
 # the privacy predicates: what the node refuses to do behind a proxy
 
 tests/test_asmap: tests/test_asmap.c daemon/asmap.c daemon/asmap.h daemon/netaddr.c bitcoin_sha3.c base32.c tests/data_asmap.raw

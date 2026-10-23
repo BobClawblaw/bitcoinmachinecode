@@ -7,8 +7,10 @@
 #include <poll.h>
 #include <errno.h>
 #include <arpa/inet.h>
+#include <sys/random.h>
 #include "torcontrol.h"
 #include "netaddr.h"
+#include "../crypto_hkdf.h"
 
 extern int tcp_connect_ip(unsigned ip_netorder, unsigned short port_be);
 
@@ -57,6 +59,37 @@ static int read_file(const char* path, unsigned char* out, long cap){
     long n = read(fd, out, (size_t)cap); close(fd); return (int)n;
 }
 
+/* METHODS=NULL,SAFECOOKIE,... as a set: exact names, not substrings (a
+ * strstr for "COOKIE" also matched "SAFECOOKIE"). */
+static int has_method(const char* methods, const char* name){
+    size_t nl = strlen(name);
+    for (const char* p = methods; *p; ){
+        size_t n = strcspn(p, ",");
+        if (n == nl && !memcmp(p, name, nl)) return 1;
+        p += n; if (*p == ',') p++;
+    }
+    return 0;
+}
+static int unhex32(const char* h, unsigned char out[32]){
+    if (strlen(h) != 64) return 0;
+    for (int i = 0; i < 64; i++){
+        char c = h[i]; int v = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+        if (v < 0) return 0;
+        if (i & 1) out[i/2] |= (unsigned char)v; else out[i/2] = (unsigned char)(v << 4);
+    }
+    return 1;
+}
+/* Core torcontrol.cpp ComputeResponse: HMAC-SHA256(key, cookie | client
+ * nonce | server nonce). */
+static void safecookie_hmac(unsigned char out[32], const char* key, const unsigned char cookie[32],
+                            const unsigned char cn[32], const unsigned char sn[32]){
+    unsigned char m[96];
+    memcpy(m, cookie, 32); memcpy(m + 32, cn, 32); memcpy(m + 64, sn, 32);
+    hmac_sha256(out, (const unsigned char*)key, strlen(key), m, sizeof m);
+}
+#define TOR_SAFE_SERVERKEY "Tor safe cookie authentication server-to-controller hash"
+#define TOR_SAFE_CLIENTKEY "Tor safe cookie authentication controller-to-server hash"
+
 int torctl_add_onion(torctl_t* t, const char* ctrl_ip, int ctrl_port,
                      const char* password, const char* cookie_override,
                      int virtual_port, const char* target,
@@ -72,19 +105,55 @@ int torctl_add_onion(torctl_t* t, const char* ctrl_ip, int ctrl_port,
     char methods[128] = {0}, cookiefile[512] = {0};
     reply_value(reply, "METHODS=", methods, sizeof methods);
     reply_value(reply, "COOKIEFILE=", cookiefile, sizeof cookiefile);
-    /* 2. AUTHENTICATE */
+    /* 2. AUTHENTICATE -- HST-5 (audit 2026-10-23): Core's choice, in Core's
+     * order (torcontrol.cpp protocolinfo_cb):
+     *   - -torpassword set: HASHEDPASSWORD, or fail -- no fallback;
+     *   - else NULL when offered;
+     *   - else SAFECOOKIE: AUTHCHALLENGE with a random client nonce, the
+     *     SERVER proves it knows the cookie (SERVERHASH) before we answer
+     *     with our HMAC; the cookie itself never goes on the wire.
+     * This used to send the plain COOKIE -- the raw bytes of whatever file
+     * the control port's COOKIEFILE= named, hex-encoded -- to any listener
+     * on the control address, and preferred it over NULL. Core never uses
+     * plain COOKIE, and neither does this now: a tor that offers only that
+     * gets Core's "no supported authentication method". */
     char cmd[2048];
-    if (password && *password && strstr(methods, "HASHEDPASSWORD")){
-        snprintf(cmd, sizeof cmd, "AUTHENTICATE \"%s\"\r\n", password);
-    } else if (strstr(methods, "COOKIE") || cookie_override){
+    if (password && *password){
+        if (!has_method(methods, "HASHEDPASSWORD")){
+            snprintf(t->err, sizeof t->err, "-torpassword is set but tor does not offer HASHEDPASSWORD (%s)", methods); close(fd); return 0; }
+        char esc[1100]; long o = 0;               /* Core: ReplaceAll(torpassword, "\"", "\\\"") */
+        for (const char* p = password; *p && o < (long)sizeof esc - 3; p++){ if (*p == '"') esc[o++] = '\\'; esc[o++] = *p; }
+        esc[o] = 0;
+        snprintf(cmd, sizeof cmd, "AUTHENTICATE \"%s\"\r\n", esc);
+    } else if (has_method(methods, "NULL")){
+        snprintf(cmd, sizeof cmd, "AUTHENTICATE\r\n");
+    } else if (has_method(methods, "SAFECOOKIE")){
         const char* path = cookie_override ? cookie_override : cookiefile;
         unsigned char cookie[64]; int n = read_file(path, cookie, sizeof cookie);
-        if (n != 32){ snprintf(t->err, sizeof t->err, "cannot read the tor auth cookie %s (%d bytes)", path, n); close(fd); return 0; }
-        char hex[65]; for (int i = 0; i < 32; i++) hexbyte(cookie[i], hex + 2*i); hex[64] = 0;
+        if (n != 32){ snprintf(t->err, sizeof t->err, "cannot read the tor auth cookie %s (%d bytes, need 32)", path, n); close(fd); return 0; }
+        unsigned char cn[32], sn[32], sh[32], want[32];
+        if (getrandom(cn, sizeof cn, 0) != (ssize_t)sizeof cn){
+            snprintf(t->err, sizeof t->err, "no randomness for the SAFECOOKIE nonce"); close(fd); return 0; }
+        char hex[65]; for (int i = 0; i < 32; i++) hexbyte(cn[i], hex + 2*i);
+        hex[64] = 0;
+        snprintf(cmd, sizeof cmd, "AUTHCHALLENGE SAFECOOKIE %s\r\n", hex);
+        if (!send_cmd(fd, cmd, timeout_ms) || read_reply(fd, reply, sizeof reply, timeout_ms) != 250){
+            snprintf(t->err, sizeof t->err, "tor AUTHCHALLENGE failed: %.100s", reply); close(fd); return 0; }
+        char shx[80] = {0}, snx[80] = {0};
+        if (strlen(reply) < 4 || strncmp(reply + 4, "AUTHCHALLENGE ", 14) ||   /* "250 AUTHCHALLENGE SERVERHASH=.. SERVERNONCE=.." */ !reply_value(reply, "SERVERHASH=", shx, sizeof shx)
+            || !reply_value(reply, "SERVERNONCE=", snx, sizeof snx) || !unhex32(shx, sh) || !unhex32(snx, sn)){
+            snprintf(t->err, sizeof t->err, "invalid reply to AUTHCHALLENGE"); close(fd); return 0; }
+        safecookie_hmac(want, TOR_SAFE_SERVERKEY, cookie, cn, sn);
+        unsigned char diff = 0; for (int i = 0; i < 32; i++) diff |= (unsigned char)(want[i] ^ sh[i]);
+        if (diff){ snprintf(t->err, sizeof t->err, "tor's SERVERHASH does not prove the cookie -- not authenticating"); close(fd); return 0; }
+        safecookie_hmac(want, TOR_SAFE_CLIENTKEY, cookie, cn, sn);
+        for (int i = 0; i < 32; i++) hexbyte(want[i], hex + 2*i);
+        hex[64] = 0;
         snprintf(cmd, sizeof cmd, "AUTHENTICATE %s\r\n", hex);
-    } else if (strstr(methods, "NULL")){
-        snprintf(cmd, sizeof cmd, "AUTHENTICATE\r\n");
-    } else { snprintf(t->err, sizeof t->err, "no usable tor auth method (%s)", methods); close(fd); return 0; }
+        memset(cookie, 0, sizeof cookie);
+    } else if (has_method(methods, "HASHEDPASSWORD")){
+        snprintf(t->err, sizeof t->err, "tor wants a password and no -torpassword is set"); close(fd); return 0;
+    } else { snprintf(t->err, sizeof t->err, "no supported tor auth method (%s)", methods); close(fd); return 0; }
     if (!send_cmd(fd, cmd, timeout_ms) || read_reply(fd, reply, sizeof reply, timeout_ms) != 250){
         snprintf(t->err, sizeof t->err, "tor AUTHENTICATE rejected: %.100s", reply); close(fd); return 0; }
     /* 3. ADD_ONION with the persisted key, or NEW:ED25519-V3 the first time */
