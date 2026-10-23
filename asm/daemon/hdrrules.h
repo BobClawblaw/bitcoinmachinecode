@@ -35,6 +35,7 @@
 #define BMC_HDRRULES_H
 
 #include <string.h>
+#include <stdint.h>
 
 #define HDR_SFC_BIT_DERSIG 2   /* BIP66, script_flags_consts.inc */
 #define HDR_SFC_BIT_CLTV   9   /* BIP65 */
@@ -54,7 +55,12 @@ static inline int hdr_contextual_ok(long height, const unsigned char* hdr,
                                     unsigned long prev_mtp, long now,
                                     unsigned long long flags, long bip34_h,
                                     const char** reason){
-    unsigned int ver, ntime;
+    /* CON-5 (audit 2026-10-23): nVersion is Core's int32_t
+     * (primitives/block.h), so a header with the top bit set is NEGATIVE
+     * and fails every one of the version floors below. Read as unsigned,
+     * 0x80000000.. passed them all and such a header was stored and its
+     * block connected -- a chain Core refuses. */
+    int32_t ver; unsigned int ntime;
     memcpy(&ver,   hdr,      4);
     memcpy(&ntime, hdr + 68, 4);
 
