@@ -762,6 +762,23 @@ that long, `walletlock` re-locks, `walletpassphrasechange` re-wraps in place.
 `encryptwallet` on a plaintext `bmcwallet.dat` seals it and writes
 `bmcwallet.enc`. There is no recovery without the passphrase.
 
+#### Legacy BMCWAL v2 wallet files
+
+A mnemonic file whose first line is `BMCWAL v2` (written by builds before
+2026-09-02; `cipher=ctr-sha512` on its third line), and an extra-key blob
+with `cipher=ctr-sha512` and no `format=wcrypt` line, use a cipher that is
+broken (CRY-1, audit 2026-10-23): the key is XORed with a public pad, so
+anyone who holds the file can recover the mnemonic or key from it without the
+passphrase. Treat such a file, and every copy, backup or snapshot of it, as
+plaintext.
+
+Opening one still works, so an old wallet can be migrated: the file is
+rewritten in place as `BMCWAL v3` (the `wallet_crypter.c` container), and
+every open logs `[wallet] SECURITY WARNING: ... legacy BMCWAL v2 cipher`.
+The rewrite does not reach copies made before it. If a v2 file ever existed,
+create a new wallet with this build, move the funds to it, and destroy the
+old files and their backups. No build since 2026-09-02 writes the v2 format.
+
 ### Shutdown
 
 `systemctl stop bmcbitcoind` sends SIGTERM. The parent logs `[serve]

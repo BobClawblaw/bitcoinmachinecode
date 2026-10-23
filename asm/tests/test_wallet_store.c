@@ -22,6 +22,15 @@ static int file_has(const char* path, const char* needle){
     FILE* f = fopen(path, "r"); if (!f) return 0; static char buf[65536]; size_t n = fread(buf, 1, sizeof buf - 1, f); fclose(f); buf[n] = 0;
     return strstr(buf, needle) != NULL;
 }
+/* CRY-1: run `wallet_store_load`/`wallet_secret_read` with stderr captured
+ * into a file, so the test can see whether the legacy-cipher warning fired. */
+#include <fcntl.h>
+static int saved_err = -1;
+static void err_capture_begin(void){
+    fflush(stderr); saved_err = dup(2);
+    int fd = open("stderr.txt", O_WRONLY|O_CREAT|O_TRUNC, 0600); dup2(fd, 2); close(fd);
+}
+static void err_capture_end(void){ fflush(stderr); dup2(saved_err, 2); close(saved_err); saved_err = -1; }
 static int copy_file(const char* from, const char* to){
     FILE* a = fopen(from, "r"); if (!a) return 0; FILE* b = fopen(to, "w"); if (!b){ fclose(a); return 0; }
     static char buf[65536]; size_t n; while ((n = fread(buf, 1, sizeof buf, a)) > 0) fwrite(buf, 1, n, b); fclose(a); fclose(b); return 1;
@@ -56,13 +65,28 @@ int main(void){
     ck("fixture copied", copy_file(fix_v2, "legacy.dat"));
     ck("fixture is v2 (2048-iteration KDF)", file_has("legacy.dat", "BMCWAL v2") && file_has("legacy.dat", "ctr-sha512"));
     snprintf(pass, sizeof pass, "wrong"); mn[0] = 0;
-    ck("wrong passphrase on legacy -> -1", wallet_store_load("legacy.dat", mn, sizeof mn, pass, sizeof pass) == -1);
+    err_capture_begin();
+    int wrong_rc = wallet_store_load("legacy.dat", mn, sizeof mn, pass, sizeof pass);
+    err_capture_end();
+    ck("wrong passphrase on legacy -> -1", wrong_rc == -1);
+    ck("CRY-1: a v2 file warns even when the passphrase is wrong (the file is weak regardless)",
+       file_has("stderr.txt", "SECURITY WARNING") && file_has("stderr.txt", "PLAINTEXT"));
     ck("...and the file is untouched", file_has("legacy.dat", "BMCWAL v2"));
     snprintf(pass, sizeof pass, "correct horse"); mn[0] = 0;
-    ck("right passphrase opens the legacy file", wallet_store_load("legacy.dat", mn, sizeof mn, pass, sizeof pass) == 0 && !strcmp(mn, MN));
+    err_capture_begin();
+    int right_rc = wallet_store_load("legacy.dat", mn, sizeof mn, pass, sizeof pass);
+    err_capture_end();
+    ck("right passphrase opens the legacy file", right_rc == 0 && !strcmp(mn, MN));
+    ck("CRY-1: opening it warns that the file and every copy must be treated as plaintext",
+       file_has("stderr.txt", "SECURITY WARNING") && file_has("stderr.txt", "ANY copy or")
+       && file_has("stderr.txt", "move the funds"));
     ck("...which is now v3", file_has("legacy.dat", "BMCWAL v3") && file_has("legacy.dat", "format=wcrypt") && !file_has("legacy.dat", "ctr-sha512"));
     snprintf(pass, sizeof pass, "correct horse"); mn[0] = 0;
-    ck("...and opens again through the strong path", wallet_store_load("legacy.dat", mn, sizeof mn, pass, sizeof pass) == 0 && !strcmp(mn, MN));
+    err_capture_begin();
+    int v3_rc = wallet_store_load("legacy.dat", mn, sizeof mn, pass, sizeof pass);
+    err_capture_end();
+    ck("...and opens again through the strong path", v3_rc == 0 && !strcmp(mn, MN));
+    ck("CRY-1: the upgraded v3 file does NOT warn", !file_has("stderr.txt", "SECURITY WARNING"));
     ck("no .tmp left behind", access("legacy.dat.tmp", F_OK) != 0);
     printf("---- secret blob (addhdkey's xprv store) ----\n");
     char out[512];
@@ -73,7 +97,11 @@ int main(void){
     ck("wrong passphrase -> -1", wallet_secret_read("k.dat", "BMCHDK v1", out, sizeof out, "nope") == -1);
     ck("wrong magic -> -1", wallet_secret_read("k.dat", "BMCOTHER v1", out, sizeof out, "hunter2") == -1);
     ck("legacy hdk fixture copied", copy_file(fix_hdk, "lk.dat"));
-    ck("legacy blob opens", wallet_secret_read("lk.dat", "BMCHDK v1", out, sizeof out, "correct horse") == 0 && !strcmp(out, XPRV));
+    err_capture_begin();
+    int lk_rc = wallet_secret_read("lk.dat", "BMCHDK v1", out, sizeof out, "correct horse");
+    err_capture_end();
+    ck("legacy blob opens", lk_rc == 0 && !strcmp(out, XPRV));
+    ck("CRY-1: the legacy secret blob (same cipher) warns too", file_has("stderr.txt", "SECURITY WARNING"));
     ck("...and is upgraded in place", file_has("lk.dat", "format=wcrypt") && !file_has("lk.dat", "ctr-sha512"));
     ck("...and opens again sealed", wallet_secret_read("lk.dat", "BMCHDK v1", out, sizeof out, "correct horse") == 0 && !strcmp(out, XPRV));
     printf("%s (%d failures)\n", failures ? "TESTS FAILED" : "ALL PASS", failures);
