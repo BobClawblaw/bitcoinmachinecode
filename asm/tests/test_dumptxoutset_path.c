@@ -79,6 +79,15 @@ int main(void){
     ck("a fresh path passes the path checks (fails later without a UTXO set: -1)", r == -1);
     ck("...and its temp file is removed", !exists("clean.dat.incomplete") && !exists("clean.dat"));
 
+    /* 4. a crashed dump's regular "<path>.incomplete" does not block the
+     * path: Core's fopen("wb") overwrites it, and so does this */
+    put_file("stale.dat.incomplete", "HALF A SNAPSHOT");
+    snprintf(path, sizeof path, "%s/stale.dat", cwd);
+    r = utxo_dump_rpc_run(path, no_hash, &h, &coins, msg, sizeof msg);
+    ck("a stale regular <path>.incomplete is replaced (fails later without a UTXO set: -1)", r == -1);
+    if (r != -1) printf("      got r=%ld [%s]\n", r, msg);
+    ck("...and it is gone afterwards", !exists("stale.dat.incomplete") && !exists("stale.dat"));
+
     if (fails){ printf("\nTESTS FAILED (%d failures)\n", fails); return 1; }
     printf("\nALL TESTS PASSED (0 failures)\n");
     return 0;

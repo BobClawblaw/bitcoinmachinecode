@@ -336,6 +336,12 @@ long utxo_dump_rpc_run(const char* path,
       if (lstat(path, &ex) == 0){
           MSG("%s already exists. If you are sure this is what you want, move it out of the way first", path);
           return -2; } }
+    /* A regular "<path>.incomplete" is a crashed dump's leftover: Core's
+     * fopen("wb") overwrites it, so it is removed here before the O_EXCL
+     * create. Anything else at that name (a symlink, a directory) is left
+     * alone and the create below refuses it. */
+    { struct stat ex;
+      if (lstat(pretmp, &ex) == 0 && S_ISREG(ex.st_mode)) unlink(pretmp); }
     { int pfd = open(pretmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
       if (pfd < 0){ MSG("Couldn't open file %s for writing.", pretmp); return -2; }
       close(pfd); }
