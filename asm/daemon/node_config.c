@@ -20,6 +20,7 @@
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <time.h>
+#include <arpa/inet.h>
 
 /* STATICALLY initialised to the compiled defaults.
  *
@@ -200,7 +201,6 @@ static const struct { const char* key; const char* why; } k_noeffect[] = {
     {"rpcdoccheck",        "debug-only"},
     {"test",               "debug-only"},
     {"fastprune",          "debug-only pruning knob; this node prunes by its own MiB budget"},
-    {"testnet",            "testnet3 is refused by design; use testnet4=1"},
     {"version",            "command-line only"},
     {"help",               "command-line only"},
     {"conf",               "command-line only (-conf=)"},
@@ -222,9 +222,9 @@ int nodecfg_unimplemented(const char* key){
 /* Does a `[section]` header name the selected chain?
  *
  * Core's section names are the chain's own name, with one exception: [test]
- * is testnet3. This build refuses testnet3 outright (see the k_noeffect table
- * entry for "testnet"), so a [test] section can never match and its keys are
- * always skipped -- which is the correct outcome, not an oversight.
+ * is testnet3. This build refuses testnet3 outright (chainparams_select
+ * refuses chain "test", which testnet=1 selects), so a [test] section never
+ * applies on a node that runs -- the correct outcome, not an oversight.
  * Comparison is exact and case-sensitive, as Core's is. */
 int nodecfg_section_is(const char* section, const char* chain){
     if (!section || !chain) return 0;
@@ -354,6 +354,9 @@ static void set_defaults(void){
      * observe it. See issues/293. */
     g_cfg.boot_catchup          = 0;
     g_cfg.rpcbind[0]            = 0;
+    g_cfg.rpcport               = 0;
+    g_cfg.rpcuser[0]            = 0;
+    g_cfg.rpcpassword[0]        = 0;
     g_cfg.n_rpcallowip          = 0;
     g_cfg.networkactive         = 1;
     g_cfg.forcednsseed          = 0;
@@ -580,13 +583,115 @@ const char* node_config_path(const char* datadir, char* buf, unsigned long cap){
 }
 
 static int g_include_depth = 0;
+
+/* ---- CFG-3 / CFG-4 (audit 2026-10-23): Core's line grammar ---------------
+ * Core reads the file with std::getline (common/config.cpp GetConfigOptions):
+ * a line of any length is ONE line; everything from the first '#' is a
+ * comment; the rest is trimmed of " \t\r\n". What is left is empty, a
+ * `[section]` (first char '[' AND last char ']'), or `key=value` -- and
+ * anything else is a parse error that stops the node:
+ *   - a line starting with '-' ("options ... must be specified without
+ *     leading -"),
+ *   - a line with no '=' -- which is what `[regtest` without its ']' is,
+ *   - a '#' on an rpcpassword line ("can be ambiguous").
+ * This parser used to read 1024-byte fgets chunks, so a long comment's tail
+ * came back as a fresh "line" and was parsed as a key, and it merely warned
+ * on `[regtest` and went on applying the following keys to whatever section
+ * came before -- the base section, on mainnet, for a block an operator wrote
+ * for regtest. */
+static char g_cfg_err[512];
+const char* node_config_error(void){ return g_cfg_err[0] ? g_cfg_err : NULL; }
+/* The message is pre + detail + post: literal format strings only. */
+static void cfg_fail(const char* path, long lineno, const char* pre, const char* detail, const char* post){
+    if(g_cfg_err[0]) return;                      /* the first error is the one to report */
+    char m[256]; snprintf(m, sizeof m, "%s%s%s", pre, detail ? detail : "", post ? post : "");
+    if(lineno > 0) snprintf(g_cfg_err, sizeof g_cfg_err, "%s line %ld: %s", path, lineno, m);
+    else           snprintf(g_cfg_err, sizeof g_cfg_err, "%s: %s", path, m);
+    fprintf(stderr, "[config] FATAL: %s\n", g_cfg_err);
+}
+enum { CL_EMPTY, CL_SECTION, CL_KV, CL_ERROR };
+static int cfg_trim_ws(int c){ return c==' '||c=='\t'||c=='\r'||c=='\n'; }
+/* Classify one line IN PLACE (it is modified). For CL_SECTION, *key is the
+ * section name; for CL_KV, key and val are the trimmed halves; for CL_ERROR,
+ * *key is the reason. */
+static int cfg_classify(char* line, char** key, char** val){
+    int used_hash = 0;
+    char* h = strchr(line, '#'); if(h){ *h = 0; used_hash = 1; }
+    char* p = line; while(*p && cfg_trim_ws((unsigned char)*p)) p++;
+    size_t n = strlen(p); while(n && cfg_trim_ws((unsigned char)p[n-1])) p[--n] = 0;
+    if(!n) return CL_EMPTY;
+    if(p[0]=='[' && p[n-1]==']'){ p[n-1] = 0; *key = p + 1; return CL_SECTION; }
+    if(p[0]=='-'){ *key = (char*)"options in the configuration file must be specified without a leading -"; return CL_ERROR; }
+    char* eq = strchr(p, '=');
+    if(!eq){ *key = (char*)"not a key=value line or a [section] header"; return CL_ERROR; }
+    *eq = 0;
+    char* k = p; size_t kl = strlen(k); while(kl && cfg_trim_ws((unsigned char)k[kl-1])) k[--kl] = 0;
+    char* v = eq + 1; while(*v && cfg_trim_ws((unsigned char)*v)) v++;
+    if(used_hash && strstr(k, "rpcpassword")){
+        *key = (char*)"using # in rpcpassword can be ambiguous and should be avoided"; return CL_ERROR; }
+    *key = k; *val = v;
+    return CL_KV;
+}
+/* Core InterpretBool: an empty value is true, otherwise the leading integer
+ * is nonzero. */
+static int cfg_bool(const char* v){ return !v || !*v || atoi(v) != 0; }
+/* Core ToIntegral<uint16_t> then "!= 0" (init.cpp CheckHostPortOptions):
+ * decimal digits only, 1..65535. -1 when it is not a port. */
+static int cfg_port(const char* v){
+    if(!v || !*v) return -1;
+    long r = 0;
+    for(const char* c = v; *c; c++){
+        if(*c < '0' || *c > '9') return -1;
+        r = r * 10 + (*c - '0'); if(r > 65535) return -1;
+    }
+    return r >= 1 ? (int)r : -1;
+}
+/* CFG-5: Core's SplitHostPort (util/strencodings.cpp), then the host must
+ * fit `hcap`. A colon is the port separator only when it follows "[...]" or
+ * is the only colon; a bracketed host loses its brackets. Returns 0 when the
+ * port part is not 1..65535 or the host is empty or too long. */
+static int cfg_split_host_port(const char* in, char* host, size_t hcap, int* port){
+    size_t n = strlen(in);
+    const char* colon = strrchr(in, ':');
+    int valid = 0;
+    *port = 0;
+    if(colon){
+        size_t ci = (size_t)(colon - in);
+        int bracketed = in[0] == '[' && ci > 0 && in[ci-1] == ']';
+        int multi = 0;
+        for(size_t k = 0; k < ci; k++) if(in[k] == ':'){ multi = 1; break; }
+        if(ci == 0 || bracketed || !multi){
+            int p = cfg_port(colon + 1);
+            if(p > 0){ *port = p; n = ci; valid = 1; }
+        } else valid = 1;
+    } else valid = 1;
+    if(!valid) return 0;
+    const char* h = in; size_t hl = n;
+    if(hl >= 2 && h[0] == '[' && h[hl-1] == ']'){ h++; hl -= 2; }
+    if(!hl || hl >= hcap) return 0;
+    memcpy(host, h, hl); host[hl] = 0;
+    return 1;
+}
+/* CFG-1: Core's precedence for the single-valued RPC keys -- a section value
+ * outranks a base one, and the first value at a rank wins. */
+static int g_rank_rpcport, g_rank_rpcuser, g_rank_rpcpassword;
+static int cfg_rank_take(int* have, int rank){
+    if(*have >= rank) return 0;
+    *have = rank; return 1;
+}
+
 long node_config_load(const char* path){
-    if(!g_include_depth) set_defaults();
+    if(!g_include_depth){
+        set_defaults();
+        g_cfg_err[0] = 0;
+        g_rank_rpcport = g_rank_rpcuser = g_rank_rpcpassword = 0;
+    }
     FILE* f = fopen(path, "r");
     if(!f){
         fprintf(stderr,"[config] no config file at %s -- using compiled defaults\n", path);
         return 0;
     }
+    char* gl = NULL; size_t glcap = 0;            /* CFG-4: getline, any length */
     long applied = 0; int bad = 0; int unimpl = 0;
     /* ---- DMN-4 (audit 2026-09-03): SECTIONS and NEGATION ----
      *
@@ -610,32 +715,49 @@ long node_config_load(const char* path){
      * keys are applied, and the chain itself comes from this file -- so the
      * file is read twice: once for the chain selectors in the base section
      * (which is the only place Core honours them), then once for real. */
-    char cur_section[32] = "";
+    char cur_section[64] = "";
     {
-        char l0[1024]; char sec0[32] = "";
-        while(fgets(l0, sizeof l0, f)){
-            char* q = l0;
-            while(*q==' '||*q=='\t') q++;
-            if(*q=='#'||*q=='\n'||*q==0) continue;
-            if(*q=='['){
-                char* e = strchr(q, ']');
-                if(e){ size_t n2 = (size_t)(e - q - 1); if(n2 >= sizeof sec0) n2 = sizeof sec0 - 1;
-                       memcpy(sec0, q+1, n2); sec0[n2] = 0; }
-                continue;
+        /* Core GetChainArg: -chain, -regtest, -signet, -testnet, -testnet4
+         * from the base section, last value wins, and MORE THAN ONE of them
+         * set is an error ("Invalid combination ... Can use at most one").
+         * CFG-6: the name must be one Core knows (ChainTypeFromString: main,
+         * test, testnet4, signet, regtest); "mainnet" is not one, and was
+         * accepted by chainparams_select while every "is this main?" test in
+         * this file said no -- so the base section's network keys, bind=
+         * among them, were dropped and P2P listened on every interface. */
+        int in_base = 1, have_chain = 0;
+        int sel_regtest = 0, sel_signet = 0, sel_testnet = 0, sel_testnet4 = 0;
+        char chain_val[64] = "";
+        while(getline(&gl, &glcap, f) >= 0){
+            char *k0 = 0, *v0 = 0;
+            int t0 = cfg_classify(gl, &k0, &v0);
+            if(t0 == CL_SECTION){ in_base = 0; continue; }
+            if(t0 != CL_KV || !in_base) continue;   /* errors are reported by the main pass */
+            int neg = (k0[0]=='n' && k0[1]=='o');
+            const char* kk = neg ? k0 + 2 : k0;
+            int b0 = neg ? !cfg_bool(v0) : cfg_bool(v0);
+            if     (!neg && !strcmp(kk,"chain")){ have_chain = 1; snprintf(chain_val, sizeof chain_val, "%s", v0); }
+            else if(!strcmp(kk,"regtest"))  sel_regtest  = b0;
+            else if(!strcmp(kk,"signet"))   sel_signet   = b0;
+            else if(!strcmp(kk,"testnet"))  sel_testnet  = b0;
+            else if(!strcmp(kk,"testnet4")) sel_testnet4 = b0;
+        }
+        if(have_chain + sel_regtest + sel_signet + sel_testnet + sel_testnet4 > 1){
+            cfg_fail(path, 0, "Invalid combination of -regtest, -signet, -testnet, -testnet4 and -chain. Can use at most one.", NULL, NULL);
+            free(gl); fclose(f); return -1;
+        }
+        const char* pick = have_chain ? chain_val : sel_regtest ? "regtest" : sel_signet ? "signet"
+                         : sel_testnet ? "test" : sel_testnet4 ? "testnet4" : NULL;
+        if(pick){
+            static const char* const core_chains[] = { "main", "test", "testnet4", "signet", "regtest" };
+            const char* known = NULL;
+            for(unsigned ci = 0; ci < sizeof core_chains / sizeof core_chains[0]; ci++)
+                if(!strcmp(pick, core_chains[ci])) known = core_chains[ci];
+            if(!known){
+                cfg_fail(path, 0, "Unknown chain ", pick, ". (Core's names: main, test, testnet4, signet, regtest)");
+                free(gl); fclose(f); return -1;
             }
-            if(sec0[0]) continue;                 /* chain selectors: base section only */
-            char* e2 = strchr(q,'='); if(!e2) continue;
-            *e2 = 0;
-            char* k0 = q; char* v0 = e2+1;
-            size_t vl0 = strlen(v0);
-            while(vl0 && (v0[vl0-1]=='\n'||v0[vl0-1]=='\r'||v0[vl0-1]==' '||v0[vl0-1]=='\t')) v0[--vl0]=0;
-            size_t kl0 = strlen(k0);
-            while(kl0 && (k0[kl0-1]==' '||k0[kl0-1]=='\t')) k0[--kl0]=0;
-            int b0 = atoi(v0);
-            if     (!strcmp(k0,"chain")   && *v0)  snprintf(g_cfg.chain,sizeof g_cfg.chain,"%s",v0);
-            else if(!strcmp(k0,"regtest") && b0==1) snprintf(g_cfg.chain,sizeof g_cfg.chain,"regtest");
-            else if(!strcmp(k0,"signet")  && b0==1) snprintf(g_cfg.chain,sizeof g_cfg.chain,"signet");
-            else if(!strcmp(k0,"testnet4")&& b0==1) snprintf(g_cfg.chain,sizeof g_cfg.chain,"testnet4");
+            snprintf(g_cfg.chain, sizeof g_cfg.chain, "%s", known);
         }
         rewind(f);
     }
@@ -645,35 +767,33 @@ long node_config_load(const char* path){
      * whole file is read: `listen=1` may appear on a line BELOW `connect=`,
      * and a file must not mean different things depending on key order. */
     int saw_dnsseed = 0, saw_listen = 0;
-    char line[1024];
-    while(fgets(line, sizeof line, f)){
-        char* p = line;
-        while(*p==' '||*p=='\t') p++;
-        if(*p=='#'||*p=='\n'||*p==0) continue;
+    long lineno = 0;
+    while(getline(&gl, &glcap, f) >= 0){
+        lineno++;
         /* 2026-09-08: Core strips everything from the first '#' on a line
-         * (util/settings.cpp GetConfigOptions), so `printtoconsole=1  # why`
+         * (common/config.cpp GetConfigOptions), so `printtoconsole=1  # why`
          * is printtoconsole=1 there. Here the value "1  # why" was "not a
          * usable number" and silently became 0: the 09-08 bench resume lost
          * its console tee to exactly that line. Same rule now, same limit:
-         * a '#' inside a value (an rpcpassword) truncates it in Core too. */
-        { char* h = strchr(p, '#'); if(h) *h = 0; }
+         * a '#' inside a value truncates it in Core too (and on an
+         * rpcpassword line Core refuses the file, as cfg_classify does). */
+        char *key = 0, *val = 0;
+        int lt = cfg_classify(gl, &key, &val);
+        if(lt == CL_EMPTY) continue;
+        if(lt == CL_ERROR){
+            cfg_fail(path, lineno, "parse error: ", key, NULL);
+            free(gl); fclose(f); return -1;
+        }
         /* DMN-4: a section header changes which chain the following keys
          * belong to. Previously it fell through the `no =` test and was
-         * simply ignored, taking its scoping with it. */
-        if(*p=='['){
-            char* e = strchr(p, ']');
-            if(e){ size_t n2 = (size_t)(e - p - 1); if(n2 >= sizeof cur_section) n2 = sizeof cur_section - 1;
-                   memcpy(cur_section, p+1, n2); cur_section[n2] = 0; }
-            else fprintf(stderr,"[config] malformed section header (no ']'): %s", p);
+         * simply ignored, taking its scoping with it. A name too long to be
+         * any chain's is kept as one that matches none. */
+        if(lt == CL_SECTION){
+            if(strlen(key) >= sizeof cur_section) snprintf(cur_section, sizeof cur_section, "?");
+            else snprintf(cur_section, sizeof cur_section, "%s", key);
             continue;
         }
-        char* eq = strchr(p,'='); if(!eq) continue;
-        *eq = 0;
-        char* key = p; char* val = eq+1;
-        size_t vl = strlen(val);
-        while(vl && (val[vl-1]=='\n'||val[vl-1]=='\r'||val[vl-1]==' '||val[vl-1]=='\t')) val[--vl]=0;
         size_t kl = strlen(key);
-        while(kl && (key[kl-1]==' '||key[kl-1]=='\t')) key[--kl]=0;
 
         /* DMN-4: apply a sectioned key only on its own chain. */
         if(cur_section[0] && !nodecfg_section_is(cur_section, g_cfg.chain)){
@@ -742,19 +862,35 @@ long node_config_load(const char* path){
             t=clamp_int(IV,5,3600,key,&bad);  if(t>=0){g_cfg.peer_timeout_s=t;applied++;} }
         else if(!strcmp(key,"port")){         /* Core: P2P listen port      */
             t=clamp_int(IV,1,65535,key,&bad); if(t>=0){g_cfg.port=t;g_cfg.port_explicit=1;applied++;} }
-        else if(!strcmp(key,"chain")){        /* Core: -chain=main|regtest  */
-            snprintf(g_cfg.chain,sizeof g_cfg.chain,"%s",val); applied++; }
+        else if(!strcmp(key,"chain") || !strcmp(key,"regtest") || !strcmp(key,"testnet4")
+                || !strcmp(key,"signet") || !strcmp(key,"testnet")){
+            /* Core -chain / -regtest / -testnet4 / -signet / -testnet: the
+             * chain was chosen by the first pass, from the base section only
+             * (Core GetChainArg reads no network section). Inside a section
+             * these do nothing, in Core and here. */
+            if(!cur_section[0]) applied++; }
+        /* CFG-1: the RPC listener's port and the legacy credential pair. */
+        else if(!strcmp(key,"rpcport")){      /* Core: 1..65535, else InitError */
+            int rp = cfg_port(val);
+            if(rp < 0){
+                cfg_fail(path, lineno, "Invalid port specified in -rpcport: '", val, "'");
+                free(gl); fclose(f); return -1;
+            }
+            if(cfg_rank_take(&g_rank_rpcport, cur_section[0] ? 2 : 1)) g_cfg.rpcport = rp;
+            applied++; }
+        else if(!strcmp(key,"rpcuser") || !strcmp(key,"rpcpassword")){
+            int isuser = key[3] == 'u';
+            char* dst = isuser ? g_cfg.rpcuser : g_cfg.rpcpassword;
+            size_t cap = isuser ? sizeof g_cfg.rpcuser : sizeof g_cfg.rpcpassword;
+            if(strlen(val) >= cap){              /* never a silently truncated credential */
+                cfg_fail(path, lineno, "", key, " is longer than this node accepts");
+                free(gl); fclose(f); return -1;
+            }
+            if(cfg_rank_take(isuser ? &g_rank_rpcuser : &g_rank_rpcpassword, cur_section[0] ? 2 : 1))
+                snprintf(dst, cap, "%s", val);
+            applied++; }
         else if(!strcmp(key,"addrindex")){    /* EXTENSION: live addr index */
             t=clamp_int(IV,0,1,key,&bad); if(t>=0){g_cfg.addrindex=t;applied++;} }
-        else if(!strcmp(key,"regtest")){      /* Core: -regtest (bool form) */
-            t=clamp_int(IV,0,1,key,&bad);
-            if(t==1){ snprintf(g_cfg.chain,sizeof g_cfg.chain,"regtest"); applied++; } }
-        else if(!strcmp(key,"testnet4")){     /* Core: -testnet4 (bool form) */
-            t=clamp_int(IV,0,1,key,&bad);
-            if(t==1){ snprintf(g_cfg.chain,sizeof g_cfg.chain,"testnet4"); applied++; } }
-        else if(!strcmp(key,"signet")){       /* Core: -signet (bool form) */
-            t=clamp_int(IV,0,1,key,&bad);
-            if(t==1){ snprintf(g_cfg.chain,sizeof g_cfg.chain,"signet"); applied++; } }
         else if(!strcmp(key,"bytespersigop")){ /* Core: -bytespersigop=<n> */
             t=clamp_int(IV,1,100000,key,&bad);
             if(!bad){ g_cfg.bytespersigop=t; applied++; } }
@@ -766,12 +902,34 @@ long node_config_load(const char* path){
             snprintf(g_cfg.walletdir,sizeof g_cfg.walletdir,"%s",val); applied++; }
         else if(!strcmp(key,"debuglogfile")){ /* Core: -debuglogfile=<file>, 0 = none */
             snprintf(g_cfg.debuglogfile,sizeof g_cfg.debuglogfile,"%s",val); applied++; }
-        else if(!strcmp(key,"bind")){         /* Core: -bind=<addr>[:<port>] */
-            char tmp[64]; snprintf(tmp,sizeof tmp,"%s",val);
-            char* colon = strrchr(tmp,':');
-            if(colon){ *colon = 0; int bp = atoi(colon+1);
-                       if(bp>0 && bp<65536){ g_cfg.port = bp; } }
-            snprintf(g_cfg.bind_addr,sizeof g_cfg.bind_addr,"%s",tmp);
+        else if(!strcmp(key,"bind")){         /* Core: -bind=<addr>[:<port>][=onion] */
+            /* CFG-5 (audit 2026-10-23): this split at the LAST colon and
+             * atoi'd the rest, so bind=::1 became host ":" and port 1, and a
+             * bad port was quietly dropped. Core splits with SplitHostPort
+             * ([v6]:port, bare v6, v4:port, host) and refuses an invalid
+             * port or an address it cannot parse (CheckHostPortOptions, then
+             * a numeric Lookup). =onion is refused: this node has no
+             * separate onion-inbound bind, and treating "8334=onion" as a
+             * port would move the main listener. */
+            char host[64]; int bp = 0;
+            const char* why = NULL;
+            /* An empty bind= keeps meaning "not set" (every interface), as
+             * the sample config documents; it names no address to widen. */
+            if(!*val){ g_cfg.bind_addr[0] = 0; applied++; continue; }
+            if(strchr(val, '=')) why = strstr(val, "=onion") ? "the =onion bind is not supported by this node" : "not an address[:port]";
+            else if(!cfg_split_host_port(val, host, sizeof host, &bp)) why = "invalid port or address";
+            else {
+                unsigned char a6[16];
+                if(inet_pton(AF_INET, host, a6) != 1 && inet_pton(AF_INET6, host, a6) != 1)
+                    why = "not a numeric IPv4 or IPv6 address";
+            }
+            if(why){
+                char bm[200]; snprintf(bm, sizeof bm, "bind=%.120s: %s", val, why);
+                cfg_fail(path, lineno, "Invalid -", bm, NULL);
+                free(gl); fclose(f); return -1;
+            }
+            if(bp) g_cfg.port = bp;
+            snprintf(g_cfg.bind_addr,sizeof g_cfg.bind_addr,"%s",host);
             applied++; }
         else if(!strcmp(key,"bmc.dialratelimit")){
             /* outbound connection attempts per second, node-wide (2026-09-07).
@@ -1275,6 +1433,7 @@ long node_config_load(const char* path){
         }
 #undef IV
     }
+    free(gl);
     fclose(f);
     if(unimpl)
         fprintf(stderr,"[config] %d Core option(s) in this file have no effect here "
@@ -1289,9 +1448,16 @@ long node_config_load(const char* path){
             char ip[800];
             if(g_cfg.includeconf[i][0] == '/') snprintf(ip, sizeof ip, "%s", g_cfg.includeconf[i]);
             else snprintf(ip, sizeof ip, "%s%s", dir, g_cfg.includeconf[i]);
+            /* Core: "Failed to include configuration file" is an init
+             * error, not a skipped file. */
+            if(access(ip, R_OK) != 0){
+                cfg_fail(ip, 0, "Failed to include configuration file", NULL, NULL);
+                g_include_depth = 0; return -1;
+            }
             fprintf(stderr,"[config] includeconf: reading %s\n", ip);
             long a = node_config_load(ip);
-            if(a > 0) applied += a;
+            if(a < 0){ g_include_depth = 0; return -1; }
+            applied += a;
         }
         g_include_depth = 0;
     }

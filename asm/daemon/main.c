@@ -11687,27 +11687,19 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
  * g_rpc_wallet are declared near the top of the file so serve_download_worker,
  * defined earlier, can publish into the shared status.) */
 
-/* Parse rpcport/rpcuser/rpcpassword out of the daemon's config file (node_config
- * treats them as foreign keys, so we read them here). */
-static void serve_rpc_read_creds(const char* cfgpath, int* port,
-                                 char* user, size_t ucap, char* pass, size_t pcap){
-    *port = g_chainp->default_rpc_port;   /* 8332 main / 18443 regtest */
-    user[0] = 0; pass[0] = 0;
-    if (!cfgpath) return;
-    FILE* f = fopen(cfgpath, "r"); if (!f) return;
-    char line[1024];
-    while (fgets(line, sizeof line, f)){
-        char* p = line; while (*p == ' ' || *p == '\t') p++;
-        if (*p == '#' || *p == '\n' || !*p) continue;
-        char* eq = strchr(p, '='); if (!eq) continue; *eq = 0;
-        char* k = p; char* v = eq + 1;
-        size_t vl = strlen(v); while (vl && (v[vl-1]=='\n'||v[vl-1]=='\r'||v[vl-1]==' '||v[vl-1]=='\t')) v[--vl] = 0;
-        size_t kl = strlen(k); while (kl && (k[kl-1]==' '||k[kl-1]=='\t')) k[--kl] = 0;
-        if      (!strcmp(k, "rpcport"))     *port = atoi(v);
-        else if (!strcmp(k, "rpcuser"))     { strncpy(user, v, ucap-1); user[ucap-1] = 0; }
-        else if (!strcmp(k, "rpcpassword")) { strncpy(pass, v, pcap-1); pass[pcap-1] = 0; }
-    }
-    fclose(f);
+/* rpcport/rpcuser/rpcpassword, as node_config_load resolved them.
+ *
+ * CFG-1 (audit 2026-10-23): this used to re-read the config file with a flat
+ * parser of its own -- no [sections], no includeconf, no inline '#' comments,
+ * the LAST value winning wherever it appeared, and rpcport through atoi. So a
+ * `[regtest] rpcpassword=` block was a working mainnet credential, and
+ * rpcport=70000 wrapped through htons to 4464. node_config.c now reads these
+ * three keys with everything else, with Core's scoping and precedence, and
+ * refuses a bad rpcport at load time as Core's CheckHostPortOptions does. */
+static void serve_rpc_read_creds(int* port, char* user, size_t ucap, char* pass, size_t pcap){
+    *port = g_cfg.rpcport > 0 ? g_cfg.rpcport : g_chainp->default_rpc_port;   /* 8332 main / 18443 regtest */
+    snprintf(user, ucap, "%s", g_cfg.rpcuser);
+    snprintf(pass, pcap, "%s", g_cfg.rpcpassword);
 }
 
 /* Start the embedded RPC server in the serve parent (non-blocking: rpc_server
@@ -11781,8 +11773,9 @@ static void mempool_reload_join(void){
 }
 
 static void serve_start_rpc(const char* dir, const char* cfgpath){
-    static char user[128], pass[256]; int port;
-    serve_rpc_read_creds(cfgpath, &port, user, sizeof user, pass, sizeof pass);
+    static char user[sizeof g_cfg.rpcuser], pass[sizeof g_cfg.rpcpassword]; int port;
+    (void)cfgpath;
+    serve_rpc_read_creds(&port, user, sizeof user, pass, sizeof pass);
     /* Start on ANY usable credential, not just rpcuser/rpcpassword.
      *
      * This used to bail out whenever those two were absent, which meant
@@ -13071,6 +13064,12 @@ int main(int argc, char** argv){
      * the download worker inherits the same resolved values. */
     { char cfgpath[512];
       node_config_load(node_config_path(absp, cfgpath, sizeof cfgpath));
+      /* CFG-1/3/4/5/6: a file Core would refuse to start on stops this node
+       * too, before anything acts on half of it. */
+      if(node_config_error()){
+          fprintf(stderr,"[boot] FATAL: configuration error: %s -- refusing to start\n", node_config_error());
+          return 1;
+      }
       { extern int (*g_serve_tx_gate)(void); extern int (*g_serve_inv_gate)(const unsigned char*, long);
         extern int (*g_serve_mempool_hook)(int, void*); extern void (*g_serve_policy_log)(const char*);
         g_serve_tx_gate = serve_tx_gate; g_serve_inv_gate = serve_inv_gate;
