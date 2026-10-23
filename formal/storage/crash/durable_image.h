@@ -66,7 +66,8 @@ static size_t di_strlen(const char* s){ size_t n = 0; while (s[n]) n++; return n
 static char* di_cat(char* d, const char* s){ while (*s) *d++ = *s++; *d = 0; return d; }
 static char* di_u64(char* d, unsigned long long v){
     char t[24]; int n = 0; do { t[n++] = (char)('0' + v % 10); v /= 10; } while (v);
-    while (n) *d++ = t[--n]; *d = 0; return d;
+    while (n) *d++ = t[--n];
+    *d = 0; return d;
 }
 static int di_statx(int dfd, const char* path, int flags, struct statx* sx){
     return (int)syscall(SYS_statx, dfd, path, flags, STATX_INO | STATX_BTIME | STATX_SIZE | STATX_TYPE, sx);
@@ -175,17 +176,19 @@ static int di_copy_path(const char* src, const char* dst){
 /* the power-loss image of "." into dst (created) */
 static int di_build_image(const char* dst, const char* const* cached){
     if (mkdir(dst, 0755) != 0 && errno != EEXIST) return -1;
-    char p[900];
+    char p[1200];
     for (int i = 0; i < di_nns; i++){
         if (di_cached(di_ns[i].name, cached)) continue;
         char k[480]; di_key(k, di_ns[i].ino, di_ns[i].bt);
-        snprintf(p, sizeof p, "%s/%s", dst, di_ns[i].name);
+        if (strlen(dst) + 66 > sizeof p) continue;
+        memcpy(p, dst, strlen(dst)); p[strlen(dst)] = '/'; strcpy(p + strlen(dst) + 1, di_ns[i].name);
         if (di_copy_path(k, p) != 0){ int o = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0644); if (o >= 0) close(o); }
     }
     DIR* d = opendir("."); struct dirent* e;
     while (d && (e = readdir(d))){
         if (e->d_type != DT_REG || !di_cached(e->d_name, cached)) continue;
-        snprintf(p, sizeof p, "%s/%s", dst, e->d_name);
+        if (strlen(dst) + strlen(e->d_name) + 2 > sizeof p) continue;
+        memcpy(p, dst, strlen(dst)); p[strlen(dst)] = '/'; strcpy(p + strlen(dst) + 1, e->d_name);
         di_copy_path(e->d_name, p);
     }
     if (d) closedir(d);
@@ -193,7 +196,11 @@ static int di_build_image(const char* dst, const char* const* cached){
 }
 static void di_print_log(const char* tag){
     printf("  [%s] syncs in order:", tag);
-    for (int i = 0; i < di_nlog; i++) printf(" %s", di_log[i]);
+    for (int i = 0; i < di_nlog; ){
+        int j = i; while (j < di_nlog && !strcmp(di_log[j], di_log[i])) j++;
+        if (j - i > 1) printf(" %s(x%d)", di_log[i], j - i); else printf(" %s", di_log[i]);
+        i = j;
+    }
     printf("\n");
 }
 static int di_synced(const char* name){ for (int i = 0; i < di_nlog; i++) if (!strcmp(di_log[i], name)) return 1; return 0; }

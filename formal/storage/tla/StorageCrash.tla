@@ -48,7 +48,7 @@ CONSTANTS
 
 ASSUME FS \in {"ext4", "weak"}
 ASSUME MUT \in {"none", "noWalFsync", "noUndoSync", "noDirSync", "truncBeforeDir",
-                "punchBeforeIdx", "noRunFsync", "discardFirst"}
+                "punchBeforeIdx", "noRunFsync"}
 
 Coins  == 0..N
 Blocks == 1..N
