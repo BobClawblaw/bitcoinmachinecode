@@ -89,7 +89,7 @@ int main(int argc, char** argv){
     static const uint32_t limits[] = {0x1d00ffffu, 0x1e0377aeu, 0x207fffffu, 0};
     long n_pow = 0, n_acc = 0, n_resid = 0, n_unarmed_extra = 0;
     long n_dt = 0, n_dt_eq = 0, n_dt_off = 0;
-    long n_rt = 0, n_rt_p3c = 0, n_rt_cap = 0;
+    long n_rt = 0, n_rt_cap = 0;
     long n_div = 0, n_bw = 0, n_bw_dom = 0, n_cw = 0, n_bw_lowexp = 0, n_bw_hiexp = 0, n_bw_trunc = 0;
 
     for (long it = 0; it < iters; it++){
@@ -189,11 +189,7 @@ int main(int argc, char** argv){
                 unsigned int want = core_calc_next_work(base, ts, &limr);
                 n_rt++;
                 if (want == lbr) n_rt_cap++;
-                if (got != want){
-                    int n4, o4; cu256 nt = cu_set_compact(want, &n4, &o4);
-                    if (cu_bits(&nt) <= 16) n_rt_p3c++;       /* P3c: new target < 2^16 */
-                    else { if (bad < 10) printf("MISMATCH retarget base=%08x ts=%lld got=%08x want=%08x\n", base, (long long)ts, got, want); bad++; }
-                }
+                if (got != want){ if (bad < 10) printf("MISMATCH retarget base=%08x ts=%lld got=%08x want=%08x\n", base, (long long)ts, got, want); bad++; }
             }
         }
 
@@ -213,7 +209,7 @@ int main(int argc, char** argv){
     printf("[diff] u256_div %ld, block_work %ld (in-domain %ld), chainwork_add %ld\n", n_div, n_bw, n_bw_dom, n_cw);
     printf("[diff] block_work out-of-domain differences (pow-valid bits): exp<3 %ld, exp 33/34 %ld, work>=2^128 %ld\n",
            n_bw_lowexp, n_bw_hiexp, n_bw_trunc);
-    printf("[diff] pow_retarget_bits %ld (powLimit cap %ld, P3c new-target<2^16 divergences %ld)\n", n_rt, n_rt_cap, n_rt_p3c);
+    printf("[diff] pow_retarget_bits %ld (powLimit cap %ld)\n", n_rt, n_rt_cap);
     printf("[diff] unexpected mismatches: %ld\n", bad);
     return bad ? 1 : 0;
 }

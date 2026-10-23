@@ -52,7 +52,7 @@ Core facts relied on, each read from the v31.1 source:
 | P2a | `powr_target_bytes` (bitcoin_pow_rules.c) | == Core SetCompact whenever Core's flags are clear and exponent <= 32; for exponent 33/34 with a nonzero mantissa bmc decodes 0 where Core decodes a nonzero target | CBMC, real file `#include`d | complete (fixed loops) | PROVED | 0.3 s |
 | P2b | `diff_target` (asm) | == SetCompact on exponent >= 3, sign clear, no overflow | differential test only (2M) and its role inside P1 | - | BOUNDED-OK (testing) | in DIFF |
 | P2c | `compact_to_target_le` (bitcoin_chainwork.asm) | == SetCompact for exponent 3..32 with the sign bit clear; 0 for exponent < 3 or 33/34 | z3, hand-written instruction semantics (P5 C2T) plus the diff | unbounded | PROVED (hand semantics) | in P5 |
-| P3 | `powr_compact` | == Core GetCompact(false) for every 256-bit target t with t == 0 or t >= 2^16; for 0 < t < 2^16 it ALWAYS differs (finding F1) | CBMC | complete | PROVED (with the divergence characterized) | 2.4 s |
+| P3 | `powr_compact` | == Core GetCompact(false) for every 256-bit target t (before the F1 fix: only for t == 0 or t >= 2^16) | CBMC | complete | PROVED | 2.4 s |
 | P4-LEM | `pow_retarget_bits` multiply and divide loops, clamp | MUL/DIV step lemmas (no u64 wrap, exact u8 digits, carry < ts, rem < T); composition: the 40 output bytes are exactly floor(N*ts/T); for main/testnet4/signet, target <= powLimit times 4T is < 2^256, so Core's mod-2^256 multiply never wraps on the reachable domain (signet's margin is under 1300 s of clamp) | z3 (bit-vector steps, integer compositions), modelled lines grepped from the product | unbounded | PROVED | 10 s |
 | P4-CAP | the powLimit cap | decode(Lb) <= full powLimit; GetCompact(decode(Lb)) == powr_compact(decode(Lb)) == Lb; GetCompact(x) == Lb for EVERY x in (decode(Lb), full]. So capping at decode(Lb) (bmc) and at the full powLimit (Core) give the same compact | CBMC, per chain | complete | PROVED | 1 s |
 | P4 | `pow_retarget_bits`, whole function | == Core CalculateNextWorkRequired | CBMC end to end | - | OPEN: timed out at 15 min (and at 5 min with the exponent fixed). Covered by P2a+P3+P4-LEM+P4-CAP (composition on paper, below) and by the differential test | - |
@@ -116,13 +116,18 @@ docstring.
 ## Findings (confirmed on the compiled code)
 
 **F1. `powr_compact` encodes targets below 2^16 wrongly (GetCompact divergence).**
+FIXED in e0476262: the second shift is gone. What follows describes the code
+before the fix; `confirm_p3c` is now a regression check that the cases below
+equal Core, and run.sh's `P3-F1` mutant restores the shift and must be caught
+by P3.
+
 `asm/bitcoin_pow_rules.c` powr_compact gathers the size<3 mantissa bytes
 already left-aligned (zero-filled), and then shifts again with
 `if (size < 3) word <<= 8 * (3 - size);`. Core's GetCompact shifts the value
 once (`GetLow64() << 8*(3-nSize)`). The result: P3 proves bmc differs from
 Core for EVERY target 0 < t < 2^16, and is equal everywhere else.
 
-Concrete reproduction on the compiled `bitcoin_pow_rules.o` (`confirm_p3c`):
+Concrete reproduction on the compiled `bitcoin_pow_rules.o` before the fix:
 - `pow_retarget_bits(0x03000100, 302400, 0x1d00ffff)` gives 0x01000000.
   Core CalculateNextWorkRequired gives 0x01400000 (target 64).
 - `pow_retarget_bits(0x03004000, 302400, 0x1d00ffff)` gives 0x02000000.
@@ -134,8 +139,8 @@ The only caller is pow_retarget_bits, so the effect is a wrong required nBits
 Reachability: the new target must be < 2^16, so the base target must be
 < 2^18 (or < 2^14 at the 4x clamp). That base target is a block nBits that
 passed PoW, i.e. a block hash <= 2^18: about 2^238 expected hashes. It is
-unreachable on any real chain, and the differential counts it only under that
-synthetic domain (P3c class). Severity: informational/latent (not exploitable).
+unreachable on any real chain; before the fix the differential test exempted
+it as the P3c class, and it now counts every retarget mismatch. Severity: informational/latent (not exploitable).
 
 Core reference: arith_uint256.cpp GetCompact. rpc_chain.c has no separate
 GetCompact copy (its `target_bytes` is a display-only SetCompact for

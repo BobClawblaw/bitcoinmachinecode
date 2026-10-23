@@ -16,7 +16,7 @@
  * same two operators are what diff_pow and check_core_port.py exercise.
  *
  * -DMIN_BASE_LOG2=k additionally assumes the base target >= 2^k (k = 18
- * keeps the new target >= 2^16, outside finding F1); -DEXP=e fixes the
+ * kept the new target >= 2^16, outside finding F1 before its fix); -DEXP=e fixes the
  * exponent. STATUS: OPEN -- this end-to-end harness did not close within
  * 15 min (mainnet, k = 18) nor 5 min with the exponent fixed, so run.sh does
  * not run it; P4 is covered by P2a + P3 + P4-LEM + P4-CAP and the

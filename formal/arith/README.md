@@ -3,7 +3,8 @@
 Goal: show that bmc's consensus arithmetic accepts exactly what Bitcoin Core
 v31.1 accepts, bit for bit, for all inputs, or say precisely where it does
 not. The code under test is the security integration branch
-`integ/2026-10-23-sec-all` (b841251b). The reference is Core v31.1's source.
+`integ/2026-10-23-sec-all` (b841251b; rebased onto fc2c2756 after F1 was
+fixed there). The reference is Core v31.1's source.
 
 `run.sh` runs every group and exits 0 only if every proof holds, every
 REACH witness is found and every mutant is caught. Each group also has its
@@ -125,6 +126,9 @@ Trusted environment and what was not covered:
 ## Findings (confirmed on the compiled code)
 
 - **F1: powr_compact (asm/bitcoin_pow_rules.c) mis-encodes targets below 2^16.**
+  FIXED in e0476262 (on the integration branch). P3 now holds for every
+  target, `pow/confirm_p3c` checks the cases below equal Core, and the
+  `P3-F1` mutant puts the removed shift back and must be caught.
   - *Cause.* For a short mantissa (size < 3), the byte loop already
     left-aligns it, and then `if (size < 3) word <<= 8*(3-size)` shifts it a
     second time. Core's arith_uint256::GetCompact shifts once.

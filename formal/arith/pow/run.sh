@@ -82,7 +82,10 @@ prod_mutant P3 "$PR" 's/if \(word & 0x00800000\)\{ word >>= 8; size\+\+; \}/if (
     _lim timeout 900 "$CBMC" "$here/cbmc/p3_getcompact.c" -I"$A" -DBMC_POW_RULES_C='"@F@"' --function p3 $U
 prod_mutant P2a "$PR" 's/        word >>= 8 \* \(3 - size\);/        word >>= 8 * (2 - size);/' -- \
     _lim timeout 900 "$CBMC" "$here/cbmc/p3_getcompact.c" -I"$A" -DBMC_POW_RULES_C='"@F@"' --function p2a $U
-run_expect P3c confirm 1 _lim timeout 60 "$B/confirm_p3c"
+# F1: put back the second shift that commit e0476262 removed; P3 must catch it
+prod_mutant P3-F1 "$PR" 's/^    if \(word & 0x00800000\)\{ word >>= 8; size\+\+; \}$/    if (size < 3) word <<= 8 * (3 - size);\n&/' -- \
+    _lim timeout 900 "$CBMC" "$here/cbmc/p3_getcompact.c" -I"$A" -DBMC_POW_RULES_C='"@F@"' --function p3 $U
+run_expect F1 confirm 1 _lim timeout 60 "$B/confirm_p3c"
 
 # ---- P4: retarget arithmetic: lemmas (z3) + cap lemma (CBMC); whole-function CBMC is OPEN
 for l in 'unsigned long long v = (unsigned long long)n[i] * (unsigned long long)ts + carry;' \
