@@ -30,6 +30,7 @@
 #include "crypto_bip324.h"
 #include "crypto_hkdf.h"
 #include "crypto_ellswift.h"
+#include "daemon/secure_zero.h"   /* CRY-4: key material is wiped with a barrier */
 
 static void expand32(unsigned char out[32], const unsigned char prk[32], const char* label){
     hkdf_sha256_expand(out, 32, prk, (const unsigned char*)label, strlen(label));
@@ -45,13 +46,15 @@ int bip324_init(bip324_cipher_t* c,
     static const char SALT_PREFIX[] = "bitcoin_v2_shared_secret";
 
     memset(c, 0, sizeof *c);
-    if (!ellswift_ecdh(ecdh, their_ellswift64, our_ellswift64, our_seckey32, initiator))
+    if (!ellswift_ecdh(ecdh, their_ellswift64, our_ellswift64, our_seckey32, initiator)){
+        secure_zero(ecdh, sizeof ecdh);
         return 0;
+    }
 
     memcpy(salt, SALT_PREFIX, 24);
     memcpy(salt + 24, net_magic, 4);
     hkdf_sha256_extract(prk, salt, sizeof salt, ecdh, sizeof ecdh);
-    memset(ecdh, 0, sizeof ecdh);
+    secure_zero(ecdh, sizeof ecdh);    /* CRY-4: a memset of a dead local is deleted at -O2 */
 
     /* Which role's keys we send with. self_decrypt flips it so the same
      * object can read back what it wrote. */
@@ -76,8 +79,8 @@ int bip324_init(bip324_cipher_t* c,
 
     expand32(c->session_id, prk, "session_id");
 
-    memset(okm, 0, sizeof okm);
-    memset(prk, 0, sizeof prk);
+    secure_zero(okm, sizeof okm);
+    secure_zero(prk, sizeof prk);
     c->ready = 1;
     return 1;
 }
