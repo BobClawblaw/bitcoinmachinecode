@@ -2430,19 +2430,21 @@ static void txoq_service(void){
     }
 }
 
-static volatile sig_atomic_t g_inbound_n = 0;
+#include "inbound_children.h"   /* HST-1/HST-2: the inbound child count */
 static pid_t g_dl_worker_pid = -1;       /* set by main() right after fork(); parent forwards SIGTERM here */
 static volatile sig_atomic_t g_dl_worker_exited = 0, g_dl_worker_status = 0;
 static void reap_children(int sig){
     (void)sig; int st; pid_t p;
+    int saved_errno = errno;             /* a handler must not clobber the interrupted code's errno */
     while((p = waitpid(-1,&st,WNOHANG)) > 0){
         /* The download worker is a child too. Before 2026-08-22 its death was
          * silently reaped here and the serve parent lived on with no worker
          * (block 481827: worker segfaulted, unit stayed "active" for 13 min).
          * Remember it; serve_mux exits non-zero so systemd restarts the unit. */
         if (g_dl_worker_pid > 0 && p == g_dl_worker_pid){ g_dl_worker_exited = 1; g_dl_worker_status = st; }
-        else if(g_inbound_n > 0) g_inbound_n--;
+        else inb_reaped(p);              /* counts only if it was an inbound child */
     }
+    errno = saved_errno;
 }
 /* Reap one child without ever blocking on it; 1 = gone, 0 = still alive
  * after timeout_ms. The download worker runs with SIGCHLD = SIG_IGN, and
@@ -12425,7 +12427,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
      * read the previous leg's revents. */
     struct pollfd pfds[MUX_MAX_OUT+4+NETPERM_MAX_BIND];   /* +1: the I2P acceptor pipe */
     for(;;){
-        if(g_node_status) g_node_status->n_inbound = (int)g_inbound_n;   /* for the RPC thread */
+        if(g_node_status) g_node_status->n_inbound = inb_count();   /* for the RPC thread */
         int nfds=0;
         pfds[nfds].fd=l;     pfds[nfds].events=POLLIN; pfds[nfds].revents=0; nfds++;
         /* the IPv6 listener sits beside it; -1 when the host has no IPv6,
@@ -12647,7 +12649,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                 memcpy(ipb, peerdesc, n); ipb[n] = 0;
                 if(!(netperm_for(ipb) & NP_DOWNLOAD)){ close(c); c = -1; }
             }
-            if(c>=0 && g_inbound_n >= CFG_INBOUND_LIMIT()){
+            if(c>=0 && inb_count() >= CFG_INBOUND_LIMIT()){
                 /* At capacity: accept and close immediately so the connection
                  * is refused cleanly rather than sitting in the backlog, and
                  * do NOT fork. Rate-limited log -- under a flood this would
@@ -12657,7 +12659,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                                  nms = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
                 if(nms - last_full_log_ms > 10000){
                     fprintf(stderr,"[serve] inbound at capacity (%d/%d) -- refusing new connections\n",
-                            (int)g_inbound_n, CFG_INBOUND_LIMIT());
+                            inb_count(), CFG_INBOUND_LIMIT());
                     last_full_log_ms = nms;
                 }
                 close(c);
@@ -12779,9 +12781,9 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                     close(c); _exit(0);
                 }
                 close(c);
-                if(w > 0){ g_inbound_n++; upl_track(w); }
+                if(w > 0){ inb_register(w); upl_track(w); }
                 fprintf(stderr,"[serve] inbound %s accepted -> child pid %d (%d/%d inbound)\n",
-                        peerdesc, w, (int)g_inbound_n, CFG_INBOUND_LIMIT());
+                        peerdesc, w, inb_count(), CFG_INBOUND_LIMIT());
             }
         }
         /* outbound: on rotation, pull from each peer (periodic getheaders-from-
