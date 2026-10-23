@@ -5914,19 +5914,31 @@ for(; i < cnt; i++){
              * At the very start of a fetch the parent is whatever the
              * store already holds; within a page it is the window this
              * loop has just appended. hst_median_time_past reads the
-             * store, so it is only consulted for a height whose 11
-             * ancestors are already there -- otherwise the floor is
-             * skipped for that header rather than evaluated against a
-             * window that does not exist. The ceiling and the version
-             * rules need no ancestors and always run. */
+             * store, the window shortened to the ancestors that exist
+             * below height 11 exactly as Core's GetMedianTimePast is.
+             * CON-13 (audit 2026-10-23): the floor used to be skipped
+             * below height 11 and whenever the window could not be read;
+             * Core evaluates it for every header but genesis, and an
+             * unreadable parent window now refuses the page instead of
+             * accepting the header unevaluated. The ceiling and the
+             * version rules need no ancestors and always run; BIP94's
+             * timewarp rule (CON-8) reads the parent header. */
             { long hh = pos + (long)i;
               const char* why = "?";
               unsigned long pmtp = 0;
-              if (hh >= 11) (void)hst_median_time_past(hst, hh - 1, &pmtp);
+              unsigned char prec[112];
+              if (hh >= 1 && (!hst_median_time_past(hst, hh - 1, &pmtp)
+                              || hst_get_at(hst, (unsigned long long)(hh - 1), prec) != 1)){
+                  fprintf(stderr,"[dlc] header at height %ld from %s: the parent's median-time-past window is unreadable -- discarding the page\n",
+                          hh, cand);
+                  dlc_headers_rollback(hst, have0); return -1;
+              }
               unsigned long long hflags =
                   script_flags_for_block((unsigned long long)hh, bh);
+              extern const chainparams_t* g_chainp;
               if(!hdr_contextual_ok(hh, h, pmtp, (long)time(NULL),
-                                    hflags, dlc_bip34_height(), &why)){
+                                    hflags, dlc_bip34_height(), &why)
+                 || (hh >= 1 && !hdr_timewarp_ok(hh, h, prec, g_chainp && g_chainp->enforce_bip94, &why))){
                   fprintf(stderr,"[dlc] header at height %ld from %s rejected: %s -- discarding the page\n",
                           hh, cand, why);
                   dlc_headers_rollback(hst, have0); return -1;

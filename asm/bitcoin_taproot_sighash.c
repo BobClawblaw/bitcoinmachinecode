@@ -390,15 +390,20 @@ static int ts_agg_hashes(const tapctx_t* c, const txview_t* t,
      * -- SCR-5, audit 2026-09-03: the pre-fix single-byte encoding refused a
      * scriptPubKey >= 253 bytes outright, a false reject vs Core). It
      * therefore has no `end` to bound against, and the API gives none. Rather than trust that, the walk carries its own hard
-     * ceiling: TS_SPK_RUN_CAP bytes total, checked before every advance, so a
-     * corrupted length cannot run away even though it cannot be proven
-     * in-bounds. The real fix is an spks_len parameter; that is an ABI change
-     * across ~10 call sites in two .c files and five tests, deliberately not
-     * bundled into a sighash restructure. Recorded in the commit message. */
-    #define TS_SPK_RUN_CAP (4u<<20)
+     * ceiling, checked before every advance, so a corrupted length cannot
+     * run away even though it cannot be proven in-bounds.
+     *
+     * CON-6 (audit 2026-10-23): that ceiling was a fixed 4 MiB, and Core has
+     * no cap at all -- PrecomputedTransactionData hashes every spent
+     * scriptPubKey. 420 inputs spending 10,000-byte scripts already pass
+     * 4 MiB, so a valid taproot spend was refused. The ceiling is now sized
+     * to the input: every writer caps an entry at MAX_SCRIPT_SIZE behind a
+     * CompactSize of at most 3 bytes, so num_inputs * (3 + 10,000) is the
+     * longest run a writer can emit. */
+    #define TS_SPK_RUN_MAX(n) ((uint64_t)(n) * (3u + 10000u))
     {
         const uint8_t* p = c->spks;
-        const uint8_t* run_end = c->spks + TS_SPK_RUN_CAP;
+        const uint8_t* run_end = c->spks + TS_SPK_RUN_MAX(n);
         int ok = 1;
         for (int64_t i=0;i<n;i++){
             uint64_t sl = read_cs(&p, run_end, &ok);
@@ -449,7 +454,7 @@ static __thread tap_cache_t tap_cache;
  * hashing. */
 static int ts_spk_at_nin(const tapctx_t* c, const uint8_t** sp, uint64_t* sl){
     const uint8_t* p = c->spks;
-    const uint8_t* run_end = c->spks + TS_SPK_RUN_CAP;
+    const uint8_t* run_end = c->spks + TS_SPK_RUN_MAX(c->num_inputs);
     int ok = 1;
     for (int64_t i = 0; i < c->num_inputs; i++){
         uint64_t l = read_cs(&p, run_end, &ok);

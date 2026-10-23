@@ -133,8 +133,15 @@ int serve_block_ctx_ok(void* st, const unsigned char* hdr80){
     unsigned char bh[32]; memset(bh, 0, 32);
     unsigned long long flags = script_flags_for_block((unsigned long long)height, bh);
     const char* reason = "?";
+    unsigned char phdr[80];
+    if (!sv_hdr_at(st, tip, phdr)){
+        fprintf(stderr, "[serve] inbound block at height %ld REJECTED: parent header unreadable "
+                        "(not appended)\n", height);
+        return 0;
+    }
     if (!hdr_contextual_ok(height, hdr80, (unsigned long)mtp, (long)time(0),
-                           flags, g_sv_bip34_h, &reason)){
+                           flags, g_sv_bip34_h, &reason)
+        || !hdr_timewarp_ok(height, hdr80, phdr, g_sv_bip94, &reason)){   /* CON-8 */
         fprintf(stderr, "[serve] inbound block at height %ld REJECTED: %s (not appended)\n",
                 height, reason);
         return 0;
