@@ -323,15 +323,11 @@ int main(void){
                     }
                     if (kd == 1 && !strncmp(c9, "inv", 3)){
                         answered = 1;
-                        /* MSG_BLOCK, block 4's hash. In EITHER byte order on
-                         * purpose: the handler writes block_hash's output
-                         * reversed, which is not the order getdata looks up
-                         * (an open question outside F1, reported with it);
-                         * this case is about the locator, not that. */
-                        if (rl9 >= 1 + 36 && rb9[1] == 2){
-                            unsigned char rev[32]; for (int q = 0; q < 32; q++) rev[q] = bhash[4][31-q];
-                            if (!memcmp(rb9 + 5, rev, 32) || !memcmp(rb9 + 5, bhash[4], 32)) served_from4 = 1;
-                        }
+                        /* MSG_BLOCK, block 4's hash in wire order: block_hash's
+                         * output as-is, what a getdata carries back. This took
+                         * either byte order while the handler still reversed
+                         * it (fixed 2026-10-23; tests/test_getblocks pins it). */
+                        if (rl9 >= 1 + 36 && rb9[1] == 2 && !memcmp(rb9 + 5, bhash[4], 32)) served_from4 = 1;
                     }
                 }
                 char lbl[160];

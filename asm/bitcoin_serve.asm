@@ -1557,7 +1557,7 @@ node_serve_loop:
     cmp  rax, [s_cnt]
     ja   .gb_empty
     ; build inv: reserve 3 bytes for count varint at hp_buf[0..2], entries at
-    ; hp_buf[3..]. Each entry = type u32 (2=MSG_BLOCK) + hash32 (LE wire order).
+    ; hp_buf[3..]. Each entry = type u32 (2=MSG_BLOCK) + hash32 (wire order).
     mov  qword [s_p], 3
     mov  qword [s_n], 0
 .gbl_loop:
@@ -1579,24 +1579,22 @@ node_serve_loop:
     lea  rdi, [sb_buf+0x200000]  ; scratch hash slot inside sb_buf (see below)
     lea  rsi, [sb_buf]
     call block_hash
-    ; reverse the hash into hp_buf at offset [s_p]+4 (after the type u32)
+    ; entry at hp_buf+[s_p]: type u32 = 2 (MSG_BLOCK), then the hash in
+    ; INTERNAL order -- block_hash's sha256d output as-is, the bytes a getdata
+    ; carries back and the order idx_get is keyed on. 2026-10-23: this copied
+    ; the hash byte-reversed (display order), so every getblocks reply named
+    ; 500 blocks nobody has; the tip announce (node_announce_tip) had the same
+    ; bug until 2026-09-19.
     mov  rdx, [s_p]
-    add  rdx, 4
-    ; type = 2 (MSG_BLOCK) at hp_buf[rdx-4 .. rdx-1]
-    mov  dword [hp_buf + rdx - 4], 2
-    lea  r10, [sb_buf + 0x200000 + 31]  ; last byte of the hash output
-    lea  r11, [hp_buf + rdx]            ; dest base (type u32 already written)
-    xor  ecx, ecx
-.gbl_rev:
-    cmp  rcx, 32
-    jae  .gbl_rev_done
-    mov  r9, rcx
-    neg  r9                  ; -rcx
-    mov  al, [r10 + r9]      ; sb_buf+0x200000+31-rcx  (base + index)
-    mov  [r11 + rcx], al     ; hp_buf+rdx+rcx
-    inc  rcx
-    jmp  .gbl_rev
-.gbl_rev_done:
+    mov  dword [hp_buf + rdx], 2
+    mov  rax, [sb_buf + 0x200000]
+    mov  [hp_buf + rdx + 4], rax
+    mov  rax, [sb_buf + 0x200000 + 8]
+    mov  [hp_buf + rdx + 12], rax
+    mov  rax, [sb_buf + 0x200000 + 16]
+    mov  [hp_buf + rdx + 20], rax
+    mov  rax, [sb_buf + 0x200000 + 24]
+    mov  [hp_buf + rdx + 28], rax
     add  qword [s_p], 36
     mov  rax, [s_n]
     inc  rax
