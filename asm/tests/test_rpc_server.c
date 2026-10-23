@@ -31,6 +31,26 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
+/* RPC-21 follow-up: the longpoll pool's serve step, replaced by the test */
+#include <pthread.h>
+#include <malloc.h>
+#define LP_TEST_SCRATCH (1u << 20)
+static pthread_mutex_t g_lpt_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t g_lpt_ids[256]; static int g_lpt_n; static long g_lpt_served;
+static size_t lp_heap_in_use(void){ struct mallinfo2 m = mallinfo2(); return m.uordblks + m.hblkhd; }
+static void lp_test_serve(void* req){
+    static __thread char* scratch;                 /* the getblocktemplate path's shape */
+    if (!scratch){ scratch = malloc(LP_TEST_SCRATCH); if (scratch) memset(scratch, 1, LP_TEST_SCRATCH); }
+    pthread_t me = pthread_self();
+    pthread_mutex_lock(&g_lpt_mu);
+    int seen = 0;
+    for (int i = 0; i < g_lpt_n; i++) if (pthread_equal(g_lpt_ids[i], me)) seen = 1;
+    if (!seen && g_lpt_n < 256) g_lpt_ids[g_lpt_n++] = me;
+    g_lpt_served++;
+    pthread_mutex_unlock(&g_lpt_mu);
+    free(req);
+}
+
 static int fails = 0;
 static void ck(const char* label, int cond) {
     printf("%s %s\n", cond ? "ok  :" : "FAIL:", label);
@@ -622,6 +642,38 @@ int main(void) {
         ck("RPC-5 releasing one frees exactly one slot", rpc_lp_try_take() == 1);
         for (int i = 0; i < cap; i++) rpc_lp_release();
         ck("RPC-5 all slots return when the waiters finish", rpc_lp_waiters_inflight() == 0);
+    }
+
+    /* ---- RPC-21 follow-up (audit 2026-10-23): the longpoll waiters are a
+     * fixed pool. Each waiter used to be a fresh detached thread, and the
+     * getblocktemplate it rendered keeps per-thread heap scratch (static
+     * __thread buffers) that no thread exit frees: one leak per longpoll,
+     * for the life of the node. The serve step is replaced here by one that
+     * keeps 1 MiB of __thread scratch the same way and records its thread;
+     * three rounds of LP_MAX_WAITERS requests must run on at most
+     * LP_MAX_WAITERS threads, and the heap must grow by about one round's
+     * scratch, not three. */
+    {
+        extern void rpc_lp_set_serve_for_test(void (*fn)(void* req));
+        extern int rpc_lp_submit_for_test(void* tag);
+        extern int rpc_lp_max_waiters(void);
+        extern int rpc_lp_waiters_inflight(void);
+        int cap = rpc_lp_max_waiters();
+        size_t h0 = lp_heap_in_use();
+        rpc_lp_set_serve_for_test(lp_test_serve);
+        int submitted = 0;
+        for (int round = 0; round < 3; round++){
+            for (int i = 0; i < cap; i++) if (rpc_lp_submit_for_test(NULL) == 0) submitted++;
+            for (int w = 0; w < 500 && rpc_lp_waiters_inflight() > 0; w++) usleep(10000);
+        }
+        rpc_lp_set_serve_for_test(NULL);
+        size_t grew = lp_heap_in_use() - h0;
+        pthread_mutex_lock(&g_lpt_mu); int nthreads = g_lpt_n; long served = g_lpt_served; pthread_mutex_unlock(&g_lpt_mu);
+        printf("      (%d longpolls served on %d thread(s), heap +%zu KiB)\n", (int)served, nthreads, grew >> 10);
+        ck("RPC-21 every submitted longpoll was served", submitted == 3 * cap && served == submitted);
+        ck("RPC-21 longpolls run on a fixed set of threads (<= LP_MAX_WAITERS)", nthreads <= cap);
+        ck("RPC-21 per-thread scratch is held once per pool thread, not once per longpoll",
+           grew < (size_t)(cap + 4) * LP_TEST_SCRATCH);
     }
 
     /* ---- RPC-10 (audit 2026-09-03): Core's reply framing ----

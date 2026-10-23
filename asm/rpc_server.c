@@ -1206,8 +1206,16 @@ int rpc_body_fast(const char* body, unsigned long blen){ return rpc_body_is_fast
 
 typedef struct { int cfd; char* buf; size_t body_off, blen; unsigned char prev[32]; int have_prev; } lp_req_t;
 
-static void* lp_waiter(void* arg){
-    lp_req_t* r = (lp_req_t*)arg;
+/* The longpoll waiters run on a FIXED pool of LP_MAX_WAITERS threads, started
+ * on first use and never exiting (audit 2026-10-23, the RPC-21 follow-up).
+ * They used to be one detached thread per request: the getblocktemplate it
+ * rendered allocates per-thread heap scratch (static __thread buffers, the
+ * RPC-21 class) that nothing frees when a thread exits, so a miner
+ * long-polling every block leaked that scratch once per block, for as long as
+ * the node ran. A fixed set of threads holds it at most LP_MAX_WAITERS times.
+ * lp_waiters_take() already caps the requests in flight at LP_MAX_WAITERS, so
+ * the queue below (the same size) always has room for an admitted request. */
+static void lp_serve(lp_req_t* r){
     if (r->have_prev){
         for (int waited = 0; waited < LP_MAX_WAIT_S * 1000; waited += LP_POLL_MS){
             unsigned char cur[32];
@@ -1220,8 +1228,57 @@ static void* lp_waiter(void* arg){
     char* lp_resp = render_request(r->buf + r->body_off, r->blen, &lp_len);
     send_response(r->cfd, lp_resp, lp_len);        /* socket write, lock released */
     free(r->buf); free(r);
-    lp_waiters_release();                          /* RPC-5 */
+}
+static void (*g_lp_serve_fn)(lp_req_t*) = lp_serve;   /* test seam: rpc_lp_set_serve_for_test */
+static pthread_mutex_t g_lp_q_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_lp_q_cv   = PTHREAD_COND_INITIALIZER;
+static lp_req_t* g_lp_q[LP_MAX_WAITERS];
+static int g_lp_q_head, g_lp_q_n, g_lp_pool_n;
+static pthread_once_t g_lp_pool_once = PTHREAD_ONCE_INIT;
+static void* lp_pool_thread(void* arg){
+    (void)arg;
+    for (;;){
+        pthread_mutex_lock(&g_lp_q_lock);
+        while (g_lp_q_n == 0) pthread_cond_wait(&g_lp_q_cv, &g_lp_q_lock);
+        lp_req_t* r = g_lp_q[g_lp_q_head];
+        g_lp_q_head = (g_lp_q_head + 1) % LP_MAX_WAITERS; g_lp_q_n--;
+        pthread_mutex_unlock(&g_lp_q_lock);
+        g_lp_serve_fn(r);
+        lp_waiters_release();                      /* RPC-5 */
+    }
     return NULL;
+}
+static void lp_pool_start(void){
+    for (int i = 0; i < LP_MAX_WAITERS; i++){
+        pthread_t th;
+        if (bmc_pthread_create(&th, lp_pool_thread, 0) != 0) break;
+        pthread_detach(th);
+        g_lp_pool_n++;
+    }
+}
+/* 0: queued (the pool owns r, its buf and its fd); -1: no pool thread, or the
+ * queue is full -- the caller answers serially */
+static int lp_submit(lp_req_t* r){
+    pthread_once(&g_lp_pool_once, lp_pool_start);
+    int ok = -1;
+    pthread_mutex_lock(&g_lp_q_lock);
+    if (g_lp_pool_n > 0 && g_lp_q_n < LP_MAX_WAITERS){
+        g_lp_q[(g_lp_q_head + g_lp_q_n) % LP_MAX_WAITERS] = r; g_lp_q_n++;
+        pthread_cond_signal(&g_lp_q_cv); ok = 0;
+    }
+    pthread_mutex_unlock(&g_lp_q_lock);
+    return ok;
+}
+/* test_rpc_server: replace what a pool thread does with a request, and submit
+ * one, so the pool's thread reuse is measured without a chain behind it */
+void rpc_lp_set_serve_for_test(void (*fn)(void* req)){ g_lp_serve_fn = fn ? (void (*)(lp_req_t*))fn : lp_serve; }
+int rpc_lp_submit_for_test(void* tag){
+    if (!lp_waiters_take()) return -1;
+    lp_req_t* r = calloc(1, sizeof *r);
+    if (!r){ lp_waiters_release(); return -1; }
+    r->cfd = -1; r->buf = (char*)tag;
+    if (lp_submit(r) != 0){ free(r); lp_waiters_release(); return -1; }
+    return 0;
 }
 
 /* extract the 64-hex prev-tip embedded in the request's longpollid ("<tip
@@ -1400,7 +1457,7 @@ static void service_conn(int cfd) {
           (void)write_all(cfd, e, strlen(e)); free(buf); close(cfd); return;
       } }
     /* longpoll: a getblocktemplate carrying a longpollid waits OFF-THREAD
-     * (see the block comment above lp_waiter) */
+     * (see the block comment above lp_serve) */
     { int is_lp = 0;
       for (size_t i = 0; !is_lp && i + 12 <= blen; i++)
           if (!memcmp(body + i, "\"longpollid\"", 12)) is_lp = 1;
@@ -1416,11 +1473,7 @@ static void service_conn(int cfd) {
               if (r){
                   r->cfd = cfd; r->buf = buf; r->body_off = (size_t)(body - buf); r->blen = blen;
                   r->have_prev = lp_extract_prev(body, blen, r->prev);
-                  pthread_t th;
-                  if (bmc_pthread_create(&th, lp_waiter, r) == 0){
-                      pthread_detach(th);
-                      return;                        /* r owns buf + cfd now */
-                  }
+                  if (lp_submit(r) == 0) return;      /* the pool owns r, buf and cfd now */
                   free(r);                           /* fall through: serial */
               }
               lp_waiters_release();                  /* RPC-5: spawn failed */
