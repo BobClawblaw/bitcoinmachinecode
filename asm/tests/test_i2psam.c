@@ -25,6 +25,28 @@
 #include "../daemon/i2psam.h"
 #include "test_tmpdir.h"
 #include "i2p_vec.h"                 /* REAL_DEST_B64 / REAL_B32, from the local router */
+/* What a real bridge hands back for DESTINATION=TRANSIENT, and what the key
+ * file holds: the public Destination followed by its private keys (SAM v3
+ * "$privkey"). Built from the router's public destination plus key bytes. */
+static char PRIV_B64[4096];
+static const char I2PB64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-~";
+static void make_priv(void){
+    unsigned char raw[2048]; int n = 0; unsigned acc = 0; int bits = 0;
+    for (const char* p = REAL_DEST_B64; *p && *p != '='; p++){
+        int v = (int)(strchr(I2PB64, *p) - I2PB64);
+        acc = (acc << 6) | (unsigned)v; bits += 6;
+        if (bits >= 8){ bits -= 8; raw[n++] = (unsigned char)(acc >> bits); }
+    }
+    for (int i = 0; i < 288; i++) raw[n++] = (unsigned char)(0x5a ^ i);   /* the private keys */
+    int o = 0;
+    for (int i = 0; i < n; i += 3){
+        unsigned x = raw[i], y = i + 1 < n ? raw[i+1] : 0, z = i + 2 < n ? raw[i+2] : 0;
+        PRIV_B64[o++] = I2PB64[x >> 2]; PRIV_B64[o++] = I2PB64[((x & 3) << 4) | (y >> 4)];
+        PRIV_B64[o++] = i + 1 < n ? I2PB64[((y & 15) << 2) | (z >> 6)] : '=';
+        PRIV_B64[o++] = i + 2 < n ? I2PB64[z & 63] : '=';
+    }
+    PRIV_B64[o] = 0;
+}
 static int fails = 0;
 static void ck(const char* l, int c){ if (c) printf("  ok  %s\n", l); else { printf("  FAIL %s\n", l); fails++; } }
 static int rdn(int fd, char* b, int n){ int g = 0; while (g < n){ int r = (int)read(fd, b + g, (size_t)(n - g)); if (r <= 0) break; g += r; } return g; }
@@ -43,7 +65,7 @@ static void serve_conn(int c, int mode, int report){
     if (!strncmp(l, "SESSION CREATE", 14)){
         if (mode == 1){ (void)!write(c, "SESSION STATUS RESULT=DUPLICATED_ID\n", strlen("SESSION STATUS RESULT=DUPLICATED_ID\n")); return; }
         char msg[8192];
-        if (strstr(l, "DESTINATION=TRANSIENT")) snprintf(msg, sizeof msg, "SESSION STATUS RESULT=OK DESTINATION=%s\n", REAL_DEST_B64);
+        if (strstr(l, "DESTINATION=TRANSIENT")) snprintf(msg, sizeof msg, "SESSION STATUS RESULT=OK DESTINATION=%s\n", PRIV_B64);
         else                                    snprintf(msg, sizeof msg, "SESSION STATUS RESULT=OK\n");
         (void)!write(c, msg, strlen(msg));
         rdline(c, l, sizeof l);            /* hold it open until the client closes */
@@ -85,6 +107,12 @@ int main(void){
       ck("base64(I2P alphabet) + sha256 + base32 == the router's b32 for its destination",
          i2psam_dest_to_b32(b32, sizeof b32, REAL_DEST_B64) && !strcmp(b32, REAL_B32)); }
     ck("a truncated destination is rejected", !i2psam_dest_to_b32((char[80]){0}, 80, "AAAA"));
+    make_priv();
+    { char b32[80];
+      ck("I2P-1 (audit 2026-10-23): our address from the PRIVATE key hashes only its public Destination",
+         i2psam_privkey_to_b32(b32, sizeof b32, PRIV_B64) && !strcmp(b32, REAL_B32));
+      ck("...hashing the whole private blob would give another, wrong, address",
+         i2psam_dest_to_b32(b32, sizeof b32, PRIV_B64) && strcmp(b32, REAL_B32)); }
 
     printf("\n== session: HELLO then SESSION CREATE, Core's parameters ==\n");
     int port, rp[2]; (void)!pipe(rp); int ls = listen_lo(&port);
@@ -126,7 +154,7 @@ int main(void){
     ck("same address as the first run (persistent identity)", !strcmp(s.b32, REAL_B32));
     i2psam_close(&s); kill(pid, SIGKILL); waitpid(pid, &st, 0);
     wl = 0; while ((n = (int)read(rp[0], wire + wl, (size_t)(16000 - wl))) > 0) wl += n; wire[wl] = 0; close(rp[0]); close(ls);
-    ck("SESSION CREATE carried the destination, not TRANSIENT", strstr(wire, "DESTINATION=TRANSIENT") == NULL && strstr(wire, REAL_DEST_B64) != NULL);
+    ck("SESSION CREATE carried the persisted private key, not TRANSIENT", strstr(wire, "DESTINATION=TRANSIENT") == NULL && strstr(wire, PRIV_B64) != NULL);
 
     printf("\n== failures are reported ==\n");
     (void)!pipe(rp); ls = listen_lo(&port);
