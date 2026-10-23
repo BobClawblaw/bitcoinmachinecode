@@ -207,6 +207,7 @@ align 16
 s_plen:   dq 0
 s_fh:     dq 0
 s_ghstop: dq -1        ; NET-8: hashStop height for getheaders, -1 = absent/unknown
+s_gbstop: times 32 db 0 ; getblocks: the hashStop hash itself (wire order)
 s_cmd:    times 16 db 0
 s_cnt:    dq 0
 s_nf:     dq 0        ; notfound entries accumulated for THIS getdata
@@ -1376,6 +1377,7 @@ node_serve_loop:
     mov  rdx, [s_htidx]
     lea  rcx, [s_fh]         ; out_from
     lea  r8,  [s_ghstop]     ; out_stop (-1 = none/unknown)
+    xor  r9d, r9d            ; out_stop_hash: not needed here
     call serve_locator_from
     test eax, eax
     jz   .next               ; malformed: drop, as the inv path does
@@ -1539,13 +1541,13 @@ node_serve_loop:
     ; ReadCompactSize throws and the message is dropped. serve_locator_from
     ; parses it as getheaders does (canonical count, <= 101, length checked)
     ; and walks the whole locator (FindForkInGlobalIndex). rax = 1 ok / 0
-    ; malformed; s_fh = the height to serve from. The stop hash it reports
-    ; is not used here (as before).
+    ; malformed; s_fh = the height to serve from, s_gbstop = the stop hash.
     lea  rdi, [pl_buf]
     mov  rsi, [s_plen]
     mov  rdx, [s_htidx]
     lea  rcx, [s_fh]         ; out_from
-    lea  r8,  [s_ghstop]     ; out_stop (unused by getblocks)
+    lea  r8,  [s_ghstop]     ; out_stop height (unused: the walk compares hashes)
+    lea  r9,  [s_gbstop]     ; out_stop_hash
     call serve_locator_from
     test eax, eax
     jz   .next               ; malformed: drop, as getheaders does
@@ -1579,6 +1581,27 @@ node_serve_loop:
     lea  rdi, [sb_buf+0x200000]  ; scratch hash slot inside sb_buf (see below)
     lea  rsi, [sb_buf]
     call block_hash
+    ; hashStop. Core (net_processing.cpp GETBLOCKS) walks the active chain
+    ; from the fork point's successor and breaks BEFORE queueing the block
+    ; whose hash is hashStop: the stop block itself is not announced. A stop
+    ; at or below the start, off this chain, unknown or all-zero is never met
+    ; and limits nothing. This handler ignored hashStop (2026-10-23) and
+    ; always sent up to 500. Compared by hash, not by the index's height for
+    ; it: the walk is over the blocks actually served, so a stale index entry
+    ; (a child that has not yet seen a reorg) cannot stop it early.
+    mov  rax, [sb_buf + 0x200000]
+    cmp  rax, [s_gbstop]
+    jne  .gbl_nostop
+    mov  rax, [sb_buf + 0x200000 + 8]
+    cmp  rax, [s_gbstop + 8]
+    jne  .gbl_nostop
+    mov  rax, [sb_buf + 0x200000 + 16]
+    cmp  rax, [s_gbstop + 16]
+    jne  .gbl_nostop
+    mov  rax, [sb_buf + 0x200000 + 24]
+    cmp  rax, [s_gbstop + 24]
+    je   .gb_done            ; this block is hashStop: stop before it
+.gbl_nostop:
     ; entry at hp_buf+[s_p]: type u32 = 2 (MSG_BLOCK), then the hash in
     ; INTERNAL order -- block_hash's sha256d output as-is, the bytes a getdata
     ; carries back and the order idx_get is keyed on. 2026-10-23: this copied

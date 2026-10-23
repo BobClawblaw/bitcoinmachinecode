@@ -88,7 +88,10 @@ int serve_inv_bounds(const unsigned char* pl, long plen,
  * Payload: version(4) | CompactSize(count) | count*32 locator | 32 stop.
  *
  * Returns 1 with *out_from set to the height to serve FROM, and *out_stop set
- * to the stop hash's height or -1 when the stop hash is zero/unknown.
+ * to the stop hash's height or -1 when the stop hash is zero/unknown. When
+ * out_stop_hash is not NULL the stop hash itself is copied there (getblocks
+ * compares it against each block it walks, as Core does; zeroed on a
+ * malformed message).
  * Returns 0 when the message is malformed, which the caller drops. In C for
  * the same reason the inv bounds are: a second hand-written varint walk in
  * assembly is how the first one went wrong.
@@ -96,9 +99,10 @@ int serve_inv_bounds(const unsigned char* pl, long plen,
 extern int idx_get(void* idx, const unsigned char hash[32], long* height);
 
 int serve_locator_from(const unsigned char* pl, unsigned long plen, void* htidx,
-                       long* out_from, long* out_stop){
+                       long* out_from, long* out_stop, unsigned char* out_stop_hash){
     *out_from = 0;
     *out_stop = -1;
+    if (out_stop_hash) for (int i = 0; i < 32; i++) out_stop_hash[i] = 0;
     if (!pl || !htidx) return 0;
     if (plen < 4 + 1) return 0;
 
@@ -140,6 +144,7 @@ int serve_locator_from(const unsigned char* pl, unsigned long plen, void* htidx,
 
     /* hashStop: all-zero means "as many as you have" */
     { const unsigned char* stop = pl + p + n * 32u;
+      if (out_stop_hash) for (int i = 0; i < 32; i++) out_stop_hash[i] = stop[i];
       int zero = 1;
       for (int i = 0; i < 32; i++) if (stop[i]){ zero = 0; break; }
       if (!zero){ long sh = 0; if (idx_get(htidx, stop, &sh) == 1) *out_stop = sh; } }

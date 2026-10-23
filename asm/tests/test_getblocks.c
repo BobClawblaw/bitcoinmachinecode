@@ -134,6 +134,14 @@ static int inv_height(const msg_t* m, long i){
     return -1;
 }
 
+/* the inv is exactly heights from..from+n-1, in order */
+static int inv_is_range(const msg_t* m, long from, long n){
+    unsigned off;
+    if (vec_count(m, &off) != n) return 0;
+    for (long i = 0; i < n; i++) if (inv_height(m, i) != from + i) return 0;
+    return 1;
+}
+
 /* version | CompactSize n | n hashes | stop */
 static unsigned char req[4 + 3 + 200*32 + 32];
 static unsigned build_locator(const unsigned char (*loc)[32], int n, const unsigned char* stop){
@@ -189,6 +197,28 @@ int main(void){
               pong && b && b->len == (unsigned)blen[4] && !memcmp(b->p, blk[4], b->len) && !count_cmd("notfound"), 1);
       } else cki("byte order: the inv entry, sent back as a getdata, serves block 4 byte-exact", 0, 1);
       peer_close(fd); }
+
+    /* ---- hashStop ----
+     * Core walks from the fork point's successor and breaks BEFORE the block
+     * whose hash is hashStop (exclusive), at most 500 entries. A stop at or
+     * below the start height, or unknown, is never met: the full 500 go out.
+     * The handler ignored hashStop. Locator [block 3] throughout: the walk
+     * starts at 4. */
+    { static const struct { int stop; const char* what; long n; } C[] = {
+          {  7, "a stop at height 7 announces 4..6 (exclusive)",           3 },
+          {  2, "a stop below the start height limits nothing (500)",     500 },
+          {  3, "a stop AT the fork point limits nothing (500)",          500 },
+          { -1, "an unknown stop hash limits nothing (500)",              500 } };
+      for (unsigned k = 0; k < sizeof C / sizeof C[0]; k++){
+          int fd = peer_open();
+          unsigned char loc[1][32]; memcpy(loc[0], bhash[3], 32);
+          unsigned char unk[32]; memset(unk, 0xee, 32);
+          send_getblocks(fd, (const unsigned char (*)[32])loc, 1, C[k].stop >= 0 ? bhash[C[k].stop] : unk);
+          int pong = reply(fd);
+          char lbl[160]; snprintf(lbl, sizeof lbl, "hashStop: %s", C[k].what);
+          cki(lbl, pong && count_cmd("inv") == 1 && inv_is_range(first_cmd("inv"), 4, C[k].n), 1);
+          peer_close(fd);
+      } }
 
     close(ls);
     printf("\n%s (%d failures)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED", failures);
