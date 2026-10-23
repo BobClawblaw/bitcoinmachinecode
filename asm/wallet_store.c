@@ -19,8 +19,18 @@
  *   - Key derivation: K[64] = bip39_mnemonic_to_seed("", secret_password)
  *       = PBKDF2-HMAC-SHA512(password=secret, salt="", 2048 iters, 64 bytes),
  *     reusing the exact BIP39 primitive already verified in the link chain.
- *   - Encryption: CTR stream; keystream block i = sha512_full(K || u32le(i)),
- *     XORed over the mnemonic bytes. Requires only hmac/sha512 already linked.
+ *   - Encryption (v2, LEGACY): what the code below actually computes is
+ *     keystream block = sha512_full(u32le(counter) || 0^4) XOR K -- the key is
+ *     NOT hashed with the counter, whatever this comment used to say
+ *     ("sha512_full(K || u32le(i))"). The hash input is public, so every
+ *     block is a fixed public pad XOR the same 64-byte K: one known 64-byte
+ *     run of plaintext (a BIP39 mnemonic is mostly dictionary words) yields K
+ *     and with it the whole file. CRY-1 (audit 2026-10-23). A v2 file is
+ *     therefore PLAINTEXT for every purpose but casual viewing; see
+ *     legacy_cipher_warning() below and docs/OPERATIONS.md.
+ *     Nothing writes v2 (or the legacy secret-blob shape) any more -- every
+ *     write goes through store_write_sealed -- and the read path survives
+ *     only so an old file can be migrated.
  *   - Integrity & wrong-password detection: tag = sha512_full(K || "BMCWAL-tag"
  *     || ciphertext)[0..31] stored in the file; recomputed + compared on load.
  *   - Backward compatible: V1 plaintext wallets (no encryption) still load; the
@@ -52,6 +62,7 @@
 #include <fcntl.h>
 #include <stdint.h>
 #include <sys/stat.h>
+#include "daemon/secure_zero.h"
 
 #define BMCWAL_MAGIC_V1 "BMCWAL v1"
 #define BMCWAL_MAGIC_V2 "BMCWAL v2"   /* LEGACY, read-only since 2026-09-02: 2048-iteration PBKDF2, custom CTR/tag */
@@ -70,8 +81,13 @@ static int store_write_atomic(const char* path, const char* body){
      * creates at 0666 & ~umask, so the mnemonic was briefly world-readable
      * under the tmp name -- the same window the old plaintext path had under
      * the real name, just less obvious. */
-    int tfd = open(tmp, O_WRONLY|O_CREAT|O_TRUNC, 0600);
+    /* O_NOFOLLOW: a symlink planted at the tmp name is refused rather than
+     * followed; fchmod: a tmp left over from a crash keeps its old mode
+     * through O_CREAT, so set 0600 on the fd before the secret is written
+     * (HST-7, audit 2026-10-23). */
+    int tfd = open(tmp, O_WRONLY|O_CREAT|O_TRUNC|O_NOFOLLOW|O_CLOEXEC, 0600);
     if (tfd < 0) return -1;
+    if (fchmod(tfd, 0600) != 0){ close(tfd); remove(tmp); return -1; }
     FILE* f = fdopen(tfd, "w"); if (!f){ close(tfd); remove(tmp); return -1; }
     int ok = fputs(body, f) >= 0 && fflush(f) == 0;
     /* ---- WAL-4 (audit 2026-09-03): fsync the file, then the directory.
@@ -135,8 +151,8 @@ static long store_open_sealed(const char* hex, const char* pass, char* out, int 
     unsigned char plain[4096];
     long n = wcrypt_open(pass, (long)strlen(pass), blob, hl / 2, plain, sizeof plain);
     free(blob);
-    if (n <= 0 || n >= cap) return n <= 0 ? n : -1;
-    memcpy(out, plain, (size_t)n); out[n] = 0; memset(plain, 0, sizeof plain);
+    if (n <= 0 || n >= cap){ secure_zero(plain, sizeof plain); return n <= 0 ? n : -1; }
+    memcpy(out, plain, (size_t)n); out[n] = 0; secure_zero(plain, sizeof plain);
     return n;
 }
 
@@ -217,7 +233,33 @@ static void make_tag(unsigned char tag[32], const unsigned char K[64],
     unsigned char d[64];
     sha512_full(d, buf, 68 + ctlen);
     memcpy(tag, d, 32);
+    secure_zero(buf, 64);          /* the key prefix */
+    secure_zero(d, sizeof d);
     free(buf);
+}
+
+/* ---------------------------------------------------------------- CRY-1
+ * (audit 2026-10-23) The legacy cipher (ctr_xor above) XORs every 64-byte
+ * block with K and a PUBLIC pad, so 64 known bytes of plaintext recover K and
+ * decrypt the whole file -- the passphrase protected nothing. Upgrading to v3
+ * on open fixes the file on disk from then on, but it cannot reach a copy:
+ * a backup, a snapshot, an rsync target, the NAS. Every one of those is, in
+ * effect, the mnemonic in the clear.
+ *
+ * The decryption math is deliberately unchanged (it must still read the old
+ * files to migrate them); what changes is that opening one SAYS so, loudly,
+ * every time, whether or not the passphrase was right -- the file is weak
+ * regardless of who opens it. */
+static void legacy_cipher_warning(const char* path, const char* what){
+    fprintf(stderr,
+        "[wallet] SECURITY WARNING: %s is a %s written with the legacy BMCWAL v2 cipher.\n"
+        "[wallet]   That cipher is broken (CRY-1): anyone holding this file, or ANY copy or\n"
+        "[wallet]   backup of it, can recover the secret inside WITHOUT the passphrase.\n"
+        "[wallet]   Treat the file and every copy of it as PLAINTEXT. Upgrading it in place\n"
+        "[wallet]   does not protect copies made before today: move the funds to a wallet\n"
+        "[wallet]   created fresh by this build, then destroy the old copies.\n"
+        "[wallet]   See docs/OPERATIONS.md (\"Legacy BMCWAL v2 wallet files\").\n",
+        path, what);
 }
 
 /* ---- public API ------------------------------------------------------ */
@@ -299,27 +341,29 @@ int wallet_store_load(const char* path, char* mnemonic_out, int cap,
         /* Encrypted wallet: the secret passphrase is NOT in the file. The caller
          * supplies it via the *input* value of pass_out (pre-filled), else via
          * env BMC_WALLET_PASS. Return -1 if it's wrong/missing. */
+        legacy_cipher_warning(path, "wallet mnemonic file");
         const char* sec = NULL;
         if (pass_out && pcap > 0 && pass_out[0]) sec = pass_out;   /* caller pre-filled */
         if (!sec) sec = getenv("BMC_WALLET_PASS");
         if (!sec || !sec[0]) { if (pass_out && pcap>0) pass_out[0] = 0; return -1; }
         unsigned char K[64];
         if (!deriv_key(K, sec)) return -1;    /* CRY-4: over-long passphrase */
-        int ctlen = (int)(strlen(cthex)/2); if (ctlen <= 0) return -1;
+        int ctlen = (int)(strlen(cthex)/2);
         /* first pass validate hex length (must be even) */
-        if ((int)strlen(cthex) & 1) return -1;
+        if (ctlen <= 0 || ((int)strlen(cthex) & 1)) { secure_zero(K, sizeof K); return -1; }
         unsigned char* ct = (unsigned char*)malloc((size_t)ctlen);
-        if (!ct) return -1;
-        if (hex_decode(ct, cthex) != ctlen) { free(ct); return -1; }
+        if (!ct) { secure_zero(K, sizeof K); return -1; }
+        if (hex_decode(ct, cthex) != ctlen) { secure_zero(K, sizeof K); free(ct); return -1; }
         unsigned char tag[32]; make_tag(tag, K, ct, ctlen);
         unsigned char exp[32];
-        if (hex_decode(exp, taghex) != 32) { free(ct); return -1; }
-        if (memcmp(tag, exp, 32) != 0) { free(ct); return -1; }  /* wrong passphrase */
+        if (hex_decode(exp, taghex) != 32 || memcmp(tag, exp, 32) != 0) {   /* wrong passphrase */
+            secure_zero(K, sizeof K); free(ct); return -1; }
         ctr_xor(ct, ct, ctlen, K);
+        secure_zero(K, sizeof K);
         if (ctlen >= cap) ctlen = cap - 1;
         memcpy(mnemonic_out, ct, (size_t)ctlen);
         mnemonic_out[ctlen] = 0;
-        free(ct);
+        secure_zero(ct, (size_t)ctlen); free(ct);
         /* legacy opened with the right passphrase: rewrite it in the strong
          * container now, atomically, so the 2048-iteration file stops existing */
         if (store_write_sealed(path, BMCWAL_MAGIC_V3, sec, mnemonic_out) == 0)
@@ -383,6 +427,7 @@ int wallet_secret_read(const char* path, const char* magic,
         return n > 0 ? 0 : -1;
     }
     if (!seen_magic || !cthex || !taghex[0]){ free(cthex); return -1; }
+    legacy_cipher_warning(path, "secret blob");
     int ctn = (int)strlen(cthex) / 2;
     if (ctn <= 0 || ctn >= cap){ free(cthex); return -1; }
     unsigned char* ct = (unsigned char*)malloc((size_t)ctn + 1);
@@ -395,10 +440,10 @@ int wallet_secret_read(const char* path, const char* magic,
     unsigned char tag[32];
     make_tag(tag, K, ct, ctn);
     if (memcmp(tag, want, 32) != 0){          /* wrong passphrase, or tampering */
-        memset(K, 0, sizeof K); free(ct); free(cthex); return -1; }
+        secure_zero(K, sizeof K); free(ct); free(cthex); return -1; }
     ctr_xor((unsigned char*)out, ct, ctn, K);
     out[ctn] = 0;
-    memset(K, 0, sizeof K);
+    secure_zero(K, sizeof K);
     free(ct); free(cthex);
     /* legacy blob opened with the right passphrase: rewrite it sealed, atomically */
     if (store_write_sealed(path, magic, pass, out) == 0)

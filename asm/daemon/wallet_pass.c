@@ -60,13 +60,23 @@ static void secure_wipe_local(void* p, size_t n){
 }
 
 static int read_secret_file(const char* path, char* out, int cap, const char** why){
+    /* Audit 2026-10-23 (INFO): this was stat(path) and then open(path), so
+     * the checks judged one file and the read could get another -- swap the
+     * name between the two calls and an unvetted file is read. Open first
+     * (O_NONBLOCK, so a FIFO planted at the name cannot hang the boot) and
+     * judge the descriptor that is then read. And the file must belong to
+     * root or to this account: a 0640 file owned by another unprivileged
+     * user is one that user can rewrite. */
+    int fd = open(path, O_RDONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);
+    if (fd < 0){ if (why) *why = access(path, F_OK) == 0 ? "unreadable by the service account" : "no such file"; return 0; }
     struct stat sb;
-    if (stat(path, &sb) != 0){ if (why) *why = "no such file"; return 0; }
-    if (!S_ISREG(sb.st_mode)){ if (why) *why = "not a regular file"; return 0; }
+    if (fstat(fd, &sb) != 0){ close(fd); if (why) *why = "unreadable by the service account"; return 0; }
+    if (!S_ISREG(sb.st_mode)){ close(fd); if (why) *why = "not a regular file"; return 0; }
     /* 0640 root:<group> is the intended shape; 0600 is fine too. Anything
      * world-readable, world-writable or group-writable is refused. */
-    if (sb.st_mode & 0007){ if (why) *why = "world-accessible (need mode 0640 or stricter)"; return 0; }
-    if (sb.st_mode & 0020){ if (why) *why = "group-writable (need mode 0640 or stricter)"; return 0; }
+    if (sb.st_mode & 0007){ close(fd); if (why) *why = "world-accessible (need mode 0640 or stricter)"; return 0; }
+    if (sb.st_mode & 0020){ close(fd); if (why) *why = "group-writable (need mode 0640 or stricter)"; return 0; }
+    if (sb.st_uid != 0 && sb.st_uid != geteuid()){ close(fd); if (why) *why = "owned by another account (need root or the service account)"; return 0; }
 
     /* ---- DMN-13 (audit 2026-09-03): read(2), and REFUSE rather than truncate
      *
@@ -88,8 +98,6 @@ static int read_secret_file(const char* path, char* out, int cap, const char** w
      * Refuse on overflow rather than silently shortening: a passphrase the
      * node cannot read in full is one it cannot use, and saying so is the only
      * answer that does not lose funds behind a misleading error. */
-    int fd = open(path, O_RDONLY);
-    if (fd < 0){ if (why) *why = "unreadable by the service account"; return 0; }
     out[0] = 0;
     long got = 0;
     for (;;){
@@ -147,11 +155,20 @@ int wallet_pass_load(char* out, int cap, const char** why){
     }
     /* Inside the datadir it would be swept up by any backup of the datadir,
      * which is the whole failure this replaces. The daemon has already
-     * chdir'd into the datadir, so its realpath is the comparison. */
-    { char dd[4096];
+     * chdir'd into the datadir, so its realpath is the comparison.
+     *
+     * Audit 2026-10-23 (INFO): the configured string was compared with the
+     * datadir as a prefix, so a path that only RESOLVES into the datadir --
+     * through "..", or a symlink outside it pointing in -- passed. Both sides
+     * are now resolved first. (A file that does not exist does not resolve;
+     * the read below refuses it as missing.) */
+    { char dd[4096], rp[4096];
+      const char* cmp = realpath(pf, rp) ? rp : pf;
       if (getcwd(dd, sizeof dd)){
+          char rdd[4096];
+          if (realpath(dd, rdd)) snprintf(dd, sizeof dd, "%s", rdd);
           size_t n = strlen(dd);
-          if (!strncmp(pf, dd, n) && (pf[n] == '/' || pf[n] == 0)){
+          if (!strncmp(cmp, dd, n) && (cmp[n] == '/' || cmp[n] == 0)){
               fprintf(stderr, "[wallet] walletpassfile \"%s\" is inside the datadir -- refusing; "
                               "put it somewhere a datadir backup will not carry it\n", pf);
               if (why) *why = "inside the datadir";

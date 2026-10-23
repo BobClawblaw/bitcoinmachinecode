@@ -4188,6 +4188,7 @@ static int dh_start_slot(const char* host, int out_port, int want_slot){
         }
         (void)!sendmsg(sp[1], &mh, 0);
         if(r.v2_len){ unsigned long off = 0; while(off < r.v2_len){ ssize_t w = write(sp[1], blob + off, r.v2_len - off); if(w <= 0) break; off += (unsigned long)w; } }
+        secure_zero(blob, r.v2_len);   /* CRY-4: the session keys, handed over; this child lingers until the worker has the fd */
         /* Hold on until the worker has the fd: dh_poll writes one byte and
          * closes its end after the recvmsg, and the byte wakes this poll even
          * when another process still holds that end (2026-09-25; the close
@@ -4385,7 +4386,7 @@ static int dh_poll(dh_result_t* out, int* fd_out, char* host_out, size_t hcap){
                 if(out->v2_len > DH_V2_BLOB_CAP){ out->ok = 0; snprintf(out->why, sizeof out->why, "v2 session too large"); }
                 else { unsigned long off = 0; struct pollfd pf = { g_dh[i].sp, POLLIN, 0 };
                        while(off < out->v2_len){ if(poll(&pf, 1, 2000) <= 0) break; ssize_t r = read(g_dh[i].sp, g_dh_v2_blob + off, out->v2_len - off); if(r <= 0) break; off += (unsigned long)r; }
-                       if(off == out->v2_len) g_dh_v2_len = off; else { out->ok = 0; snprintf(out->why, sizeof out->why, "v2 session truncated on the socketpair"); } }
+                       if(off == out->v2_len) g_dh_v2_len = off; else { secure_zero(g_dh_v2_blob, off); out->ok = 0; snprintf(out->why, sizeof out->why, "v2 session truncated on the socketpair"); } }
                 if(!out->ok && *fd_out >= 0){ close(*fd_out); *fd_out = -1; }
             }
         } else if(n != (ssize_t)sizeof *out){ out->ok = 0; snprintf(out->why, sizeof out->why, "helper exited without a result"); }
@@ -4407,12 +4408,14 @@ static int dh_poll(dh_result_t* out, int* fd_out, char* host_out, size_t hcap){
 }
 /* install a helper-dialled leg exactly as the inline fill does */
 static int dh_install_leg(const char* host, int fd, const dh_result_t* r){
-    for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && !strcmp(mux_out_host[k], host)){ close(fd); return 0; }   /* already a leg */
+    for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && !strcmp(mux_out_host[k], host)){ secure_zero(g_dh_v2_blob, g_dh_v2_len); g_dh_v2_len = 0; close(fd); return 0; }   /* already a leg (CRY-4: its session copy goes too) */
     if(r->v2_len){                                     /* the helper's v2 session: ours now, before the first write (2026-09-10) */
         if(g_dh_v2_len != r->v2_len || !bmc_v2_import(fd, g_dh_v2_blob, g_dh_v2_len)){
             fprintf(stderr, "[dial] %s: the helper's v2 session could not be imported -- leg not installed\n", host);
+            secure_zero(g_dh_v2_blob, g_dh_v2_len);
             g_dh_v2_len = 0; close(fd); return 0;
         }
+        secure_zero(g_dh_v2_blob, g_dh_v2_len);   /* CRY-4: imported; the copy goes */
         g_dh_v2_len = 0;
     }
     g_peer_version_len = r->vlen; if(r->vlen) memcpy(g_peer_version_payload, r->vpayload, (size_t)r->vlen);
@@ -7685,7 +7688,8 @@ static int leg_pass_start(int i, unsigned budget_s){
         if(mux_out_fd[i] >= 0 && bmc_v2_is_active(mux_out_fd[i])){ long b = bmc_v2_export(mux_out_fd[i], blob, sizeof blob); r.v2_len = b > 0 ? (unsigned long)b : 0; if(b <= 0){ r.fail_code = 99; long nd = bmc_v2_export_need(mux_out_fd[i]); r.v2_need = nd > 0 ? (unsigned long)nd : 0; } }
         unsigned long off = 0; const unsigned char* q = (const unsigned char*)&r;
         while(off < sizeof r){ ssize_t w = write(pp[1], q + off, sizeof r - off); if(w <= 0) _exit(1); off += (unsigned long)w; }
-        off = 0; while(off < r.v2_len){ ssize_t w = write(pp[1], blob + off, r.v2_len - off); if(w <= 0) _exit(1); off += (unsigned long)w; }
+        off = 0; while(off < r.v2_len){ ssize_t w = write(pp[1], blob + off, r.v2_len - off); if(w <= 0){ secure_zero(blob, r.v2_len); _exit(1); } off += (unsigned long)w; }
+        secure_zero(blob, r.v2_len);   /* CRY-4 */
         _exit(0);
     }
     close(pp[1]);
@@ -7779,6 +7783,7 @@ static long leg_pass_poll(int* stored_leg, const char* srcpool[], int nsrc, int 
         if(good && r.v2_len){ if(r.v2_len > DH_V2_BLOB_CAP) good = 0; else while(got < r.v2_len){ ssize_t n = read(g_pass[i].fd, blob + got, r.v2_len - got); if(n <= 0) break; got += (unsigned long)n; } }
         int st = 0; if(!dl_reap_bounded(g_pass[i].pid, &st, 5000)) dl_kill_reap(g_pass[i].pid, &st, "pass helper"); close(g_pass[i].fd); g_pass[i].pid = 0;
         if(!good || (r.v2_len && got != r.v2_len)){
+            secure_zero(blob, got);        /* CRY-4: a partial session is still key material */
             g_pass_crashed++;
             char d[96];
             if(WIFSIGNALED(st)) snprintf(d, sizeof d, "the pass helper died on signal %d without a report", WTERMSIG(st));
@@ -7788,6 +7793,7 @@ static long leg_pass_poll(int* stored_leg, const char* srcpool[], int nsrc, int 
             continue;
         }
         if(r.budget_fired){
+            secure_zero(blob, got);        /* CRY-4 */
             char d[80]; snprintf(d, sizeof d, "the pass exceeded %us%s (where=%d)", g_pass[i].budget_s, g_pass[i].budget_s > (unsigned)DL_BUDGET_SECS ? ", the only-leg budget" : "", r.fail_code);
             leg_close_ours(i, "sync-budget", d);
             mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i] = dh_now_ms() + redial_gap_ms();
@@ -7795,6 +7801,7 @@ static long leg_pass_poll(int* stored_leg, const char* srcpool[], int nsrc, int 
         }
         inflight_release_leg(&g_inflight, i);            /* the announced block's claim, if this pass carried one */
         long n = leg_pass_finish(i, &r, blob, got);
+        secure_zero(blob, got);            /* CRY-4: imported (or refused); the parent's copy of the session keys goes */
         if(n > 0){ stored += n; if(stored_leg) *stored_leg = i; }
         else if(mux_out_fd[i] < 0){ mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i] = dh_now_ms() + redial_gap_ms(); }   /* the bookkeeping closed it */
     }
@@ -11971,7 +11978,7 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
           } else {
               fprintf(stderr, "[rpc] encrypted wallet adopted (locked -- use walletpassphrase)\n");
           }
-          memset(boot_pass, 0, sizeof boot_pass);
+          secure_zero(boot_pass, sizeof boot_pass);   /* CRY-3: a memset of a dead local is deleted at -O2 */
       } else {
     { extern int wallet_store_load(const char*, char*, int, char*, int);
       extern long wallet_mnemonic_seed(unsigned char seed[64], const char* mn,
@@ -12003,7 +12010,12 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
                               "(encrypted? set BMC_WALLET_PASS or walletpassfile=)\n", cand[wi]);
           }
           break;
-      } } } }
+      }
+      /* CRY-3 (audit 2026-10-23): the passphrase stayed in this static for
+       * the life of the process; the copy the provider needs is
+       * g_wallet_bip39pass, which encryptwallet wipes. */
+      secure_zero(wpass, sizeof wpass);
+      secure_zero(mn, sizeof mn); } } }
     /* Hand the RPC layer the SHARED mempool (allocated pre-fork by
      * mempool_configure, written by the worker + inbound children) so
      * getrawmempool/getmempoolinfo report the real pool. All-null when the

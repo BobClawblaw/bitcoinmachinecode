@@ -61,7 +61,8 @@ scalar_small_nonzero:
     xor rcx, rcx
 .cmp:
     cmp rcx, 32
-    jae .ok
+    jae .bad            ; every byte equal: k == n, which is NOT < n (audit 2026-10-23;
+                        ; this was `jae .ok`, so k == n passed the 0 < k < n check)
     mov al, byte [rdi+rcx]
     mov r8b, byte [rdx+rcx]
     cmp al, r8b

@@ -60,6 +60,44 @@ static int make_keys(unsigned char sk[32], unsigned char es[64], int seed){
     return ellswift_create(es, sk, 0, 0);
 }
 
+/* ---- CRY-4 (audit 2026-10-23): key material in dead stack frames. The
+ * routine runs, then an open-coded loop (no call of its own lands on the
+ * frames being read) copies the dead stack below the caller into a heap
+ * snapshot, which is searched. The region is zeroed first, so a residue
+ * the test's own setup left there cannot be mistaken for the callee's. */
+#include <stdint.h>
+#include "../crypto_hkdf.h"
+#include "../crypto_poly1305.h"
+#include "../crypto_chacha20.h"
+#define STACK_SCAN (64 * 1024)
+static __attribute__((noinline)) void stack_clear(void){
+    volatile unsigned char pad[STACK_SCAN + 8192];
+    for (size_t i = 0; i < sizeof pad; i++) pad[i] = 0;
+}
+static unsigned char* g_snap;
+/* the control's callee: copies the key into a local and wipes nothing */
+static __attribute__((noinline)) void leave_in_dead_frame(const unsigned char* key){
+    volatile unsigned char local[32];
+    for (int i = 0; i < 32; i++) local[i] = key[i];
+    __asm__ volatile("" : : "r"(local) : "memory");
+}
+static __attribute__((noinline)) void run_then_snap(int which, const unsigned char* key, unsigned char* out){
+    switch (which){
+    case 0: hmac_sha256(out, key, 32, (const unsigned char*)"msg", 3); break;
+    case 1: { static const unsigned char nonce[12] = {1,2,3,4,5,6,7,8,9,10,11,12};
+              static const unsigned char pt[40] = {0};
+              chacha20poly1305_encrypt(out, out + 64, pt, sizeof pt, NULL, 0, key, nonce); break; }
+    case 2: leave_in_dead_frame(key); break;
+    }
+    const volatile unsigned char* hi; __asm__ volatile("mov %%rsp, %0" : "=r"(hi));
+    const volatile unsigned char* lo = hi - STACK_SCAN;
+    for (size_t i = 0; i < STACK_SCAN; i++) g_snap[i] = lo[i];
+}
+static int snap_has(const void* needle, size_t n){
+    for (size_t i = 0; i + n <= STACK_SCAN; i++) if (!memcmp(g_snap + i, needle, n)) return 1;
+    return 0;
+}
+
 int main(void){
     printf("== the short-ID table matches BIP324 ==\n");
     ck("id 0 is the escape, not a name", bip324_shortid_name(0) == 0);
@@ -133,7 +171,29 @@ int main(void){
                              && !strcmp(got, "block") && blen == big && !memcmp(body, p, big));
         free(p); }
 
-      bip324_t_free(&A); bip324_t_free(&B); }
+      /* CRY-4: freeing a transport wipes its session keys, not only the
+       * ephemeral secret (the struct outlives the call here, so the test can
+       * look; in the node the v2_conn is freed straight after) */
+      bip324_t_free(&A); bip324_t_free(&B);
+      { const unsigned char* pa = (const unsigned char*)&A.cipher; const unsigned char* pb = (const unsigned char*)&B.cipher;
+        int za = 1, zb = 1;
+        for (unsigned long k = 0; k < sizeof A.cipher; k++){ if (pa[k]) za = 0; if (pb[k]) zb = 0; }
+        ck("CRY-4 bip324_t_free wipes the session cipher state (both ends)", za && zb); } }
+
+    printf("== CRY-4: no key material left in dead stack frames ==\n");
+    { g_snap = malloc(STACK_SCAN);
+      unsigned char* key = malloc(32); unsigned char* out = malloc(128); unsigned char* pk = malloc(64);
+      for (int i = 0; i < 32; i++) key[i] = (unsigned char)(0x3c ^ (i * 11));
+      { chacha20_ctx c; static const unsigned char nonce[12] = {1,2,3,4,5,6,7,8,9,10,11,12};
+        chacha20_init(&c, key); chacha20_seek(&c, nonce, 0); chacha20_keystream(&c, pk, 64); }
+      stack_clear(); run_then_snap(0, key, out);
+      ck("CRY-4 hmac_sha256 leaves no key on the stack", !snap_has(key, 32));
+      stack_clear(); run_then_snap(1, key, out);
+      ck("CRY-4 chacha20poly1305_encrypt leaves no key on the stack", !snap_has(key, 32));
+      ck("CRY-4 ...nor the one-time Poly1305 key", !snap_has(pk, 32));
+      stack_clear(); run_then_snap(2, key, out);
+      ck("CRY-4 control: a key left in a dead frame IS found", snap_has(key, 32));
+      free(key); free(out); free(pk); free(g_snap); }
 
     printf("== the same handshake delivered one byte at a time ==\n");
     { unsigned char ska[32], skb[32], ea[64], eb[64];

@@ -31,6 +31,7 @@
  */
 #include <string.h>
 #include "crypto_chacha20.h"
+#include "daemon/secure_zero.h"   /* CRY-4: key material is wiped with a barrier */
 
 extern int  chacha20_cpu_has_avx2(void);
 extern void chacha20_xor_avx2(unsigned char* out, const unsigned char* in,
@@ -136,6 +137,7 @@ void chacha20_crypt(chacha20_ctx* c, const unsigned char* in, unsigned char* out
         if (in){ for (unsigned long i = 0; i < n; i++) out[i] = (unsigned char)(in[i] ^ block[i]); in += n; }
         else     memcpy(out, block, n);
         out += n; len -= n;
+        if (!len) secure_zero(block, sizeof block);   /* CRY-4: the last keystream block */
     }
 }
 
