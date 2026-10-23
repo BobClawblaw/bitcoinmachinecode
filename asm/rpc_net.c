@@ -134,17 +134,25 @@ long rpc_http_post(int port, const char* user, const char* pass,
     base64_encode(cred, ul + pl + 1, b64);
     free(cred);
 
-    char head[512];
-    int hl = snprintf(head, sizeof head,
+    /* RPC-25: the head is sized to the credentials. A fixed 512-byte head
+     * was written with snprintf's unclamped return, so a long rpcuser /
+     * rpcpassword (Core sets no limit on either) sent stack bytes from past
+     * the array and cut the Authorization line. */
+    static const char HEAD_FMT[] =
         "POST / HTTP/1.1\r\n"
         "Host: 127.0.0.1:%d\r\n"
         "Authorization: Basic %s\r\n"
         "Content-Type: application/json\r\n"
         "Content-Length: %ld\r\n"
         "Connection: close\r\n"
-        "\r\n", port, b64, bodylen);
+        "\r\n";
+    int need = snprintf(NULL, 0, HEAD_FMT, port, b64, bodylen);
+    char* head = need > 0 ? malloc((size_t)need + 1) : NULL;
+    if (!head) { free(b64); close(fd); return -1; }
+    int hl = snprintf(head, (size_t)need + 1, HEAD_FMT, port, b64, bodylen);
     free(b64);
-    if (write(fd, head, (size_t)hl) != hl) { close(fd); return -1; }
+    if (hl != need || write(fd, head, (size_t)hl) != hl) { free(head); close(fd); return -1; }
+    free(head);
     if (write(fd, body, (size_t)bodylen) != bodylen) { close(fd); return -1; }
 
     char* resp = malloc(outcap + 1);

@@ -136,6 +136,23 @@ int main(void){
     snprintf(cmd, sizeof cmd, "BMC_CLI_DRYRUN=1 %s -rpcport=1 -rpcuser=u -rpcpassword=p setlabel bc1qx '[not json' false null 2>&1", BCLI);
     rc = run_sh(cmd, out, sizeof out);
     ck("false and null convert; a bracket that is not JSON stays a string", rc == 0 && strstr(out, "\"params\":[\"bc1qx\",\"[not json\",false,null]") != NULL);
+    printf("== bmc_cli: a request past 32 KB goes out whole (RPC-25) ==\n");
+    { /* the body used to live in a 32 KB stack buffer and was sent with
+       * rj_write's FULL length, so bytes past the buffer went out */
+      enum { ARGLEN = 40000 };
+      char* arg = malloc(ARGLEN + 1); char* big = malloc(ARGLEN + 4096); char* got = malloc(256 * 1024);
+      for (int i = 0; i < ARGLEN; i++) arg[i] = "0123456789abcdef"[i & 15];
+      arg[ARGLEN] = 0;
+      snprintf(big, ARGLEN + 4096, "BMC_CLI_DRYRUN=1 %s -rpcport=1 -rpcuser=u -rpcpassword=p sendrawtransaction %s 2>&1", BCLI, arg);
+      rc = run_sh(big, got, 256 * 1024);
+      char want[256]; snprintf(want, sizeof want, "\"params\":[\"");
+      char* at = strstr(got, want);
+      size_t glen = strlen(got);
+      ck("the 40,000-byte argument is in the request intact",
+         rc == 0 && at && !strncmp(at + strlen(want), arg, ARGLEN) && !strncmp(at + strlen(want) + ARGLEN, "\"]", 2));
+      ck("and nothing past the request is printed (ends with }\\n)", glen >= 2 && !strcmp(got + glen - 2, "}\n"));
+      if (fails) printf("    got %zu bytes, rc=%d\n", glen, rc);
+      free(arg); free(big); free(got); }
     printf("%s (%d failures)\n", fails ? "TESTS FAILED" : "ALL PASS", fails);
     return fails ? 1 : 0;
 }
