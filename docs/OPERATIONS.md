@@ -175,9 +175,11 @@ automatically, provide a passphrase source, in order of precedence:
 2. `walletpassfile=<absolute path>` in `bitcoin.conf`.
 
 The file is refused, with a `[wallet] walletpassfile ... not usable: <why>`
-line, if it is not absolute, is **inside the datadir**, is world-accessible
-(any `007` bit), is group-writable, is not a regular file, or is empty. The
-first line is the passphrase. The intended shape:
+line, if it is not absolute, is **inside the datadir** (after resolving
+symlinks and `..`), is world-accessible (any `007` bit), is group-writable,
+is owned by an account other than root or the service account, is not a
+regular file, or is empty. The first line is the passphrase. The intended
+shape:
 
 ```sh
 sudo install -d -m 0755 /etc/bmc
