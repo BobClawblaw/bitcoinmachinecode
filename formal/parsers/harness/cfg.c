@@ -22,6 +22,12 @@ int main(void){
 #ifdef FP_HEX
     char* s = nd_str(70); unsigned char out[32];
     int r = nodecfg_hex32_be(s, out);
+    if (r){   /* Core's nMinimumChainWork is a uint256: at most 64 hex digits */
+        const char* q = s; while (*q == ' ' || *q == '\t') q++;
+        if (q[0] == '0' && (q[1] == 'x' || q[1] == 'X')) q += 2;
+        size_t d = 0; while (q[d] && q[d] != ' ' && q[d] != '\t' && q[d] != '\r' && q[d] != '\n') d++;
+        CHECK(d >= 1 && d <= 64, "an accepted value has 1..64 hex digits");
+    }
     COVER(r && strlen(s) >= 64, "a 64-digit value");
     free(s); (void)mode; return 0;
 #else

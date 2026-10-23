@@ -14,14 +14,17 @@ mutant M-LOC-fit    locator.c "$D/serve_invbounds.c" 's/if (plen < p + n \* 32u 
 diverge X-LOC-canon  locator.c "$D/serve_invbounds.c" "CORE: accepted locator count is canonical" "--unwind 104"
 
 # ---------------------------------------------------------------- P2P: BIP324 v2 transport
-# split by phase so each fits the 8 GB cap (the whole handshake in one run did not)
-proof  P-V2-SNIFF   v2xport.c "$A/crypto_bip324_transport.c" "-DFP_START=0 -DFP_FEEDS=2 -DFP_CHUNK=20 -DFP_EXPORT=8 --unwind 66 --unwindset advance.3:6,advance.0:2"
-proof  P-V2-GARB    v2xport.c "$A/crypto_bip324_transport.c" "-DFP_START=2 -DFP_FEEDS=2 -DFP_CHUNK=24 -DFP_EXPORT=8 --unwind 66 --unwindset advance.3:6,advance.0:34"
-proof  P-V2-APP     v2xport.c "$A/crypto_bip324_transport.c" "-DFP_START=4 -DFP_FEEDS=2 -DFP_CHUNK=40 -DFP_EXPORT=1200 --unwind 66 --unwindset advance.3:6,advance.0:2"
-mutant M-V2-garb    v2xport.c "$A/crypto_bip324_transport.c" 's/if (i > BIP324_MAX_GARBAGE_LEN) return 0;/if (i > BIP324_MAX_GARBAGE_LEN + 1) return 0;/' "garbage beyond" "-DFP_GARB -DFP_START=0 -DFP_CHUNK=4 -DFP_EXPORT=8 --unwind 66 --unwindset advance.3:6,advance.0:4120"
-proof  P-V2-GBOUND  v2xport.c "$A/crypto_bip324_transport.c" "-DFP_GARB -DFP_START=0 -DFP_CHUNK=4 -DFP_EXPORT=8 --unwind 66 --unwindset advance.3:6,advance.0:4120"
-mutant M-V2-short   v2xport.c "$A/crypto_bip324_transport.c" 's/if (t->pending_len < 13){ free(plain); return 0; }/if (t->pending_len < 2){ free(plain); return 0; }/' "" "-DFP_START=4 -DFP_FEEDS=2 -DFP_CHUNK=40 -DFP_EXPORT=1200 --unwind 66 --unwindset advance.3:6,advance.0:2"
-diverge X-V2-type   v2xport.c "$A/crypto_bip324_transport.c" "CORE:" "-DFP_START=4 -DFP_FEEDS=2 -DFP_CHUNK=40 -DFP_EXPORT=1200 --unwind 66 --unwindset advance.3:6,advance.0:2"
+# OPEN: every phase of this harness exceeded the 8 GB cap, down to one 24-byte
+# feed in the application state with the cipher stubbed and secure_zero's
+# asm barrier removed; kept, not run. X-V2-type is confirmed concretely
+# (confirm/c_v2.c) on the real transport with the real cipher.
+#OPEN proof  P-V2-SNIFF   v2xport.c "$A/crypto_bip324_transport.c" "-DFP_START=0 -DFP_FEEDS=1 -DFP_CHUNK=20 -DFP_EXPORT=8 --unwind 66 --unwindset advance.3:4,advance.0:2"
+#OPEN proof  P-V2-GARB    v2xport.c "$A/crypto_bip324_transport.c" "-DFP_START=2 -DFP_FEEDS=1 -DFP_CHUNK=24 -DFP_EXPORT=8 --unwind 66 --unwindset advance.3:4,advance.0:10"
+#OPEN proof  P-V2-APP     v2xport.c "$A/crypto_bip324_transport.c" "-DFP_START=4 -DFP_FEEDS=2 -DFP_CHUNK=24 -DFP_EXPORT=1200 --unwind 66 --unwindset advance.3:4,advance.0:2"
+#OPEN mutant M-V2-garb    v2xport.c "$A/crypto_bip324_transport.c" 's/if (i > BIP324_MAX_GARBAGE_LEN) return 0;/if (i > BIP324_MAX_GARBAGE_LEN + 1) return 0;/' "garbage beyond" "-DFP_GARB -DFP_START=0 -DFP_CHUNK=4 -DFP_EXPORT=8 --unwind 66 --unwindset advance.3:6,advance.0:4120"
+#OPEN proof  P-V2-GBOUND  v2xport.c "$A/crypto_bip324_transport.c" "-DFP_GARB -DFP_START=0 -DFP_CHUNK=4 -DFP_EXPORT=8 --unwind 66 --unwindset advance.3:6,advance.0:4120"
+#OPEN mutant M-V2-short   v2xport.c "$A/crypto_bip324_transport.c" 's/if (t->pending_len < 13){ free(plain); return 0; }/if (t->pending_len < 2){ free(plain); return 0; }/' "" "-DFP_START=4 -DFP_FEEDS=2 -DFP_CHUNK=24 -DFP_EXPORT=1200 --unwind 66 --unwindset advance.3:4,advance.0:2"
+#OPEN diverge X-V2-type   v2xport.c "$A/crypto_bip324_transport.c" "CORE:" "-DFP_START=4 -DFP_FEEDS=2 -DFP_CHUNK=24 -DFP_EXPORT=1200 --unwind 66 --unwindset advance.3:4,advance.0:2"
 
 # ---------------------------------------------------------------- block / tx witness (peer blocks, compact reconstructions)
 # P-BWTX takes ~15 min. Its mutants target one ASSERTION each, so they check
@@ -102,25 +105,32 @@ diverge X-IRS-wrap  irs.c "$D/index_runs.c" "CORE: sparse table inside the mappi
 #OPEN mutant M-HDRTREE-rs hdrtree.c "$D/hdr_tree.c" 's/if (n <= g_cap) return 1;/if (n <= g_cap + 1) return 1;/' "" "-DFP_STUB_PRINTF -DFP_FSZ=100 --unwind 4 --unwindset memcmp.0:33,block_hash.0:33,main.0:81"
 
 # ---------------------------------------------------------------- P2P: BIP152 compact blocks
-# MODEL CHANGE (stated in the README): CR_MAX_TX lowered from 20000 to 16 in a
+# OPEN: over the 8 GB cap even with the model change below and a 100-byte
+# payload (the minimum is 90: header + nonce); kept, not run.
+# MODEL CHANGE (stated in the README): CR_MAX_TX 20000 -> 4, HT_BITS 21 -> 4,
+# HT_MIN_BITS 12 -> 2 and the 4 MiB prefilled-copy buffer -> 256 bytes, in a
 # scratch copy, so the per-block arrays and the loops over ntx are within
 # the unwinding bound; every check in the code is written against the macro.
-CMPCT_M='s/#define CR_MAX_TX 20000/#define CR_MAX_TX 16/'
-proofm P-CMPCT      cmpct.c "$D/cmpct_recv.c" "$CMPCT_M" "-DFP_N=104 --unwind 24"
-proofm P-BTXN       cmpct.c "$D/cmpct_recv.c" "$CMPCT_M" "-DFP_BLOCKTXN -DFP_N=104 --unwind 24"
+CMPCT_M='s/#define CR_MAX_TX 20000/#define CR_MAX_TX 4/;s/#define HT_BITS 21 /#define HT_BITS 4 /;s/#define HT_MIN_BITS 12 /#define HT_MIN_BITS 2 /;s/unsigned char pre\[4 << 20\];/unsigned char pre[256];/'
+#OPEN proofm P-CMPCT      cmpct.c "$D/cmpct_recv.c" "$CMPCT_M" "-DFP_STUB_PRINTF -DFP_N=100 --unwind 10 --unwindset main.0:33,block_hash.0:33,sha256_full.0:33,tx_wtxid.0:33,ht_build.2:9"
+#OPEN proofm P-BTXN       cmpct.c "$D/cmpct_recv.c" "$CMPCT_M" "-DFP_STUB_PRINTF -DFP_BLOCKTXN -DFP_N=100 --unwind 10 --unwindset main.0:33,block_hash.0:33,sha256_full.0:33,tx_wtxid.0:33,ht_build.2:9"
 
 # ---------------------------------------------------------------- RPC: HTTP request line, pre-auth headers
 # @noconv: (unsigned char) reads of char bytes are intended
 proof  P-HTTP       http.c "$A/rpc_net.c" "@noconv -DFP_N=24 --unwind 26"
 mutant M-HTTP-ctl   http.c "$A/rpc_net.c" 's/if ((unsigned char)\*q < 0x20 || (unsigned char)\*q == 0x7f) return 0;/(void)0;/' "no control byte" "@noconv -DFP_N=24 --unwind 26"
-proof  P-AUTH       auth.c "$A/rpc_server.c" "@noconv -DFP_STUB_PRINTF -DFP_N=16 --unwind 18 --slice-formula"
-mutant M-AUTH-b64   auth.c "$A/rpc_server.c" 's|size_t out_cap = (inlen / 4) \* 3 + 3;|size_t out_cap = (inlen / 4) * 3;|' "" "@noconv -DFP_STUB_PRINTF -DFP_N=16 --unwind 18 --slice-formula"
-mutant M-AUTH-empty auth.c "$A/rpc_server.c" 's/if (!\*pass) by_pass = 0;/(void)0;/' "empty configured password" "@noconv -DFP_STUB_PRINTF -DFP_N=16 --unwind 18 --slice-formula"
+# OPEN (P-AUTH and its mutants): over the 8 GB cap even at a 16-byte header
+# block; kept, not run.
+#OPEN proof  P-AUTH       auth.c "$A/rpc_server.c" "@noconv -DFP_STUB_PRINTF -DFP_N=16 --unwind 18 --slice-formula"
+#OPEN mutant M-AUTH-b64   auth.c "$A/rpc_server.c" 's|size_t out_cap = (inlen / 4) \* 3 + 3;|size_t out_cap = (inlen / 4) * 3;|' "" "@noconv -DFP_STUB_PRINTF -DFP_N=16 --unwind 18 --slice-formula"
+#OPEN mutant M-AUTH-empty auth.c "$A/rpc_server.c" 's/if (!\*pass) by_pass = 0;/(void)0;/' "empty configured password" "@noconv -DFP_STUB_PRINTF -DFP_N=16 --unwind 18 --slice-formula"
 
 # ---------------------------------------------------------------- disk (-asmap) / P2P addresses: ASMap interpreter
-proof  P-ASMAP      asmap.c "$D/asmap.c" "-DFP_N=3 --unwind 26 --slice-formula"
-mutant M-ASMAP-bit  asmap.c "$D/asmap.c" 's/if (\*bitpos >= nbytes \* 8) return -1;/if (*bitpos > nbytes * 8) return -1;/' "" "-DFP_N=3 --unwind 26 --slice-formula"
-mutant M-ASMAP-ip   asmap.c "$D/asmap.c" 's/if ((int)(ip_bits_end - ip_bit) < matchlen) break;/(void)0;/' "" "-DFP_N=3 --unwind 26 --slice-formula"
+# OPEN: over the 8 GB cap even on a 2-byte bytecode (26 nested size classes
+# per JUMP, each bit read a 64-bit divide/modulo by 8); kept, not run.
+#OPEN proof  P-ASMAP      asmap.c "$D/asmap.c" "-DFP_N=2 --unwind 18 --slice-formula"
+#OPEN mutant M-ASMAP-bit  asmap.c "$D/asmap.c" 's/if (\*bitpos >= nbytes \* 8) return -1;/if (*bitpos > nbytes * 8) return -1;/' "" "-DFP_N=2 --unwind 18 --slice-formula"
+#OPEN mutant M-ASMAP-ip   asmap.c "$D/asmap.c" 's/if ((int)(ip_bits_end - ip_bit) < matchlen) break;/(void)0;/' "" "-DFP_N=2 --unwind 18 --slice-formula"
 
 # ---------------------------------------------------------------- P2P: version payload (BIP330 offer), sendtxrcncl
 # @noconv: the u32 protocol version is read into an int (a value >= 2^31 is
@@ -143,12 +153,16 @@ mutant M-CF-range   cfilters.c "$D/serve_cfilters.c" "$CF_M;s/if (stop - start +
 mutant M-CF-cap     cfilters.c "$D/serve_cfilters.c" "$CF_M;s/if (len > cap) return 0;/(void)0;/" "" "-DFP_KIND=0 @noconv -DFP_STUB_PRINTF --unwind 9 --unwindset memcmp.0:9,strcmp.0:14,cf_hash_fd.0:33"
 
 # ---------------------------------------------------------------- REST (unauthenticated with rest=1): getutxos body
-proof  P-REST       rest.c "$A/rest.c" "-DFP_STUB_PRINTF @noconv -DFP_P=4 -DFP_B=38 --unwind 40"
-mutant M-REST-fit   rest.c "$A/rest.c" 's/if (rawlen < p + (long)cnt \* 36){/if (rawlen < p + (long)cnt * 35){/' "" "-DFP_STUB_PRINTF @noconv -DFP_P=4 -DFP_B=38 --unwind 40"
-mutant M-REST-cs    rest.c "$A/rest.c" 's/if (cnt == 253){ if (rawlen < p + 2)/if (cnt == 253){ if (rawlen < p + 1)/' "" "-DFP_STUB_PRINTF @noconv -DFP_P=4 -DFP_B=38 --unwind 40"
+# OPEN: symbolic execution did not finish in 15 min (the reply is built with
+# rpc_json.c, whose own harness is OPEN for the same reason); kept, not run.
+#OPEN proof  P-REST       rest.c "$A/rest.c" "-DFP_STUB_PRINTF @noconv -DFP_P=4 -DFP_B=38 --unwind 40"
+#OPEN mutant M-REST-fit   rest.c "$A/rest.c" 's/if (rawlen < p + (long)cnt \* 36){/if (rawlen < p + (long)cnt * 35){/' "" "-DFP_STUB_PRINTF @noconv -DFP_P=4 -DFP_B=38 --unwind 40"
+#OPEN mutant M-REST-cs    rest.c "$A/rest.c" 's/if (cnt == 253){ if (rawlen < p + 2)/if (cnt == 253){ if (rawlen < p + 1)/' "" "-DFP_STUB_PRINTF @noconv -DFP_P=4 -DFP_B=38 --unwind 40"
 
 # ---------------------------------------------------------------- config file lines
-proof  P-CFG        cfg.c "$D/node_config.c" "-DFP_STUB_PRINTF -DFP_N=8 --unwind 10 --unwindset cfg_addlist.0:34"
+# OPEN (P-CFG, M-CFG-hcap: classify / host:port / addlist): over the 8 GB cap
+# at 8-byte lines; only the hex reader (P-CFGHEX) is run.
+#OPEN proof  P-CFG        cfg.c "$D/node_config.c" "-DFP_STUB_PRINTF -DFP_N=8 --unwind 10 --unwindset cfg_addlist.0:34"
 proof  P-CFGHEX     cfg.c "$D/node_config.c" "-DFP_STUB_PRINTF -DFP_HEX --unwind 72"
-mutant M-CFG-hcap   cfg.c "$D/node_config.c" 's/if(!hl || hl >= hcap) return 0;/if(!hl || hl > hcap) return 0;/' "" "-DFP_STUB_PRINTF -DFP_N=8 --unwind 10 --unwindset cfg_addlist.0:34"
-mutant M-CFG-hex    cfg.c "$D/node_config.c" 's/if(n==0 || n>64) return 0;/if(n==0 || n>66) return 0;/' "" "-DFP_STUB_PRINTF -DFP_HEX --unwind 72"
+#OPEN mutant M-CFG-hcap   cfg.c "$D/node_config.c" 's/if(!hl || hl >= hcap) return 0;/if(!hl || hl > hcap) return 0;/' "" "-DFP_STUB_PRINTF -DFP_N=8 --unwind 10 --unwindset cfg_addlist.0:34"
+mutant M-CFG-hex    cfg.c "$D/node_config.c" 's/if(n==0 || n>64) return 0;/if(n==0 || n>66) return 0;/' "1..64 hex digits" "-DFP_STUB_PRINTF -DFP_HEX --unwind 72"

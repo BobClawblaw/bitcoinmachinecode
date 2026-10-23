@@ -52,6 +52,12 @@ int bip324_decrypt(bip324_cipher_t* c, unsigned char* out, const unsigned char* 
     *ignore = nondet_int() & 1;
     return nondet_int();
 }
+/* secure_zero (daemon/secure_zero.h) is a memset plus an empty asm with a
+ * "memory" clobber, which CBMC turns into a havoc of all memory -- far over
+ * the cap. It is replaced by its memset (the barrier only stops the compiler
+ * dropping the store; it has no semantics to check). */
+#define SECURE_ZERO_H
+static inline void secure_zero(void* p, size_t n){ if (p && n) memset(p, 0, n); }
 #include SRC
 #ifndef FP_START
 #define FP_START 0
