@@ -632,6 +632,7 @@ static int compact_start_async(long height, const char* why){
         g_cmp_fallbacks++;
         fprintf(stderr, "[utxo_live] fork for background compaction failed (%s) -- compacting inline\n", strerror(errno));
         long cr = utxo_lsm_compact_range(&g_utxo_lst, (unsigned long)lo, (unsigned long)k);
+        lsm_mm_invalidate_all();                 /* ST2-9: its unlinked inputs leave every thread's mapping cache */
         fprintf(stderr, "[utxo_live] %s compact at height %ld: manifest_n=%lu -> result=%ld\n", why, height, (unsigned long)g_utxo_lst.manifest_n, cr);
         return 1;
     }
@@ -3783,6 +3784,7 @@ int utxo_live_init(const char* dir){
         long lo = 0; int ob = 0; long k = compact_pick_now(&lo, &ob);
         if (k == 0) break;
         long cr = utxo_lsm_compact_range(&g_utxo_lst, (unsigned long)lo, (unsigned long)k);
+        lsm_mm_invalidate_all();                 /* ST2-9: as after every inline compaction */
         fprintf(stderr, "[utxo_live] init: pre-catchup compact manifest_n=%lu -> %lu (result=%ld)\n",
                 (unsigned long)before, (unsigned long)g_utxo_lst.manifest_n, cr);
         if (g_utxo_lst.manifest_n >= before) break; /* no progress -- stop rather than loop */
@@ -4390,6 +4392,12 @@ long utxo_live_recover(void){
         u64 before = g_utxo_lst.manifest_n;
         if (before < 2) break;
         long cr = utxo_lsm_compact(&g_utxo_lst);
+        /* ST2-9 (audit 2026-10-23): the compaction unlinked its inputs, but
+         * every thread's run-mapping cache (utxo_lsm_mm.c) still held them,
+         * pinning their disk space until each slot happened to be evicted.
+         * The background adopt (compact_poll) bumps the cache epoch after
+         * its unlinks; the inline paths did not. */
+        lsm_mm_invalidate_all();
         fprintf(stderr, "[utxo_live] recover: compact manifest_n=%lu -> %lu (result=%ld)\n",
                 (unsigned long)before, (unsigned long)g_utxo_lst.manifest_n, cr);
         if (g_utxo_lst.manifest_n >= before) break;   /* no progress -- stop */
