@@ -36,7 +36,14 @@ extern unsigned long long script_flags_for_block(unsigned long long height, cons
 
 /* (ptr,len) span per tx -- the prefix block_check_witness_commitment reads. */
 typedef struct { const u8* ptr; u64 len; } bsub_tx_t;
-#define BSUB_MAX_TX 16384
+/* CON-14 (audit 2026-10-23): Core's real bound, not a round number. The
+ * smallest transaction is 60 bytes stripped (version 4, one 41-byte input,
+ * one 9-byte output, locktime 4, two 1-byte counts), so a block of more than
+ * (1,000,000 - 80 - 3) / 60 = 16,665 transactions has a stripped size over
+ * MAX_BLOCK_WEIGHT / 4 and fails CheckBlock's bad-blk-length -- which is the
+ * reason given for anything above this. 16,384 refused valid blocks of
+ * 16,385..16,665 small transactions. */
+#define BSUB_MAX_TX 16665
 
 static u64 bsub_varint(const u8* p, const u8* end, u64* v){
     if (p >= end) return 0;
@@ -132,7 +139,7 @@ long blk_submit_evaluate_ex(const u8* blk, unsigned long len,
     /* full consensus structural check (merkle, sizes). PoW already passed,
      * so a refusal here is dominantly the tx merkle root -- Core's string. */
     { static u8 scratch[4u<<20];
-      if (cons_verify(blk, (long)len, scratch, sizeof scratch) != 1){
+      if (cons_verify(blk, (long)len, scratch, (unsigned)(sizeof scratch / 32)) != 1){   /* CON-14: cap is a count of 32-byte slots */
           RSN("bad-txnmrklroot"); return 0; } }
 
     /* per-tx spans for the BIP141 witness-commitment check */

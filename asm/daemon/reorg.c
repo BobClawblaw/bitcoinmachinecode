@@ -19,7 +19,7 @@
  *      hdr[i].prev == blockhash(hdr[i-1]) across the whole run.       [cheap]
  *   3. Locate the fork point by walking OUR chain forward from the ancestor
  *      the peer answered from, comparing hashes height by height.
- *   4. Refuse anything deeper than REORG_MAX_DEPTH (the undo window).
+ *   4. (No depth cap -- CON-10: step 7's pre-flight is the bound.)
  *   5. Compare cumulative chainwork. Not strictly heavier -> stop, no action.
  *   6. Download and cons_verify EVERY replacement block into a staging file,
  *      checking each one hashes to the header we already validated.
@@ -688,18 +688,18 @@ long reorg_analyze(void* st, reorg_cand_t* c){
     if (c->base_height < 0){
         /* Fall back to a bounded scan back from our tip, for a peer that
          * answered from something other than a locator entry (an unsolicited
-         * headers announcement, say). Bounded by REORG_MAX_DEPTH because
-         * anything older than that is unusable anyway -- we could not
-         * disconnect that far even if we wanted to. */
-        for (long h = tip; h >= 0 && h > tip - REORG_MAX_DEPTH - 1; h--){
+         * headers announcement, say). Bounded by REORG_SCAN_BACK: a search
+         * bound only -- a deeper fork attaches through the locator, which
+         * reaches genesis. */
+        for (long h = tip; h >= 0 && h > tip - REORG_SCAN_BACK - 1; h--){
             unsigned char h32[32];
             if (!our_hash_at(st, h, h32)) break;
             if (memcmp(c->hdr[0]+4, h32, 32) == 0){ c->base_height = h; break; }
         }
     }
     if (c->base_height < 0){
-        fprintf(stderr, "[reorg] candidate REJECTED: its first header attaches to a block we do not have (within %d of our tip)\n",
-                REORG_MAX_DEPTH);
+        fprintf(stderr, "[reorg] candidate REJECTED: its first header attaches to no locator entry and no block within %d of our tip\n",
+                REORG_SCAN_BACK);
         return -1;
     }
 
@@ -770,13 +770,9 @@ long reorg_analyze(void* st, reorg_cand_t* c){
         return 0;
     }
 
-    /* ---- depth gate, BEFORE any work is computed or any block fetched ---- */
-    long depth = tip - c->fork_height;
-    if (depth > REORG_MAX_DEPTH){
-        fprintf(stderr, "[reorg] candidate REJECTED: fork at height %ld is %ld blocks deep (max %d -- deeper than the retained undo data). Human review required.\n",
-                c->fork_height, depth, REORG_MAX_DEPTH);
-        return -1;
-    }
+    /* CON-10: no depth gate. Core has none; the pre-flight in
+     * reorg_execute refuses a disconnect whose blocks or undo are missing
+     * before anything is changed. */
 
     /* ---- defensive re-assert: the first genuinely-new header must chain to
      * the fork point we just computed. Implied by the walk above, but this is
@@ -848,23 +844,24 @@ long reorg_execute(void* st, long fork_height, long nblocks,
         fprintf(stderr, "[reorg] refusing: fork height %ld is above our tip %ld\n", fork_height, tip);
         return 0;
     }
+    if (fork_height < 0){   /* genesis is never disconnected (this was implied by the old depth cap on short chains) */
+        fprintf(stderr, "[reorg] refusing: fork height %ld is below genesis\n", fork_height);
+        return 0;
+    }
     /* 3.3 (UTXO_INLINE_CONNECT_SCOPE, 2026-09-06): heights above the
      * CONNECTED tip were stored but never applied -- the parallel downloader
      * runs the archive far ahead of utxo_live, and a block that failed to
      * connect sits at applied+1. There is nothing to unapply for them: no
      * undo file, no coins to restore. They are dropped from the archive by
      * the truncate below, and only the connected part [fork+1 .. applied]
-     * goes through pre-flight and unapply. So the undo-window bound applies
-     * to the connected depth, not the archive's. Before this the pre-flight
+     * goes through pre-flight and unapply. Before this the pre-flight
      * refused ("undo records=0 but block spends N inputs") and an
      * invalidateblock -- or 3.3's own rejection of a bad block -- was
      * impossible during any backlog. */
     long applied = utxo_live_applied_height();
     long conn_top = applied < tip ? applied : tip;      /* highest CONNECTED height in the archive */
-    if (conn_top - fork_height > REORG_MAX_DEPTH){
-        fprintf(stderr, "[reorg] refusing: disconnect depth %ld exceeds max %d\n", conn_top - fork_height, REORG_MAX_DEPTH);
-        return 0;
-    }
+    /* CON-10: no disconnect-depth cap (Core has none); the pre-flight below
+     * proves every height in (fork_height, conn_top] unappliable first. */
     if (tip > conn_top){
         long drop_lo = (fork_height > conn_top ? fork_height : conn_top) + 1;   /* 2026-09-24: never below the fork */
         fprintf(stderr, "[reorg] heights %ld..%ld are stored but were never connected (applied %ld): dropped without unapply\n",
@@ -1108,7 +1105,7 @@ long reorg_execute(void* st, long fork_height, long nblocks,
          * step above, and this is the last chance to refuse bad bytes before
          * they enter the archive. */
         static unsigned char scratch[1<<20];
-        if (!cons_verify(blkbuf, len, scratch, sizeof scratch)){
+        if (!cons_verify(blkbuf, len, scratch, (unsigned)(sizeof scratch / 32))){   /* CON-14: a count of 32-byte slots, not bytes */
             fprintf(stderr, "[reorg] FATAL: replacement block %ld failed cons_verify -- chain left at height %ld\n",
                     i, store_tip(st));
             if (locked) flock(lfd, LOCK_UN);
@@ -1650,7 +1647,7 @@ long reorg_probe_peer(int fd, void* st, const char* peer){
             fprintf(stderr, "[reorg] peer %s sent a block that is not the header it announced -- aborting BEFORE any change\n", peer);
             ok = 0; break;
         }
-        if (!cons_verify(netbuf, (long)plen, scratch, sizeof scratch)){
+        if (!cons_verify(netbuf, (long)plen, scratch, (unsigned)(sizeof scratch / 32))){   /* CON-14: slots, not bytes */
             fprintf(stderr, "[reorg] replacement block at index %ld fails cons_verify -- aborting BEFORE any change\n", hi);
             ok = 0; break;
         }
@@ -1724,7 +1721,7 @@ long reorg_disconnect_to(void* st, long fork_height){
 long chain_invalidate_block(void* st, long h, const unsigned char hash[32]){
     if (h < 0 || !hash) return 0;
     int added = invset_add(hash);
-    if (added < 0){ fprintf(stderr, "[chain] invalidate: invalid.dat is full (%d marks) -- refusing\n", INVSET_MAX); return -1; }
+    if (added < 0){ fprintf(stderr, "[chain] invalidate: out of memory adding the mark (%ld held) -- refusing\n", invset_count()); return -1; }
     invset_save("invalid.dat");
     long tip = store_tip(st);
     if (h <= tip){

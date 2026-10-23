@@ -179,12 +179,11 @@ void utxo_live_test_capture_counts(long* resolved, long* sampled, long* unresolv
 }
 extern void block_hash(u8 out[32], const u8 hdr[80]);
 
-/* Rolling undo-data retention window. Stage A's own design note calls for
- * ~100-200 blocks; 200 is the top of that range, chosen because it is also
- * comfortably deeper than any reorg this node would apply automatically
- * (see REORG_MAX_DEPTH in daemon/reorg.c, which refuses to go deeper than
- * the undo data can actually support). */
-#define UTXO_UNDO_WINDOW    200   /* 2026-09-08: no longer a retention window (undo is kept for every block); kept as the reorg-depth reference REORG_MAX_DEPTH compares against */
+/* Formerly the rolling undo-data retention window (Stage A: ~100-200
+ * blocks). Since 2026-09-08 undo is kept for every block, and since CON-10
+ * (2026-10-23) there is no reorg depth cap either; the constant is kept only
+ * as the reference archive_verify.c's prune floor comment cites. */
+#define UTXO_UNDO_WINDOW    200
 /* Heights examined per prune sweep. Bounds the cold-start cost on a deep
  * store (a fresh boot starts the cursor at 0) without ever stalling the
  * download worker's loop; the cursor resumes on the next block. */
@@ -1607,13 +1606,18 @@ typedef struct {
  * prefix of table gets refilled with the empty sentinel -- correct even
  * when the arena is larger (from an earlier, bigger block) than tcap,
  * since every lookup/insert masks its hash into exactly [0,tcap). */
-static void bidx_reset(bidx_t* bx, u64 nout_hint){
+/* CON-12 (audit 2026-10-23): 1 ok / 0 an arena could not grow. The result
+ * of grow_arena was ignored, and the new mask then indexed the OLD, smaller
+ * table -- a heap overflow on a failed realloc. The caller fails the block
+ * with no reason, i.e. as a store error (the block is not at fault). */
+static int bidx_reset(bidx_t* bx, u64 nout_hint){
     u64 tcap = next_pow2_u64((nout_hint ? nout_hint : 1) * 2);
-    grow_arena((void**)&bx->table, &bx->table_cap, tcap * sizeof(bidx_slot_t));
+    if (!grow_arena((void**)&bx->table, &bx->table_cap, tcap * sizeof(bidx_slot_t))) return 0;
+    if (!grow_arena((void**)&bx->outs, &bx->outs_cap, (nout_hint ? nout_hint : 1) * sizeof(bidx_out_t))) return 0;
     bx->mask = tcap - 1;
     for (u64 i=0;i<tcap;i++) bx->table[i].out_idx = (u64)-1;
-    grow_arena((void**)&bx->outs, &bx->outs_cap, (nout_hint ? nout_hint : 1) * sizeof(bidx_out_t));
     bx->outs_n = 0;
+    return 1;
 }
 static void bidx_insert(bidx_t* bx, const u8 key[36], u64 value, const u8* spk, u32 spklen,
                         u32 creating_tx, u8 is_coinbase){
@@ -1654,12 +1658,13 @@ long bidx_get(void* bxv, u32 caller_tx_index, const u8 txid[32], u32 index,
 }
 
 typedef struct { u8* used; u64 used_cap; u8* keys; u64 keys_cap; u64 mask; } bspent_t;
-static void bspent_reset(bspent_t* bs, u64 nin_hint){
+static int bspent_reset(bspent_t* bs, u64 nin_hint){   /* 1 ok / 0 no memory (CON-12, see bidx_reset) */
     u64 tcap = next_pow2_u64((nin_hint ? nin_hint : 1) * 2);
-    grow_arena((void**)&bs->used, &bs->used_cap, tcap);
+    if (!grow_arena((void**)&bs->used, &bs->used_cap, tcap)) return 0;
+    if (!grow_arena((void**)&bs->keys, &bs->keys_cap, tcap * 36)) return 0;
     memset(bs->used, 0, tcap);   /* active tcap-sized prefix only -- see bidx_reset */
-    grow_arena((void**)&bs->keys, &bs->keys_cap, tcap * 36);
     bs->mask = tcap - 1;
+    return 1;
 }
 /* Returns 1 the first time this exact outpoint is claimed, 0 if it was
  * already claimed earlier in this same block (an in-block double-spend). */
@@ -2666,8 +2671,11 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
      * freed+reallocated) every block. ---- */
     static bidx_t bx = {0};
     static bspent_t bs = {0};
-    bidx_reset(&bx, total_nout);
-    bspent_reset(&bs, total_nin);
+    if (!bidx_reset(&bx, total_nout) || !bspent_reset(&bs, total_nin)){
+        fprintf(stderr, "[utxo_live] h=%ld: out of memory sizing the in-block index (%llu outputs, %llu inputs)\n",
+                g_apply_height, (unsigned long long)total_nout, (unsigned long long)total_nin);
+        return 0;                    /* no reason: a store error, the block is not at fault */
+    }
     /* VAL-1 fees ledger: per-tx output totals (sum(out) side; the sum(in)
      * side arrives from tx_verify.c's export). Persistent arena like bx/bs. */
     static u64* g_ptx_out = 0; static u64 g_ptx_out_cap = 0;

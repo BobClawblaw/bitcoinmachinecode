@@ -144,7 +144,7 @@ static void ckm(const char* l, int cond){
 #define MAXTX      6
 #define TXCAP      512
 #define BLKCAP     8192
-#define MAXBLK     48
+#define MAXBLK     112   /* CON-10's depth-101 case needs 101 losing + 102 winning blocks per branch */
 
 typedef struct {
     u8  raw[TXCAP];
@@ -690,8 +690,11 @@ static int lock_is_free(void){
     return WIFEXITED(st) && WEXITSTATUS(st) == 0;
 }
 
-/* Run one full reorg and verify everything. */
-static void do_reorg_case(long nbase, long nlose, long nwin, u32 winbits, const char* label){
+/* Run one full reorg and verify everything. `pre` > 0 makes the candidate
+ * start with base[nbase-pre..nbase-1] -- the overlap a real peer sends when
+ * it answers from a locator entry below the fork (pre = nbase-1 is the
+ * answer from genesis, the one locator entry every chain has). */
+static void do_reorg_case_pre(long nbase, long nlose, long nwin, u32 winbits, const char* label, long pre){
     build_base(nbase, 0x207fffffu);
     build_branch(lose, nlose, nbase, 0x20000000u, 0x207fffffu);
     build_branch(win,  nwin,  nbase, 0x30000000u, winbits);
@@ -709,7 +712,12 @@ static void do_reorg_case(long nbase, long nlose, long nwin, u32 winbits, const 
     static reorg_cand_t c;
     memset(&c,0,sizeof c);
     ckm("build locator", reorg_build_locator(store_buf, &c) > 0);
-    cand_from_blocks(&c, win, nwin);
+    if (pre > 0){
+        static blk_t cb[MAXBLK * 2];
+        for (long k = 0; k < pre; k++) cb[k] = base[nbase - pre + k];
+        for (long i = 0; i < nwin; i++) cb[pre + i] = win[i];
+        cand_from_blocks(&c, cb, pre + nwin);
+    } else cand_from_blocks(&c, win, nwin);
 
     long v = reorg_analyze(store_buf, &c);
     snprintf(lbuf,sizeof lbuf,"%s analyze -> fork AND heavier", label);
@@ -717,7 +725,7 @@ static void do_reorg_case(long nbase, long nlose, long nwin, u32 winbits, const 
     snprintf(lbuf,sizeof lbuf,"%s fork point located correctly", label);
     ck(lbuf, c.fork_height, nbase-1);
     snprintf(lbuf,sizeof lbuf,"%s first new header index", label);
-    ck(lbuf, c.first_new, 0);
+    ck(lbuf, c.first_new, pre);
 
     memsrc_t src = { win, nwin };
     snprintf(lbuf,sizeof lbuf,"%s reorg_execute", label);
@@ -749,9 +757,17 @@ static void do_reorg_case(long nbase, long nlose, long nwin, u32 winbits, const 
     utxo_live_close();
 }
 
+static void do_reorg_case(long nbase, long nlose, long nwin, u32 winbits, const char* label){
+    do_reorg_case_pre(nbase, nlose, nwin, winbits, label, 0);
+}
 static void case_reorg_depth1(void){ do_reorg_case(6, 1, 2, 0x207fffffu, "depth1"); }
 static void case_reorg_depth3(void){ do_reorg_case(8, 3, 4, 0x207fffffu, "depth3"); }
 static void case_reorg_depth12(void){ do_reorg_case(10, 12, 13, 0x207fffffu, "depth12"); }
+/* CON-10 (audit 2026-10-23): Core has no reorg depth limit; this node refused
+ * anything past 100 (REORG_MAX_DEPTH) in both reorg_analyze and
+ * reorg_execute. A 101-deep reorg onto a heavier chain now goes through,
+ * with the full UTXO-model and on-disk verification. */
+static void case_reorg_depth101(void){ do_reorg_case_pre(4, 101, 102, 0x207fffffu, "depth101", 3); }
 /* Shorter branch, MORE work: 5 easy blocks lose to 1 hard one. A height-based
  * fork choice would get this backwards; a work-based one must not. */
 static void case_reorg_shorter_but_heavier(void){ do_reorg_case(6, 5, 1, 0x1f00ffffu, "heavier-but-shorter"); }
@@ -963,11 +979,10 @@ static void case_invalid_candidates(void){
         ck("unattachable chain REJECTED", reorg_analyze(store_buf,&c), -1);
     }
 
-    /* (d) TOO DEEP: forks below REORG_MAX_DEPTH from our tip are refused
-     * outright (checked here through reorg_execute's own guard, which is the
-     * last line of defence before anything destructive happens). */
-    ck("reorg_execute refuses an over-deep disconnect",
-       reorg_execute(store_buf, tip_before - (REORG_MAX_DEPTH+1), 1, memsrc, &(memsrc_t){win,1}), 0);
+    /* (d) a fork height below genesis is refused (there was a depth cap
+     * here, REORG_MAX_DEPTH; CON-10 removed it, Core has none) */
+    ck("reorg_execute refuses a fork height below genesis",
+       reorg_execute(store_buf, -2, 1, memsrc, &(memsrc_t){win,1}), 0);
     ck("reorg_execute refuses a fork height above our tip",
        reorg_execute(store_buf, tip_before + 5, 1, memsrc, &(memsrc_t){win,1}), 0);
     ck("reorg_execute refuses an empty replacement branch",
@@ -1995,6 +2010,7 @@ int main(void){
     total += run_case("reorg depth 1",                  case_reorg_depth1);
     total += run_case("reorg depth 3",                  case_reorg_depth3);
     total += run_case("reorg depth 12 (undo window)",   case_reorg_depth12);
+    total += run_case("reorg depth 101 (no depth cap, CON-10)", case_reorg_depth101);
     total += run_case("reorg shorter-but-heavier",      case_reorg_shorter_but_heavier);
     total += run_case("fork above the applied height",  case_fork_above_applied);
     total += run_case("competing chain not heavier",    case_not_heavier);
