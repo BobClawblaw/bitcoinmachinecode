@@ -2417,10 +2417,18 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
         if (!val_read_tx(txs[0].ptr, txs[0].len, &vi0) || !vi0.coinbase_shape){
             g_last_reject = "bad-cb-missing"; return 0;
         }
+        /* CON-3 (audit 2026-10-23): CheckTransaction's bad-txns-vout-empty
+         * (consensus/tx_check.cpp), for every transaction, the coinbase
+         * included. Only submitblock's own walk refused a zero-output tx;
+         * on the connect path one was accepted. The output count is part
+         * of the txid, so this is a refusal of the block as committed. */
+        if (vi0.out_count == 0){ g_last_reject = "bad-txns-vout-empty"; return 0; }
         for (u64 t=1; t<ntx; t++){
-            if (!val_read_tx(txs[t].ptr, txs[t].len, &vix) || vix.null_prevout){
+            if (!val_read_tx(txs[t].ptr, txs[t].len, &vix)){
                 g_last_reject = "bad-txns-prevout-null"; return 0;
             }
+            if (vix.out_count == 0){ g_last_reject = "bad-txns-vout-empty"; return 0; }
+            if (vix.null_prevout){ g_last_reject = "bad-txns-prevout-null"; return 0; }
         }
         /* CheckBlock: coinbase scriptSig 2..100 bytes (pre-BIP34 history
          * included -- 2 is the floor even for the genesis-era free-form
