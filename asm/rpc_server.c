@@ -97,6 +97,33 @@ static long g_req_deadline_s = RPC_REQ_DEADLINE_DEFAULT;
 #define RPC_EXEC_LOG_MS_DEFAULT 2000   /* BMC_RPC_EXEC_LOG_MS: log an execution-lock wait or hold this long (0 = off) */
 #define RPC_QUEUE_CAP 4096
 static int g_q[RPC_QUEUE_CAP]; static int g_q_head, g_q_tail, g_q_n;
+/* RPC-24 (audit 2026-10-23): the residual RPC-4 named. Requests are read on
+ * the -rpcthreads intake workers (4 by default), so a few allowed sockets
+ * dribbling their headers still held all of them until the 60 s deadline.
+ * Two bounds, both on the read before dispatch:
+ *   - the HEADERS must arrive within RPC_HDR_DEADLINE_S (the body, which
+ *     can be an 8 MB submitblock, keeps the whole g_req_deadline_s);
+ *   - one source address reads on at most g_threads - 1 workers at once
+ *     (RPC_PER_IP_READERS), so a remote allowed host cannot take them all;
+ *     past it the connection gets 503. 127.0.0.1 and ::1 are exempt: every
+ *     local client (the CLI, mempool's backend) shares that address, and a
+ *     cap there would turn one local dribbler into 503s for all of them.
+ * g_q_src[] carries each queued connection's source key (0 = exempt) and
+ * g_rd_src[] what each worker is reading from. */
+#define RPC_HDR_DEADLINE_S 15
+static unsigned long long g_q_src[RPC_QUEUE_CAP];
+static unsigned long long g_rd_src[256];
+static pthread_mutex_t g_rd_src_mu = PTHREAD_MUTEX_INITIALIZER;
+static int rpc_per_ip_readers(void){ return g_threads > 1 ? g_threads - 1 : 1; }
+static unsigned long long rpc_src_key(const struct sockaddr_storage* ss){
+    const unsigned char* b; size_t n;
+    static const unsigned char v6lo[16] = { 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,1 };
+    if (ss->ss_family == AF_INET6){ b = ((const struct sockaddr_in6*)ss)->sin6_addr.s6_addr; n = 16; if (!memcmp(b, v6lo, 16)) return 0; }
+    else { b = (const unsigned char*)&((const struct sockaddr_in*)ss)->sin_addr.s_addr; n = 4; if (b[0] == 127 && b[1] == 0 && b[2] == 0 && b[3] == 1) return 0; }
+    unsigned long long h = 1469598103934665603ULL ^ (unsigned long long)ss->ss_family;
+    for (size_t i = 0; i < n; i++){ h ^= b[i]; h *= 1099511628211ULL; }
+    return h ? h : 1;
+}
 static pthread_mutex_t g_q_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_q_cond = PTHREAD_COND_INITIALIZER;
 static pthread_t g_workers[256]; static int g_n_workers;
@@ -1287,7 +1314,9 @@ static void service_conn(int cfd) {
         if (g_req_deadline_s > 0){
             struct timespec now_ts; clock_gettime(CLOCK_MONOTONIC, &now_ts);
             long elapsed = (long)(now_ts.tv_sec - t_start.tv_sec);
-            long left = g_req_deadline_s - elapsed;
+            long budget = g_req_deadline_s;
+            if (!hdrend && budget > RPC_HDR_DEADLINE_S) budget = RPC_HDR_DEADLINE_S;   /* RPC-24 */
+            long left = budget - elapsed;
             if (left <= 0){
                 const char* e = "HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\n\r\n";
                 (void)write_all(cfd, e, strlen(e));
@@ -1647,21 +1676,35 @@ static void* server_thread(void* arg) {
             (void)write_all(c, e, strlen(e)); close(c);
             continue;
         }
-        g_q[g_q_tail] = c; g_q_tail = (g_q_tail + 1) % RPC_QUEUE_CAP; g_q_n++;
+        g_q[g_q_tail] = c; g_q_src[g_q_tail] = rpc_src_key(&cli); g_q_tail = (g_q_tail + 1) % RPC_QUEUE_CAP; g_q_n++;
         pthread_cond_signal(&g_q_cond);
         pthread_mutex_unlock(&g_q_lock);
     }
     return NULL;
 }
 static void* worker_thread(void* arg){
-    (void)arg;
+    int me = (int)(long)arg;
     for (;;){
         pthread_mutex_lock(&g_q_lock);
         while (g_q_n == 0 && g_run) pthread_cond_wait(&g_q_cond, &g_q_lock);
         if (g_q_n == 0 && !g_run){ pthread_mutex_unlock(&g_q_lock); return NULL; }
-        int c = g_q[g_q_head]; g_q_head = (g_q_head + 1) % RPC_QUEUE_CAP; g_q_n--;
+        int c = g_q[g_q_head]; unsigned long long src = g_q_src[g_q_head]; g_q_head = (g_q_head + 1) % RPC_QUEUE_CAP; g_q_n--;
         pthread_mutex_unlock(&g_q_lock);
+        if (src){                                       /* RPC-24: one source, at most g_threads - 1 readers */
+            int busy = 0;
+            pthread_mutex_lock(&g_rd_src_mu);
+            for (int i = 0; i < g_n_workers; i++) if (i != me && g_rd_src[i] == src) busy++;
+            if (busy < rpc_per_ip_readers()) g_rd_src[me] = src;
+            pthread_mutex_unlock(&g_rd_src_mu);
+            if (busy >= rpc_per_ip_readers()){
+                struct timeval tv = { 1, 0 }; setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+                const char* e = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 35\r\n\r\nToo many connections from this host";
+                (void)write_all(c, e, strlen(e)); close(c);
+                continue;
+            }
+        }
         service_conn(c);
+        if (src){ pthread_mutex_lock(&g_rd_src_mu); g_rd_src[me] = 0; pthread_mutex_unlock(&g_rd_src_mu); }
     }
 }
 
@@ -1783,8 +1826,9 @@ int rpc_server_start(const rpc_server_cfg* cfg, int* actual_port,
     g_xq_head = g_xq_tail = g_xq_n = 0;
     g_run = 1;
     g_n_workers = 0; g_n_xworkers = 0;
+    memset(g_rd_src, 0, sizeof g_rd_src);
     for (int i = 0; i < g_threads; i++)
-        if (bmc_pthread_create(&g_workers[g_n_workers], worker_thread, NULL) == 0) g_n_workers++;
+        if (bmc_pthread_create(&g_workers[g_n_workers], worker_thread, (void*)(long)g_n_workers) == 0) g_n_workers++;
     for (int i = 0; i < g_threads; i++)          /* the execution pool: -rpcthreads of its own */
         if (bmc_pthread_create(&g_xworkers[g_n_xworkers], exec_thread, NULL) == 0) g_n_xworkers++;
     if (g_n_workers == 0 || g_n_xworkers == 0 || bmc_pthread_create(&g_thread, server_thread, NULL) != 0) {
