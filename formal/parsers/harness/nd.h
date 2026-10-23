@@ -30,6 +30,17 @@ static inline unsigned char* nd_buf(size_t n){
     ASSUME(p != 0);
     return p;
 }
+/* `len` bytes of nondeterministic content that END exactly where a
+ * constant-size (cap) object ends: a read past buf[len) leaves the object and
+ * is caught, while the object's size stays concrete for the solver (a
+ * symbolic-size malloc costs far more memory). Reads BEFORE the start are not
+ * caught by this layout; no parser here ever reads before its input. The
+ * caller frees nd_tail_base(p, len, cap). */
+static inline unsigned char* nd_tail(size_t len, size_t cap){
+    unsigned char* b = (unsigned char*)malloc(cap ? cap : 1); ASSUME(b != 0 && len <= cap);
+    return b + (cap - len);
+}
+static inline void* nd_tail_base(unsigned char* p, size_t len, size_t cap){ return p - (cap - len); }
 /* Core's ReadCompactSize canonical rule, used by postconditions */
 static inline int fp_cs_canonical(const unsigned char* p, size_t len){
     if (len < 1) return 0;

@@ -95,7 +95,7 @@ static void* mk_pool(void){
     unsigned long nslots = nondet_ulong(); ASSUME(nslots == 1 || nslots == 2);
     unsigned char* m = nd_buf(40 + nslots * 80 + 8);
     unsigned long long mask = nslots - 1, cap = nondet_ull(); ASSUME(cap <= FP_BLOB);
-    unsigned char* blob = nd_buf(cap);
+    unsigned char* blob = nd_tail(cap, FP_BLOB);
     memcpy(m + 8, &mask, 8); memcpy(m + 16, &blob, sizeof blob); memcpy(m + 24, &cap, 8);
     return m;
 }
@@ -104,9 +104,9 @@ int main(void){
     void* mp = mk_pool();
     unsigned char want[32]; for (int i = 0; i < 32; i++) want[i] = nondet_uchar(); g_want = want;
     size_t plen = nondet_size(); ASSUME(plen <= FP_N);
-    unsigned char* pl = nd_buf(plen);
+    unsigned char* pl = nd_tail(plen, FP_N);
     size_t cap = nondet_size(); ASSUME(cap <= FP_N + 16);
-    unsigned char* out = nd_buf(cap);
+    unsigned char* out = nd_tail(cap, FP_N + 16);
     long r = cmpct_recv_cmpctblock(3, mp, pl, plen, out, cap, want);
     g_ntx_seen = S.ntx;
     CHECK(g_sent <= 1, "at most one message per cmpctblock");
@@ -121,17 +121,17 @@ int main(void){
 #ifdef FP_BLOCKTXN
     /* then the peer's blocktxn reply */
     size_t blen = nondet_size(); ASSUME(blen <= FP_N);
-    unsigned char* bl = nd_buf(blen);
+    unsigned char* bl = nd_tail(blen, FP_N);
     int sent0 = g_sent;
     long r2 = cmpct_recv_blocktxn(3, bl, blen, out, cap, nondet_int() ? (const unsigned char*)want : (const unsigned char*)0);
     CHECK(g_sent - sent0 <= 1, "at most one message per blocktxn");
     if (r2 > 0) CHECK((size_t)r2 <= cap, "block fits out (blocktxn)");
     COVER(r2 > 0, "completed by blocktxn");
     COVER(r2 == 0 && g_sent - sent0 == 1, "blocktxn fallback");
-    free(bl);
+    free(nd_tail_base(bl, blen, FP_N));
 #endif
-    free(pl); free(out);
-    if (mp){ unsigned char* b; memcpy(&b, (unsigned char*)mp + 16, sizeof b); free(b); free(mp); }
+    free(nd_tail_base(pl, plen, FP_N)); free(nd_tail_base(out, cap, FP_N + 16));
+    if (mp){ unsigned char* b; memcpy(&b, (unsigned char*)mp + 16, sizeof b); unsigned long long bc; memcpy(&bc, (unsigned char*)mp + 24, 8); free(nd_tail_base(b, bc, FP_BLOB)); free(mp); }
     return 0;
 }
 /* verified on its own (P-BW*): here only its read footprint is checked */

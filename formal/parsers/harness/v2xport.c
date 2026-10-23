@@ -53,6 +53,9 @@ int bip324_decrypt(bip324_cipher_t* c, unsigned char* out, const unsigned char* 
     return nondet_int();
 }
 #include SRC
+#ifndef FP_START
+#define FP_START 0
+#endif
 static void check_msg(bip324_transport_t* t, int r, const char* type, const unsigned char* pl, unsigned long plen){
     if (r != 1) return;
     CHECK(type == t->msg_type && memchr(type, 0, 13) != 0, "type NUL-terminated in msg_type");
@@ -75,6 +78,14 @@ int main(void){
     unsigned long gl = nondet_ulong(); ASSUME(gl <= sizeof garb);
     int initiator = nondet_int() & 1;
     if (!bip324_t_init(&t, sk, es, mg, initiator, garb, gl)){ bip324_t_free(&t); return 0; }
+#if defined(FP_START) && FP_START > 0
+    /* start mid-handshake: the state advance() leaves after the key exchange
+     * (FP_START=2: scanning for the terminator) or after the version packet
+     * (FP_START=4: application packets). The cipher is the stub's: free. */
+    for (int i = 0; i < 16; i++) t.cipher.recv_garbage_terminator[i] = nondet_uchar();
+    t.keys_ready = 1; t.sent_version = 1; t.recv_state = FP_START;
+    t.send.len = 0;
+#endif
 #ifdef FP_GARB
     /* the key, then L bytes with no terminator in the first 4096 positions */
     t.recv_state = BIP324_RECV_KEY;
@@ -88,16 +99,23 @@ int main(void){
 #else
     for (int f = 0; f < FP_FEEDS; f++){
         size_t n = nondet_size(); ASSUME(n <= FP_CHUNK);
-        unsigned char* d = nd_buf(n);
+        unsigned char* d = nd_tail(n, FP_CHUNK);
         int ok = bip324_t_feed(&t, d, n);
-        free(d);
+        free(nd_tail_base(d, n, FP_CHUNK));
         if (!ok) break;
         if (t.recv_state == BIP324_RECV_GARBAGE) CHECK(t.recv.len <= 4095 + 16 + FP_CHUNK, "garbage buffer bounded");
         const char* type; const unsigned char* pl; unsigned long plen;
         int r = bip324_t_next_message(&t, &type, &pl, &plen);
         check_msg(&t, r, type, pl, plen);
-        COVER(r == 1 && t.recv_state == BIP324_RECV_APP, "a message delivered");
+#if FP_START == 4
+        COVER(r == 1 && t.recv_state == BIP324_RECV_APP && plen >= 2, "a message delivered");
+        COVER(r == 1 && type[0] == 'p', "a short-id message delivered");
+#elif FP_START == 2
+        COVER(t.recv_state == BIP324_RECV_VERSION && t.recv_garbage.len >= 2, "terminator found after garbage");
+#else
         COVER(t.recv_state == BIP324_RECV_V1, "v1 fallback");
+        COVER(!initiator && t.recv_state == BIP324_RECV_KEY && t.send.len >= 64, "responder proved v2 and queued its key");
+#endif
         if (nondet_int()){ (void)bip324_t_has_message(&t); }
     }
     if (t.recv_state == BIP324_RECV_APP && t.keys_ready && nondet_int()){
@@ -105,7 +123,9 @@ int main(void){
         CHECK(n >= 0 && (unsigned long)n <= sizeof buf, "export within cap");
         if (n > 0){ bip324_transport_t u; unsigned long cut = nondet_ulong(); ASSUME(cut <= (unsigned long)n);
             if (bip324_t_import(&u, buf, cut)) { CHECK(cut == (unsigned long)n, "import accepts only the whole export"); bip324_t_free(&u); } }
+#if FP_START == 4
         COVER(n > 0, "exported");
+#endif
     }
 #endif
     bip324_t_free(&t);

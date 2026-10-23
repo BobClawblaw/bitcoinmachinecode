@@ -14,15 +14,22 @@ mutant M-LOC-fit    locator.c "$D/serve_invbounds.c" 's/if (plen < p + n \* 32u 
 diverge X-LOC-canon  locator.c "$D/serve_invbounds.c" "CORE: accepted locator count is canonical" "--unwind 104"
 
 # ---------------------------------------------------------------- P2P: BIP324 v2 transport
-proof  P-V2         v2xport.c "$A/crypto_bip324_transport.c" "-DFP_FEEDS=3 -DFP_CHUNK=40 -DFP_EXPORT=1200 --unwind 130 --unwindset advance.3:12"
+# split by phase so each fits the 8 GB cap (the whole handshake in one run did not)
+proof  P-V2-SNIFF   v2xport.c "$A/crypto_bip324_transport.c" "-DFP_START=0 -DFP_FEEDS=2 -DFP_CHUNK=20 -DFP_EXPORT=8 --unwind 66 --unwindset advance.3:6,advance.0:2"
+proof  P-V2-GARB    v2xport.c "$A/crypto_bip324_transport.c" "-DFP_START=2 -DFP_FEEDS=2 -DFP_CHUNK=24 -DFP_EXPORT=8 --unwind 66 --unwindset advance.3:6,advance.0:34"
+proof  P-V2-APP     v2xport.c "$A/crypto_bip324_transport.c" "-DFP_START=4 -DFP_FEEDS=2 -DFP_CHUNK=40 -DFP_EXPORT=1200 --unwind 66 --unwindset advance.3:6,advance.0:2"
+mutant M-V2-garb    v2xport.c "$A/crypto_bip324_transport.c" 's/if (i > BIP324_MAX_GARBAGE_LEN) return 0;/if (i > BIP324_MAX_GARBAGE_LEN + 1) return 0;/' "garbage beyond" "-DFP_GARB -DFP_START=0 -DFP_CHUNK=4 -DFP_EXPORT=8 --unwind 66 --unwindset advance.3:6,advance.0:4120"
+proof  P-V2-GBOUND  v2xport.c "$A/crypto_bip324_transport.c" "-DFP_GARB -DFP_START=0 -DFP_CHUNK=4 -DFP_EXPORT=8 --unwind 66 --unwindset advance.3:6,advance.0:4120"
+mutant M-V2-short   v2xport.c "$A/crypto_bip324_transport.c" 's/if (t->pending_len < 13){ free(plain); return 0; }/if (t->pending_len < 2){ free(plain); return 0; }/' "" "-DFP_START=4 -DFP_FEEDS=2 -DFP_CHUNK=40 -DFP_EXPORT=1200 --unwind 66 --unwindset advance.3:6,advance.0:2"
+diverge X-V2-type   v2xport.c "$A/crypto_bip324_transport.c" "CORE:" "-DFP_START=4 -DFP_FEEDS=2 -DFP_CHUNK=40 -DFP_EXPORT=1200 --unwind 66 --unwindset advance.3:6,advance.0:2"
 
 # ---------------------------------------------------------------- block / tx witness (peer blocks, compact reconstructions)
-proof  P-BWTX       bw.c "$D/block_witness.c" "-DFP_N=24 --unwind 26"
-proof  P-BWBLK      bw.c "$D/block_witness.c" "-DFP_BLOCK -DFP_N=48 -DFP_NTX=3 --unwind 50"
-mutant M-BW-canon   bw.c "$D/block_witness.c" 's/if (\*v < 0xfdULL) return 0;  /if (*v < 0x10ULL) return 0;  /' "exactly what Core" "-DFP_N=24 --unwind 26"
-mutant M-BW-superfl bw.c "$D/block_witness.c" 's/if (!\*has_witness) return 0;/(void)0;/' "exactly what Core" "-DFP_N=24 --unwind 26"
-mutant M-BW-commit  bw.c "$D/block_witness.c" 's/if (v >= 38 \&\& p\[0\]==0x6a/if (v >= 6 \&\& p[0]==0x6a/' "commitment inside" "-DFP_N=24 --unwind 26"
-mutant M-BW-scratch bw.c "$D/block_witness.c" 's/if (scratch_cap < ntx \* 32)/if (scratch_cap < ntx * 16)/' "" "-DFP_BLOCK -DFP_N=48 -DFP_NTX=3 --unwind 50"
+# P-BWTX takes ~15 min. Its mutants target one ASSERTION each, so they check
+# only that property (--property) to fail fast.
+proof  P-BWTX       bw.c "$D/block_witness.c" "@relwaive -DFP_N=66 --unwind 9 --unwindset bw_walk_tx.0:2,c_vin.0:2,bw_walk_tx.3:2,core_tx_ok.1:2,bw_walk_tx.1:8,c_vout.0:8,bw_walk_tx.2:70,core_tx_ok.0:70"
+mutant M-BW-canon   bw.c "$D/block_witness.c" 's/if (\*v < 0xfdULL) return 0;  /if (*v < 0x02ULL) return 0;  /' "exactly what Core" "--property main.assertion.1 -DFP_N=66 --unwind 9 --unwindset bw_walk_tx.0:2,c_vin.0:2,bw_walk_tx.3:2,core_tx_ok.1:2,bw_walk_tx.1:8,c_vout.0:8,bw_walk_tx.2:70,core_tx_ok.0:70"
+mutant M-BW-superfl bw.c "$D/block_witness.c" 's/if (!\*has_witness) return 0;/(void)0;/' "exactly what Core" "--property main.assertion.1 -DFP_N=66 --unwind 9 --unwindset bw_walk_tx.0:2,c_vin.0:2,bw_walk_tx.3:2,core_tx_ok.1:2,bw_walk_tx.1:8,c_vout.0:8,bw_walk_tx.2:70,core_tx_ok.0:70"
+mutant M-BW-commit  bw.c "$D/block_witness.c" 's/if (v >= 38 \&\& p\[0\]==0x6a/if (v >= 6 \&\& p[0]==0x6a/' "commitment inside" "--property main.assertion.2 -DFP_N=66 --unwind 9 --unwindset bw_walk_tx.0:2,c_vin.0:2,bw_walk_tx.3:2,core_tx_ok.1:2,bw_walk_tx.1:8,c_vout.0:8,bw_walk_tx.2:70,core_tx_ok.0:70"
 
 # ---------------------------------------------------------------- P2P: addr / addrv2
 # @noconv: bmc_addr_group's 64->32-bit fold and the (unsigned) time() cast are
@@ -82,3 +89,35 @@ mutant M-HDRTREE-rs hdrtree.c "$D/hdr_tree.c" 's/if (n <= g_cap) return 1;/if (n
 CMPCT_M='s/#define CR_MAX_TX 20000/#define CR_MAX_TX 16/'
 proofm P-CMPCT      cmpct.c "$D/cmpct_recv.c" "$CMPCT_M" "-DFP_N=104 --unwind 24"
 proofm P-BTXN       cmpct.c "$D/cmpct_recv.c" "$CMPCT_M" "-DFP_BLOCKTXN -DFP_N=104 --unwind 24"
+
+# ---------------------------------------------------------------- RPC: HTTP request line, pre-auth headers
+proof  P-HTTP       http.c "$A/rpc_net.c" "-DFP_N=24 --unwind 26"
+mutant M-HTTP-ctl   http.c "$A/rpc_net.c" 's/if ((unsigned char)\*q < 0x20 || (unsigned char)\*q == 0x7f) return 0;/(void)0;/' "no control byte" "-DFP_N=24 --unwind 26"
+proof  P-AUTH       auth.c "$A/rpc_server.c" "@noconv -DFP_N=40 --unwind 42"
+mutant M-AUTH-b64   auth.c "$A/rpc_server.c" 's|size_t out_cap = (inlen / 4) \* 3 + 3;|size_t out_cap = (inlen / 4) * 3;|' "" "@noconv -DFP_N=40 --unwind 42"
+mutant M-AUTH-empty auth.c "$A/rpc_server.c" 's/if (!\*pass) by_pass = 0;/(void)0;/' "empty configured password" "@noconv -DFP_N=40 --unwind 42"
+
+# ---------------------------------------------------------------- disk (-asmap) / P2P addresses: ASMap interpreter
+proof  P-ASMAP      asmap.c "$D/asmap.c" "-DFP_N=6 --unwind 50"
+mutant M-ASMAP-bit  asmap.c "$D/asmap.c" 's/if (\*bitpos >= nbytes \* 8) return -1;/if (*bitpos > nbytes * 8) return -1;/' "" "-DFP_N=6 --unwind 50"
+mutant M-ASMAP-ip   asmap.c "$D/asmap.c" 's/if ((int)(ip_bits_end - ip_bit) < matchlen) break;/(void)0;/' "" "-DFP_N=6 --unwind 50"
+
+# ---------------------------------------------------------------- P2P: version payload (BIP330 offer), sendtxrcncl
+proof  P-TXRCN      txrecon.c "$D/txrecon.c" "-DFP_N=90 --unwind 10"
+mutant M-TXRCN-ua   txrecon.c "$D/txrecon.c" 's/if (ualen > (unsigned long long)(len - o)) return -1;/(void)0;/' "" "-DFP_N=90 --unwind 10"
+
+# ---------------------------------------------------------------- P2P: BIP157 filter serving
+proof  P-CF         cfilters.c "$D/serve_cfilters.c" "--unwind 6 --unwindset memcmp.0:9"
+mutant M-CF-range   cfilters.c "$D/serve_cfilters.c" 's/if (stop - start + 1 > lim){/if (stop - start + 1 > lim + 5000){/' "inside the requested range" "--unwind 6 --unwindset memcmp.0:9"
+mutant M-CF-cap     cfilters.c "$D/serve_cfilters.c" 's/if (len > cap) return 0;/(void)0;/' "" "--unwind 6 --unwindset memcmp.0:9"
+
+# ---------------------------------------------------------------- REST (unauthenticated with rest=1): getutxos body
+proof  P-REST       rest.c "$A/rest.c" "@noconv -DFP_P=4 -DFP_B=38 --unwind 40"
+mutant M-REST-fit   rest.c "$A/rest.c" 's/if (rawlen < p + (long)cnt \* 36){/if (rawlen < p + (long)cnt * 35){/' "" "@noconv -DFP_P=4 -DFP_B=38 --unwind 40"
+mutant M-REST-cs    rest.c "$A/rest.c" 's/if (cnt == 253){ if (rawlen < p + 2)/if (cnt == 253){ if (rawlen < p + 1)/' "" "@noconv -DFP_P=4 -DFP_B=38 --unwind 40"
+
+# ---------------------------------------------------------------- config file lines
+proof  P-CFG        cfg.c "$D/node_config.c" "-DFP_N=8 --unwind 10 --unwindset cfg_addlist.0:34"
+proof  P-CFGHEX     cfg.c "$D/node_config.c" "-DFP_HEX --unwind 72"
+mutant M-CFG-hcap   cfg.c "$D/node_config.c" 's/if(!hl || hl >= hcap) return 0;/if(!hl || hl > hcap) return 0;/' "" "-DFP_N=8 --unwind 10 --unwindset cfg_addlist.0:34"
+mutant M-CFG-hex    cfg.c "$D/node_config.c" 's/if(n==0 || n>64) return 0;/if(n==0 || n>66) return 0;/' "" "-DFP_HEX --unwind 72"

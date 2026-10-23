@@ -6,9 +6,10 @@
  *   - memory safety; no read outside tx[0..len),
  *   - acceptance equals Core's UnserializeTransaction (serialize.h,
  *     primitives/transaction.h) re-implemented below as a reference -- in
- *     BOTH directions -- outside one documented domain: a non-witness
- *     serialization with zero inputs (Core then reads a flags byte; such a tx
- *     fails CheckTransaction "bad-txns-vin-empty" regardless),
+ *     BOTH directions -- outside one documented domain: a first byte 00 after
+ *     the version not followed by 01 (bw_walk_tx reads a zero-input legacy
+ *     tx, Core reads a flags byte; either way the tx has no inputs and fails
+ *     CheckTransaction "bad-txns-vin-empty"),
  *   - on acceptance the commitment pointer (if any) lies in the tx, with 32
  *     readable bytes, and input 0's first witness item lies in the tx.
  * P-BWBLK claims, for blocks of 1..FP_NTX transactions of <= FP_N bytes each:
@@ -58,8 +59,11 @@ static int core_tx_ok(const uint8_t* p, size_t len, int* zero_in_legacy){
     if (!c_vin(p, len, &pos, &nin)) return 0;
     if (nin == 0){
         if (pos >= len) return 0; flags = p[pos++];
+        /* the excluded domain: bw_walk_tx (like tx_parse) reads a first byte
+         * 00 not followed by 01 as a zero-input legacy tx; such a tx fails
+         * CheckTransaction ("bad-txns-vin-empty") whatever its tail says */
+        if (flags != 1) *zero_in_legacy = 1;
         if (flags != 0){ if (!c_vin(p, len, &pos, &nin) || !c_vout(p, len, &pos)) return 0; }
-        else *zero_in_legacy = 1;
     } else if (!c_vout(p, len, &pos)) return 0;
     if (flags & 1){
         flags ^= 1;
@@ -80,23 +84,28 @@ static int core_tx_ok(const uint8_t* p, size_t len, int* zero_in_legacy){
 int main(void){
 #ifndef FP_BLOCK
     size_t len = nondet_size(); ASSUME(len <= FP_N);
-    uint8_t* tx = nd_buf(len);
+    uint8_t* tx = nd_tail(len, FP_N);
     int hw; uint64_t sn, il; const uint8_t* it; const uint8_t* cm;
     int r = bw_walk_tx(tx, len, &hw, &sn, &il, &it, &cm);
+#ifndef FP_NOREF
     int zl; int core = core_tx_ok(tx, len, &zl);
     if (!zl){ CHECK(r == core, "bw_walk_tx accepts exactly what Core deserializes"); }
+#else
+    int core = 0;
+#endif
     if (r){
         if (cm) CHECK(cm >= tx && cm + 32 <= tx + len, "commitment inside the tx");
         if (it) CHECK(it >= tx && it + il <= tx + len, "input 0 witness item inside the tx");
     }
-    free(tx);
+    free(nd_tail_base(tx, len, FP_N));
     COVER(r && hw, "a witness tx accepted");
     COVER(r && !hw && len >= 20, "a legacy tx with an output accepted");
+    COVER(r && cm, "a commitment output found");
     COVER(!r && core == 0 && len >= 10 && tx[4] == 0 && tx[5] == 1, "superfluous or truncated witness refused");
 #else
     uint64_t ntx = nondet_ull(); ASSUME(ntx >= 1 && ntx <= FP_NTX);
     bw_txref_t refs[FP_NTX];
-    for (uint64_t i = 0; i < FP_NTX; i++){ size_t l = nondet_size(); ASSUME(l <= FP_N); refs[i].ptr = nd_buf(l); refs[i].len = l; }
+    for (uint64_t i = 0; i < FP_NTX; i++){ size_t l = nondet_size(); ASSUME(l <= FP_N); refs[i].ptr = nd_tail(l, FP_N); refs[i].len = l; }
     uint8_t* scratch = nd_buf(ntx * 32);
     const char* why = 0; int seg = nondet_int() & 1;
     long r = block_check_witness_commitment(refs, ntx, sizeof refs[0], seg, scratch, ntx * 32, &why);
@@ -108,7 +117,7 @@ int main(void){
     }
     if (r == 1 && seg && cm) for (uint64_t i = 0; i < ntx; i++){ int hw; const uint8_t* d; CHECK(bw_walk_tx(refs[i].ptr, refs[i].len, &hw, &a, &b, &c, &d), "every tx walks under a commitment"); }
     (void)ok0;
-    for (uint64_t i = 0; i < FP_NTX; i++) free((void*)refs[i].ptr);
+    for (uint64_t i = 0; i < FP_NTX; i++) free(nd_tail_base((unsigned char*)refs[i].ptr, refs[i].len, FP_N));
     free(scratch);
     COVER(r == 1 && seg && cm && ntx >= 2, "commitment verified over two txs");
     COVER(r == 0, "a BLOCK_MUTATED verdict");

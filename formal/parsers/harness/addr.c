@@ -89,7 +89,7 @@ int main(void){
     g_cfg.addr_max_per_response = nondet_int(); ASSUME(g_cfg.addr_max_per_response >= 0 && g_cfg.addr_max_per_response <= 1000);
     g_cfg.addr_max_per_netgroup = nondet_int(); ASSUME(g_cfg.addr_max_per_netgroup >= 0 && g_cfg.addr_max_per_netgroup <= 1000);
     size_t plen = nondet_size(); ASSUME(plen <= FP_N);
-    unsigned char* pl = nd_buf(plen);
+    unsigned char* pl = nd_tail(plen, FP_N);
     long limit = nondet_long(); ASSUME(limit >= 0 && limit <= 1000);
     int viol = 7;
 #ifdef FP_V2
@@ -111,7 +111,7 @@ int main(void){
 #ifdef FP_CORE_STRICT
     if (added > 0) CHECK(core_addr_ok(pl, plen, FP_V2F), "CORE: addresses taken only from a payload Core deserializes");
 #endif
-    free(pl);
+    free(nd_tail_base(pl, plen, FP_N));
     COVER(added >= 2, "two addresses taken");
     COVER(viol == 1 && plen > 8, "a violation");
     COVER(g_added_calls >= 1 && added == 0, "an add the book refused");
