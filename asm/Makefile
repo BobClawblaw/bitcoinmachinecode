@@ -2923,7 +2923,7 @@ tests/test_wallet_txlog: tests/test_wallet_txlog.c wallet_txlog.c wallet_book.c 
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_wallet_txlog.c wallet_txlog.c wallet_book.c wallet_labels.c
 
 tests/test_msg_sign: tests/test_msg_sign.c wallet_msgsign.c wallet_core.c $(WALLETPRIMS) bitcoin_script.o
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_msg_sign.c wallet_msgsign.c wallet_core.c $(WALLETPRIMS) bitcoin_script.o
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -Wl,--wrap=wallet_ecdsa_sign -o $@ tests/test_msg_sign.c wallet_msgsign.c wallet_core.c $(WALLETPRIMS) bitcoin_script.o
 
 tests/test_wallet: tests/test_wallet.c wallet_core.c $(WALLETPRIMS)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_wallet.c wallet_core.c $(WALLETPRIMS)
