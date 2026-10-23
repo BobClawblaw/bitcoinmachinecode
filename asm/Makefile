@@ -1715,7 +1715,7 @@ BIP32OBJS := bitcoin_bip32.o bitcoin_hmac.o sha512.o bitcoin_keys.o \
     secp256k1_scalar_c.o bitcoin_addr.o sha256.o bitcoin_hash.o \
     ripemd160.o
 tests/test_bip32_master: tests/test_bip32_master.c $(BIP32OBJS)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_bip32_master.c $(BIP32OBJS)
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -Wl,--wrap=hmac_sha512 -o $@ tests/test_bip32_master.c $(BIP32OBJS)
 tests/test_bip32_chain: tests/test_bip32_chain.c $(BIP32OBJS)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_bip32_chain.c $(BIP32OBJS)
 
