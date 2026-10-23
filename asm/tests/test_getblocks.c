@@ -157,6 +157,15 @@ static void send_getblocks(int fd, const unsigned char (*loc)[32], int n, const 
     p2p_write(fd, "getblocks", 9, req, build_locator(loc, n, stop));
 }
 
+static void send_getheaders(int fd, const unsigned char (*loc)[32], int n, const unsigned char* stop){
+    p2p_write(fd, "getheaders", 10, req, build_locator(loc, n, stop));
+}
+/* the server hung up without a word: the next read is EOF (nothing was
+ * written to it since, so the close is a FIN, not a reset) */
+static int closed_silently(int fd){
+    char c[12]; static unsigned char b[1<<16]; unsigned bl = 0;
+    return p2p_read(fd, c, b, sizeof b, &bl) == 0;
+}
 static void send_getdata(int fd, unsigned type, const unsigned char* hash){
     unsigned char gd[37]; gd[0] = 1; put_u32(gd + 1, type); memcpy(gd + 5, hash, 32);
     p2p_write(fd, "getdata", 7, gd, sizeof gd);
@@ -303,6 +312,45 @@ int main(void){
       pong = reply(fd);
       cki("continuation: below the limit, block 500 is not followed by an inv", pong && got_block_then("block", 500, 0), 1);
       peer_close(fd); }
+
+    /* ---- MAX_LOCATOR_SZ: a complete locator of 102 entries disconnects ----
+     * Core (net_processing.cpp 4272 getblocks, 4399 getheaders) sets
+     * fDisconnect for vHave.size() > 101, after the whole locator and the
+     * stop hash have been read. Both handlers dropped the message and kept
+     * the peer. 101 entries is still served; a count of 102 over a body too
+     * short to hold it is a parse failure, dropped with the connection kept. */
+    { static unsigned char many[102][32];
+      for (int i = 0; i < 102; i++){ memset(many[i], 0xab, 32); many[i][0] = (unsigned char)i; }
+      memcpy(many[100], bhash[3], 32);                  /* entry 101 of 101 is known */
+      for (int kd = 0; kd < 2; kd++){
+          const char* kind = kd ? "getheaders" : "getblocks";
+          char lbl[200];
+          int fd = peer_open();
+          if (kd) send_getheaders(fd, (const unsigned char (*)[32])many, 102, 0);
+          else    send_getblocks(fd, (const unsigned char (*)[32])many, 102, 0);
+          snprintf(lbl, sizeof lbl, "MAX_LOCATOR_SZ: a %s with 102 locator entries is disconnected", kind);
+          cki(lbl, closed_silently(fd), 1);
+          peer_close(fd);
+
+          fd = peer_open();
+          if (kd) send_getheaders(fd, (const unsigned char (*)[32])many, 101, 0);
+          else    send_getblocks(fd, (const unsigned char (*)[32])many, 101, 0);
+          int pong = reply(fd);
+          const msg_t* m = first_cmd(kd ? "headers" : "inv");
+          unsigned off = 0; long n = vec_count(m, &off);
+          int from4 = kd ? (n > 0 && m->len >= off + 80 && !memcmp(m->p + off, blk[4], 80))
+                         : (n > 0 && inv_height(m, 0) == 4);
+          snprintf(lbl, sizeof lbl, "MAX_LOCATOR_SZ: a %s with 101 entries is served (from height 4)", kind);
+          cki(lbl, pong && from4, 1);
+          /* count 102 over 3 hashes + stop: short, a parse failure */
+          unsigned len = build_locator((const unsigned char (*)[32])many, 3, 0);
+          req[4] = 102;
+          p2p_write(fd, kind, (unsigned)strlen(kind), req, len);
+          pong = reply(fd);
+          snprintf(lbl, sizeof lbl, "MAX_LOCATOR_SZ: a %s claiming 102 entries in a short body is dropped, connection kept", kind);
+          cki(lbl, pong && !rx_eof && count_cmd(kd ? "headers" : "inv") == 0, 1);
+          peer_close(fd);
+      } }
 
     close(ls);
     printf("\n%s (%d failures)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED", failures);

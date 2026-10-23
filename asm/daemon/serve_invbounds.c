@@ -92,7 +92,9 @@ int serve_inv_bounds(const unsigned char* pl, long plen,
  * out_stop_hash is not NULL the stop hash itself is copied there (getblocks
  * compares it against each block it walks, as Core does; zeroed on a
  * malformed message).
- * Returns 0 when the message is malformed, which the caller drops. In C for
+ * Returns 0 when the message is malformed, which the caller drops, and -1
+ * when it is well formed but carries more than MAX_LOCATOR_SZ (101) entries,
+ * for which Core disconnects the peer. In C for
  * the same reason the inv bounds are: a second hand-written varint walk in
  * assembly is how the first one went wrong.
  */
@@ -130,10 +132,19 @@ int serve_locator_from(const unsigned char* pl, unsigned long plen, void* htidx,
     if ((p == 4 + 3 && n < 0xfd) || (p == 4 + 5 && n <= 0xffff) ||
         (p == 4 + 9 && n <= 0xffffffffULL)) return 0;
 
-    /* Core's MAX_LOCATOR_SZ is 101; anything larger is a malformed request.
-     * The bound also stops an absurd count from making the walk expensive. */
-    if (n > 101) return 0;
+    /* Core reads the whole CBlockLocator and the stop hash before it looks
+     * at the count, so the order of these three matters (2026-10-23):
+     *  - above MAX_SIZE (serialize.h 32), ReadCompactSize throws "size too
+     *    large": dropped, like any parse failure;
+     *  - fewer bytes than count*32 + 32: the vector read throws at the end
+     *    of the message: dropped;
+     *  - a complete locator of more than MAX_LOCATOR_SZ (101) entries:
+     *    GETBLOCKS and GETHEADERS both set fDisconnect (net_processing.cpp
+     *    4272, 4399). This returned 0 for it, so the peer was only ignored.
+     * The 101 bound also keeps the walk below cheap. */
+    if (n > 0x02000000ULL) return 0;
     if (plen < p + n * 32u + 32u) return 0;    /* locator + the stop hash */
+    if (n > 101) return -1;
 
     /* first locator entry we know wins, in the order the peer sent them --
      * they run newest-first, so this is the most recent common block */

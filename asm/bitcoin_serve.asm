@@ -130,6 +130,8 @@ cn_feeflt: db "feefilter",0
 viol_txrelay: db "transaction sent in violation of protocol",0          ; Core net_processing.cpp
 viol_invtx:   db "transaction inv sent in violation of protocol",0
 viol_mempool: db "mempool request with bloom filters disabled",0
+viol_ghlocsz: db "getheaders locator size > MAX_LOCATOR_SZ (101)",0        ; Core: fDisconnect
+viol_gblocsz: db "getblocks locator size > MAX_LOCATOR_SZ (101)",0         ; Core: fDisconnect
 viol_gbtidx:  db "getblocktxn with malformed or out-of-bounds tx indices",0  ; Core: Misbehaving(100)
 ; BIP152 output buffer (blocktxn / cmpctblock assembly) + per-connection state.
 align 16
@@ -1406,7 +1408,8 @@ node_serve_loop:
     ; serve_locator_from does the CompactSize, the bounds and the walk (Core's
     ; FindForkInGlobalIndex), in C for the same reason serve_inv_bounds is:
     ; hand-writing a second varint walk in assembly is how the first one went
-    ; wrong. rax = 1 ok / 0 malformed.
+    ; wrong. rax = 1 ok / 0 malformed (dropped) / -1 more than
+    ; MAX_LOCATOR_SZ entries (disconnected).
     lea  rdi, [pl_buf]
     mov  rsi, [s_plen]
     mov  rdx, [s_htidx]
@@ -1414,6 +1417,8 @@ node_serve_loop:
     lea  r8,  [s_ghstop]     ; out_stop (-1 = none/unknown)
     xor  r9d, r9d            ; out_stop_hash: not needed here
     call serve_locator_from
+    cmp  eax, -1
+    je   .gh_locsz           ; > MAX_LOCATOR_SZ: Core disconnects
     test eax, eax
     jz   .next               ; malformed: drop, as the inv path does
 .gh_build:
@@ -1559,6 +1564,16 @@ node_serve_loop:
     call p2p_write
     jmp  .next
 
+.gh_locsz:
+    ; A complete locator of more than MAX_LOCATOR_SZ (101) entries: Core sets
+    ; fDisconnect, unscored (net_processing.cpp 4399 getheaders, 4272
+    ; getblocks). Both used to be dropped and the connection kept.
+    lea  rdi, [viol_ghlocsz]
+    jmp  .viol_disconnect
+.gb_locsz:
+    lea  rdi, [viol_gblocsz]
+    jmp  .viol_disconnect
+
 .maybe_getb:
     ; "getb..." splits into "getblocks" (cmd[4..7]=="lock" then cmd[8..11]==0)
     ; and "getblocktxn" (cmd[4..7]=="lock", cmd[8..11]=="txn\0" -> 0x006e7874).
@@ -1576,7 +1591,9 @@ node_serve_loop:
     ; ReadCompactSize throws and the message is dropped. serve_locator_from
     ; parses it as getheaders does (canonical count, <= 101, length checked)
     ; and walks the whole locator (FindForkInGlobalIndex). rax = 1 ok / 0
-    ; malformed; s_fh = the height to serve from, s_gbstop = the stop hash.
+    ; malformed (dropped) / -1 more than MAX_LOCATOR_SZ entries
+    ; (disconnected); s_fh = the height to serve from, s_gbstop = the stop
+    ; hash.
     lea  rdi, [pl_buf]
     mov  rsi, [s_plen]
     mov  rdx, [s_htidx]
@@ -1584,6 +1601,8 @@ node_serve_loop:
     lea  r8,  [s_ghstop]     ; out_stop height (unused: the walk compares hashes)
     lea  r9,  [s_gbstop]     ; out_stop_hash
     call serve_locator_from
+    cmp  eax, -1
+    je   .gb_locsz           ; > MAX_LOCATOR_SZ: Core disconnects
     test eax, eax
     jz   .next               ; malformed: drop, as getheaders does
     ; tip = the CONNECTED tip (3.1); s_fh is a static, survives the call
