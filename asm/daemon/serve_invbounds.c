@@ -88,7 +88,9 @@ int serve_inv_bounds(const unsigned char* pl, long plen,
  *
  * Payload: version(4) | CompactSize(count) | count*32 locator | 32 stop.
  *
- * Returns 1 with *out_from set to the height to serve FROM, and *out_stop set
+ * Returns 1 with *out_from set to the height to serve FROM, or 2 with the same
+ * outputs when the locator is EMPTY (Core's getheaders answers that with the
+ * hashStop header alone; getblocks treats it as 1), and *out_stop set
  * to the stop hash's height or -1 when the stop hash is zero/unknown. When
  * out_stop_hash is not NULL the stop hash itself is copied there (getblocks
  * compares it against each block it walks, as Core does; zeroed on a
@@ -164,7 +166,7 @@ int serve_locator_from(const unsigned char* pl, unsigned long plen, void* htidx,
       int zero = 1;
       for (int i = 0; i < 32; i++) if (stop[i]){ zero = 0; break; }
       if (!zero){ long sh = 0; if (idx_get(htidx, stop, &sh) == 1) *out_stop = sh; } }
-    return 1;
+    return n == 0 ? 2 : 1;
 }
 
 /* ---- 3.1 (UTXO_INLINE_CONNECT_SCOPE, 2026-09-06): the tip bitcoin_serve.asm

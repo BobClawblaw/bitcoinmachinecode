@@ -372,6 +372,25 @@ int main(void){
           pong && n == TIP && m->len >= off + 81 && !memcmp(m->p + off, blk[1], 80), 1);
       peer_close(fd); }
 
+    /* ---- an EMPTY getheaders locator asks for the hashStop header alone ----
+     * Core (GETHEADERS, net_processing.cpp 4426-4436): LookupBlockIndex
+     * (hashStop); unknown -> no reply at all; known -> that header, and the
+     * walk breaks on it. The handler served from the start of the chain. */
+    { int fd = peer_open();
+      unsigned char unk[32]; memset(unk, 0xee, 32);
+      send_getheaders(fd, 0, 0, bhash[5]);
+      int pong = reply(fd);
+      const msg_t* m = first_cmd("headers"); unsigned off = 0; long n = vec_count(m, &off);
+      cki("empty getheaders locator, stop = block 5: exactly block 5's header",
+          pong && count_cmd("headers") == 1 && n == 1 && m->len == off + 81 && !memcmp(m->p + off, blk[5], 80), 1);
+      send_getheaders(fd, 0, 0, unk);
+      pong = reply(fd);
+      cki("empty getheaders locator, unknown stop: no reply", pong && nrx == 0, 1);
+      send_getheaders(fd, 0, 0, 0);
+      pong = reply(fd);
+      cki("empty getheaders locator, all-zero stop: no reply", pong && nrx == 0, 1);
+      peer_close(fd); }
+
     close(ls);
     printf("\n%s (%d failures)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED", failures);
     return failures ? 1 : 0;

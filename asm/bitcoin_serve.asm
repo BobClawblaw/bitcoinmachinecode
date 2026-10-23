@@ -1408,8 +1408,8 @@ node_serve_loop:
     ; serve_locator_from does the CompactSize, the bounds and the walk (Core's
     ; FindForkInGlobalIndex), in C for the same reason serve_inv_bounds is:
     ; hand-writing a second varint walk in assembly is how the first one went
-    ; wrong. rax = 1 ok / 0 malformed (dropped) / -1 more than
-    ; MAX_LOCATOR_SZ entries (disconnected).
+    ; wrong. rax = 1 ok / 2 ok, empty locator / 0 malformed (dropped) /
+    ; -1 more than MAX_LOCATOR_SZ entries (disconnected).
     lea  rdi, [pl_buf]
     mov  rsi, [s_plen]
     mov  rdx, [s_htidx]
@@ -1421,6 +1421,8 @@ node_serve_loop:
     je   .gh_locsz           ; > MAX_LOCATOR_SZ: Core disconnects
     test eax, eax
     jz   .next               ; malformed: drop, as the inv path does
+    cmp  eax, 2
+    je   .gh_nolocator       ; empty locator: the hashStop header alone
 .gh_build:
     ; tip = the CONNECTED tip (3.1), not st[24]: a peer is never told
     ; about a block this node has stored but not validated
@@ -1564,6 +1566,24 @@ node_serve_loop:
     call p2p_write
     jmp  .next
 
+.gh_nolocator:
+    ; An EMPTY locator (Core GETHEADERS, net_processing.cpp 4426-4436) asks
+    ; for the hashStop header alone: unknown (or all-zero) -> no reply at
+    ; all; otherwise exactly that one header, since the walk breaks on
+    ; hashStop. Core also refuses a stop it may not serve (BlockRequestAllowed);
+    ; here that is a stored block above the CONNECTED tip. This used to serve
+    ; from genesis, up to 2000 headers, as if the locator were unknown.
+    mov  rdi, r14
+    call serve_public_tip
+    mov  [s_cnt], rax
+    mov  rax, [s_ghstop]
+    test rax, rax
+    js   .next               ; stop unknown: nothing is sent
+    cmp  rax, [s_cnt]
+    jg   .next               ; above the connected tip: not served
+    mov  [s_fh], rax         ; from = to = the stop's height
+    mov  [s_cnt], rax
+    jmp  .gh_nostop
 .gh_locsz:
     ; A complete locator of more than MAX_LOCATOR_SZ (101) entries: Core sets
     ; fDisconnect, unscored (net_processing.cpp 4399 getheaders, 4272
@@ -1590,7 +1610,8 @@ node_serve_loop:
     ; count was served from a misread hash or from genesis, where Core's
     ; ReadCompactSize throws and the message is dropped. serve_locator_from
     ; parses it as getheaders does (canonical count, <= 101, length checked)
-    ; and walks the whole locator (FindForkInGlobalIndex). rax = 1 ok / 0
+    ; and walks the whole locator (FindForkInGlobalIndex). rax = 1 or 2 ok
+    ; (2 = empty locator, served like any unknown one) / 0
     ; malformed (dropped) / -1 more than MAX_LOCATOR_SZ entries
     ; (disconnected); s_fh = the height to serve from, s_gbstop = the stop
     ; hash.
