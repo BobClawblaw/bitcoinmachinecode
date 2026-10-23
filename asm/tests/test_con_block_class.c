@@ -346,6 +346,20 @@ int main(void){
            utxo_live_dryrun_block(g_blk, (u64)blen, n1), 1);
     }
 
+    /* CON-9: a non-canonical tx count (fd 02 00) does not decode: MUTATED
+     * (dropped and re-fetched), not a reasonless store error that halts the
+     * applier. Same header, same transactions. */
+    {
+        splen = mk_spend(g_sp, sptxid, h1_cbtxid, -1, 0);
+        cblen = mk_coinbase(cb, cbtxid, n1, NULL, 0, 0, NULL, 0);
+        blen = assemble(g_blk, prev, n1, cb, cblen, cbtxid, g_sp, splen, sptxid);
+        ck("CON-9 control: the canonical block dry-runs clean", utxo_live_dryrun_block(g_blk, (u64)blen, n1), 1);
+        memmove(g_blk + 83, g_blk + 81, (size_t)(blen - 81));
+        g_blk[80] = 0xfd; g_blk[81] = 0x02; g_blk[82] = 0x00;
+        ck_fail("CON-9 tx count fd 02 00 is MUTATED block-decode-failed",
+                utxo_live_dryrun_block(g_blk, (u64)(blen + 2), n1), "block-decode-failed", 1);
+    }
+
     /* PURITY + COHERENCE */
     ck("UTXO count unchanged", utxo_live_count(), count0);
     ck("applied height unchanged", utxo_live_applied_height(), n1 - 1);

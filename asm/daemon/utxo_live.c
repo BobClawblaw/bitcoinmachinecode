@@ -2298,12 +2298,19 @@ static int val_build_height_push(u64 h, u8* want){
 
 static int apply_block_inner(const u8* blockbuf, u64 blocklen){
     g_last_reject = ""; g_last_mutated = 0;
-    if (blocklen < 81) return 0;
+    /* CON-9 (audit 2026-10-23): a block that does not decode -- too short,
+     * a non-canonical or truncated tx count, a transaction tx_parse refuses
+     * -- is Core's deserialization failure: nothing is marked, the bytes are
+     * simply not a block. These returned 0 with no reason, which classifies
+     * as a STORE error: the applier halted and retried the same bytes for
+     * ever. They are filed as MUTATED (dropped and fetched again). */
+    #define VAL_DECODE_FAIL() do { g_last_reject = VAL_DECODE_FAILED; g_last_mutated = 1; return 0; } while (0)
+    if (blocklen < 81) VAL_DECODE_FAIL();
     const u8* p = blockbuf + 80;
     const u8* blkend = blockbuf + blocklen;
     u64 consumed;
     u64 ntx = utxo_walk_read_varint(p, blkend, &consumed);
-    if (!consumed) return 0;
+    if (!consumed) VAL_DECODE_FAIL();
     p += consumed;
     g_blk_ntx = ntx; g_blk_nin = 0;   /* bmc.benchlog's per-block counts (nin filled by Phase 0) */
     if (ntx == 0) return 1;   /* matches the old loop's own (never actually
@@ -2364,7 +2371,7 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
     for (u64 t=0; t<ntx; t++){
         u8 info[64];
         int ok = tx_parse(info, q, (unsigned long)(blkend - q));
-        if (!ok) return 0;
+        if (!ok) VAL_DECODE_FAIL();
         u64 txlen; memcpy(&txlen, info, 8);
         u32 pn_in, pn_out; memcpy(&pn_in, info+12, 4); memcpy(&pn_out, info+16, 4);
         txs[t].ptr = q; txs[t].len = txlen; txs[t].pn_in = pn_in;
@@ -2910,6 +2917,7 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
     if (!ctx.fatal && g_mined_cb)
         for (u64 t=0; t<ntx; t++) g_mined_cb(txs[t].txid);
     return ctx.fatal ? 0 : 1;
+    #undef VAL_DECODE_FAIL
 }
 
 /* apply_block_at(buf, len, height): apply_block_inner, but with this block's
