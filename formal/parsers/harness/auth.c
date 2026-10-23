@@ -21,7 +21,7 @@ void hmac_sha256(unsigned char out[32], const unsigned char* k, size_t kl, const
 #endif
 int main(void){
     size_t len = nondet_size(); ASSUME(len <= FP_N);
-    char* h = (char*)nd_buf(len + 4);           /* the caller's buffer continues past hlen (the CRLFCRLF) */
+    char* h = (char*)nd_tail(len + 4, FP_N + 4); /* the caller's buffer continues past hlen (the CRLFCRLF) */
     h[len] = '\r'; h[len+1] = '\n'; h[len+2] = '\r'; h[len+3] = '\n';
     const char* user = nondet_int() ? "u" : "";
     const char* pass = nondet_int() ? "pw" : "";
@@ -30,7 +30,7 @@ int main(void){
 #endif
     int ok = rpc_auth_ok_for_test(h, len, user, pass);
     if (ok && !g_cookie_pass[0] && !g_n_rpcauth) CHECK(*pass != 0, "an empty configured password never authenticates");
-    free(h);
+    free(nd_tail_base((unsigned char*)h, len + 4, FP_N + 4));
     COVER(ok, "credentials accepted");
     COVER(!ok && len >= 30, "a long header refused");
     return 0;

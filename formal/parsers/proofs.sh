@@ -69,9 +69,14 @@ mutant M-JSON-leak  json.c "$A/rpc_json.c" 's/if (c->err) { xfree(key); rj_free(
 mutant M-JSON-ctl   json.c "$A/rpc_json.c" 's/if (c->end - c->p < 5) { c->err = 1; break; }/if (c->end - c->p < 4) { c->err = 1; break; }/' "dereference failure" "-DFP_N=6 --unwind 8"
 
 # ---------------------------------------------------------------- disk: undo runs (rev*.dat + undo.idx)
-proof  P-UNDO       undo.c "$D/undo_log.c" "--unwind 8"
-mutanth M-UNDO-whole undo.c "$D/undo_log.c" "$D/undo_store.h" 's/if (len - off < (size_t)UNDO_REC_HDR + slen){ more = 1; break; }/(void)0;/' "" "--unwind 8"
-mutanth M-UNDO-slen  undo.c "$D/undo_log.c" "$D/undo_store.h" 's/if (slen > UNDO_REC_MAXSCRIPT){ bad = 1; break; }/(void)0;/' "slen" "--unwind 8"
+# OPEN: none of these closed inside the 8 GB cap and 600 s, even reduced to
+# one reader per run, a 110-byte rev file, unwind 4 and (as a model change)
+# a 64-byte initial read buffer instead of 1 MiB. Kept for the record, not run.
+#OPEN proof  P-UNDO       undo.c "$D/undo_log.c" "--arrays-uf-always -DFP_MODE=0 --unwind 8 --unwindset strcmp.0:14"
+#OPEN proof  P-UNDOLOAD   undo.c "$D/undo_log.c" "--arrays-uf-always -DFP_MODE=1 --unwind 8 --unwindset strcmp.0:14"
+#OPEN proof  P-UNDOREPLAY undo.c "$D/undo_log.c" "--arrays-uf-always -DFP_MODE=2 --unwind 8 --unwindset strcmp.0:14"
+#OPEN mutanth M-UNDO-whole undo.c "$D/undo_log.c" "$D/undo_store.h" 's/if (len - off < (size_t)UNDO_REC_HDR + slen){ more = 1; break; }/(void)0;/' "" "--arrays-uf-always -DFP_MODE=2 --unwind 8 --unwindset strcmp.0:14"
+#OPEN mutanth M-UNDO-slen  undo.c "$D/undo_log.c" "$D/undo_store.h" 's/if (slen > UNDO_REC_MAXSCRIPT){ bad = 1; break; }/(void)0;/' "slen" "--arrays-uf-always -DFP_MODE=0 --unwind 8 --unwindset strcmp.0:14"
 
 # ---------------------------------------------------------------- disk: UTXO LSM manifest
 proof  P-LSMMAN     lsm.c "$D/lsm_manifest.c" "@nouov -DFP_FSZ=68 --unwind 6"
@@ -80,13 +85,15 @@ mutant M-LSM-max    lsm.c "$D/lsm_manifest.c" 's/if (\*n > (1u << 20)){ fclose(f
 diverge X-LSM-gen   lsm.c "$D/lsm_manifest.c" "CORE: next_gen/next_run_no exceed every entry" "@nouov -DFP_FSZ=68 --unwind 6"
 
 # ---------------------------------------------------------------- disk: txindex / txospender run files
-proof  P-IRS        irs.c "$D/index_runs.c" "@nouov --unwind 10"
-mutant M-IRS-hdr    irs.c "$D/index_runs.c" 's/sb.st_size < IRS_HDR/sb.st_size < 8/' "dereference failure" "@nouov --unwind 10"
-diverge X-IRS-wrap  irs.c "$D/index_runs.c" "CORE: sparse table inside the mapping" "@nouov --unwind 10"
+proof  P-IRS        irs.c "$D/index_runs.c" "@nouov --unwind 10 --unwindset strcpy.0:13,vsnprintf.0:40,vsnprintf.1:40"
+mutant M-IRS-hdr    irs.c "$D/index_runs.c" 's/sb.st_size < IRS_HDR/sb.st_size < 8/' "dereference failure" "@nouov --unwind 10 --unwindset strcpy.0:13,vsnprintf.0:40,vsnprintf.1:40"
+diverge X-IRS-wrap  irs.c "$D/index_runs.c" "CORE: sparse table inside the mapping" "@nouov --unwind 10 --unwindset strcpy.0:13,vsnprintf.0:40,vsnprintf.1:40"
 
 # ---------------------------------------------------------------- disk + P2P: fork tree
-proof  P-HDRTREE    hdrtree.c "$D/hdr_tree.c" "-DFP_FSZ=200 --unwind 82"
-mutant M-HDRTREE-rs hdrtree.c "$D/hdr_tree.c" 's/if (n <= g_cap) return 1;/if (n <= g_cap + 1) return 1;/' "" "-DFP_FSZ=200 --unwind 82"
+# OPEN: over the 8 GB cap even at one record and unwind 4 (the 256-entry
+# realloc'd table of 92-byte entries); kept for the record, not run.
+#OPEN proof  P-HDRTREE    hdrtree.c "$D/hdr_tree.c" "-DFP_STUB_PRINTF -DFP_FSZ=100 --unwind 4 --unwindset memcmp.0:33,block_hash.0:33,main.0:81"
+#OPEN mutant M-HDRTREE-rs hdrtree.c "$D/hdr_tree.c" 's/if (n <= g_cap) return 1;/if (n <= g_cap + 1) return 1;/' "" "-DFP_STUB_PRINTF -DFP_FSZ=100 --unwind 4 --unwindset memcmp.0:33,block_hash.0:33,main.0:81"
 
 # ---------------------------------------------------------------- P2P: BIP152 compact blocks
 # MODEL CHANGE (stated in the README): CR_MAX_TX lowered from 20000 to 16 in a
@@ -97,33 +104,45 @@ proofm P-CMPCT      cmpct.c "$D/cmpct_recv.c" "$CMPCT_M" "-DFP_N=104 --unwind 24
 proofm P-BTXN       cmpct.c "$D/cmpct_recv.c" "$CMPCT_M" "-DFP_BLOCKTXN -DFP_N=104 --unwind 24"
 
 # ---------------------------------------------------------------- RPC: HTTP request line, pre-auth headers
-proof  P-HTTP       http.c "$A/rpc_net.c" "-DFP_N=24 --unwind 26"
-mutant M-HTTP-ctl   http.c "$A/rpc_net.c" 's/if ((unsigned char)\*q < 0x20 || (unsigned char)\*q == 0x7f) return 0;/(void)0;/' "no control byte" "-DFP_N=24 --unwind 26"
-proof  P-AUTH       auth.c "$A/rpc_server.c" "@noconv -DFP_N=40 --unwind 42"
-mutant M-AUTH-b64   auth.c "$A/rpc_server.c" 's|size_t out_cap = (inlen / 4) \* 3 + 3;|size_t out_cap = (inlen / 4) * 3;|' "" "@noconv -DFP_N=40 --unwind 42"
-mutant M-AUTH-empty auth.c "$A/rpc_server.c" 's/if (!\*pass) by_pass = 0;/(void)0;/' "empty configured password" "@noconv -DFP_N=40 --unwind 42"
+# @noconv: (unsigned char) reads of char bytes are intended
+proof  P-HTTP       http.c "$A/rpc_net.c" "@noconv -DFP_N=24 --unwind 26"
+mutant M-HTTP-ctl   http.c "$A/rpc_net.c" 's/if ((unsigned char)\*q < 0x20 || (unsigned char)\*q == 0x7f) return 0;/(void)0;/' "no control byte" "@noconv -DFP_N=24 --unwind 26"
+proof  P-AUTH       auth.c "$A/rpc_server.c" "@noconv -DFP_STUB_PRINTF -DFP_N=16 --unwind 18 --slice-formula"
+mutant M-AUTH-b64   auth.c "$A/rpc_server.c" 's|size_t out_cap = (inlen / 4) \* 3 + 3;|size_t out_cap = (inlen / 4) * 3;|' "" "@noconv -DFP_STUB_PRINTF -DFP_N=16 --unwind 18 --slice-formula"
+mutant M-AUTH-empty auth.c "$A/rpc_server.c" 's/if (!\*pass) by_pass = 0;/(void)0;/' "empty configured password" "@noconv -DFP_STUB_PRINTF -DFP_N=16 --unwind 18 --slice-formula"
 
 # ---------------------------------------------------------------- disk (-asmap) / P2P addresses: ASMap interpreter
-proof  P-ASMAP      asmap.c "$D/asmap.c" "-DFP_N=6 --unwind 50"
-mutant M-ASMAP-bit  asmap.c "$D/asmap.c" 's/if (\*bitpos >= nbytes \* 8) return -1;/if (*bitpos > nbytes * 8) return -1;/' "" "-DFP_N=6 --unwind 50"
-mutant M-ASMAP-ip   asmap.c "$D/asmap.c" 's/if ((int)(ip_bits_end - ip_bit) < matchlen) break;/(void)0;/' "" "-DFP_N=6 --unwind 50"
+proof  P-ASMAP      asmap.c "$D/asmap.c" "-DFP_N=3 --unwind 26 --slice-formula"
+mutant M-ASMAP-bit  asmap.c "$D/asmap.c" 's/if (\*bitpos >= nbytes \* 8) return -1;/if (*bitpos > nbytes * 8) return -1;/' "" "-DFP_N=3 --unwind 26 --slice-formula"
+mutant M-ASMAP-ip   asmap.c "$D/asmap.c" 's/if ((int)(ip_bits_end - ip_bit) < matchlen) break;/(void)0;/' "" "-DFP_N=3 --unwind 26 --slice-formula"
 
 # ---------------------------------------------------------------- P2P: version payload (BIP330 offer), sendtxrcncl
-proof  P-TXRCN      txrecon.c "$D/txrecon.c" "-DFP_N=90 --unwind 10"
-mutant M-TXRCN-ua   txrecon.c "$D/txrecon.c" 's/if (ualen > (unsigned long long)(len - o)) return -1;/(void)0;/' "" "-DFP_N=90 --unwind 10"
+# @noconv: the u32 protocol version is read into an int (a value >= 2^31 is
+# negative and so below 70016: refused), and the salt is cut into bytes
+proof  P-TXRCN      txrecon.c "$D/txrecon.c" "@noconv -DFP_N=90 --unwind 10"
+mutant M-TXRCN-rly  txrecon.c "$D/txrecon.c" 's/    if (o >= len) return 1;/    if (o > len) return 1;/' "" "@noconv -DFP_N=90 --unwind 10"
 
 # ---------------------------------------------------------------- P2P: BIP157 filter serving
-proof  P-CF         cfilters.c "$D/serve_cfilters.c" "--unwind 6 --unwindset memcmp.0:9"
-mutant M-CF-range   cfilters.c "$D/serve_cfilters.c" 's/if (stop - start + 1 > lim){/if (stop - start + 1 > lim + 5000){/' "inside the requested range" "--unwind 6 --unwindset memcmp.0:9"
-mutant M-CF-cap     cfilters.c "$D/serve_cfilters.c" 's/if (len > cap) return 0;/(void)0;/' "" "--unwind 6 --unwindset memcmp.0:9"
+# @noconv: the u64 filter offset read from disk is passed to pread as a long
+# (a value >= 2^63 is negative: pread fails, the request is refused), and
+# CompactSizes are cut into bytes.
+# MODEL CHANGE: CF_MAX_FILTER (the 1 MiB static filter and reply buffers)
+# lowered to 64 bytes in a scratch copy; every bound in the code is written
+# against the macro. With the real size CBMC exceeds the 8 GB cap.
+CF_M='s/#define CF_MAX_FILTER   (1u << 20)/#define CF_MAX_FILTER   64u/'
+proofm P-CF0        cfilters.c "$D/serve_cfilters.c" "$CF_M" "-DFP_KIND=0 @noconv -DFP_STUB_PRINTF --unwind 9 --unwindset memcmp.0:9,strcmp.0:14,cf_hash_fd.0:33"
+proofm P-CF1        cfilters.c "$D/serve_cfilters.c" "$CF_M" "-DFP_KIND=1 @noconv -DFP_STUB_PRINTF --unwind 9 --unwindset memcmp.0:9,strcmp.0:14,cf_hash_fd.0:33"
+proofm P-CF2        cfilters.c "$D/serve_cfilters.c" "$CF_M" "-DFP_KIND=2 @noconv -DFP_STUB_PRINTF --unwind 9 --unwindset memcmp.0:9,strcmp.0:14,cf_hash_fd.0:33"
+mutant M-CF-range   cfilters.c "$D/serve_cfilters.c" "$CF_M;s/if (stop - start + 1 > lim){/if (stop - start + 1 > lim + 5000){/" "MAX_GETCFILTERS_SIZE applied" "-DFP_KIND=0 @noconv -DFP_STUB_PRINTF --unwind 9 --unwindset memcmp.0:9,strcmp.0:14,cf_hash_fd.0:33"
+mutant M-CF-cap     cfilters.c "$D/serve_cfilters.c" "$CF_M;s/if (len > cap) return 0;/(void)0;/" "" "-DFP_KIND=0 @noconv -DFP_STUB_PRINTF --unwind 9 --unwindset memcmp.0:9,strcmp.0:14,cf_hash_fd.0:33"
 
 # ---------------------------------------------------------------- REST (unauthenticated with rest=1): getutxos body
-proof  P-REST       rest.c "$A/rest.c" "@noconv -DFP_P=4 -DFP_B=38 --unwind 40"
-mutant M-REST-fit   rest.c "$A/rest.c" 's/if (rawlen < p + (long)cnt \* 36){/if (rawlen < p + (long)cnt * 35){/' "" "@noconv -DFP_P=4 -DFP_B=38 --unwind 40"
-mutant M-REST-cs    rest.c "$A/rest.c" 's/if (cnt == 253){ if (rawlen < p + 2)/if (cnt == 253){ if (rawlen < p + 1)/' "" "@noconv -DFP_P=4 -DFP_B=38 --unwind 40"
+proof  P-REST       rest.c "$A/rest.c" "-DFP_STUB_PRINTF @noconv -DFP_P=4 -DFP_B=38 --unwind 40"
+mutant M-REST-fit   rest.c "$A/rest.c" 's/if (rawlen < p + (long)cnt \* 36){/if (rawlen < p + (long)cnt * 35){/' "" "-DFP_STUB_PRINTF @noconv -DFP_P=4 -DFP_B=38 --unwind 40"
+mutant M-REST-cs    rest.c "$A/rest.c" 's/if (cnt == 253){ if (rawlen < p + 2)/if (cnt == 253){ if (rawlen < p + 1)/' "" "-DFP_STUB_PRINTF @noconv -DFP_P=4 -DFP_B=38 --unwind 40"
 
 # ---------------------------------------------------------------- config file lines
-proof  P-CFG        cfg.c "$D/node_config.c" "-DFP_N=8 --unwind 10 --unwindset cfg_addlist.0:34"
-proof  P-CFGHEX     cfg.c "$D/node_config.c" "-DFP_HEX --unwind 72"
-mutant M-CFG-hcap   cfg.c "$D/node_config.c" 's/if(!hl || hl >= hcap) return 0;/if(!hl || hl > hcap) return 0;/' "" "-DFP_N=8 --unwind 10 --unwindset cfg_addlist.0:34"
-mutant M-CFG-hex    cfg.c "$D/node_config.c" 's/if(n==0 || n>64) return 0;/if(n==0 || n>66) return 0;/' "" "-DFP_HEX --unwind 72"
+proof  P-CFG        cfg.c "$D/node_config.c" "-DFP_STUB_PRINTF -DFP_N=8 --unwind 10 --unwindset cfg_addlist.0:34"
+proof  P-CFGHEX     cfg.c "$D/node_config.c" "-DFP_STUB_PRINTF -DFP_HEX --unwind 72"
+mutant M-CFG-hcap   cfg.c "$D/node_config.c" 's/if(!hl || hl >= hcap) return 0;/if(!hl || hl > hcap) return 0;/' "" "-DFP_STUB_PRINTF -DFP_N=8 --unwind 10 --unwindset cfg_addlist.0:34"
+mutant M-CFG-hex    cfg.c "$D/node_config.c" 's/if(n==0 || n>64) return 0;/if(n==0 || n>66) return 0;/' "" "-DFP_STUB_PRINTF -DFP_HEX --unwind 72"

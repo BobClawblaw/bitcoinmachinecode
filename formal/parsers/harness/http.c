@@ -14,7 +14,7 @@
 #endif
 int main(void){
     size_t len = nondet_size(); ASSUME(len <= FP_N);
-    char* buf = (char*)nd_buf(len + 1); buf[len] = 0;
+    char* buf = (char*)nd_tail(len + 1, FP_N + 1); buf[len] = 0;
     const char *m, *p, *b; size_t ml, pl, bl;
     int r = http_request_parse(buf, len, &m, &ml, &p, &pl, &b, &bl);
     if (r){
@@ -23,7 +23,7 @@ int main(void){
         CHECK(m[ml] == ' ' && p[pl] == ' ', "separated by spaces");
         for (const char* q = buf; q < p + pl; q++) CHECK((unsigned char)*q >= 0x20 && *q != 0x7f, "no control byte in the request line");
     }
-    free(buf);
+    free(nd_tail_base((unsigned char*)buf, len + 1, FP_N + 1));
     COVER(r && ml == 4 && pl >= 1, "a POST-sized request parsed");
     COVER(r && bl >= 2, "with a body");
     return 0;

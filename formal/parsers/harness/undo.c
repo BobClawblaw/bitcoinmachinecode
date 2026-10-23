@@ -16,6 +16,7 @@
  *   - undo_replay hands the callback a 51 + slen readable record each time,
  *     and the record count is <= run length / 51 (the DoS bound). */
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -23,12 +24,16 @@
 #include <sys/uio.h>
 #include "nd.h"
 #ifndef FP_FSZ
-#define FP_FSZ 160
+#define FP_FSZ 110
 #endif
 #ifndef FP_SHORT
 #define FP_SHORT 1
 #endif
 static size_t g_rsz; static unsigned char* g_rev; static int g_open; static int g_short;
+/* snprintf only names rev files here (us_rev_name); CBMC's printf-family
+ * model is far over the memory cap, so the name is a fixed "rev" */
+int snprintf(char* s, size_t n, const char* fmt, ...){ (void)fmt; if (n >= 4){ memcpy(s, "rev", 4); } else if (n) s[0] = 0; return 3; }
+int fprintf(FILE* f, const char* fmt, ...){ (void)f; (void)fmt; return 0; }
 int open(const char* p, int fl, ...){ (void)fl; if (nondet_int()) return -1; g_open++;
     return strcmp(p, "undo.idx") == 0 ? 10 : 11; }
 int close(int fd){ (void)fd; g_open--; return 0; }
@@ -61,8 +66,12 @@ static int cb(void* ctx, const unsigned char* txid, unsigned index, unsigned lon
 int main(void){
     g_rsz = nondet_size(); ASSUME(g_rsz <= FP_FSZ); g_rev = nd_buf(g_rsz);
     long h = nondet_long(); ASSUME(h >= 0 && h <= (1L << 40));
-    int mode = nondet_int();
-    if (mode == 0){
+#ifndef FP_MODE
+#define FP_MODE 0
+#endif
+    int mode = FP_MODE;   /* one reader per run (memory cap): 0 us_read_run, 1 undo_load, 2 replay */
+#if FP_MODE == 0
+    {
         unsigned char* buf; int torn;
         long len = us_read_run(h, &buf, &torn);
         if (len >= 0){
@@ -74,7 +83,9 @@ int main(void){
         }
         COVER(len >= 102, "two records read");
         COVER(len >= 0 && torn, "a torn run");
-    } else if (mode == 1){
+    }
+#elif FP_MODE == 1
+    {
         long max = nondet_long(); ASSUME(max >= 0 && max <= 3);
         undo_rec_t* out = (undo_rec_t*)malloc((size_t)(max ? max : 1) * sizeof(undo_rec_t)); ASSUME(out != 0);
         long n = undo_load(h, out, max);
@@ -82,7 +93,9 @@ int main(void){
         for (long i = 0; i < n; i++) CHECK(out[i].slen <= 10000, "loaded slen bound");
         free(out);
         COVER(n == 2, "two records loaded");
-    } else {
+    }
+#else
+    {
         int torn = 0;
         long n = nondet_int() ? undo_replay(h, cb, 0) : undo_replay_tolerant(h, cb, 0, &torn);
         CHECK(n <= g_cbn, "replayed = callbacks");
@@ -90,6 +103,8 @@ int main(void){
         COVER(n == 2, "two records replayed");
         COVER(n >= 1 && torn, "tolerant replay over a torn tail");
     }
+#endif
+    (void)mode;
     CHECK(g_open == 0, "every fd closed");
     free(g_rev);
     return 0;

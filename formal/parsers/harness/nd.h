@@ -51,4 +51,34 @@ static inline int fp_cs_canonical(const unsigned char* p, size_t len){
     unsigned long long v = 0; for (int i = 0; i < 8; i++) v |= (unsigned long long)p[1+i] << (8*i);
     return v > 0xffffffffULL;
 }
+/* libc functions CBMC 6.11 has no model for, written the way the C
+ * standard specifies them (trusted) */
+#include <string.h>
+void* memchr(const void* s, int c, size_t n){
+    const unsigned char* p = (const unsigned char*)s;
+    for (size_t i = 0; i < n; i++) if (p[i] == (unsigned char)c) return (void*)(p + i);
+    return 0;
+}
+int strncasecmp(const char* a, const char* b, size_t n){
+    for (size_t i = 0; i < n; i++){
+        int x = (unsigned char)a[i], y = (unsigned char)b[i];
+        if (x >= 'A' && x <= 'Z') x += 32;
+        if (y >= 'A' && y <= 'Z') y += 32;
+        if (x != y) return x - y;
+        if (!x) return 0;
+    }
+    return 0;
+}
+/* FP_STUB_PRINTF: CBMC's printf-family models are far over the memory cap in
+ * these harnesses; where formatted text is only logged or echoed, the
+ * harness stubs them: the output buffer gets a NUL (its first byte), the
+ * return value is 0. Text content is then not under test. */
+#ifdef FP_STUB_PRINTF
+#include <stdio.h>
+#include <stdarg.h>
+int snprintf(char* s, size_t n, const char* f, ...){ (void)f; if (n) s[0] = 0; return 0; }
+int vsnprintf(char* s, size_t n, const char* f, va_list ap){ (void)f; (void)ap; if (n) s[0] = 0; return 0; }
+int fprintf(FILE* fp, const char* f, ...){ (void)fp; (void)f; return 0; }
+int printf(const char* f, ...){ (void)f; return 0; }
+#endif
 #endif
