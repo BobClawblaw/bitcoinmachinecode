@@ -220,6 +220,13 @@ int http_request_parse(const char* buf, size_t len,
     if (!sp1) return 0;
     const char* sp2 = memchr(sp1 + 1, ' ', (size_t)(line_end - (sp1 + 1)));
     if (!sp2) return 0;
+    /* RPC-26: no control bytes anywhere in the request line. The line is cut
+     * at the first CR only, so a bare LF (or a NUL, an ESC) could sit in the
+     * request target; HTTP allows none of them there (RFC 9112 3.2), and the
+     * target is echoed into the exec-lock log lines. Refused as malformed
+     * (the callers answer 400). */
+    for (const char* q = buf; q < line_end; q++)
+        if ((unsigned char)*q < 0x20 || (unsigned char)*q == 0x7f) return 0;
     if (method) *method = buf;
     if (method_len) *method_len = (size_t)(sp1 - buf);
     if (path) *path = sp1 + 1;

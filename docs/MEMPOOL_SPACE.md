@@ -139,8 +139,9 @@ from the mempool. Lightning routes are mempool's own lightning backend and
 are unrelated. The genesis coinbase 404s, as on Core.
 
 **If the backend stops advancing while the node's tip does**, check the node
-before the backend. The facade runs one thread per connection
-(`Connection: close`), so every backend request is a new connection, and the
+before the backend. Every backend request is a new connection
+(`Connection: close`), served by a fixed pool of 16 threads (since
+2026-10-23; up to 64 more wait their turn, past that they get 503), and the
 node's descriptor limit (1,024 under the reference unit) is shared with
 everything else it serves. On 2026-10-07 a per-thread leak used up all 1,024.
 The facade and RPC stopped accepting while P2P carried on, and the backend
