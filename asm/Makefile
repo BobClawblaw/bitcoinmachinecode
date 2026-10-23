@@ -2914,8 +2914,8 @@ tests/test_tx_submit: tests/test_tx_submit.c tests/modern_spend.h daemon/tx_subm
 daemon/bmc_wallet_cli: daemon/wallet_cli.c wallet_core.c wallet_store.c daemon/wallet_crypter.c bitcoin_aes.c wallet_book.c wallet_txlog.c wallet_msgsign.c $(WALLETPRIMS) bitcoin_script.o
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) $(HARDENFLAGS) -o $@ daemon/wallet_cli.c wallet_core.c wallet_store.c daemon/wallet_crypter.c bitcoin_aes.c wallet_book.c wallet_txlog.c wallet_msgsign.c $(WALLETPRIMS) bitcoin_script.o
 
-tests/test_wallet_txlog: tests/test_wallet_txlog.c wallet_txlog.c
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_wallet_txlog.c wallet_txlog.c
+tests/test_wallet_txlog: tests/test_wallet_txlog.c wallet_txlog.c wallet_book.c wallet_labels.c
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_wallet_txlog.c wallet_txlog.c wallet_book.c wallet_labels.c
 
 tests/test_msg_sign: tests/test_msg_sign.c wallet_msgsign.c wallet_core.c $(WALLETPRIMS) bitcoin_script.o
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_msg_sign.c wallet_msgsign.c wallet_core.c $(WALLETPRIMS) bitcoin_script.o
