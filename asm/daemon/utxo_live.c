@@ -1807,6 +1807,12 @@ static int bip30_enforced(long height, const u8 hash32[32])
  * Reset on entry; only meaningful right after a 0 return. */
 static const char* g_last_reject = "";
 const char* utxo_live_last_reject(void){ return g_last_reject; }
+/* The reason filed for a block whose bytes do not decode the way Core's
+ * deserializer requires (non-canonical CompactSize, a superfluous witness
+ * record, a truncated transaction). Core never gets as far as validating
+ * such a block -- the block message throws while it is read and nothing is
+ * marked -- so it is always filed with g_last_mutated set (CON-1/CON-9). */
+#define VAL_DECODE_FAILED "block-decode-failed"
 
 /* ---- failure classification + honest recovery (incident 2026-09-01) ----
  * utxo_live_catchup() used to fail with a bare -1 and daemon/main.c treated
@@ -1833,6 +1839,9 @@ const char* utxo_live_last_reject(void){ return g_last_reject; }
 #define UTXO_FAIL_MUTATED 4  /* the bytes are not the block their header names (witness mutation): Core BLOCK_MUTATED */
 static int  g_last_fail_kind = UTXO_FAIL_NONE;
 static int  g_last_mutated = 0;     /* set by the witness-commitment phase; classifies the failure */
+/* Whether the last apply/dry-run failure was a mutation (tests; a dry run
+ * leaves it set until the next call). */
+long utxo_live_last_mutated(void){ return g_last_mutated; }
 long utxo_live_store_inconsistencies(void){ return g_store_inconsistent; }
 static long g_last_fail_height = -1;
 long utxo_live_last_fail_kind(void){ return g_last_fail_kind; }
@@ -2349,7 +2358,23 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
      * Context-free, so it runs on the dry run too: submitblock and a GBT
      * proposal answer Core's exact reason without touching state. Placed
      * before Phase 0.15 because a block that fails a size rule should be
-     * refused on that rule, the way Core orders CheckBlock. ---- */
+     * refused on that rule, the way Core orders CheckBlock.
+     *
+     * CON-1 (audit 2026-10-23): only the two CheckBlock rules stay here.
+     * Both measure the stripped serialization, which the txids -- and so the
+     * header's merkle root -- commit to, so a peer cannot make a real block
+     * fail them. The WEIGHT rule counts the witness bytes, which nothing has
+     * proven yet at this point: junk witness items appended to a real block
+     * pushed it over 4,000,000 here, the block was REJECTED, and the reject
+     * hook invalidated the real block's hash. Core runs bad-blk-weight in
+     * ContextualCheckBlock only AFTER CheckWitnessMalleation (validation.cpp
+     * "before we've checked the coinbase witness, it would be possible for
+     * the weight to be too large by filling up the coinbase witness, which
+     * doesn't change the block hash"), so the weight check now sits after
+     * Phase 0.25 below. And a transaction that does not decode here is a
+     * deserialization failure in Core (the block message is dropped, the
+     * hash is never marked), so it is filed as MUTATED, not as a reject. ---- */
+    u64 stripped = 0;
     {
         const u64 MAX_BLOCK_WEIGHT = 4000000ULL;
         const u64 WITNESS_SCALE_FACTOR = 4ULL;
@@ -2362,11 +2387,13 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
 
         /* header + CompactSize(ntx); `consumed` is that CompactSize's width,
          * read at the top of this function. */
-        u64 stripped = 80 + consumed;
+        stripped = 80 + consumed;
         val_txinfo_t vw;
         for (u64 t = 0; t < ntx; t++){
             if (!val_read_tx(txs[t].ptr, txs[t].len, &vw)){
-                g_last_reject = "bad-txns-prevout-null"; return 0;   /* same reason Phase 0.15 gives */
+                fprintf(stderr, "[utxo_live] MUTATED h=%ld: tx %llu does not decode\n",
+                        g_apply_height, (unsigned long long)t);
+                g_last_reject = VAL_DECODE_FAILED; g_last_mutated = 1; return 0;
             }
             stripped += vw.stripped_len;
         }
@@ -2375,13 +2402,6 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
             fprintf(stderr, "[utxo_live] REJECT h=%ld: bad-blk-length (stripped %llu B)\n",
                     g_apply_height, (unsigned long long)stripped);
             g_last_reject = "bad-blk-length"; return 0;
-        }
-
-        u64 weight = 3ULL * stripped + blocklen;
-        if (weight > MAX_BLOCK_WEIGHT){
-            fprintf(stderr, "[utxo_live] REJECT h=%ld: bad-blk-weight (%llu > 4000000)\n",
-                    g_apply_height, (unsigned long long)weight);
-            g_last_reject = "bad-blk-weight"; return 0;
         }
     }
 
@@ -2437,15 +2457,41 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
         long wr = block_check_witness_commitment(txs, ntx, sizeof(block_tx_t), segwit_active,
                                                  txid_scratch, sizeof txid_scratch, &wreason);
         if (wr != 1) {
-            fprintf(stderr, "[utxo_live] %s h=%ld: %s\n", wr == 0 ? "MUTATED" : "REJECT", g_apply_height, wreason);
-            /* wr == 0: the witness does not match the commitment, i.e. these
-             * bytes are not the block -- a MUTATION, never a rejection (see
-             * utxo_live_set_mutated_fn); wr == -1: malformed, a real refusal */
+            /* Every outcome here is a MUTATION, never a rejection (see
+             * utxo_live_set_mutated_fn): wr == 0 is Core's BLOCK_MUTATED
+             * (nonce size, commitment mismatch, unexpected witness); wr == -1
+             * is a transaction whose witness section does not decode -- in
+             * Core that is a deserialization failure of the block message,
+             * which marks nothing either (CON-1, audit 2026-10-23: it was
+             * filed as a real refusal and the reject hook invalidated the
+             * block). The one exception is the internal scratch bound, which
+             * says nothing about the block: no reason, so it classifies as a
+             * store error and the pass retries. */
+            if (wr != 0 && !strcmp(wreason, "witness-commitment: scratch too small")){
+                fprintf(stderr, "[utxo_live] h=%ld: %s\n", g_apply_height, wreason);
+                return 0;
+            }
+            fprintf(stderr, "[utxo_live] MUTATED h=%ld: %s\n", g_apply_height, wreason);
             g_last_reject = wr == 0 && !strcmp(wreason, "bad-witness-nonce-size") ? "bad-witness-nonce-size"
                           : wr == 0 && !strcmp(wreason, "unexpected-witness")      ? "unexpected-witness"
-                          : "bad-witness-merkle-match";
-            if (wr == 0) g_last_mutated = 1;
+                          : wr == 0                                                 ? "bad-witness-merkle-match"
+                          : VAL_DECODE_FAILED;
+            g_last_mutated = 1;
             return 0;
+        }
+    }
+
+    /* ---- Phase 0.27 (CON-1): ContextualCheckBlock's weight rule, AFTER the
+     * witness has been proven by Phase 0.25 -- exactly Core's order. Past
+     * that check the coinbase witness is one 32-byte item and every other
+     * witness byte is committed through the wtxids, so an overweight block
+     * here is overweight as mined: a real refusal. ---- */
+    {
+        u64 weight = 3ULL * stripped + blocklen;
+        if (weight > 4000000ULL){
+            fprintf(stderr, "[utxo_live] REJECT h=%ld: bad-blk-weight (%llu > 4000000)\n",
+                    g_apply_height, (unsigned long long)weight);
+            g_last_reject = "bad-blk-weight"; return 0;
         }
     }
 
