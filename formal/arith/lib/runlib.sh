@@ -49,8 +49,10 @@ cbmc_mutant(){
         echo "FAIL  $id  mutant  sed did not change $f"; FAILS=$((FAILS+1)); rm -rf "$tmp"; return
     fi
     ( cd "$tmp/sub" && _lim timeout 1800 "$CBMC" "$h" "$@" ) >"$log" 2>&1
-    if grep -q '^VERIFICATION FAILED' "$log"; then
-        echo "PASS  $id  mutant  $(_dt $t)  [$sedx] -> $(grep -m1 'FAILURE' "$log" | sed 's/^ *//')"
+    # caught = a property assertion fails; an unwinding-assertion failure
+    # alone means the bound was too small, not that the mutant was caught
+    if grep -q '^VERIFICATION FAILED' "$log" && grep 'FAILURE' "$log" | grep -vq 'unwinding assertion'; then
+        echo "PASS  $id  mutant  $(_dt $t)  [$sedx] -> $(grep 'FAILURE' "$log" | grep -v 'unwinding assertion' | head -1 | sed 's/^ *//')"
     else
         echo "FAIL  $id  mutant  $(_dt $t)  mutation [$sedx] NOT detected  see $log"; FAILS=$((FAILS+1))
     fi

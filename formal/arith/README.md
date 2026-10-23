@@ -121,3 +121,30 @@ Trusted environment and what was not covered:
   either. This is relay policy, the code documents it on purpose, and the
   block path (L3) still rejects such a transaction. It is listed as an
   observation, not as a consensus finding.
+
+## Findings (confirmed on the compiled code)
+
+- **F1: powr_compact (asm/bitcoin_pow_rules.c) mis-encodes targets below 2^16.**
+  - *Cause.* For a short mantissa (size < 3), the byte loop already
+    left-aligns it, and then `if (size < 3) word <<= 8*(3-size)` shifts it a
+    second time. Core's arith_uint256::GetCompact shifts once.
+  - *Concrete case.* `pow_retarget_bits(0x03000100, 302400, 0x1d00ffff)`
+    returns 0x01000000; Core gives 0x01400000. Details are in
+    `pow/NOTES.md` and `pow/confirm_p3c.c`.
+  - *Reachability.* It needs a retarget base target below 2^18, which means
+    a block hash at or below about 2^18 (about 2^238 expected hashes).
+  - *Severity.* Latent/informational: unreachable on any real chain, but
+    wrong code in a consensus function.
+
+Other divergences are not consensus findings, because accept/reject cannot
+differ on a reachable input. They are characterized in the group notes:
+
+- The reject string for the accumulated fee (money).
+- pow_check refuses exponent < 3, where Core needs hash < 2^15 to accept.
+- pow_check runs unarmed (`pow_pow_limit_bits == 0`) in the offline tools.
+- block_work returns 0 for exponents 33/34, and chainwork_add saturates at
+  2^128.
+- The lenient CompactSize readers that sit behind canonical ones (limits).
+- An empty P2WPKH witness counts 0 sigops where Core counts 1.
+- The mempool BIP68 path skips the rule for transactions with time-based
+  inputs (locks).
