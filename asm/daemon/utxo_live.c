@@ -4042,9 +4042,18 @@ int utxo_live_init(const char* dir){
     /* utxo_lsm_init(lst) -> 1 ok / -1 err, but utxo_lsm_reload(lst,u) ->
      * REPLAYED RECORD COUNT / -1 err (not literally 1) -- different
      * contracts, so they need different success checks. */
-    long r = have_prior_state
-        ? (g_utxo_in_reload = 1, utxo_lsm_reload(&g_utxo_lst, g_utxo_table), g_utxo_in_reload = 0)
-        : utxo_lsm_init(&g_utxo_lst);
+    /* Statements, not a comma expression: `(flag = 1, reload(), flag = 0)`
+     * has the value of its LAST operand, so from TXOQ-1 (2026-09-05) until
+     * 2026-10-23 r was 0 on every reload and the UTX-2 and UTX-6 checks
+     * below never saw a failure (tests/test_sto_crash UTX-2, UTX-6). */
+    long r;
+    if (have_prior_state){
+        g_utxo_in_reload = 1;
+        r = utxo_lsm_reload(&g_utxo_lst, g_utxo_table);
+        g_utxo_in_reload = 0;
+    } else {
+        r = utxo_lsm_init(&g_utxo_lst);
+    }
     /* UTX-2 (audit 2026-09-03): ANY negative reload is fatal, not just -1.
      *
      * utxo_store_reload returns -2 when the WAL replay hits utxo_put == 2 --
@@ -4077,6 +4086,16 @@ int utxo_live_init(const char* dir){
     if (!ok) {
         fprintf(stderr, "[utxo_live] utxo_lsm_%s failed (r=%ld)\n",
                 have_prior_state ? "reload" : "init", r);
+        /* A store that exists and will not reload (UTX-2's full memtable,
+         * UTX-6's unreadable manifest, any other reload error) fails HALTED,
+         * as a missing run does below: the untracked mode a failed init
+         * otherwise leaves would advertise the stored tip, blocks this node
+         * never connected. A fresh store that fails to init has no set to
+         * protect and keeps the untracked mode. */
+        if (have_prior_state){
+            g_applied_height = read_applied_height();
+            g_halted = 1;
+        }
         if (have_prior_state && r == -2)
             fprintf(stderr,
                 "[utxo_live] FATAL: the WAL tail does not fit this memtable "
