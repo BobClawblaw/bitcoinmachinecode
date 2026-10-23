@@ -959,9 +959,11 @@ static void bench_block_line(long h, const u64* v0, const u64* p0, u64 t0, u64 t
 extern void tx_verify_set_script_checks(int on);
 static long g_assumevalid_height = -1;
 static int  g_av_announced_end = 0;
+static unsigned char g_av_hash[32];     /* the assumed-valid block's hash (wire order) */
+static int  g_av_src = 0;               /* where it was found: 1 headers.dat, 2 index.dat */
 extern const chainparams_t* g_chainp;
 static void utxo_live_resolve_assumevalid(void){
-    g_assumevalid_height = -1;
+    g_assumevalid_height = -1; g_av_src = 0;
     unsigned char want[32];
     if (g_cfg.assumevalid_mode == 2) return;                       /* assumevalid=0 */
     if (g_cfg.assumevalid_mode == 1) memcpy(want, g_cfg.assumevalid, 32);
@@ -998,12 +1000,52 @@ static void utxo_live_resolve_assumevalid(void){
         while (fread(rec, 1, 48, f) == 48){ if (!memcmp(rec, want, 32)){ g_assumevalid_height = h; break; } h++; }
         fclose(f);
     }
+    if (g_assumevalid_height >= 0){
+        memcpy(g_av_hash, want, 32);
+        g_av_src = !strcmp(src, "the header chain") ? 1 : 2;
+    }
     if (g_assumevalid_height >= 0)
-        fprintf(stderr, "[utxo_live] assumevalid: block found at height %ld on %s -- script evaluation skipped through it, resumed above\n", g_assumevalid_height, src);
+        fprintf(stderr, "[utxo_live] assumevalid: block found at height %ld on %s -- script evaluation skipped through its ancestors, resumed above\n", g_assumevalid_height, src);
     else
         fprintf(stderr, "[utxo_live] assumevalid: block not on the header chain yet -- every script is evaluated; re-checked every 1,000 blocks\n");
 }
 long utxo_live_assumevalid_resolve_now(void){ utxo_live_resolve_assumevalid(); return g_assumevalid_height; }
+
+/* 1 = the hash recorded at `h` in `file` (records of `rec` bytes, hash at
+ * `off`) is `hash`. Read per call, never cached: headers.dat is truncated
+ * and re-appended on a header reorg. */
+static int av_hash_at(const char* file, long rec, long off, long h, const unsigned char hash[32]){
+    int fd = open(file, O_RDONLY);
+    if (fd < 0) return 0;
+    unsigned char got[32];
+    int ok = pread(fd, got, 32, (off_t)h * rec + off) == 32 && !memcmp(got, hash, 32);
+    close(fd);
+    return ok;
+}
+/* CON-7 (audit 2026-10-23): may block (h, hash) skip script evaluation?
+ *
+ * Core's ConnectBlock skips scripts only for a block that is an ANCESTOR of
+ * the assumed-valid block on the best header chain (pindexBestHeader->
+ * GetAncestor(h) == pindex, and the assumed-valid block's own ancestor at h
+ * is the block). This decided by height alone (h <= the resolved height),
+ * so a block on a side branch below that height -- reconnected through a
+ * reorg -- or a block applied after the header chain moved, had its
+ * scripts skipped too. Now: the assumed-valid block must still sit at its
+ * height on the chain it was found on, and this block's hash must be that
+ * chain's hash at h, i.e. the block is its ancestor. The header chain is
+ * headers.dat (112-byte records, hash at +80); the fallback for a datadir
+ * with no header mirror is the archive index (48-byte records, hash at +0).
+ * Core's -minimumchainwork condition holds for anything in headers.dat (the
+ * header phase's low-work hold); its two-weeks-of-work-on-top condition is
+ * not modelled (see the CON-7 commit). A dry run never comes here. */
+int utxo_live_assumevalid_skips(long h, const unsigned char hash[32]){
+    if (g_assumevalid_height < 0 || h < 0 || h > g_assumevalid_height) return 0;
+    const char* file = g_av_src == 1 ? "headers.dat" : g_av_src == 2 ? "index.dat" : 0;
+    if (!file) return 0;
+    long rec = g_av_src == 1 ? 112 : 48, off = g_av_src == 1 ? 80 : 0;
+    return av_hash_at(file, rec, off, g_assumevalid_height, g_av_hash)
+        && av_hash_at(file, rec, off, h, hash);
+}
 
 
 
@@ -2947,9 +2989,13 @@ static int apply_block_at_inner(const u8* blockbuf, u64 blocklen, long height){
     /* headers arrive after init on a fresh sync: while unresolved, look again
      * every 1,000 blocks (one scan of headers.dat, ~100 MB at the tip) */
     if (g_assumevalid_height < 0 && g_cfg.assumevalid_mode != 2 && height > 0 && height % 1000 == 0) utxo_live_resolve_assumevalid();
-    { int on = (g_assumevalid_height < 0 || height > g_assumevalid_height);
+    { int on = 1;
+      if (g_assumevalid_height >= 0 && height <= g_assumevalid_height && blocklen >= 80){
+          unsigned char bh[32]; block_hash(bh, blockbuf);
+          on = !utxo_live_assumevalid_skips(height, bh);      /* CON-7: ancestry, not height */
+      }
       tx_verify_set_script_checks(on);
-      if (on && g_assumevalid_height >= 0 && !g_av_announced_end){ g_av_announced_end = 1;
+      if (on && g_assumevalid_height >= 0 && height > g_assumevalid_height && !g_av_announced_end){ g_av_announced_end = 1;
           fprintf(stderr, "[utxo_live] assumevalid: above height %ld -- script evaluation resumed\n", g_assumevalid_height); } }
     /* GHOST GUARD (closes the multi-block WAL-vs-checkpoint window, 2026-08-25):
      * an undo_<h>.dat here can only mean h was applied -- partially or fully --
