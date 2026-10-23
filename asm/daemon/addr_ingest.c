@@ -47,7 +47,7 @@ extern unsigned net_netgroup_v4(unsigned ip);           /* daemon/net_policy.c *
 typedef struct { unsigned ng[AI_MAX_PER_RESPONSE]; int cnt[AI_MAX_PER_RESPONSE]; int n; int taken;
                  long limit; /* > 0: consider at most this many records (caller's token budget) */
                  int* viol;  /* audit 2026-09-02 N3: set to 1 when the payload is a protocol violation
-                              * (malformed, or a count above MAX_ADDR_TO_SEND); NULL = nobody asked */     unsigned src_group;   /* NET-10: netgroup of the peer that sent this response */
+                              * (a well-formed vector of more than MAX_ADDR_TO_SEND, F2); NULL = nobody asked */     unsigned src_group;   /* NET-10: netgroup of the peer that sent this response */
 } ai_quota_t;
 #define AI_VIOL(q) do { if ((q)->viol) *(q)->viol = 1; } while (0)
 
@@ -66,15 +66,26 @@ static void ai_u16(unsigned char*p,unsigned v){p[0]=v>>8;p[1]=v&0xff;}
 #include "netaddr.h"
 #include "addrbook.h"
 static ab2_t* g_book;
-/* CompactSize reader (the addrv2 count); 1 ok / 0 truncated */
+/* CompactSize reader (the addrv2 count), as Core's ReadCompactSize with its
+ * range check: 1 ok / 0 truncated, non-canonical, or above MAX_SIZE */
+#define AI_MAX_SIZE 0x02000000ULL                       /* Core serialize.h MAX_SIZE */
 static int ai_compact(const unsigned char* pl, long plen, unsigned long long* pos, unsigned long long* v){
     if((long)*pos >= plen) return 0;
     unsigned char c = pl[*pos];
     if(c < 0xfd){ *v = c; *pos += 1; return 1; }
-    if(c == 0xfd){ if((long)*pos + 3 > plen) return 0; *v = (unsigned long long)pl[*pos+1] | ((unsigned long long)pl[*pos+2] << 8); *pos += 3; return 1; }
-    if(c == 0xfe){ if((long)*pos + 5 > plen) return 0; *v = 0; for(int i=0;i<4;i++) *v |= (unsigned long long)pl[*pos+1+i] << (8*i); *pos += 5; return 1; }
-    if((long)*pos + 9 > plen) return 0;
-    *v = 0; for(int i=0;i<8;i++) *v |= (unsigned long long)pl[*pos+1+i] << (8*i); *pos += 9; return 1;
+    if(c == 0xfd){
+        if((long)*pos + 3 > plen) return 0;
+        *v = (unsigned long long)pl[*pos+1] | ((unsigned long long)pl[*pos+2] << 8);
+        if(*v < 0xfd) return 0;
+        *pos += 3; return 1;
+    }
+    if(c == 0xfe){
+        if((long)*pos + 5 > plen) return 0;
+        *v = 0; for(int i=0;i<4;i++) *v |= (unsigned long long)pl[*pos+1+i] << (8*i);
+        if(*v <= 0xffff || *v > AI_MAX_SIZE) return 0;
+        *pos += 5; return 1;
+    }
+    return 0;                                           /* the 9-byte form is either non-canonical or above MAX_SIZE */
 }
 ab2_t* addr_book(void){
     if(!g_book) g_book = ab2_open(".", 1);
@@ -105,15 +116,50 @@ static long ai_ingest_one(ab2_t* b, const bmc_addr_t* a, unsigned long long svc,
      * owns. 0 when the caller could not identify the leg -- never capped. */
     return ab2_add_from(b, a, svc, tm, q->src_group) > 0 ? 1 : 0;
 }
+/* ---- WHOLE-MESSAGE VALIDITY (formal/parsers F2, 2026-10-23) ---------------
+ * Core deserializes the whole vector (`vRecv >> ser_params(vAddr)`,
+ * net_processing.cpp 4039) before it looks at a single address: any
+ * deserialization failure -- a non-canonical or over-MAX_SIZE CompactSize,
+ * fewer records than the count, a known BIP155 network id with the wrong
+ * address length -- throws, ProcessMessages catches it (5283), and the message
+ * is dropped WHOLE, with nothing taken and the peer NOT scored. Only a vector
+ * that deserialized and holds more than MAX_ADDR_TO_SEND (1000) entries is
+ * Misbehaving ("addr message size = %u", 4048).
+ *
+ * The parsers below used to stop at the first bad record and keep the ones
+ * before it, read a count Core refuses, and score every malformed payload.
+ * addr_msg_records() is that rule in one place: the record count of a payload
+ * Core deserializes, or -1. Exported so tx_relay.c applies it before its
+ * token bucket, which Core also charges only after the vector parsed. */
+static long ai_records_v1(const unsigned char* pl, long plen){
+    return p2p_addr_count(pl, plen);                    /* canonical, <= MAX_SIZE, and every record present; else -1 */
+}
+static long ai_records_v2(const unsigned char* pl, long plen){
+    unsigned long long pos = 0, cnt = 0;
+    if(plen < 1 || !ai_compact(pl, plen, &pos, &cnt)) return -1;
+    for(unsigned long long k = 0; k < cnt; k++){        /* every record must deserialize; each takes >= 9 bytes */
+        bmc_addr_t a; unsigned long long svc; unsigned tm; long used = 0;
+        long r = bmc_addr_decode_v2(&a, &svc, &tm, pl + pos, plen - (long)pos, &used);
+        if(r == -1) return -1;
+        pos += (unsigned long long)used;
+    }
+    return (long)cnt;
+}
+long addr_msg_records(const char* cmd, const unsigned char* pl, long plen){
+    if(!cmd || !pl) return -1;
+    if(!strncmp(cmd,"addrv2",6)) return ai_records_v2(pl, plen);
+    if(!strncmp(cmd,"addr",4))   return ai_records_v1(pl, plen);
+    return -1;
+}
 /* legacy `addr`: CompactSize count, then 30-byte records; IPv4 arrives
  * ::ffff:-mapped, IPv6 native (see netaddr.c). Before 2026-08-28 this read
  * the IPv4 from the wrong offset and fabricated addresses from timestamps. */
 static long ai_ingest_addr1(void* unused, const unsigned char* pl, long plen, ai_quota_t* q){
     (void)unused;
-    long cnt = p2p_addr_count(pl, plen);
-    if(cnt < 0){ AI_VIOL(q); return 0; }                  /* count does not fit the payload: malformed */
+    long cnt = ai_records_v1(pl, plen);
+    if(cnt < 0) return 0;                               /* Core: does not deserialize -- dropped whole, unscored */
     if(cnt == 0) return 0;
-    if(cnt > 1000){ AI_VIOL(q); return 0; }               /* Core: MAX_ADDR_TO_SEND, misbehaving */
+    if(cnt > 1000){ AI_VIOL(q); return 0; }             /* Core: MAX_ADDR_TO_SEND, misbehaving */
     long base = (pl[0]<0xfd)?1:(pl[0]==0xfd?3:(pl[0]==0xfe?5:9));
     ab2_t* b = addr_book(); if(!b) return 0;
     long added=0;
@@ -130,17 +176,18 @@ static long ai_ingest_addr1(void* unused, const unsigned char* pl, long plen, ai
  * An entry of an unknown network id is skipped over (Core does the same). */
 static long ai_ingest_addrv2(void* unused, const unsigned char* pl, long plen, ai_quota_t* q){
     (void)unused;
-    if(plen < 1) return 0;
-    unsigned long long pos = 0, cnt = 0;
-    if(!ai_compact(pl, plen, &pos, &cnt)){ AI_VIOL(q); return 0; }   /* truncated count: malformed */
-    if(cnt > 1000){ AI_VIOL(q); return 0; }               /* Core: MAX_ADDR_TO_SEND, misbehaving */
+    long cnt = ai_records_v2(pl, plen);
+    if(cnt < 0) return 0;                               /* Core: does not deserialize -- dropped whole, unscored */
+    if(cnt > 1000){ AI_VIOL(q); return 0; }             /* Core: MAX_ADDR_TO_SEND, misbehaving */
+    unsigned long long pos = 0, c2 = 0;
+    (void)ai_compact(pl, plen, &pos, &c2);              /* cannot fail: ai_records_v2 read it */
     ab2_t* b = addr_book(); if(!b) return 0;
     long added = 0;
-    for(unsigned long long k=0; k<cnt && (long)pos < plen; k++){
-        if(q->limit > 0 && (long)k >= q->limit) break;   /* token budget exhausted */
+    for(long k=0; k<cnt; k++){
+        if(q->limit > 0 && k >= q->limit) break;         /* token budget exhausted */
         bmc_addr_t a; unsigned long long svc; unsigned tm; long used = 0;
         long r = bmc_addr_decode_v2(&a, &svc, &tm, pl + pos, plen - (long)pos, &used);
-        if(r == -1){ AI_VIOL(q); break; }                 /* malformed record: violation, stop */
+        if(r == -1) break;                                /* cannot happen: every record was decoded above */
         pos += (unsigned long long)used;
         if(r == -2) continue;                             /* unknown network: skipped */
         added += ai_ingest_one(b, &a, svc, tm, q);
