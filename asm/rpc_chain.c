@@ -5262,9 +5262,27 @@ static int cmd_dumptxoutset(const rj_val* params, rj_val** res, long* ec, const 
         return 0;
     }
     if (!g_utxo_dump){ *ec = -1; *em = "UTXO dump unavailable in this process"; return 0; }
+    /* ST2-3 (audit 2026-10-23): resolve the path the way Core does --
+     * fsbridge::AbsPathJoin(GetDataDirNet(), path): an absolute path stands,
+     * a relative one (an empty one included) is joined to the per-chain
+     * datadir, which is this process's working directory (main.c chdir()s
+     * into it). The runner then refuses an existing file exactly as Core
+     * does (-2 here -> RPC_INVALID_PARAMETER) and the reply names the
+     * resolved path, as Core's "path" field does. */
+    static char abspath[1024];
+    if (path[0] == '/'){
+        if (snprintf(abspath, sizeof abspath, "%s", path) >= (int)sizeof abspath){ *ec = -8; *em = "path too long"; return 0; }
+    } else {
+        char cwd[PATH_MAX];
+        if (!getcwd(cwd, sizeof cwd)){ *ec = -1; *em = "cannot resolve the datadir"; return 0; }
+        int w = path[0] ? snprintf(abspath, sizeof abspath, "%s%s%s", cwd, strcmp(cwd, "/") ? "/" : "", path)
+                        : snprintf(abspath, sizeof abspath, "%s", cwd);
+        if (w < 0 || w >= (int)sizeof abspath){ *ec = -8; *em = "path too long"; return 0; }
+    }
     long height = 0; unsigned long long coins = 0;
-    static char msg[256];
-    long r = g_utxo_dump(path, gdump_hash_at, &height, &coins, msg, sizeof msg);
+    static char msg[1280];
+    long r = g_utxo_dump(abspath, gdump_hash_at, &height, &coins, msg, sizeof msg);
+    if (r == -2){ *ec = -8; *em = msg[0] ? msg : "invalid path"; return 0; }
     if (r == 0){ *ec = -1; *em = msg[0] ? msg : "UTXO set busy"; return 0; }
     if (r != 1){ *ec = -1; *em = msg[0] ? msg : "UTXO dump failed"; return 0; }
     rj_val* o = rj_obj();
@@ -5272,7 +5290,7 @@ static int cmd_dumptxoutset(const rj_val* params, rj_val** res, long* ec, const 
     { u8 rec[48]; char hx[65];
       if (read_idx_rec(height, rec)){ hex_rev(hx, rec, 32); rj_obj_set(o, "base_hash", rj_str(hx)); } }
     rj_obj_set(o, "base_height", rj_numf("%ld", height));
-    rj_obj_set(o, "path", rj_str(path));
+    rj_obj_set(o, "path", rj_str(abspath));
     *res = o;
     return 1;
 }
