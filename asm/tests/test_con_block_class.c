@@ -1,5 +1,6 @@
-/* tests/test_con_block_class.c -- CON-1 / CON-3 / CON-4 (audit 2026-10-23):
- * how a block that fails the connect checks is CLASSIFIED.
+/* tests/test_con_block_class.c -- CON-1 / CON-2 / CON-3 / CON-4 (audit
+ * 2026-10-23): what the connect checks refuse, and how a refusal is
+ * CLASSIFIED.
  *
  * A REJECT invalidates the block's hash (the reject hook: invalid.dat,
  * archive truncate, headers rollback). A MUTATION only drops the bytes and
@@ -20,6 +21,10 @@
  *         COMMITTED is REJECTED bad-blk-weight.
  *   CON-3     a transaction with zero outputs (coinbase or not) is rejected
  *             bad-txns-vout-empty (consensus/tx_check.cpp), as committed data.
+ *   CON-2     a spend of OP_2 <0x0000>, OP_2 <0x0080> or P2SH(OP_2 <0x0000>):
+ *             Core's VerifyScript fails EVAL_FALSE on the program push
+ *             before the witness branch; they were anyone-can-spend here.
+ *             Control: OP_2 <0x0001> stays anyone-can-spend, as in Core.
  *   CON-4     a non-coinbase transaction carrying the 00 01 marker with every
  *             stack empty, in a block whose commitment covers exactly those
  *             bytes (what a miner would have to produce): Core cannot
@@ -99,13 +104,21 @@ static int cscript_height(long h, u8* ss){
 }
 
 static u8 g_wsh_spk[34];   /* 00 20 sha256(51) */
+/* CON-2 prevouts, paid by the coinbases of heights 2..5:
+ *   [0] 52 02 00 00          OP_2 <0x0000>        program false
+ *   [1] 52 02 00 80          OP_2 <0x0080>        program negative zero
+ *   [2] P2SH(52 02 00 00)    the wrapped form
+ *   [3] 52 02 00 01          OP_2 <0x0001>        program true: anyone-can-spend, as in Core */
+static u8 g_con2_spk[4][23]; static int g_con2_len[4]; static u8 g_con2_txid[4][32];
+extern void hash160(u8 out[20], const void* in, long long len);
 /* Coinbase at height h. commit == NULL: legacy form, one OP_TRUE output
  * (nout_zero: no outputs at all). commit != NULL: segwit form with a second
  * output carrying the BIP141 commitment, and a witness for input 0 shaped by
  * wit: 0 = one 32-byte zero nonce (valid), 1 = zero items (marker, empty
  * stack), 2 = one 32-byte nonce with its length encoded fd 20 00. */
 enum { CBW_NONCE = 0, CBW_EMPTY = 1, CBW_NONCANON = 2 };
-static long mk_coinbase(u8* tx, u8 txid[32], long h, const u8* commit, int wit, int nout_zero, int pay_wsh){
+static long mk_coinbase(u8* tx, u8 txid[32], long h, const u8* commit, int wit, int nout_zero,
+                        const u8* pay_spk, int pay_len){
     u8* q = tx;
     put32(q,1); q+=4;
     if (commit){ *q++ = 0x00; *q++ = 0x01; }
@@ -119,7 +132,7 @@ static long mk_coinbase(u8* tx, u8 txid[32], long h, const u8* commit, int wit, 
     else {
         *q++ = commit ? 2 : 1;
         put64(q, 50000000ULL); q+=8;
-        if (pay_wsh){ *q++ = 34; memcpy(q, g_wsh_spk, 34); q += 34; }
+        if (pay_spk){ *q++ = (u8)pay_len; memcpy(q, pay_spk, (size_t)pay_len); q += pay_len; }
         else { *q++ = 1; *q++ = 0x51; }
         if (commit){
             put64(q, 0); q+=8; *q++ = 38;
@@ -132,6 +145,18 @@ static long mk_coinbase(u8* tx, u8 txid[32], long h, const u8* commit, int wit, 
         else if (wit == CBW_EMPTY){ *q++ = 0; }
         else { *q++ = 1; *q++ = 0xfd; *q++ = 32; *q++ = 0; memset(q, 0, 32); q += 32; }
     }
+    put32(q,0); q+=4;
+    long n = q - tx;
+    tx_txid(txid, tx, (unsigned long)n, g_txid_scratch, sizeof g_txid_scratch);
+    return n;
+}
+/* 1-in spend of prev:0 with an explicit scriptSig, legacy form, one OP_TRUE output. */
+static long mk_spend_ss(u8* tx, u8 txid[32], const u8 prev[32], const u8* ss, int ssn){
+    u8* q = tx;
+    put32(q,1); q+=4; *q++ = 1;
+    memcpy(q, prev, 32); q+=32; put32(q,0); q+=4;
+    *q++ = (u8)ssn; memcpy(q, ss, (size_t)ssn); q += ssn; put32(q,0xffffffffu); q+=4;
+    *q++ = 1; put64(q, 40000000ULL); q+=8; *q++ = 1; *q++ = 0x51;
     put32(q,0); q+=4;
     long n = q - tx;
     tx_txid(txid, tx, (unsigned long)n, g_txid_scratch, sizeof g_txid_scratch);
@@ -195,6 +220,11 @@ int main(void){
     ck("store_init", store_init(store_buf), 1);
     ck("utxo_live_init", utxo_live_init("."), 1);
     { u8 one = 0x51; g_wsh_spk[0] = 0x00; g_wsh_spk[1] = 0x20; sha256_full(g_wsh_spk + 2, &one, 1); }
+    { static const u8 f0[4] = {0x52,0x02,0x00,0x00}, nz[4] = {0x52,0x02,0x00,0x80}, t1[4] = {0x52,0x02,0x00,0x01};
+      memcpy(g_con2_spk[0], f0, 4); g_con2_len[0] = 4;
+      memcpy(g_con2_spk[1], nz, 4); g_con2_len[1] = 4;
+      g_con2_spk[2][0] = 0xa9; g_con2_spk[2][1] = 0x14; hash160(g_con2_spk[2] + 2, f0, 4); g_con2_spk[2][22] = 0x87; g_con2_len[2] = 23;
+      memcpy(g_con2_spk[3], t1, 4); g_con2_len[3] = 4; }
 
     long n1 = 150;
     u8 prev[32]; memset(prev,0,32);
@@ -202,7 +232,11 @@ int main(void){
     u8 h1_cbtxid[32]; memset(h1_cbtxid,0,32);   /* pays OP_TRUE: a legacy spend of it is valid */
     for (long h=0; h<n1; h++){
         u8 raw[320], hash[32], cb[160], txid[32];
-        long txlen = mk_coinbase(cb, txid, h, NULL, 0, 0, h == 0);
+        const u8* pspk = NULL; int plen = 0;
+        if (h == 0){ pspk = g_wsh_spk; plen = 34; }
+        else if (h >= 2 && h <= 5){ pspk = g_con2_spk[h-2]; plen = g_con2_len[h-2]; }
+        long txlen = mk_coinbase(cb, txid, h, NULL, 0, 0, pspk, plen);
+        if (h >= 2 && h <= 5) memcpy(g_con2_txid[h-2], txid, 32);
         if (h==0) memcpy(h0_cbtxid, txid, 32);
         if (h==1) memcpy(h1_cbtxid, txid, 32);
         u8* o = raw;
@@ -225,7 +259,7 @@ int main(void){
      * witness spend dry-runs clean (proves the fixture's commitment math). */
     splen = mk_spend(g_sp, sptxid, h0_cbtxid, 1, 0);
     commitment_for(commit, g_sp, splen);
-    cblen = mk_coinbase(cb, cbtxid, n1, commit, CBW_NONCE, 0, 0);
+    cblen = mk_coinbase(cb, cbtxid, n1, commit, CBW_NONCE, 0, NULL, 0);
     blen = assemble(g_blk, prev, n1, cb, cblen, cbtxid, g_sp, splen, sptxid);
     ck("baseline segwit block with commitment dry-runs clean", utxo_live_dryrun_block(g_blk, (u64)blen, n1), 1);
 
@@ -237,7 +271,7 @@ int main(void){
         u8 tid[32];
         splen = mk_spend(g_sp, tid, h0_cbtxid, BIG_WIT, 0);
         ck("CON-1 fixture: junk witness keeps the txid", memcmp(tid, sptxid, 32), 0);
-        cblen = mk_coinbase(cb, cbtxid, n1, small_commit, CBW_NONCE, 0, 0);
+        cblen = mk_coinbase(cb, cbtxid, n1, small_commit, CBW_NONCE, 0, NULL, 0);
         blen = assemble(g_blk, prev, n1, cb, cblen, cbtxid, g_sp, splen, sptxid);
         ck_fail("CON-1 (a) junk witness over 4M weight is MUTATED, not bad-blk-weight",
                 utxo_live_dryrun_block(g_blk, (u64)blen, n1), "bad-witness-merkle-match", 1);
@@ -245,7 +279,7 @@ int main(void){
         /* the true refusal: the commitment covers the 4 MB witness, i.e.
          * the block is overweight as mined */
         commitment_for(commit, g_sp, splen);
-        cblen = mk_coinbase(cb, cbtxid, n1, commit, CBW_NONCE, 0, 0);
+        cblen = mk_coinbase(cb, cbtxid, n1, commit, CBW_NONCE, 0, NULL, 0);
         blen = assemble(g_blk, prev, n1, cb, cblen, cbtxid, g_sp, splen, sptxid);
         ck_fail("CON-1 overweight as committed is still REJECTED bad-blk-weight",
                 utxo_live_dryrun_block(g_blk, (u64)blen, n1), "bad-blk-weight", 0);
@@ -254,13 +288,13 @@ int main(void){
     /* CON-1 (b): coinbase with the marker but an empty witness stack */
     splen = mk_spend(g_sp, sptxid, h0_cbtxid, 1, 0);
     commitment_for(commit, g_sp, splen);
-    cblen = mk_coinbase(cb, cbtxid, n1, commit, CBW_EMPTY, 0, 0);
+    cblen = mk_coinbase(cb, cbtxid, n1, commit, CBW_EMPTY, 0, NULL, 0);
     blen = assemble(g_blk, prev, n1, cb, cblen, cbtxid, g_sp, splen, sptxid);
     ck_fail("CON-1 (b) coinbase marker + empty stack is MUTATED",
             utxo_live_dryrun_block(g_blk, (u64)blen, n1), "block-decode-failed", 1);
 
     /* CON-1 (c): coinbase nonce length encoded fd 20 00 */
-    cblen = mk_coinbase(cb, cbtxid, n1, commit, CBW_NONCANON, 0, 0);
+    cblen = mk_coinbase(cb, cbtxid, n1, commit, CBW_NONCANON, 0, NULL, 0);
     blen = assemble(g_blk, prev, n1, cb, cblen, cbtxid, g_sp, splen, sptxid);
     ck_fail("CON-1 (c) non-canonical nonce length is MUTATED",
             utxo_live_dryrun_block(g_blk, (u64)blen, n1), "block-decode-failed", 1);
@@ -269,29 +303,55 @@ int main(void){
      * exactly those bytes (a miner-made block) */
     splen = mk_spend(g_sp, sptxid, h1_cbtxid, 0, 0);
     commitment_for(commit, g_sp, splen);
-    cblen = mk_coinbase(cb, cbtxid, n1, commit, CBW_NONCE, 0, 0);
+    cblen = mk_coinbase(cb, cbtxid, n1, commit, CBW_NONCE, 0, NULL, 0);
     blen = assemble(g_blk, prev, n1, cb, cblen, cbtxid, g_sp, splen, sptxid);
     ck_fail("CON-4 superfluous witness record on tx1 (commitment matching) is MUTATED",
             utxo_live_dryrun_block(g_blk, (u64)blen, n1), "block-decode-failed", 1);
 
     /* CON-3: zero-output transactions */
     splen = mk_spend(g_sp, sptxid, h1_cbtxid, -1, 1);
-    cblen = mk_coinbase(cb, cbtxid, n1, NULL, 0, 0, 0);
+    cblen = mk_coinbase(cb, cbtxid, n1, NULL, 0, 0, NULL, 0);
     blen = assemble(g_blk, prev, n1, cb, cblen, cbtxid, g_sp, splen, sptxid);
     ck_fail("CON-3 zero-output tx1 is REJECTED bad-txns-vout-empty",
             utxo_live_dryrun_block(g_blk, (u64)blen, n1), "bad-txns-vout-empty", 0);
     splen = mk_spend(g_sp, sptxid, h1_cbtxid, -1, 0);
-    cblen = mk_coinbase(cb, cbtxid, n1, NULL, 0, 1, 0);
+    cblen = mk_coinbase(cb, cbtxid, n1, NULL, 0, 1, NULL, 0);
     blen = assemble(g_blk, prev, n1, cb, cblen, cbtxid, g_sp, splen, sptxid);
     ck_fail("CON-3 zero-output coinbase is REJECTED bad-txns-vout-empty",
             utxo_live_dryrun_block(g_blk, (u64)blen, n1), "bad-txns-vout-empty", 0);
+
+    /* CON-2: spends of witness programs whose push is false. Core's
+     * VerifyScript fails EVAL_FALSE on the scriptPubKey (or redeemScript)
+     * before it looks at the witness; the true-program control is
+     * anyone-can-spend in Core as well. All committed data: REJECT. */
+    {
+        static const u8 ss_none[1] = {0};
+        static const u8 ss_wrap[5] = {0x04,0x52,0x02,0x00,0x00};
+        struct { int k; const u8* ss; int ssn; const char* name; } c2[] = {
+            { 0, ss_none, 0, "CON-2 OP_2 <0x0000> spend is REJECTED (EVAL_FALSE)" },
+            { 1, ss_none, 0, "CON-2 OP_2 <0x0080> (negative zero) spend is REJECTED (EVAL_FALSE)" },
+            { 2, ss_wrap, 5, "CON-2 P2SH-wrapped OP_2 <0x0000> spend is REJECTED (EVAL_FALSE)" },
+        };
+        for (unsigned i = 0; i < sizeof c2 / sizeof c2[0]; i++){
+            splen = mk_spend_ss(g_sp, sptxid, g_con2_txid[c2[i].k], c2[i].ss, c2[i].ssn);
+            cblen = mk_coinbase(cb, cbtxid, n1, NULL, 0, 0, NULL, 0);
+            blen = assemble(g_blk, prev, n1, cb, cblen, cbtxid, g_sp, splen, sptxid);
+            ck_fail(c2[i].name, utxo_live_dryrun_block(g_blk, (u64)blen, n1),
+                    "witness program evaluates false (EVAL_FALSE)", 0);
+        }
+        splen = mk_spend_ss(g_sp, sptxid, g_con2_txid[3], ss_none, 0);
+        cblen = mk_coinbase(cb, cbtxid, n1, NULL, 0, 0, NULL, 0);
+        blen = assemble(g_blk, prev, n1, cb, cblen, cbtxid, g_sp, splen, sptxid);
+        ck("CON-2 control: OP_2 <0x0001> (unknown version, true program) spends, as in Core",
+           utxo_live_dryrun_block(g_blk, (u64)blen, n1), 1);
+    }
 
     /* PURITY + COHERENCE */
     ck("UTXO count unchanged", utxo_live_count(), count0);
     ck("applied height unchanged", utxo_live_applied_height(), n1 - 1);
     splen = mk_spend(g_sp, sptxid, h0_cbtxid, 1, 0);
     commitment_for(commit, g_sp, splen);
-    cblen = mk_coinbase(cb, cbtxid, n1, commit, CBW_NONCE, 0, 0);
+    cblen = mk_coinbase(cb, cbtxid, n1, commit, CBW_NONCE, 0, NULL, 0);
     blen = assemble(g_blk, prev, n1, cb, cblen, cbtxid, g_sp, splen, sptxid);
     { u8 bh[32]; block_hash(bh, g_blk);
       ck("store_append valid segwit block", store_append(store_buf, bh, g_blk, blen), n1); }
