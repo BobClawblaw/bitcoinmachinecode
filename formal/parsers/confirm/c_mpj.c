@@ -15,7 +15,7 @@ int main(int argc, char** argv){
     if (!mpj_open("j.dat", 2)) return 3;
     mpj_close();
     FILE* f = fopen("j.dat", "r+b"); unsigned char z[8] = {0}; fseek(f, 24, SEEK_SET); fwrite(z, 1, 8, f); fclose(f);
-    if (!mpj_open("j.dat", 2)) return 4;
+    if (!mpj_open("j.dat", 2)){ printf("not reproduced: mpj_open refuses the journal (next_seq = 0 in the header)\n"); return 1; }
     printf("reopened: capacity %llu next_seq %llu\n", (unsigned long long)mpj_capacity(), (unsigned long long)mpj_next_seq());
     fflush(stdout);
     signal(SIGALRM, on_alarm); alarm(3);

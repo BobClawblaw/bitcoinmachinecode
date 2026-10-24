@@ -16,7 +16,14 @@ defaults to `$HOME/.local/opt/formal`), gcc for the concrete confirmations.
     formal/parsers/confirm/run.sh    # the concrete reproductions of the findings
 
 `run.sh` exits 0 only if every proof verifies, every cover goal is reached,
-every mutant is caught and every divergence still reproduces. Each CBMC
+every mutant is caught and every divergence entry gives the expected outcome:
+with `FP_EXPECT=fixed` (the default, since the F1..F7 fixes are in this tree)
+it must verify (any other failed property, or no verdict, is a failure);
+with `FP_EXPECT=found` it must still reproduce -- for running this runner over
+the tree and harness as of the findings (19c89a60, whose locator and addr
+harnesses match the code before the fixes). `confirm/run.sh` takes
+the same variable: fixed wants every driver to exit 1 ("not reproduced", so a
+crash still fails), found wants every one to reproduce its finding. Each CBMC
 process runs under `flock` (one at a time) inside
 `systemd-run --user --scope -p MemoryMax=8G -p MemorySwapMax=0`, niced, with a
 timeout, and only while `free -g` reports at least 25 GB available.
@@ -92,6 +99,50 @@ assertions; "PROVED" = no bound on the input length.
 Vacuity: every proof's cover run reached all its goals (listed in each
 harness: e.g. two entries accepted, a 3-byte CompactSize accepted, a witness
 tx accepted, a commitment found, two records loaded).
+
+### Re-run on the fixed parsers (2026-10-24)
+
+After the fixes merged (#434, with #424..#435 in main), the whole set was
+re-run twice: on the code as of the findings, where every proof and mutant
+passed, every divergence was FOUND and `confirm/run.sh` reproduced F1..F7
+(3500 s, no failures); and with main merged in. On main, all seven
+divergence entries report GONE and no confirm driver reproduces its finding.
+The harness needed four changes for the fixed code, none of them a defect in
+the parsers:
+
+* `serve_locator_from` gained the stop-hash argument and returns -1 for a
+  complete locator of more than 101 entries (Core disconnects). P-LOC now
+  claims -1 only above 101 and either way a locator that fits, and covers the
+  -1 case (5 of 5); M-LOC-max mutates the new line.
+* The addr claim "a count over 1000 is a violation" encoded the old rule.
+  Core deserializes the whole vector first: a payload that throws is dropped
+  unscored, and only a vector that deserializes with more than 1000 entries
+  is Misbehaving. P-ADDR1/P-ADDRV2 now claim exactly that, and the "a
+  violation" cover became "a malformed payload dropped unscored".
+* The `p2p_addr_count` model was updated to the fixed routine.
+* The Core reference treated BIP155 network id 3 (TORv2) as known with
+  length 10. v31.1's `SetNetFromBIP155Network` no longer lists it, so Core
+  skips such a record, as this node does; that model error was what still
+  failed X-ADDRV2-core on main.
+
+Two runner fixes came out of it: a divergence entry used to count as GONE on
+any log without the expected failure, so a timeout passed as GONE (X-ADDRV2-core
+did, once); GONE now needs VERIFICATION SUCCESSFUL. And X-MPJ-stats lacked the
+`@noconv` its proof has (the record's int64 time fields stored as u64), so it
+also failed two intended conversions; it now runs with it (GONE on main, FOUND
+on the code as of the findings, 45 s each). Under FP_CORE_STRICT the addr
+harness drops its "dropped whole" claim, whose added half the CORE claim
+restates; with both, X-ADDRV2-core did not finish in 7200 s.
+
+M-ADDRV2-max and M-ADDR1-fit are equivalent mutants on the fixed code
+(proofs.sh says why) and are not run. P-ADDRV2 takes 4122 s on the fixed code
+(the record walk runs twice: validate, then ingest), against 184 s before;
+the default per-run timeout is now 7200 s. On main the changed entries gave:
+P-LOC 3+1 s, M-LOC-max 3 s, M-LOC-fit 1 s, P-ADDR1 13+11 s, P-ADDRV2
+4122+34 s, M-ADDRV2-len 1259 s, X-ADDR1-core 14 s, X-ADDRV2-core 3758 s;
+every other entry gave the same result as in the table. `confirm/run.sh` on
+main: no driver reproduces its finding (each exits 1); `c_lsm` used to exit 0
+whatever it found, and `c_mpj` now says when `mpj_open` refuses the journal.
 
 
 ## Findings (each confirmed on the compiled code by `confirm/run.sh`)
@@ -182,8 +233,9 @@ a corrupt manifest.
   with a length `1 <= tl <= cap`, reading only `p[0..cap)`); `block_hash`,
   `sha256d`, `merkle_root`, `siphash24_uint256` as free functions of readable
   inputs; `p2p_addr_count` is re-modelled in C instruction by instruction
-  (harness/addr.c) -- that model is trusted, and its 4-byte read of the 9-byte
-  form is confirmed on the real object (F2a).
+  (harness/addr.c) -- that model is trusted. It follows the routine as fixed
+  for F2a; the 4-byte read of the 9-byte form the earlier model had was
+  confirmed on the real object before the fix.
 * **C library models**: CBMC 6.11's own, plus `memchr` and `strncasecmp`
   written to the C standard in harness/nd.h (CBMC has no model for them);
   `FP_STUB_PRINTF` harnesses replace the printf family by a stub writing an

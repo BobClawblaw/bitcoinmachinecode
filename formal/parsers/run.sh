@@ -12,7 +12,12 @@ CBMC="$FORMAL_TOOLS/cbmc/usr/bin/cbmc"
 export LD_LIBRARY_PATH="$FORMAL_TOOLS/cbmc/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 LOG="$HERE/logs"; mkdir -p "$LOG"
 FILTER="${1:-}"
-TIMEOUT="${FP_TIMEOUT:-1800}"       # seconds per CBMC run
+TIMEOUT="${FP_TIMEOUT:-7200}"       # seconds per CBMC run (P-ADDRV2 takes ~4100 s on the fixed parsers)
+# FP_EXPECT=fixed (default; the parsers carry the F1..F7 fixes): a divergence
+# entry passes when it no longer reproduces. FP_EXPECT=found: it passes only
+# when it still does (a checkout of the code before the fixes).
+EXPECT="${FP_EXPECT:-fixed}"
+case "$EXPECT" in fixed|found) ;; *) echo "run.sh: FP_EXPECT must be fixed or found" >&2; exit 2;; esac
 CHECKS="--bounds-check --pointer-check --signed-overflow-check --unsigned-overflow-check \
 --pointer-overflow-check --conversion-check --div-by-zero-check --memory-leak-check \
 --float-overflow-check --nan-check --unwinding-assertions --object-bits 12"
@@ -139,7 +144,11 @@ diverge(){
   local t1=$(date +%s)
   if grep -q "^VERIFICATION FAILED" "$LOG/$name.log" && grep -F -- "$expect" "$LOG/$name.log" | grep -q "FAILURE"; then
     printf 'FOUND  %-28s %4ss  (%s)\n' "$name" $((t1-t0)) "$expect"
-  else printf 'GONE   %-28s the divergence no longer reproduces  see logs/%s.log\n' "$name" "$name"; fails=$((fails+1)); fi
+    [ "$EXPECT" = found ] || fails=$((fails+1))
+  elif grep -q "^VERIFICATION SUCCESSFUL" "$LOG/$name.log"; then
+    printf 'GONE   %-28s %4ss  the divergence no longer reproduces\n' "$name" $((t1-t0))
+    [ "$EXPECT" = fixed ] || fails=$((fails+1))
+  else printf 'FAIL   %-28s another property failed, or no verdict  see logs/%s.log\n' "$name" "$name"; fails=$((fails+1)); fi
 }
 
 . "$HERE/proofs.sh"

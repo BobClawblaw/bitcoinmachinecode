@@ -16,6 +16,7 @@ int main(int argc, char** argv){
     int r = lsm_manifest_read_file("m.dat", &st, 0);
     unlink("m.dat");
     printf("read = %d; entry gen = 2^64-1; next_gen after read = %llu, next_run_no = %llu\n", r, (unsigned long long)st.next_gen, (unsigned long long)st.next_run_no);
-    printf("%s\n", r == 0 && st.next_gen <= g ? "CONFIRMED: next_gen not past the entry's gen" : "not reproduced");
-    return 0;
+    int confirmed = r == 0 && st.next_gen <= g;
+    printf("%s\n", confirmed ? "CONFIRMED: next_gen not past the entry's gen" : "not reproduced");
+    return confirmed ? 0 : 1;
 }

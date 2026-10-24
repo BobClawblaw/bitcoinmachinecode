@@ -4,8 +4,8 @@
  *
  * Environment (stubs; trusted):
  *   p2p_addr_count (bitcoin_addrmgr.asm): modelled in C below, instruction
- *     for instruction (the 0xff form reads only 4 count bytes; 32-bit imul,
- *     add and unsigned compare against the low 32 bits of plen)
+ *     for instruction (since F2a: all 8 bytes of the 0xff form, canonical
+ *     spellings only, MAX_SIZE, and a 64-bit divide for the fit check)
  *   the address book (ab2_open/ab2_add_from): a sink that checks each record
  *   asmap: inactive;  time(): free;  g_cfg: free per-response / per-netgroup
  *     caps in [0, 1000]
@@ -13,7 +13,9 @@
  *   - memory safety of the parsers and the quota table,
  *   - added <= 1000 (MAX_ADDR_TO_SEND) and <= the limit when one is given,
  *   - every address handed to the book has the length of its network,
- *   - a count over 1000 is always a violation,
+ *   - a payload Core throws on is dropped whole, unscored; a vector Core
+ *     deserializes with a count over 1000 is a violation and takes nothing
+ *     (unreachable at FP_N = 64: 1001 records do not fit),
  *   - FP_CORE_STRICT: an address is taken only from a payload Core's
  *     deserializer accepts whole (canonical CompactSizes within MAX_SIZE, no
  *     known network with the wrong length, no truncation before `count`
@@ -29,15 +31,14 @@
 node_config_t g_cfg;
 long p2p_addr_count(const void* plv, long plen){
     const unsigned char* b = plv;
-    if (plen < 1) return -1;
-    unsigned long long eax = b[0], ecx = 1;                             /* movzx eax, byte [rbx] */
-    if (b[0] == 0xfd){ if (plen < 3) return -1; eax = (eax & 0xffff0000ull) | (unsigned long long)(b[1] | (b[2] << 8)); ecx = 3; }   /* mov ax,[rbx+1] */
-    else if (b[0] == 0xfe){ if (plen < 5) return -1; eax = (unsigned long long)b[1] | ((unsigned long long)b[2] << 8) | ((unsigned long long)b[3] << 16) | ((unsigned long long)b[4] << 24); ecx = 5; }
-    else if (b[0] == 0xff){ if (plen < 9) return -1; eax = (unsigned long long)b[1] | ((unsigned long long)b[2] << 8) | ((unsigned long long)b[3] << 16) | ((unsigned long long)b[4] << 24); ecx = 9; }   /* mov eax,[rbx+1]: 4 bytes only */
-    unsigned long long edx = eax;
-    unsigned long long need = ((eax * 30u) + ecx) & 0xffffffffull;      /* imul eax,30 ; add eax,ecx (mod 2^32) */
-    if (need > ((unsigned long long)plen & 0xffffffffull)) return -1;   /* cmp eax, r12d ; ja .err (unsigned) */
-    return (long)edx;
+    if (plen < 1) return -1;                                            /* cmp r12, 1 ; jl .err */
+    unsigned long long v = b[0], w = 1;                                 /* movzx eax, byte [rbx] */
+    if (b[0] == 0xfd){ if (plen < 3) return -1; v = (unsigned long long)(b[1] | (b[2] << 8)); w = 3; if (v < 0xfd) return -1; }   /* movzx eax, word [rbx+1] */
+    else if (b[0] == 0xfe){ if (plen < 5) return -1; v = 0; for (int i = 0; i < 4; i++) v |= (unsigned long long)b[1+i] << (8*i); w = 5; if (v < 0x10000) return -1; }
+    else if (b[0] == 0xff){ if (plen < 9) return -1; v = 0; for (int i = 0; i < 8; i++) v |= (unsigned long long)b[1+i] << (8*i); w = 9; if ((v >> 32) == 0) return -1; }   /* mov rax, [rbx+1]: all 8 bytes */
+    if (v > 0x02000000ull) return -1;                                   /* cmp rax, 0x02000000 ; ja .err */
+    if (((unsigned long long)plen - w) / 30u < v) return -1;            /* (plen - width) / 30 >= count, div in 64 bits */
+    return (long)v;
 }
 /* the clock: some second between 2001 and 2100 (environment) */
 time_t time(time_t* t){ time_t v = (time_t)nondet_long(); ASSUME(v >= 1000000000L && v <= 4000000000L); if (t) *t = v; return v; }
@@ -79,7 +80,7 @@ static int core_addr_ok(const unsigned char* p, unsigned long len, int v2){
         if (pos + 1 > len) return 0; int net = p[pos++];
         if (!core_cs(p, len, &pos, &al, 1)) return 0;
         if (al > 512) return 0;
-        int want = net == 1 ? 4 : net == 2 ? 16 : net == 3 ? 10 : net == 4 ? 32 : net == 5 ? 32 : net == 6 ? 16 : -1;
+        int want = net == 1 ? 4 : net == 2 ? 16 : net == 4 ? 32 : net == 5 ? 32 : net == 6 ? 16 : -1;   /* TORV2 (3) is not in v31.1's SetNetFromBIP155Network switch: unknown, skipped */
         if (want >= 0 && (unsigned long long)want != al) return 0;
         if (pos + al + 2 > len) return 0; pos += al + 2;
     }
@@ -103,17 +104,22 @@ int main(void){
     CHECK(viol == 0 || viol == 1, "viol is set");
     CHECK(added >= 0 && added <= 1000 && added <= g_added_calls, "added within MAX_ADDR_TO_SEND");
     if (limit > 0) CHECK(added <= limit, "added within the token budget");
-    /* the code's own rule (ai_quota_t.viol): a count above MAX_ADDR_TO_SEND
-     * is a violation and nothing is taken. Read the count as Core does; the
-     * 9-byte form is left to X-ADDR1-core (the asm counter reads 4 bytes) */
-    { unsigned long cpos = 0; unsigned long long c;
-      if (plen >= 1 && pl[0] != 0xff && core_cs(pl, plen, &cpos, &c, 0) && c > 1000) CHECK(viol == 1 && added == 0, "count over 1000 is a violation and takes nothing"); }
+    /* Core's rule (net_processing.cpp: the vector is deserialized whole before
+     * the MAX_ADDR_TO_SEND check): a payload that throws is dropped, unscored,
+     * nothing taken; only a vector that deserializes and holds more than 1000
+     * entries is Misbehaving */
+    if (!core_addr_ok(pl, plen, FP_V2F)){
+#ifndef FP_CORE_STRICT  /* the CORE claim below is its added half; both at once double the formula */
+        CHECK(viol == 0 && added == 0, "a payload Core throws on is dropped whole, unscored");
+#endif
+    } else { unsigned long cpos = 0; unsigned long long c;
+      if (core_cs(pl, plen, &cpos, &c, 1) && c > 1000) CHECK(viol == 1 && added == 0, "count over 1000 is a violation and takes nothing"); }
 #ifdef FP_CORE_STRICT
     if (added > 0) CHECK(core_addr_ok(pl, plen, FP_V2F), "CORE: addresses taken only from a payload Core deserializes");
 #endif
     free(nd_tail_base(pl, plen, FP_N));
     COVER(added >= 2, "two addresses taken");
-    COVER(viol == 1 && plen > 8, "a violation");
+    COVER(viol == 0 && added == 0 && plen > 8 && !core_addr_ok(pl, plen, FP_V2F), "a malformed payload dropped unscored");
     COVER(g_added_calls >= 1 && added == 0, "an add the book refused");
     return 0;
 }

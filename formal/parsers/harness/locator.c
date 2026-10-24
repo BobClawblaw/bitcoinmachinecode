@@ -6,7 +6,9 @@
  * Claims, for every payload length (unbounded: the only payload-dependent
  * loop is over n <= 101, which the code bounds itself):
  *   - memory safety; every idx_get key and the stop hash lie in pl[0..plen),
- *   - result 1 => n <= MAX_LOCATOR_SZ (101) and 4 + |cs| + 32n + 32 <= plen,
+ *   - result 1 or 2 (served) => n <= MAX_LOCATOR_SZ (101), result -1
+ *     (disconnect) => n > 101, and either way 4 + |cs| + 32n + 32 <= plen:
+ *     Core reads the whole locator and stop hash before it looks at n,
  *   - idx_get is called at most 101 times (the DoS bound, before any work),
  *   - FP_CORE_STRICT: an accepted count is canonical (Core's ReadCompactSize). */
 #include <stdlib.h>
@@ -23,16 +25,18 @@ long idxscan_tip(void){ return nondet_long(); }
 int main(void){
     size_t plen = nondet_size(); ASSUME(plen <= (size_t)LONG_MAX / 2);
     unsigned char* pl = nd_buf(plen); g_pl = pl; g_plen = plen;
-    long from, stop; char htidx;
-    int r = serve_locator_from(pl, plen, &htidx, &from, &stop);
+    long from, stop; char htidx; unsigned char sh[32];
+    int r = serve_locator_from(pl, plen, &htidx, &from, &stop, sh);
+    CHECK(r >= -1 && r <= 2, "result is drop, disconnect or served");
     CHECK(g_calls <= 102, "at most 101 locator lookups + the stop hash");
-    if (r == 1){
+    if (r != 0){
         CHECK(plen >= 5, "accepted payload has a count");
         unsigned long long n; size_t w;
         if (pl[4] < 0xfd){ n = pl[4]; w = 1; } else if (pl[4] == 0xfd){ n = pl[5] | (pl[6] << 8); w = 3; }
         else if (pl[4] == 0xfe){ n = 0; for (int i = 0; i < 4; i++) n |= (unsigned long long)pl[5+i] << (8*i); w = 5; }
         else { n = 0; for (int i = 0; i < 8; i++) n |= (unsigned long long)pl[5+i] << (8*i); w = 9; }
-        CHECK(n <= 101, "count <= MAX_LOCATOR_SZ");
+        if (r == -1) CHECK(n > 101, "only a locator over MAX_LOCATOR_SZ disconnects");
+        else CHECK(n <= 101, "count <= MAX_LOCATOR_SZ");
         CHECK(4 + w + 32 * n + 32 <= plen, "locator and stop hash fit");
 #ifdef FP_CORE_STRICT
         CHECK(fp_cs_canonical(pl + 4, plen - 4), "CORE: accepted locator count is canonical");
@@ -43,5 +47,6 @@ int main(void){
     COVER(r == 1 && from > 0, "a locator hit");
     COVER(r == 1 && stop >= 0, "a known stop hash");
     COVER(r == 0 && plen > 40, "a long malformed payload refused");
+    COVER(r == -1, "a complete locator over MAX_LOCATOR_SZ disconnects");
     return 0;
 }

@@ -9,7 +9,7 @@ mutant M-INV-fit    inv_bounds.c "$D/serve_invbounds.c" 's|if ((unsigned long lo
 
 # ---------------------------------------------------------------- P2P: getheaders / getblocks locator
 proof  P-LOC        locator.c "$D/serve_invbounds.c" "--unwind 104"
-mutant M-LOC-max    locator.c "$D/serve_invbounds.c" 's/if (n > 101) return 0;/if (n > 102) return 0;/' "MAX_LOCATOR_SZ" "--unwind 104"
+mutant M-LOC-max    locator.c "$D/serve_invbounds.c" 's/if (n > 101) return -1;/if (n > 102) return -1;/' "MAX_LOCATOR_SZ" "--unwind 104"
 mutant M-LOC-fit    locator.c "$D/serve_invbounds.c" 's/if (plen < p + n \* 32u + 32u) return 0;/if (plen < p + n * 32u) return 0;/' "inside the payload" "--unwind 104"
 diverge X-LOC-canon  locator.c "$D/serve_invbounds.c" "CORE: accepted locator count is canonical" "--unwind 104"
 
@@ -39,8 +39,14 @@ mutant M-BW-commit  bw.c "$D/block_witness.c" 's/if (v >= 38 \&\& p\[0\]==0x6a/i
 # intentional narrowings; the clock is bounded to 2001..2100 by the stub
 proof  P-ADDR1      addr.c "$D/addr_ingest.c" "@noconv -DFP_N=64 --unwind 10 --unwindset memcmp.0:17"
 proof  P-ADDRV2     addr.c "$D/addr_ingest.c" "@noconv -DFP_V2 -DFP_N=64 --unwind 10 --unwindset memcmp.0:17"
-mutant M-ADDRV2-max addr.c "$D/addr_ingest.c" 's/if(cnt > 1000){ AI_VIOL(q); return 0; }               \/\* Core: MAX_ADDR_TO_SEND/if(cnt > 1001){ AI_VIOL(q); return 0; }               \/* Core: MAX_ADDR_TO_SEND/' "count over 1000" "@noconv -DFP_V2 -DFP_N=64 --unwind 10 --unwindset memcmp.0:17"
-mutant M-ADDR1-fit  addr.c "$D/addr_ingest.c" 's/if(base+k\*30+30>plen) break;/(void)0;/;s/(pl\[0\]==0xfe?5:9))/(pl[0]==0xfe?5:10))/' "" "@noconv -DFP_N=64 --unwind 10 --unwindset memcmp.0:17"
+# EQUIVALENT since F2 (kept, not run): Core scores only a vector that deserializes
+# whole, and 1001 records do not fit in FP_N = 64 bytes, so the cap is not
+# reachable here (test_addr_ingest_violation.c checks it on the real code).
+#EQUIV mutant M-ADDRV2-max addr.c "$D/addr_ingest.c" 's/if(cnt > 1000){ AI_VIOL(q); return 0; }               \/\* Core: MAX_ADDR_TO_SEND/if(cnt > 1001){ AI_VIOL(q); return 0; }               \/* Core: MAX_ADDR_TO_SEND/' "count over 1000" "@noconv -DFP_V2 -DFP_N=64 --unwind 10 --unwindset memcmp.0:17"
+# EQUIVALENT since F2a (kept, not run): p2p_addr_count now refuses a count whose
+# records do not all fit and every 9-byte count, so the per-record bound it
+# removes is redundant.
+#EQUIV mutant M-ADDR1-fit  addr.c "$D/addr_ingest.c" 's/if(base+k\*30+30>plen) break;/(void)0;/;s/(pl\[0\]==0xfe?5:9))/(pl[0]==0xfe?5:10))/' "" "@noconv -DFP_N=64 --unwind 10 --unwindset memcmp.0:17"
 mutanth M-ADDRV2-len addr.c "$D/addr_ingest.c" "$D/netaddr.c" 's/if (o + al + 2 > len) return -1;/if (o + al > len) return -1;/' "" "@noconv -DFP_V2 -DFP_N=64 --unwind 10 --unwindset memcmp.0:17"
 diverge X-ADDR1-core  addr.c "$D/addr_ingest.c" "CORE: addresses taken only from a payload Core deserializes" "@noconv -DFP_N=64 --unwind 10 --unwindset memcmp.0:17"
 diverge X-ADDRV2-core addr.c "$D/addr_ingest.c" "CORE: addresses taken only from a payload Core deserializes" "@noconv -DFP_V2 -DFP_N=64 --unwind 10 --unwindset memcmp.0:17"
@@ -62,7 +68,7 @@ diverge X-MPD-delta mpd.c "$D/mempool_persist.c" "arithmetic overflow on unsigne
 proof  P-MPJ        mpj.c "$D/mempool_journal.c" "@nouov @noconv --unwind 9 --unwindset pread.0:65,mpj_recent.0:4,mpj_lookup.0:4,memcmp.0:33"
 mutant M-MPJ-cap    mpj.c "$D/mempool_journal.c" 's|filecap > ((uint64_t)sb.st_size - MPJ_HDR_BYTES) / MPJ_REC_BYTES|filecap > ((uint64_t)sb.st_size) / MPJ_REC_BYTES|' "mapping no longer than the file" "@nouov @noconv --unwind 9 --unwindset pread.0:65,mpj_recent.0:4,mpj_lookup.0:4,memcmp.0:33"
 mutant M-MPJ-wrap   mpj.c "$D/mempool_journal.c" 's/    if (next <= 1) return 0;/    (void)0;/' "unwinding assertion" "@nouov @noconv --unwind 9 --unwindset pread.0:65,mpj_recent.0:4,mpj_lookup.0:4,memcmp.0:33"
-diverge X-MPJ-stats mpj.c "$D/mempool_journal.c" "unwinding assertion loop 0" "@nouov -DFP_STATS --unwindset mpj_stats.0:4,pread.0:65,mpj_recent.0:4,mpj_lookup.0:4 --unwind 9"
+diverge X-MPJ-stats mpj.c "$D/mempool_journal.c" "unwinding assertion loop 0" "@nouov @noconv -DFP_STATS --unwindset mpj_stats.0:4,pread.0:65,mpj_recent.0:4,mpj_lookup.0:4 --unwind 9"
 
 # ---------------------------------------------------------------- RPC: JSON body
 # OPEN: symbolic execution of the recursive descent did not finish inside
