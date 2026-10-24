@@ -273,11 +273,24 @@ static int advance(bip324_transport_t* t){
                 unsigned char id = plain[0];
                 unsigned long off;
                 if (id == 0){
-                    if (t->pending_len < 13){ free(plain); return 0; }
+                    /* Core's V2Transport::GetMessageType (net.cpp): a long
+                     * type is 12 bytes, printable ASCII (0x20..0x7f) up to
+                     * the first NUL and NUL after it; anything else -- or
+                     * fewer than 12 bytes -- is no type, and
+                     * GetReceivedMessage rejects THAT message (reject_message)
+                     * while the session carries on. This delivered a control
+                     * byte or a byte above 0x7f as part of the type, cut the
+                     * type at the first NUL whatever followed, and ended the
+                     * session on a short one (formal/parsers F3). */
+                    int valid = t->pending_len >= 13, i = 0;
+                    if (valid){
+                        const unsigned char* mt = plain + 1;
+                        for (; i < 12 && mt[i]; i++) if (mt[i] < 0x20 || mt[i] > 0x7f) valid = 0;
+                        for (; i < 12; i++) if (mt[i]) valid = 0;
+                    }
+                    if (!valid){ free(plain); break; }    /* invalid type: drop the message */
                     memcpy(t->msg_type, plain + 1, 12);
                     t->msg_type[12] = 0;
-                    for (int i = 0; i < 12; i++)   /* NUL-padded, like v1 */
-                        if (t->msg_type[i] == 0){ for (int j = i; j < 12; j++) t->msg_type[j] = 0; break; }
                     off = 13;
                 } else {
                     const char* nm = bip324_shortid_name(id);

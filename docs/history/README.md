@@ -11,6 +11,7 @@ over everything else in docs/: what happened, why, and what it taught.
 | [The Measuring Equipment](2026-09-19-the-measuring-equipment/) | 2026-09-02 to 2026-09-19: parity with Core v31.1, and making the benchmarks true | complete; the `[[PENDING]]` figures filled in on 2026-09-21 |
 | [Run 28 vs Core](2026-09-21-run-28-vs-core/) | 2026-09-19 to 2026-09-21: the clean benchmark pair, 18 h 24 m 02 s against 19 h 32 m 54 s, UTXO set MuHash-identical | ready to post |
 | [The Applier](2026-10-07-the-applier/) | 2026-09-21 to 2026-10-07: from 5.9% to 2.6× ahead of Core; the win was concurrency, then the applier itself; two outages and the deploy rules they left | ready to post |
+| [The Review](2026-10-23-the-review/) | 2026-10-23: a security review (9 HIGH), formal verification of four areas, every fix (PRs #424 to #435), and a final sync MuHash-identical to Core | published |
 
 Each directory holds the Markdown source (the single source of truth), the
 rendered editions (PDF, and for forum posting BBCode) and the scripts that
@@ -19,6 +20,7 @@ build them. Edit the `.md`, then rebuild:
 - 21 FOR 21: `./rebuild.sh` (python3, weasyprint, PyMuPDF)
 - The Measuring Equipment: `python3 make_pdf.py` and `python3 make_bbcode.py`
 - The Applier: the same two scripts
+- The Review: `python3 make_pdf.py`
 
 21 FOR 21 was first published from `/storage/bmc-book` on the project's host,
 where the original is still served. The copy here rebuilds to the same PDF
