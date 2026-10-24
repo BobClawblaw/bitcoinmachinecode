@@ -31,6 +31,11 @@ extern long p2p_write(int, const char*, unsigned, const void*, unsigned);
 extern int  p2p_read(int, char[12], void*, unsigned, unsigned*);
 extern void idx_init(void* idx, unsigned long slots);
 extern int  idx_put(void* idx, const unsigned char hash[32], long height);
+extern void reorg_set_min_chain_work(const unsigned char be32[32]);
+
+/* this connection's permissions, as main.c reports them to the serve gates */
+static unsigned g_perms = 0;
+unsigned serve_conn_perms(void){ return g_perms; }
 
 static int failures = 0;
 static void cki(const char* l, long g, long e){
@@ -408,6 +413,59 @@ int main(void){
       cki("no stall: a getheaders and the ping after it are answered within 2 s (log fd -1)",
           pong && count_cmd("headers") == 1 && ms < 2000, 1);
       peer_close(fd); }
+
+    /* ---- getheaders below -minimumchainwork: an empty headers message ----
+     * Core (GETHEADERS, net_processing.cpp 4410-4422): while the active
+     * chain's work is below the floor, and the peer lacks the download
+     * permission, getheaders is answered with an empty headers message --
+     * after the locator checks, before either walk, so an empty locator
+     * gets it too. bmc served its headers regardless. chainwork.dat gets one
+     * cumulative record per height, work h+1 at height h (16 bytes LE); the
+     * tip's is 520. */
+    { FILE* f = fopen("chainwork.dat", "wb");
+      for (int h = 0; f && h < NB; h++){ unsigned char w[16]; memset(w, 0, 16); put_u32(w, (unsigned)h + 1); fwrite(w, 1, 16, f); }
+      if (f) fclose(f);
+      static const struct { unsigned floor; unsigned perms; int empty; const char* what; } W[] = {
+          { 521, 0,                       1, "floor 521 above the tip's work 520: an empty headers message" },
+          { 521, 1u << 4 /* download */,  0, "floor 521, peer with the download permission: served" },
+          { 521, 1u << 0 /* noban */,     0, "floor 521, peer with noban (implies download): served" },
+          { 520, 0,                       0, "floor 520 = the tip's work: served" } };
+      for (unsigned k = 0; k < sizeof W / sizeof W[0]; k++){
+          unsigned char be[32]; memset(be, 0, 32);
+          be[28] = (unsigned char)(W[k].floor >> 24); be[29] = (unsigned char)(W[k].floor >> 16);
+          be[30] = (unsigned char)(W[k].floor >> 8);  be[31] = (unsigned char)W[k].floor;
+          reorg_set_min_chain_work(be);
+          g_perms = W[k].perms & (1u << 0) ? (W[k].perms | (1u << 4)) : W[k].perms;   /* netperm: noban implies download */
+          int fd = peer_open();
+          unsigned char loc[1][32]; memcpy(loc[0], bhash[3], 32);
+          send_getheaders(fd, (const unsigned char (*)[32])loc, 1, 0);
+          int pong = reply(fd);
+          const msg_t* m = first_cmd("headers"); unsigned off = 0; long n = vec_count(m, &off);
+          char lbl[200]; snprintf(lbl, sizeof lbl, "min chain work: %s", W[k].what);
+          cki(lbl, pong && count_cmd("headers") == 1 && (W[k].empty ? (n == 0 && m->len == 1) : n == TIP - 3), 1);
+          if (k == 0){
+              send_getheaders(fd, 0, 0, bhash[5]);
+              pong = reply(fd);
+              m = first_cmd("headers"); off = 0; n = vec_count(m, &off);
+              cki("min chain work: an empty locator (stop = block 5) also gets the empty headers message",
+                  pong && count_cmd("headers") == 1 && n == 0 && m->len == 1, 1);
+          }
+          peer_close(fd);
+      }
+      /* the record for the tip not written yet: the last one decides (work
+       * only grows with height). Records 0..399, floor 400 = record 399's. */
+      if (truncate("chainwork.dat", 400 * 16) != 0) printf("FAIL truncate chainwork.dat\n");
+      unsigned char be[32]; memset(be, 0, 32); be[30] = 400 >> 8; be[31] = 400 & 0xff;
+      reorg_set_min_chain_work(be); g_perms = 0;
+      int fd = peer_open();
+      unsigned char loc[1][32]; memcpy(loc[0], bhash[3], 32);
+      send_getheaders(fd, (const unsigned char (*)[32])loc, 1, 0);
+      int pong = reply(fd);
+      const msg_t* m = first_cmd("headers"); unsigned off = 0; long n = vec_count(m, &off);
+      cki("min chain work: chainwork.dat behind the tip, its last record clears the floor: served", pong && n == TIP - 3, 1);
+      peer_close(fd);
+      memset(be, 0, 32); reorg_set_min_chain_work(be);              /* no floor for what follows */
+    }
 
     /* ---- a hash index a reorg behind: the archive decides ----
      * A serve child keeps its own hash index; after a reorg it maps the

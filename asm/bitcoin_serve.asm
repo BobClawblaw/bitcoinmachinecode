@@ -32,6 +32,7 @@ extern g_peer_wants_addrv2
     extern serve_inv_bounds
     extern serve_locator_from
     extern serve_set_locator_store ; daemon/serve_invbounds.c
+    extern serve_getheaders_low_work ; daemon/serve_invbounds.c
     extern serve_public_tip     ; 3.1: the CONNECTED tip (daemon/serve_invbounds.c)
 extern node_relay_flag
 extern serve_tx_gate
@@ -210,6 +211,7 @@ align 16
 s_plen:   dq 0
 s_fh:     dq 0
 s_ghstop: dq -1        ; NET-8: hashStop height for getheaders, -1 = absent/unknown
+s_ghret:  dq 0         ; serve_locator_from's result, kept across the low-work gate
 s_gbstop: times 32 db 0 ; getblocks: the hashStop hash itself (wire order)
 s_gbcont: times 32 db 0 ; getblocks: Core's m_continuation_block (wire order)
 s_gbcont_set: dq 0      ; 1 while s_gbcont holds one (per connection)
@@ -1426,7 +1428,18 @@ node_serve_loop:
     je   .gh_locsz           ; > MAX_LOCATOR_SZ: Core disconnects
     test eax, eax
     jz   .next               ; malformed: drop, as the inv path does
-    cmp  eax, 2
+    mov  [s_ghret], rax
+    ; Core (net_processing.cpp 4410-4422): no headers from a chain below
+    ; -minimumchainwork, unless the peer has the download permission -- an
+    ; empty headers message instead, after the locator checks and before
+    ; either walk. serve_getheaders_low_work: 1 = answer empty.
+    mov  rdi, r14
+    call serve_public_tip
+    mov  rdi, rax
+    call serve_getheaders_low_work
+    test eax, eax
+    jnz  .gh_empty
+    cmp  qword [s_ghret], 2
     je   .gh_nolocator       ; empty locator: the hashStop header alone
 .gh_build:
     ; tip = the CONNECTED tip (3.1), not st[24]: a peer is never told

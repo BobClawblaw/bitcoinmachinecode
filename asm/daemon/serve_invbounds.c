@@ -24,6 +24,8 @@
 #include <sys/stat.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include "netperm.h"
 
 #define INV_ENTRY   36                 /* type u32 LE + 32-byte hash */
 #define INV_MAX_SZ  50000              /* Core's MAX_INV_SZ */
@@ -126,6 +128,36 @@ static int loc_on_chain(long h, const unsigned char hash[32]){
     unsigned char rec[48];
     if (h < 0 || pread(fd, rec, sizeof rec, (off_t)h * 48) != (ssize_t)sizeof rec) return 0;
     return memcmp(rec, hash, 32) == 0;    /* the record holds the hash in wire order */
+}
+
+/* ---- getheaders below the minimum chain work ----
+ * Core (GETHEADERS, net_processing.cpp 4410-4422) serves no headers from an
+ * active chain whose work is below -minimumchainwork, unless the peer has the
+ * download permission: it answers with an EMPTY headers message, "to tell
+ * the peer to go away but not treat us as unresponsive", so a peer never
+ * starts a low-work headers sync from it. bmc served whatever it had. The
+ * floor is minchainwork.c's (set in main before the serve processes fork);
+ * the work is chainwork.dat's cumulative record at `tip` (16 bytes LE, one
+ * per height), read here because only the download worker opens the
+ * chainwork store. A record not written yet falls back to the last one:
+ * work only grows with height, so the last record clearing the floor means
+ * the tip does. No floor, no minchainwork.o linked (the harnesses), or a
+ * download-permission peer: served as before. 1 = answer empty. */
+extern int reorg_min_chain_work_set(void) __attribute__((weak));
+extern int reorg_work_meets_minimum(const unsigned char work[16]) __attribute__((weak));
+extern unsigned serve_conn_perms(void) __attribute__((weak));   /* daemon/main.c */
+static int g_cw_fd = -2;                    /* -2 = not opened yet */
+int serve_getheaders_low_work(long tip){
+    if (!reorg_min_chain_work_set || !reorg_work_meets_minimum || !reorg_min_chain_work_set()) return 0;
+    if (serve_conn_perms && (serve_conn_perms() & NP_DOWNLOAD)) return 0;
+    unsigned char w[16]; memset(w, 0, sizeof w);   /* no record: no work */
+    if (g_cw_fd == -2) g_cw_fd = open("chainwork.dat", O_RDONLY | O_CLOEXEC);
+    if (g_cw_fd >= 0 && tip >= 0 && pread(g_cw_fd, w, 16, (off_t)tip * 16) != 16){
+        struct stat sb; long n = fstat(g_cw_fd, &sb) == 0 ? (long)(sb.st_size / 16) : 0;
+        memset(w, 0, sizeof w);
+        if (n > 0 && pread(g_cw_fd, w, 16, (off_t)(n - 1) * 16) != 16) memset(w, 0, sizeof w);
+    }
+    return !reorg_work_meets_minimum(w);
 }
 
 int serve_locator_from(const unsigned char* pl, unsigned long plen, void* htidx,

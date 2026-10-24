@@ -1600,8 +1600,10 @@ tests/test_serve: tests/test_serve.c $(SERVETXVALSRCS) $(SERVEOBJS) $(TEST_TMPDI
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_serve.c $(SERVETXVALSRCS) $(SERVEOBJS)
 # getblocks/getheaders answers against Core v31.1 (byte order, hashStop, the
 # 500-entry continuation, MAX_LOCATOR_SZ, the fork point of an unknown locator).
-tests/test_getblocks: tests/test_getblocks.c $(SERVETXVALSRCS) $(SERVEOBJS) $(TEST_TMPDIR_H)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_getblocks.c $(SERVETXVALSRCS) $(SERVEOBJS)
+# minchainwork.c + bitcoin_chainwork.o: the getheaders -minimumchainwork rule
+# (serve_invbounds.c references them weakly; the daemon links both anyway)
+tests/test_getblocks: tests/test_getblocks.c $(SERVETXVALSRCS) $(SERVEOBJS) daemon/minchainwork.c bitcoin_chainwork.o $(TEST_TMPDIR_H)
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_getblocks.c $(SERVETXVALSRCS) $(SERVEOBJS) daemon/minchainwork.c bitcoin_chainwork.o
 
 # Protocol-violation reporting from the asm serve loop (audit finding 7).
 # The framer's message-size bound (audit finding 6).
