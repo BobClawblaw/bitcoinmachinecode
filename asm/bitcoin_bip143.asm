@@ -62,7 +62,7 @@ extern sha256_full                    ; asm
 %define SIGHASH_SINGLE       3
 %define SIGHASH_ANYONECANPAY 0x80
 
-section .tbss alloc noexec nowrite tls align=8
+section .tbss nobits alloc noexec write tls align=8
 global bip143_mbuf
 bip143_mbuf: resq 1
 global bip143_soff

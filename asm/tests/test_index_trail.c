@@ -14,6 +14,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include "test_tmpdir.h"
 #ifdef __APPLE__
 #define TRUE_BIN "/usr/bin/true"   /* macOS has no /bin/true */
@@ -143,6 +145,27 @@ int main(void){
     st = it_tick(&e, -1, 0, -1, ++now, on_run, 0);
     ck("without an applied height nothing is built", st == IT_IDLE && g_spawns == spawns_before);
 
+    /* HST-4 (audit 2026-10-23): the REAL spawn path execs the builder with
+     * fds 0-2 only. It inherited every descriptor of the worker -- store
+     * files, peer sockets, the datadir .lock -- here a marker on fd 77. */
+    { FILE* sf = fopen("fds_builder.sh", "w");
+      fputs("#!/bin/sh\nls /proc/$$/fd | tr '\\n' ' ' > \"$1/fds_trail.out\"\nexit 1\n", sf); fclose(sf);
+      chmod("fds_builder.sh", 0755);
+      char sp[4200]; snprintf(sp, sizeof sp, "%s/fds_builder.sh", tt_workdir());
+      int mk = open("/dev/null", O_RDONLY); if (mk >= 0 && mk != 77){ dup2(mk, 77); close(mk); }
+      it_spawn_hook = 0;
+      itrail_t f; it_configure(&f, "txindex", sp, sp, ".", "main", 100, 10, 0, 1);
+      long long fn = 5000;
+      int st = it_tick(&f, -1, 0, 500, ++fn, on_run, 0);
+      ck("HST-4: the real spawn starts the builder", st == IT_BUILDING && f.pid > 0);
+      pid_t was = f.pid;
+      for (int i = 0; i < 3000 && f.pid == was; i++){ usleep(1000); it_tick(&f, -1, 0, 500, ++fn, on_run, 0); }
+      close(77);
+      char fl[512] = " "; FILE* ff = fopen("fds_trail.out", "r");
+      if (ff){ size_t k = fread(fl + 1, 1, sizeof fl - 3, ff); fl[k + 1] = 0; fclose(ff); }
+      ck("HST-4: the builder ran and listed its fds", strstr(fl, " 0 ") != 0);
+      ck("HST-4: ...and the worker's fd 77 is not among them", strstr(fl, " 77 ") == 0);
+      printf("      builder fds:%s\n", fl); }
     printf(fails ? "\nFAILURES: %d\n" : "\nall good\n", fails);
     return fails ? 1 : 0;
 }

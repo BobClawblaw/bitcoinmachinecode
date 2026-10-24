@@ -262,7 +262,7 @@ SCRIPT_MAX_BYTES equ 65536           ; get-time script-read scratch
     mov  %1, [rel %2 wrt ..gottpoff]
     add  %1, qword [fs:0]
 %endmacro
-section .tbss alloc noexec nowrite tls align=16
+section .tbss nobits alloc noexec write tls align=16
 global lsm_get_scratch
 lsm_get_scratch: resb BLOOM_MAX_BYTES + SCRIPT_MAX_BYTES
 section .text

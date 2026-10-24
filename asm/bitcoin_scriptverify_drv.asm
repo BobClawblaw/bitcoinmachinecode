@@ -69,7 +69,7 @@ extern sv_checksig_export             ; C seam: alias of the static legacy hook
 %define CTX_VERSION   48
 %define CTX_AMOUNT    56
 
-section .tbss alloc noexec nowrite tls align=8
+section .tbss nobits alloc noexec write tls align=8
 global svs_main_e
 svs_main_e: resq 1
 global svs_copy_e

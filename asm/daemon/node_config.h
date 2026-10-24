@@ -241,6 +241,17 @@ typedef struct {
     /* Core -rpcbind / -rpcallowip. rpcbind is IGNORED unless at least one
      * rpcallowip is given, exactly as Core does -- see daemon/rpc_acl.h. */
     char rpcbind[64];
+    /* CFG-1 (audit 2026-10-23): Core -rpcport / -rpcuser / -rpcpassword, read
+     * HERE with the rest of the file -- sections, includeconf, inline '#'
+     * comments and all -- instead of by a second flat reader in main.c that
+     * ignored every one of them. Core's precedence: a [chain] section value
+     * beats a base-section value, and within one of them the FIRST occurrence
+     * wins (common/settings.cpp GetSetting, reverse_precedence). rpcport is
+     * NETWORK_ONLY, so a base-section rpcport is ignored on a non-main chain.
+     * rpcport 0 = not configured (the chain's default). */
+    int  rpcport;
+    char rpcuser[256];
+    char rpcpassword[1024];
     char rpcallowip[16][64];
     int  n_rpcallowip;
     char signetchallenge[2048];
@@ -311,7 +322,7 @@ typedef struct {
     int  rpcthreads;                /* default 16 (>= 1)  */
     int  rpcworkqueue;              /* default 64 (>= 1)  */
     int  rpcservertimeout;          /* default 30 s (>= 1) */
-    char rpcwhitelist[16][512];     /* -rpcwhitelist=<user>:<m1>,<m2> (repeatable) */
+    char** rpcwhitelist;            /* -rpcwhitelist=<user>[:<m1>,<m2>] (repeatable, heap, no cap: CFG-2) */
     int  n_rpcwhitelist;
     int  rpcwhitelistdefault;       /* -1 = unset (Core: 1 when any whitelist exists) */
     int  rpccookieperms;            /* 0 owner (0600), 1 group (0640), 2 all (0644) */
@@ -328,9 +339,18 @@ extern node_config_t g_cfg;
 const char* nodecfg_noeffect_reason(const char* key);
 
 /* Fill g_cfg with compiled defaults, then overlay <path> if it exists.
- * Returns the number of keys applied from the file (0 if absent/empty).
- * Never fails: an unreadable or malformed file leaves defaults in place. */
+ * Returns the number of keys applied from the file (0 if absent/empty), or
+ * -1 when the file is malformed in a way Core refuses to start on (see
+ * node_config_error). A missing main file still means compiled defaults. */
 long node_config_load(const char* path);
+
+/* CFG-3/4/1 (audit 2026-10-23): NULL, or why the last node_config_load must
+ * stop the node -- a line Core's GetConfigOptions rejects (an unclosed
+ * `[section`, a line with no '=', a leading '-', a '#' in an rpcpassword
+ * line), an invalid -rpcport, an unknown chain or a conflicting chain
+ * selection, a malformed bind=, a missing includeconf file. Core fails init
+ * on every one of these; the daemon exits on it (main.c). */
+const char* node_config_error(void);
 
 /* One line per group, so the resolved config is visible in the log at boot
  * rather than having to be inferred from behaviour. */

@@ -2430,19 +2430,21 @@ static void txoq_service(void){
     }
 }
 
-static volatile sig_atomic_t g_inbound_n = 0;
+#include "inbound_children.h"   /* HST-1/HST-2: the inbound child count */
 static pid_t g_dl_worker_pid = -1;       /* set by main() right after fork(); parent forwards SIGTERM here */
 static volatile sig_atomic_t g_dl_worker_exited = 0, g_dl_worker_status = 0;
 static void reap_children(int sig){
     (void)sig; int st; pid_t p;
+    int saved_errno = errno;             /* a handler must not clobber the interrupted code's errno */
     while((p = waitpid(-1,&st,WNOHANG)) > 0){
         /* The download worker is a child too. Before 2026-08-22 its death was
          * silently reaped here and the serve parent lived on with no worker
          * (block 481827: worker segfaulted, unit stayed "active" for 13 min).
          * Remember it; serve_mux exits non-zero so systemd restarts the unit. */
         if (g_dl_worker_pid > 0 && p == g_dl_worker_pid){ g_dl_worker_exited = 1; g_dl_worker_status = st; }
-        else if(g_inbound_n > 0) g_inbound_n--;
+        else inb_reaped(p);              /* counts only if it was an inbound child */
     }
+    errno = saved_errno;
 }
 /* Reap one child without ever blocking on it; 1 = gone, 0 = still alive
  * after timeout_ms. The download worker runs with SIGCHLD = SIG_IGN, and
@@ -11741,27 +11743,19 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
  * g_rpc_wallet are declared near the top of the file so serve_download_worker,
  * defined earlier, can publish into the shared status.) */
 
-/* Parse rpcport/rpcuser/rpcpassword out of the daemon's config file (node_config
- * treats them as foreign keys, so we read them here). */
-static void serve_rpc_read_creds(const char* cfgpath, int* port,
-                                 char* user, size_t ucap, char* pass, size_t pcap){
-    *port = g_chainp->default_rpc_port;   /* 8332 main / 18443 regtest */
-    user[0] = 0; pass[0] = 0;
-    if (!cfgpath) return;
-    FILE* f = fopen(cfgpath, "r"); if (!f) return;
-    char line[1024];
-    while (fgets(line, sizeof line, f)){
-        char* p = line; while (*p == ' ' || *p == '\t') p++;
-        if (*p == '#' || *p == '\n' || !*p) continue;
-        char* eq = strchr(p, '='); if (!eq) continue; *eq = 0;
-        char* k = p; char* v = eq + 1;
-        size_t vl = strlen(v); while (vl && (v[vl-1]=='\n'||v[vl-1]=='\r'||v[vl-1]==' '||v[vl-1]=='\t')) v[--vl] = 0;
-        size_t kl = strlen(k); while (kl && (k[kl-1]==' '||k[kl-1]=='\t')) k[--kl] = 0;
-        if      (!strcmp(k, "rpcport"))     *port = atoi(v);
-        else if (!strcmp(k, "rpcuser"))     { strncpy(user, v, ucap-1); user[ucap-1] = 0; }
-        else if (!strcmp(k, "rpcpassword")) { strncpy(pass, v, pcap-1); pass[pcap-1] = 0; }
-    }
-    fclose(f);
+/* rpcport/rpcuser/rpcpassword, as node_config_load resolved them.
+ *
+ * CFG-1 (audit 2026-10-23): this used to re-read the config file with a flat
+ * parser of its own -- no [sections], no includeconf, no inline '#' comments,
+ * the LAST value winning wherever it appeared, and rpcport through atoi. So a
+ * `[regtest] rpcpassword=` block was a working mainnet credential, and
+ * rpcport=70000 wrapped through htons to 4464. node_config.c now reads these
+ * three keys with everything else, with Core's scoping and precedence, and
+ * refuses a bad rpcport at load time as Core's CheckHostPortOptions does. */
+static void serve_rpc_read_creds(int* port, char* user, size_t ucap, char* pass, size_t pcap){
+    *port = g_cfg.rpcport > 0 ? g_cfg.rpcport : g_chainp->default_rpc_port;   /* 8332 main / 18443 regtest */
+    snprintf(user, ucap, "%s", g_cfg.rpcuser);
+    snprintf(pass, pcap, "%s", g_cfg.rpcpassword);
 }
 
 /* Start the embedded RPC server in the serve parent (non-blocking: rpc_server
@@ -11835,8 +11829,9 @@ static void mempool_reload_join(void){
 }
 
 static void serve_start_rpc(const char* dir, const char* cfgpath){
-    static char user[128], pass[256]; int port;
-    serve_rpc_read_creds(cfgpath, &port, user, sizeof user, pass, sizeof pass);
+    static char user[sizeof g_cfg.rpcuser], pass[sizeof g_cfg.rpcpassword]; int port;
+    (void)cfgpath;
+    serve_rpc_read_creds(&port, user, sizeof user, pass, sizeof pass);
     /* Start on ANY usable credential, not just rpcuser/rpcpassword.
      *
      * This used to bail out whenever those two were absent, which meant
@@ -12172,9 +12167,15 @@ extern long mpool_policy_entry_info(void*, const unsigned char*, struct mp_entry
     cfg.threads = g_cfg.rpcthreads; cfg.workqueue = g_cfg.rpcworkqueue; cfg.timeout_s = g_cfg.rpcservertimeout;
     rpc_cookie_set_perms(g_cfg.rpccookieperms);
     rpc_whitelist_clear();
+    /* CFG-2 (audit 2026-10-23): a refused entry is FATAL, like a bad
+     * rpcallowip above. It used to be logged and skipped, and with every
+     * entry skipped no whitelist existed at all -- every user could call
+     * every method, the opposite of what the operator configured. */
     for(int wi = 0; wi < g_cfg.n_rpcwhitelist; wi++)
-        if(!rpc_whitelist_add(g_cfg.rpcwhitelist[wi]))
-            fprintf(stderr,"[rpc] rpcwhitelist=%s rejected (expected <user>:<rpc1>,<rpc2>,...)\n", g_cfg.rpcwhitelist[wi]);
+        if(!rpc_whitelist_add(g_cfg.rpcwhitelist[wi])){
+            fprintf(stderr,"[rpc] FATAL: rpcwhitelist=%s could not be applied -- refusing to start\n", g_cfg.rpcwhitelist[wi]);
+            exit(1);
+        }
     rpc_whitelist_set_default(g_cfg.rpcwhitelistdefault);
     if(g_cfg.n_rpcwhitelist)
         fprintf(stderr,"[rpc] %d rpcwhitelist entr%s; users without one may call %s\n", g_cfg.n_rpcwhitelist,
@@ -12485,7 +12486,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
      * read the previous leg's revents. */
     struct pollfd pfds[MUX_MAX_OUT+4+NETPERM_MAX_BIND];   /* +1: the I2P acceptor pipe */
     for(;;){
-        if(g_node_status) g_node_status->n_inbound = (int)g_inbound_n;   /* for the RPC thread */
+        if(g_node_status) g_node_status->n_inbound = inb_count();   /* for the RPC thread */
         int nfds=0;
         pfds[nfds].fd=l;     pfds[nfds].events=POLLIN; pfds[nfds].revents=0; nfds++;
         /* the IPv6 listener sits beside it; -1 when the host has no IPv6,
@@ -12707,7 +12708,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                 memcpy(ipb, peerdesc, n); ipb[n] = 0;
                 if(!(netperm_for(ipb) & NP_DOWNLOAD)){ close(c); c = -1; }
             }
-            if(c>=0 && g_inbound_n >= CFG_INBOUND_LIMIT()){
+            if(c>=0 && inb_count() >= CFG_INBOUND_LIMIT()){
                 /* At capacity: accept and close immediately so the connection
                  * is refused cleanly rather than sitting in the backlog, and
                  * do NOT fork. Rate-limited log -- under a flood this would
@@ -12717,7 +12718,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                                  nms = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
                 if(nms - last_full_log_ms > 10000){
                     fprintf(stderr,"[serve] inbound at capacity (%d/%d) -- refusing new connections\n",
-                            (int)g_inbound_n, CFG_INBOUND_LIMIT());
+                            inb_count(), CFG_INBOUND_LIMIT());
                     last_full_log_ms = nms;
                 }
                 close(c);
@@ -12839,9 +12840,9 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                     close(c); _exit(0);
                 }
                 close(c);
-                if(w > 0){ g_inbound_n++; upl_track(w); }
+                if(w > 0){ inb_register(w); upl_track(w); }
                 fprintf(stderr,"[serve] inbound %s accepted -> child pid %d (%d/%d inbound)\n",
-                        peerdesc, w, (int)g_inbound_n, CFG_INBOUND_LIMIT());
+                        peerdesc, w, inb_count(), CFG_INBOUND_LIMIT());
             }
         }
         /* outbound: on rotation, pull from each peer (periodic getheaders-from-
@@ -13130,6 +13131,12 @@ int main(int argc, char** argv){
      * the download worker inherits the same resolved values. */
     { char cfgpath[512];
       node_config_load(node_config_path(absp, cfgpath, sizeof cfgpath));
+      /* CFG-1/3/4/5/6: a file Core would refuse to start on stops this node
+       * too, before anything acts on half of it. */
+      if(node_config_error()){
+          fprintf(stderr,"[boot] FATAL: configuration error: %s -- refusing to start\n", node_config_error());
+          return 1;
+      }
       { extern int (*g_serve_tx_gate)(void); extern int (*g_serve_inv_gate)(const unsigned char*, long);
         extern int (*g_serve_mempool_hook)(int, void*); extern void (*g_serve_policy_log)(const char*);
         g_serve_tx_gate = serve_tx_gate; g_serve_inv_gate = serve_inv_gate;
