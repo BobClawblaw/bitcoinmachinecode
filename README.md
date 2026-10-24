@@ -13,10 +13,13 @@ Tor, I2P and CJDNS, with BIP324 encrypted transport, and runs on mainnet,
 testnet4, signet (public or custom) and regtest.
 
 > **Status: experimental.** The code has been through internal and external
-> security review (see `docs/audits/`) but has not received an independent
-> human audit of its consensus and cryptographic assembly. Run it for study
-> and evaluation, on a machine you can afford to lose, with no funds near it.
-> For a production node, run [Bitcoin Core](https://bitcoincore.org).
+> security review (see `docs/audits/`), most recently the 2026-10-23 review
+> and a formal verification of four areas
+> ([`docs/history/2026-10-23-the-review/`](docs/history/2026-10-23-the-review/)).
+> It has not received an independent human audit of its consensus and
+> cryptographic assembly. Run it for study and evaluation, on a machine you
+> can afford to lose, with no funds near it. For a production node, run
+> [Bitcoin Core](https://bitcoincore.org).
 
 ## Highlights
 
@@ -94,6 +97,10 @@ testnet4, signet (public or custom) and regtest.
   delete anything below a sync hole.
 - Startup verification (`checkblocks`/`checklevel`) at Core's defaults;
   `reindex` and `reindex-chainstate`.
+- A UTXO store that exists but will not reload, or whose manifest names a
+  missing run, halts the boot with the tip held; the node never starts on a
+  partial set (2026-10-23). Block files, the index and undo data are synced
+  before each WAL drain.
 
 **Mempool (Core policy)**
 
@@ -108,7 +115,9 @@ testnet4, signet (public or custom) and regtest.
 - TRUC (BIP431 / v3) topology rules, ephemeral dust, `submitpackage` with
   child-pays-for-parent effective feerate, and 1-parent-1-child (1p1c)
   package relay.
-- Taproot witness standardness, `datacarrier`/`datacarriersize`,
+- Taproot witness standardness; spends of unknown witness versions are
+  non-standard (not relayed or mined) and stay consensus-valid, as in Core.
+  `datacarrier`/`datacarriersize`,
   `permitbaremultisig`, `dustrelayfee`, `minrelaytxfee`,
   `incrementalrelayfee`, `mempoolexpiry`, `acceptnonstdtxn`.
 - Mempool admission runs the consensus verifier (legacy + full taproot)
@@ -193,7 +202,9 @@ testnet4, signet (public or custom) and regtest.
   proofs, the mempool, fee estimates, and address pages from a native
   address history index (about 200 GB on mainnet, built during the sync).
   mempool.space runs against the node unpatched; see
-  [`docs/MEMPOOL_SPACE.md`](docs/MEMPOOL_SPACE.md).
+  [`docs/MEMPOOL_SPACE.md`](docs/MEMPOOL_SPACE.md). The listener sends no
+  wildcard CORS header, bounds its batches, and serves from a fixed thread
+  pool with total deadlines.
 - `getblocktemplate`/`submitblock`/`submitheader`,
   `prioritisetransaction`, `dumptxoutset` (assumeutxo snapshot export).
 - ZMQ publishers for `hashblock`, `hashtx`, `rawblock`, `rawtx` and Core's
@@ -361,7 +372,10 @@ the service account needs read access to tor's control cookie
 the node reads at its default value and is the reference. Keys are Bitcoin
 Core's names and units; unknown keys are ignored with a message, and any
 Core option the node does not implement is named at startup as having no
-effect. Values are read once at startup. The `[config]` block in the console
+effect. An error Core's reader stops on (a parse error, an unknown chain, an
+invalid `rpcport` or `bind`, a failed `includeconf`) stops the boot here too, and
+RPC credentials apply only to their own chain's section, as in Core
+(2026-10-23). Values are read once at startup. The `[config]` block in the console
 log echoes the resolved values.
 
 | key | default | meaning |
@@ -423,8 +437,9 @@ log echoes the resolved values.
   node creates its own ephemeral v3 onion service (ED25519 key persisted in
   the datadir) that targets a loopback-only listener, keeps the control
   connection open for the daemon's lifetime, and announces the onion address
-  to onion peers only. Cookie authentication on the control port is used
-  when offered; `torpassword` is the fallback. Setting `proxy=` also stops
+  to onion peers only. Control-port authentication follows Core: with
+  `torpassword` set, HASHEDPASSWORD or nothing; otherwise NULL when offered,
+  then SAFECOOKIE. The plain cookie is never sent (2026-10-23). Setting `proxy=` also stops
   the node using the system resolver for peer hostnames (names are handed to
   the proxy), skips the DNS seeds, gives every proxied connection its own
   SOCKS5 credentials (`proxyrandomize`) so Tor isolates circuits, and never
@@ -579,7 +594,9 @@ in [`docs/FEATURE_GAPS.md`](docs/FEATURE_GAPS.md):
 | [`docs/ENGINEERING.md`](docs/ENGINEERING.md) | architecture, binaries and command lines, on-disk formats, validation gates |
 | [`docs/ENGINEERING_RULES.md`](docs/ENGINEERING_RULES.md) | the rules the codebase is written under |
 | [`docs/ABI_STACK_ALIGNMENT.md`](docs/ABI_STACK_ALIGNMENT.md) | the SysV stack-alignment contract and the audit that enforces it |
-| [`docs/audits/`](docs/audits/) | external security audits and the project's responses |
+| [`SECURITY.md`](SECURITY.md) | how to report a vulnerability |
+| [`docs/audits/`](docs/audits/) | security audits and reviews, and the project's responses |
+| [`docs/history/`](docs/history/) | long-form accounts of the larger pieces of work, each with a PDF edition |
 | [`docs/devlog/`](docs/devlog/) | development log: incident log, plans, benchmarks, assessments |
 | `worklog/` | dated development action logs |
 | [`config/bitcoin.sample.conf`](config/bitcoin.sample.conf) | every configuration key at its default |
@@ -596,13 +613,26 @@ September 2026. The clean pair (2026-09-21): Core 19 h 32 m 54 s, this node
 18 h 24 m 02 s, with the UTXO set identical by MuHash. A full-verification
 sync (`assumevalid=0`, every script of every block) completed on 2026-09-27
 in 8 h 0 m at nice 10 on the benchmark box, its per-height digests equal to
-Core's throughout. The latest default sync (run 44, 2026-10-08) reached the
-tip with every index in 4 h 2 m against Core rerun #7's 9 h 50 m, with a
-heap peak of 11.3 GB against Core's 12.0
-([`docs/releases/2026-10-08-the-heap-the-merge-budget-and-header-ranges.md`](docs/releases/2026-10-08-the-heap-the-merge-budget-and-header-ranges.md)).
+Core's throughout. The release report's latest default sync (run 46, 2026-10-10)
+reached the tip with every index in 3 h 17 m 55 s against Core rerun #7's
+9 h 50 m 04 s, with a heap peak of 13.3 GB against Core's 12.0 and a mean of
+8.2 against 10.0
+([`docs/releases/2026-10-07-faster-than-core-in-every-stage-of-the-sync.md`](docs/releases/2026-10-07-faster-than-core-in-every-stage-of-the-sync.md),
+addendum).
 Signature verification is level with libsecp256k1 on one
 core (2026-09-27). The landing notes in [`docs/releases/`](docs/releases/)
 record each change and the run that measured it; the daily record is in
 [`worklog/`](worklog/).
 mempool.space runs against the production node through the Esplora facade
 ([`docs/MEMPOOL_SPACE.md`](docs/MEMPOOL_SPACE.md)).
+
+The 2026-10-23 review found 9 HIGH, 18 MEDIUM and 36 LOW findings, five of
+the HIGHs consensus splits from Core. Formal verification of the consensus
+arithmetic, the secp256k1 assembly, the UTXO store's crash consistency and
+the untrusted-input parsers found more. Every finding is fixed (PRs #424 to
+#435), and the fixed build passed the full test gate and a from-genesis
+sync with its UTXO set MuHash-identical to Core v31.1's at 972,848. What is
+still open, and what changed for operators, are the review's two appendices
+([`docs/history/2026-10-23-the-review/`](docs/history/2026-10-23-the-review/)).
+Production has run that build since 2026-10-24
+([`docs/devlog/DEPLOYMENT_HISTORY.md`](docs/devlog/DEPLOYMENT_HISTORY.md)).
