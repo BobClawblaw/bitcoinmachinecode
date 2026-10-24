@@ -34,6 +34,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 #define BMCLBL_MAGIC "BMCLBL v1"
 #define LBL_MAX_ADDR 128
@@ -86,10 +88,25 @@ static int lbl_read_all(const char* path, lbl_e** out){
     return n;
 }
 
+/* HST-7 (audit 2026-10-23): wallet files were created with fopen and only
+ * chmod'ed 0600 afterwards (or, for the labels file, never), so under the
+ * usual umask they were world-readable while being written, an existing
+ * file kept its old mode, and a symlink planted at the name was followed.
+ * Open with O_NOFOLLOW, create 0600, and fchmod the fd before any byte is
+ * written. */
+static FILE* fopen_0600(const char* path, int append){
+    int fd = open(path, O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC) | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) return NULL;
+    if (fchmod(fd, 0600) != 0){ close(fd); return NULL; }
+    FILE* f = fdopen(fd, append ? "a" : "w");
+    if (!f) close(fd);
+    return f;
+}
+
 static int lbl_write_all(const char* path, const lbl_e* arr, int n){
     char tmp[512];
     if (snprintf(tmp, sizeof tmp, "%s.tmp", path) >= (int)sizeof tmp) return -1;
-    FILE* f = fopen(tmp, "w");
+    FILE* f = fopen_0600(tmp, 0);
     if (!f) return -1;
     int bad = fprintf(f, "%s\n", BMCLBL_MAGIC) < 0;
     for (int i = 0; i < n && !bad; i++)

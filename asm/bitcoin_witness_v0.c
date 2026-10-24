@@ -154,6 +154,25 @@ int sv_classify_segwit(const uint8_t* spk, uint32_t spl,
     return 2;
 }
 
+/* sv_witness_program_true: CastToBool over a witness program's bytes.
+ *
+ * CON-2 (audit 2026-10-23). Core's VerifyScript evaluates the scriptPubKey
+ * (or, P2SH-wrapped, the redeemScript) as an ordinary script BEFORE it looks
+ * at the witness: `OP_n <program>` leaves the program on top of the stack,
+ * and a false top (all zero bytes, or zeros ending in a 0x80 negative-zero
+ * sign byte) fails SCRIPT_ERR_EVAL_FALSE there -- for every witness version.
+ * The classify sites went straight to the witness branch, so an unknown
+ * version with a false program (52 02 0000, OP_2 push 0x0000) was spendable
+ * here and unspendable to Core. For v0/v1 a false program cannot be
+ * satisfied anyway; the check runs for every version so the error, and the
+ * rule, are Core's. 1 true / 0 false. */
+int sv_witness_program_true(const uint8_t* prog, uint32_t n){
+    for (uint32_t k = 0; k < n; k++){
+        if (prog[k] != 0) return !(k == n - 1 && prog[k] == 0x80);
+    }
+    return 0;
+}
+
 /* sv_verify_witness_v0: Core's VerifyWitnessProgram (version 0 arm) +
  * ExecuteWitnessScript, driving the shared interpreter with
  * SIGVERSION_WITNESS_V0 and the BIP143 checksig hook above.

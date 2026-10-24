@@ -163,9 +163,15 @@ int main(int argc, char** argv) {
     }
 
     rj_val* req = rpc_request_build(method, params, 1);
-    char body[32768];
-    long bodylen = rj_write(body, sizeof body, req, 0);
+    /* RPC-25: the request is serialized to a buffer sized to it. A fixed
+     * 32 KB stack buffer took rj_write's return -- the value's FULL length,
+     * not what was written -- as the body length, so a request past 32 KB (a
+     * large hex transaction or PSBT) sent and printed bytes from beyond the
+     * buffer. bitcoin-cli has no request cap. */
+    long bodylen = 0;
+    char* body = rj_write_alloc(req, 0, &bodylen);
     rj_free(req);
+    if (!body) { memset(secret, 0, sizeof secret); fprintf(stderr, "error: out of memory for the request\n"); return 1; }
     memset(secret, 0, sizeof secret);
     if (getenv("BMC_CLI_DRYRUN")) {          /* test seam: print the request, send nothing */
         fwrite(body, 1, (size_t)bodylen, stdout); putchar('\n'); return 0;
@@ -181,6 +187,8 @@ int main(int argc, char** argv) {
     char errmsg[256];
     long blen = rpc_http_post(g_rpcport, g_rpcuser, g_rpcpass, body, bodylen,
                               resp, RESP_CAP, errmsg, sizeof errmsg);
+    memset(body, 0, (size_t)bodylen);        /* it may carry a walletpassphrase */
+    free(body);
     if (blen < 0) {
         fprintf(stderr, "error: %s\n", errmsg);
         return 1;

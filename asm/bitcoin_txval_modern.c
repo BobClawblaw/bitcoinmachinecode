@@ -24,6 +24,7 @@ extern int  p2wpkh_verify(const uint8_t* tx, int64_t txlen, int64_t n_in,
                           const uint8_t* prev_spk, int64_t prev_spklen, uint64_t amount,
                           const uint8_t* vchSig, uint64_t siglen,
                           const uint8_t* vchPub, uint64_t publen);
+extern int  sv_witness_program_true(const uint8_t* prog, uint32_t n);
 extern int  sv_classify_segwit(const uint8_t* spk, uint32_t spl, const uint8_t* ss, uint32_t ssl,
                                uint32_t* version, const uint8_t** prog, uint32_t* proglen, int* wrapped);
 extern int  sv_verify_witness_v0(const uint8_t* prog, uint32_t proglen,
@@ -312,6 +313,8 @@ int txval_modern(const uint8_t* tx, int64_t txlen, void* utxo){
             uint32_t wver=0, wplen=0; const uint8_t* wprog=0; int wrapped=0;
             int cls = sv_classify_segwit(spk, sl, in->scriptSig, in->scriptSiglen, &wver, &wprog, &wplen, &wrapped);
             if (cls < 0){ g_reason = "p2sh-wrapped witness program: malformed scriptSig"; return 0; }
+            /* CON-2: Core's EVAL_FALSE on the program push, every version (taproot included) */
+            if (cls > 0 && !sv_witness_program_true(wprog, wplen)){ g_reason = "witness program evaluates false (EVAL_FALSE)"; return 0; }
             if (cls > 0 && !(wver == 1 && wplen == 32 && !wrapped)){   /* native v1/32 = taproot, handled below */
                 if (!wrapped && in->scriptSiglen != 0){ g_reason = "witness program scriptSig must be empty"; return 0; }
                 if (wver != 0){ g_reason = "unknown witness version (policy: discouraged)"; return 0; }

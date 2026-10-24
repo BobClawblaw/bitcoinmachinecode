@@ -28,6 +28,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #define BMCABK_MAGIC "BMCABK v1"
 
@@ -84,6 +86,21 @@ static int book_read_all(const char* path, struct book_e** out) {
 
 /* ---- public API ------------------------------------------------------- */
 
+/* HST-7 (audit 2026-10-23): wallet files were created with fopen and only
+ * chmod'ed 0600 afterwards (or, for the labels file, never), so under the
+ * usual umask they were world-readable while being written, an existing
+ * file kept its old mode, and a symlink planted at the name was followed.
+ * Open with O_NOFOLLOW, create 0600, and fchmod the fd before any byte is
+ * written. */
+static FILE* fopen_0600(const char* path, int append){
+    int fd = open(path, O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC) | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) return NULL;
+    if (fchmod(fd, 0600) != 0){ close(fd); return NULL; }
+    FILE* f = fdopen(fd, append ? "a" : "w");
+    if (!f) close(fd);
+    return f;
+}
+
 int book_validate(const char* label) { return label_ok(label) ? 0 : -1; }
 
 /* Add or update (set) a label. Returns 0 on success. */
@@ -109,13 +126,12 @@ int book_set(const char* path, const char* label, const char* addr, int overwrit
     /* simplest: write manually through book_write_all is awkward; do inline */
     char tmp[1024];
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
-    FILE* f = fopen(tmp, "w");
+    FILE* f = fopen_0600(tmp, 0);
     if (!f) { free(arr); return -1; }
     fprintf(f, BMCABK_MAGIC "\n");
     for (int i = 0; i < n; i++) fprintf(f, "%s %s\n", arr[i].label, arr[i].addr);
-    fclose(f); chmod(tmp, 0600);
+    fclose(f);
     if (rename(tmp, path) != 0) { remove(tmp); free(arr); return -1; }
-    chmod(path, 0600);
     free(arr);
     return 0;
 }
@@ -130,13 +146,12 @@ int book_rm(const char* path, const char* label) {
     for (int i = found; i < n-1; i++) arr[i] = arr[i+1];
     n--;
     char tmp[1024]; snprintf(tmp, sizeof tmp, "%s.tmp", path);
-    FILE* f = fopen(tmp, "w");
+    FILE* f = fopen_0600(tmp, 0);
     if (!f) { free(arr); return -1; }
     fprintf(f, BMCABK_MAGIC "\n");
     for (int i = 0; i < n; i++) fprintf(f, "%s %s\n", arr[i].label, arr[i].addr);
-    fclose(f); chmod(tmp, 0600);
+    fclose(f);
     if (rename(tmp, path) != 0) { remove(tmp); free(arr); return -1; }
-    chmod(path, 0600);
     free(arr);
     return 0;
 }

@@ -106,6 +106,27 @@ int main(void){
     /* that changes tx boundaries/txid... cons_verify requires n_in==1 for tx0 -> reject */
     cki("cons_verify non-coinbase-first rejected", cons_verify(bad_cb, blen, scratch, 64), 0);
 
+    /* CON-9 (audit 2026-10-23): the tx count must be a CANONICAL
+     * CompactSize (Core's ReadCompactSize throws "non-canonical"). The same
+     * block with 2 written fd 02 00 / fe 02 00 00 00 / ff 02 0..0 -- same
+     * header, same transactions, same merkle root -- is not a block. */
+    {
+        static const unsigned char wide3[3] = {0xfd, 0x02, 0x00};
+        static const unsigned char wide5[5] = {0xfe, 0x02, 0x00, 0x00, 0x00};
+        static const unsigned char wide9[9] = {0xff, 0x02, 0, 0, 0, 0, 0, 0, 0};
+        const unsigned char* w[3] = { wide3, wide5, wide9 };
+        const unsigned long wl[3] = { 3, 5, 9 };
+        const char* nm[3] = { "CON-9 tx count fd 02 00 (non-canonical) rejected",
+                              "CON-9 tx count fe 02 00 00 00 (non-canonical) rejected",
+                              "CON-9 tx count ff 02 00.. (non-canonical) rejected" };
+        for (int k = 0; k < 3; k++){
+            static unsigned char nc[2048 + 16];
+            memcpy(nc, block, 80); memcpy(nc + 80, w[k], wl[k]);
+            memcpy(nc + 80 + wl[k], block + 81, blen - 81);
+            cki(nm[k], cons_verify(nc, blen - 1 + wl[k], scratch, 64), 0);
+        }
+    }
+
     /* capacity too small (cap=1, but 2 txs) -> reject */
     cki("cons_verify cap too small rejected", cons_verify(block, blen, scratch, 1), 0);
 

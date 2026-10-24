@@ -178,6 +178,23 @@ extern const char* utxo_live_last_reject(void);
 static u8 store_buf[4096];
 static u8 raw[512];
 
+/* ST2-9: the run files this process still maps after their unlink -- the
+ * per-thread mapping cache (utxo_lsm_mm.c) holding a compaction's inputs */
+static int runs_mapped(int deleted_only){
+    FILE* f = fopen("/proc/self/maps", "r"); if (!f) return -1;
+    char line[1024]; int n = 0;
+    while (fgets(line, sizeof line, f))
+        if (strstr(line, "utxo_run_") && (!deleted_only || strstr(line, "(deleted)"))) n++;
+    fclose(f); return n;
+}
+extern void* utxo_live_test_tbl(void);
+extern long utxo_lsm_get(void* lst, void* u, const u8 txid[32], unsigned index, u64* value,
+                         unsigned long* height, unsigned long* is_coinbase, const u8** script, unsigned long* slen);
+static long lookup(const u8 txid[32]){
+    u64 v = 0; unsigned long h = 0, cb = 0, sl = 0; const u8* sc = 0;
+    return utxo_lsm_get(utxo_live_test_lst(), utxo_live_test_tbl(), txid, 0, &v, &h, &cb, &sc, &sl);
+}
+
 int main(void){
     tt_isolate();
     memset(store_buf,0,sizeof store_buf);
@@ -221,8 +238,21 @@ int main(void){
     ck("recovery IS applicable (store error + full manifest)", utxo_live_recovery_applicable(), 1);
     lst->manifest_cap = saved_cap;                    /* let the compaction publish */
     utxo_live_set_flush_thresholds(64, 128);
+    /* ST2-9: the catch-up's lookups left this thread's mapping cache holding
+     * the runs going into the compaction */
+    ck("the oldest coin is found", lookup(height0_txid), 1);
+    ck("the runs are mapped going into the compaction", runs_mapped(0) >= 2, 1);
+    ck("no unlinked run is mapped before the compaction", runs_mapped(1), 0);
     long rounds = utxo_live_recover();
     ck("recover() compacted at least one round", rounds > 0, 1);
+    /* ST2-9 (audit 2026-10-23): the inline compaction unlinks its inputs; the
+     * cache must let them go (the background adopt bumps the cache epoch, the
+     * inline path did not), or their disk space stays pinned for good. A
+     * lookup is when a thread notices the epoch. */
+    ck("the oldest coin is still found after the compaction", lookup(height0_txid), 1);
+    { u8 absent[32]; memset(absent, 0x5C, 32);        /* asks every run of the new manifest */
+      ck("an absent coin is absent", lookup(absent), 0); }
+    ck("no compacted (unlinked) run is still mapped", runs_mapped(1), 0);
     ck("post-recovery walk == pre-recovery count", utxo_live_verify_after_recovery(count_before), 1);
     ck("not halted", utxo_live_halted(), 0);
     ck("catch-up resumes and applies the pending block", utxo_live_catchup(store_buf), 1);

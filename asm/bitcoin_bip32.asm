@@ -19,7 +19,9 @@
 ;
 ; PUBLIC ABI (System V AMD64)
 ;   int  bip32_master(u8 k[32], u8 c[32], const u8* seed, i64 seedlen)
-;        -> 1 on success, 0 if the derived key is zero (invalid, per BIP32).
+;        -> 1 on success, 0 if the derived key is zero or >= n (invalid, per
+;           BIP32: "In case parse256(IL) is 0 or parse256(IL) >= n, the master
+;           key is invalid").
 ; ============================================================================
 
 BITS 64
@@ -86,20 +88,12 @@ bip32_master:
     inc  rcx
     jmp  .ccp
 .ccp_done:
-    ; return 1 if k != 0, else 0
-    mov  rsi, [rbp-0x30]
-    xor  rax, rax
-    xor  rcx, rcx
-.zk:
-    cmp  rcx, 32
-    jae  .zk_done
-    or   al, byte [rsi+rcx]
-    inc  rcx
-    jmp  .zk
-.zk_done:
-    test rax, rax
-    setne al
-    movzx rax, al
+    ; return 1 if 0 < k < n, else 0. This tested k != 0 only; BIP32 also
+    ; rejects k >= n (audit 2026-10-23 INFO), and bip32_ckd_priv already used
+    ; scalar_small_nonzero for exactly that range. A leaf, no stack use.
+    mov  rdi, [rbp-0x30]
+    call scalar_small_nonzero
+    movzx eax, al
 
     add  rsp, 0x80
     pop  r15

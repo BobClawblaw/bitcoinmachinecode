@@ -38,6 +38,7 @@
 #include "v2transport.h"
 #include "../crypto_bip324_transport.h"
 #include "../crypto_ellswift.h"
+#include "secure_zero.h"     /* CRY-4: the ephemeral key and session state are wiped */
 
 #define V2_FD_MAX 4096
 
@@ -82,7 +83,7 @@ int bmc_v2_is_active(int fd){
  * key, which is a fingerprint. So this fails rather than fall back to
  * anything weaker. */
 static int fill_random(unsigned char* p, unsigned long n){
-    int fd = open("/dev/urandom", O_RDONLY);
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);   /* CRY-4: not inherited by an exec'd notify child */
     if (fd < 0) return 0;
     unsigned long got = 0;
     while (got < n){
@@ -133,7 +134,7 @@ static void conn_free(int fd){
     if (!c) return;
     bip324_t_free(&c->t);
     free(c->held);
-    memset(c, 0, sizeof *c);
+    secure_zero(c, sizeof *c);          /* CRY-4: a memset before free may be dropped */
     free(c);
     g_conn[fd] = 0;
 }
@@ -170,27 +171,32 @@ int bmc_v2_handshake(int fd, int initiator, int timeout_ms){
     unsigned char seckey[32], ellswift[64], rnd[32];
     unsigned char garbage[BIP324_MAX_GARBAGE_LEN];
     unsigned char lenpick[2];
-    if (!fill_random(seckey, sizeof seckey)) return -1;
-    if (!fill_random(rnd, sizeof rnd)) return -1;
-    if (!fill_random(lenpick, sizeof lenpick)) return -1;
+    /* CRY-4 (audit 2026-10-23): every exit before the transport owns the
+     * ephemeral key used to return with it still in this frame, and the one
+     * wipe was a memset of a dead local. */
+#define HS_FAIL() do { secure_zero(seckey, sizeof seckey); secure_zero(rnd, sizeof rnd); return -1; } while (0)
+    if (!fill_random(seckey, sizeof seckey)) HS_FAIL();
+    if (!fill_random(rnd, sizeof rnd)) HS_FAIL();
+    if (!fill_random(lenpick, sizeof lenpick)) HS_FAIL();
     seckey[0] &= 0x7f;                      /* keep it below the group order */
     if (!seckey[0] && !seckey[1]) seckey[1] = 1;
 
     unsigned long glen = 0;
     if (g_garbage_max){
         glen = ((unsigned long)lenpick[0] | ((unsigned long)lenpick[1] << 8)) % (g_garbage_max + 1);
-        if (glen && !fill_random(garbage, glen)) return -1;
+        if (glen && !fill_random(garbage, glen)) HS_FAIL();
     }
-    if (!ellswift_create(ellswift, seckey, rnd, sizeof rnd)) return -1;
+    if (!ellswift_create(ellswift, seckey, rnd, sizeof rnd)) HS_FAIL();
 
     v2_conn* c = (v2_conn*)calloc(1, sizeof *c);
-    if (!c) return -1;
+    if (!c) HS_FAIL();
     unsigned char magic[4];
     memcpy(magic, &net_magic, 4);
     if (!bip324_t_init(&c->t, seckey, ellswift, magic, initiator, garbage, glen)){
-        free(c); return -1;
+        bip324_t_free(&c->t); secure_zero(c, sizeof *c); free(c); HS_FAIL();   /* init may have copied the key */
     }
-    memset(seckey, 0, sizeof seckey);
+#undef HS_FAIL
+    secure_zero(seckey, sizeof seckey); secure_zero(rnd, sizeof rnd);
     g_conn[fd] = c;
 
     if (!flush_send(fd, &c->t)){ conn_free(fd); return -1; }
@@ -361,7 +367,7 @@ int bmc_v2_import(int fd, const unsigned char* in, unsigned long len){
     bmc_v2_close(fd);
     v2_conn* c = (v2_conn*)calloc(1, sizeof *c);
     if (!c) return 0;
-    if (!bip324_t_import(&c->t, in, len)){ free(c); return 0; }
+    if (!bip324_t_import(&c->t, in, len)){ bip324_t_free(&c->t); secure_zero(c, sizeof *c); free(c); return 0; }
     g_conn[fd] = c;
     install_hooks();
     g_v2_active[fd] = 1;
