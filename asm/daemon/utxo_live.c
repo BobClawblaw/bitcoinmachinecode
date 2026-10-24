@@ -497,6 +497,18 @@ static int manifest_names(u64 run_no){
     for (u64 i = 0; i < g_utxo_lst.manifest_n; i++){ u64 r; memcpy(&r, e + i*16 + 8, 8); if (r == run_no) return 1; }
     return 0;
 }
+/* the first run the reloaded manifest names that is not a regular file in
+ * the store directory, or -1 if every one is there */
+static long manifest_missing_run(void){
+    const unsigned char* e = (const unsigned char*)g_utxo_lst.manifest_buf;
+    for (u64 i = 0; i < g_utxo_lst.manifest_n; i++){
+        u64 r; memcpy(&r, e + i*16 + 8, 8);
+        char n[64]; snprintf(n, sizeof n, "utxo_run_%06u.dat", (unsigned)r);
+        struct stat sb;
+        if (stat(n, &sb) != 0 || !S_ISREG(sb.st_mode)) return (long)r;
+    }
+    return -1;
+}
 static unsigned long g_cmp_deferred = 0;   /* merges deferred because the apply was behind (2026-09-09) */
 static void compact_adopt(int st){
     struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -4030,9 +4042,18 @@ int utxo_live_init(const char* dir){
     /* utxo_lsm_init(lst) -> 1 ok / -1 err, but utxo_lsm_reload(lst,u) ->
      * REPLAYED RECORD COUNT / -1 err (not literally 1) -- different
      * contracts, so they need different success checks. */
-    long r = have_prior_state
-        ? (g_utxo_in_reload = 1, utxo_lsm_reload(&g_utxo_lst, g_utxo_table), g_utxo_in_reload = 0)
-        : utxo_lsm_init(&g_utxo_lst);
+    /* Statements, not a comma expression: `(flag = 1, reload(), flag = 0)`
+     * has the value of its LAST operand, so from TXOQ-1 (2026-09-05) until
+     * 2026-10-23 r was 0 on every reload and the UTX-2 and UTX-6 checks
+     * below never saw a failure (tests/test_sto_crash UTX-2, UTX-6). */
+    long r;
+    if (have_prior_state){
+        g_utxo_in_reload = 1;
+        r = utxo_lsm_reload(&g_utxo_lst, g_utxo_table);
+        g_utxo_in_reload = 0;
+    } else {
+        r = utxo_lsm_init(&g_utxo_lst);
+    }
     /* UTX-2 (audit 2026-09-03): ANY negative reload is fatal, not just -1.
      *
      * utxo_store_reload returns -2 when the WAL replay hits utxo_put == 2 --
@@ -4065,6 +4086,16 @@ int utxo_live_init(const char* dir){
     if (!ok) {
         fprintf(stderr, "[utxo_live] utxo_lsm_%s failed (r=%ld)\n",
                 have_prior_state ? "reload" : "init", r);
+        /* A store that exists and will not reload (UTX-2's full memtable,
+         * UTX-6's unreadable manifest, any other reload error) fails HALTED,
+         * as a missing run does below: the untracked mode a failed init
+         * otherwise leaves would advertise the stored tip, blocks this node
+         * never connected. A fresh store that fails to init has no set to
+         * protect and keeps the untracked mode. */
+        if (have_prior_state){
+            g_applied_height = read_applied_height();
+            g_halted = 1;
+        }
         if (have_prior_state && r == -2)
             fprintf(stderr,
                 "[utxo_live] FATAL: the WAL tail does not fit this memtable "
@@ -4099,6 +4130,29 @@ int utxo_live_init(const char* dir){
                 (unsigned)UTXO_LIVE_MANIFEST_CAP);
         return 0;
     }
+    /* A manifest that names a run file which is not there (deleted, or a
+     * create lost to a power cut on a file system without the STO-W
+     * directory fsync) reloads fine: the runs are opened by name on lookup.
+     * Booting on it would answer every lookup that reaches that run with an
+     * error, and the next compaction or flush would publish a manifest that
+     * drops it. Core refuses to start on a damaged coins database; so does
+     * this. HALTED, not merely failed: a failed init alone is the untracked
+     * mode, whose public tip is the stored tip (utxo_live_public_tip), so
+     * the node would advertise blocks it never connected. Halted keeps the
+     * public and RPC tips at the persisted applied height and nothing is
+     * applied (main gates the catch-up on a successful init). */
+    { long mr = manifest_missing_run();
+      if (mr >= 0){
+          g_applied_height = read_applied_height();
+          g_halted = 1;
+          fprintf(stderr,
+              "[utxo_live] FATAL: utxo_manifest.dat names utxo_run_%06u.dat, which is not in %s "
+              "(%lu run(s) named). The coin set is incomplete. Refusing to start.\n"
+              "[utxo_live]   Fix: restore the run file from a backup, or rebuild the chainstate "
+              "(-reindex-chainstate).\n",
+              (unsigned)mr, dir, (unsigned long)g_utxo_lst.manifest_n);
+          return 0;
+      } }
     if (g_fz_table){
         /* plan B3: from here a threshold crossing freezes and forks instead
          * of flushing inline. The unretired generations start at the
