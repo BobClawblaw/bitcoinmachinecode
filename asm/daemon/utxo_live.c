@@ -41,6 +41,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <signal.h>
+#include <pthread.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <dirent.h>
@@ -89,6 +90,12 @@ extern long undo_discard(long height);
 extern int  undo_exists(long height);         /* 2026-09-08: an index entry in the packed store */
 extern long undo_commit(long height);         /* closes the block's run with the END marker */
 extern long undo_sync(void);                  /* ST2-4: fdatasync the rev files written since the last call + undo.idx */
+extern long undo_begin(long height);          /* STO-A: the block's slot, before its first put/del */
+extern void undo_mark_dirty_heights(long lo, long hi);
+extern void undo_set_discard_hook(long (*fn)(void));
+extern void utxo_store_set_predrain_hook(long (*fn)(void));
+extern unsigned long long utxo_store_logoff_healed;   /* STO-E: bitcoin_utxo_store.asm's reload */
+extern void utxo_store_forget_buffer(void);           /* a forked child drops its parent's WAL buffer */
 extern long undo_migrate_legacy(void);        /* folds pre-09-08 undo_<h>.dat files into the store */
 extern long undo_prune_from(long from_height, long tip_height, long window, long max_scan);
 /* utxo_walk.h supplies u8/u32/u64 but not u16 (undo records carry a u16
@@ -296,7 +303,9 @@ extern void undo_set_coin_observer_timing(int on);
 /* 2026-10-05: the split of `put` under bmc.benchlog (plan B1): ins = the
  * utxo_lsm_put of each created output; get / undo / del = the three parts of
  * undo_capture_and_del per spent input (undo_log.c's counters); wal = the
- * block-end drain. commit (undo_commit) is booked under undo. Not in the
+ * block-end drain, which STO-A (2026-10-23) removed: the field stays in the
+ * line's format and reads 0, and a drain of a full buffer is booked under the
+ * put that triggered it. commit (undo_commit) is booked under undo. Not in the
  * phase enum: the enum's indices are a public contract (utxo_live_timing_us,
  * tests/test_utxo_catchup_timing). Only summed when the benchlog is on. */
 enum { TMP_INS, TMP_GET, TMP_UNDO, TMP_DEL, TMP_WAL, TMP_N };
@@ -488,13 +497,26 @@ static int manifest_names(u64 run_no){
     for (u64 i = 0; i < g_utxo_lst.manifest_n; i++){ u64 r; memcpy(&r, e + i*16 + 8, 8); if (r == run_no) return 1; }
     return 0;
 }
+/* the first run the reloaded manifest names that is not a regular file in
+ * the store directory, or -1 if every one is there */
+static long manifest_missing_run(void){
+    const unsigned char* e = (const unsigned char*)g_utxo_lst.manifest_buf;
+    for (u64 i = 0; i < g_utxo_lst.manifest_n; i++){
+        u64 r; memcpy(&r, e + i*16 + 8, 8);
+        char n[64]; snprintf(n, sizeof n, "utxo_run_%06u.dat", (unsigned)r);
+        struct stat sb;
+        if (stat(n, &sb) != 0 || !S_ISREG(sb.st_mode)) return (long)r;
+    }
+    return -1;
+}
 static unsigned long g_cmp_deferred = 0;   /* merges deferred because the apply was behind (2026-09-09) */
 static void compact_adopt(int st){
     struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
     double secs = (t1.tv_sec - g_cmp_t0.tv_sec) + (t1.tv_nsec - g_cmp_t0.tv_nsec) / 1e9;
     if (WIFEXITED(st) && WEXITSTATUS(st) == 0){
         u64 nbase = ~0ULL;
-        if (lsm_manifest_adopt_child(&g_utxo_lst, g_cmp_inputs, g_cmp_nin, g_cmp_is_full, g_cmp_old_base, &nbase) != 0){
+        int ar = lsm_manifest_adopt_child(&g_utxo_lst, g_cmp_inputs, g_cmp_nin, g_cmp_is_full, g_cmp_old_base, &nbase);
+        if (ar < 0){
             /* keep the old manifest: its runs are all still on disk (unlink
              * was deferred), so this process stays consistent. The child's
              * output is an orphan; drop it now rather than at next boot.
@@ -512,7 +534,16 @@ static void compact_adopt(int st){
         } else {
             lsm_mm_invalidate_all();
             int gone = 0;
-            for (int i = 0; i < g_cmp_nin; i++) if (!manifest_names(g_cmp_inputs[i])){ unlink_run(g_cmp_inputs[i]); gone++; }
+            /* STO-D (formal/storage, 2026-10-23): the inputs go only once the
+             * manifest that drops them is durable. ar = 1: its directory
+             * fsync failed, a power loss may bring back the manifest that
+             * names them, so they stay -- orphans to the boot sweep, which
+             * makes the manifest durable before it unlinks anything. */
+            if (ar == 0){
+                for (int i = 0; i < g_cmp_nin; i++) if (!manifest_names(g_cmp_inputs[i])){ unlink_run(g_cmp_inputs[i]); gone++; }
+            } else
+                fprintf(stderr, "[utxo_live] WARNING: fsync of the chain directory after the merge's manifest failed (%s): its %d input run(s) stay on disk until the next boot's sweep\n",
+                        strerror(errno), g_cmp_nin);
             long interim = (long)g_utxo_lst.manifest_n - ((long)g_cmp_n_before - g_cmp_nin + 1);   /* runs flushed since fork */
             fprintf(stderr, "[utxo_live] compaction done in %.1fs (%s; started at height %ld): manifest_n %lu -> %lu, merged into run %lu, %ld flushed meanwhile, %d input run(s) unlinked; apply never waited; %lu merge(s) deferred so far\n",
                     secs, g_cmp_desc, g_cmp_height, (unsigned long)g_cmp_n_before, (unsigned long)g_utxo_lst.manifest_n, (unsigned long)g_cmp_child_run, interim, gone, g_cmp_deferred);
@@ -646,6 +677,7 @@ static int compact_start_async(long height, const char* why){
         setpriority(PRIO_PROCESS, 0, 10);
         syscall(SYS_ioprio_set, 1 /* IOPRIO_WHO_PROCESS */, 0, (2 << 13) | 7 /* best-effort, prio 7 */);
         utxo_lsm_set_flush_hook(0);
+        utxo_store_set_predrain_hook(0); undo_set_discard_hook(0);
         utxo_lsm_set_defer_unlink(1);
         utxo_lsm_set_defer_publish(1);
         long cr = utxo_lsm_compact_range(&g_utxo_lst, (unsigned long)lo, (unsigned long)k);
@@ -754,6 +786,7 @@ static int    g_fz_delta_known = 0;
 static u64    g_wal_live_start = 0;    /* utxo.idx's log_off: the first byte of the unretired generations */
 static int    g_fz_punch_ok = -1;      /* -1 untested, 1 the WAL's filesystem punches holes, 0 it does not */
 static int    g_fz_fatal = 0;          /* an adopt failed: the next threshold crossing returns -1 (fatal, as a flush error) */
+static int    g_fz_dir_unsynced = 0;   /* STO-D: a manifest was renamed, its directory fsync failed (see fz_retire_wal) */
 static unsigned long g_fz_count = 0, g_fz_waits = 0, g_fz_inline = 0, g_fz_bytes_retired = 0;
 #define FZ_FALLOC_KEEP_SIZE  0x01      /* linux/falloc.h: FALLOC_FL_KEEP_SIZE */
 #define FZ_FALLOC_PUNCH_HOLE 0x02      /* FALLOC_FL_PUNCH_HOLE (needs KEEP_SIZE) -- by raw syscall, as the ioprio call above, so no feature macro is needed */
@@ -766,6 +799,31 @@ static u64 clock_ns(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t)
  * a replay of bytes the run also holds. */
 static void fz_retire_wal(void){
     u64 off = g_utxo_lst.fz_wal_end;
+    /* STO-D (formal/storage, 2026-10-23): the generations retired here must
+     * be in a run a durable manifest names. When the directory fsync after
+     * the manifest's rename failed, it is retried here, and while it fails
+     * nothing is retired: the next call (the next adopt, or one with nothing
+     * to publish) retires these generations with its own. */
+    if (g_fz_dir_unsynced){
+        if (lsm_dir_sync() != 0){
+            fprintf(stderr, "[utxo_live] WARNING: fsync of the chain directory failed again (%s): utxo.idx keeps its log_off, the unretired generations replay on the next boot (duplicates, not a loss)\n", strerror(errno));
+            return;
+        }
+        g_fz_dir_unsynced = 0;
+    }
+    /* STO-E (formal/storage, 2026-10-23): utxo.idx below names a log_off,
+     * and a reload writes at the WAL's physical end. Without this fsync the
+     * WAL's durable length could be below log_off after a power loss, and
+     * every record appended after that boot landed below log_off, where no
+     * later reload reads it -- a silently wrong set. Durable WAL first, then
+     * the offset into it (Core never lets a coins-DB marker run ahead of its
+     * data). One fsync per adopted flush, of bytes written since the last
+     * checkpoint. A failure keeps the old log_off: the generation replays
+     * over its own run on the next boot (duplicates, not a loss). */
+    if (g_utxo_lst.log_fd >= 0 && fsync((int)g_utxo_lst.log_fd) != 0){
+        fprintf(stderr, "[utxo_live] WARNING: fsync of the WAL before retiring its generation failed (%s): utxo.idx keeps its log_off, the retired generation replays on the next boot (duplicates, not a loss)\n", strerror(errno));
+        return;
+    }
     unsigned char h[20]; u32 magic = 0x55545849u; u64 n = 0;      /* "UTXI", bitcoin_utxo_store.asm's MAGIC_IDX */
     memcpy(h, &magic, 4); memcpy(h + 4, &off, 8); memcpy(h + 12, &n, 8);
     int fd = open("utxo.idx.tmp", O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -778,9 +836,20 @@ static void fz_retire_wal(void){
     if (rename("utxo.idx.tmp", "utxo.idx") != 0){
         fprintf(stderr, "[utxo_live] WARNING: rename utxo.idx.tmp -> utxo.idx failed (%s)\n", strerror(errno)); unlink("utxo.idx.tmp"); return;
     }
-    { int dfd = open(".", O_RDONLY); if (dfd >= 0){ fsync(dfd); close(dfd); } }
+    /* STO-D (formal/storage, 2026-10-23): this result was ignored, and the
+     * punch below frees the bytes the OLD log_off points at. The punch is the
+     * WAL's own metadata, durable at its next fsync; the rename is durable
+     * only at a directory fsync. With the fsync failed, a power loss could
+     * keep the hole and the old utxo.idx: the reload would start at zeros,
+     * stop there and truncate the live generation behind them. So no punch
+     * until a rename is known durable: the next retire punches the whole
+     * range (g_wal_live_start stays). */
+    int dir_ok = lsm_dir_sync() == 0;
+    if (!dir_ok)
+        fprintf(stderr, "[utxo_live] WARNING: fsync of the chain directory after the utxo.idx rename failed (%s): the retired WAL bytes keep their disk space until the next retire\n", strerror(errno));
     { int nfd = open("utxo.idx", O_RDWR); if (nfd >= 0){ if (g_utxo_lst.idx_fd >= 0) close((int)g_utxo_lst.idx_fd); g_utxo_lst.idx_fd = nfd; } }
     g_utxo_lst.ckpt_log_off = off; g_utxo_lst.ckpt_n = 0;
+    if (!dir_ok) return;
     if (off > g_wal_live_start && g_fz_punch_ok != 0){
         if (syscall(SYS_fallocate, (int)g_utxo_lst.log_fd, FZ_FALLOC_PUNCH_HOLE | FZ_FALLOC_KEEP_SIZE, (off_t)g_wal_live_start, (off_t)(off - g_wal_live_start)) == 0){
             g_fz_punch_ok = 1; g_fz_bytes_retired += (unsigned long)(off - g_wal_live_start);
@@ -822,11 +891,23 @@ static void fz_adopt(int how){
         g_utxo_lst.manifest_n++;
         u64 base = lsm_manifest_persisted_live();
         u64 persist = (base != ~0ULL && g_fz_delta_known) ? base + g_fz_delta : ~0ULL;
-        if (lsm_manifest_publish(&g_utxo_lst, persist) != 0){
+        int pr = lsm_manifest_publish(&g_utxo_lst, persist);
+        if (pr < 0){
             g_utxo_lst.manifest_n--; g_fz_fatal = 1;
             fprintf(stderr, "[utxo_live] FATAL: could not publish the manifest with run %lu (%s) -- the run is an orphan, the generation stays in the WAL; halting at the next put\n", (unsigned long)g_utxo_lst.fz_run_no, strerror(errno));
             return;
         }
+        /* STO-D (formal/storage, 2026-10-23): the manifest is renamed but its
+         * directory fsync failed (this result was ignored). Retiring the WAL
+         * on top of it would let a power loss keep the utxo.idx rename and
+         * lose this one: the generation in no named run and past log_off.
+         * fz_retire_wal retries the directory fsync first and keeps the old
+         * log_off if that fails too (a replay over the run, not a loss). */
+        if (pr == 1){
+            g_fz_dir_unsynced = 1;
+            fprintf(stderr, "[utxo_live] WARNING: fsync of the chain directory after the manifest with run %lu failed (%s): retrying it before the WAL generation is retired\n",
+                    (unsigned long)g_utxo_lst.fz_run_no, strerror(errno));
+        } else g_fz_dir_unsynced = 0;
     }
     fz_retire_wal();
     g_utxo_lst.fz_active = 0; g_utxo_lst.fz_tomb_n = 0;
@@ -891,6 +972,7 @@ static long fz_hook(void* lst, void* u){
         /* the writer: no stdio, no hooks, the run from the copy, then gone */
         if (g_test_child_probe) g_test_child_probe(FORK_FOR_WRITER);
         utxo_lsm_set_flush_hook(0); utxo_lsm_set_freeze_hook(0);
+        utxo_store_set_predrain_hook(0); undo_set_discard_hook(0);
         long cr = utxo_lsm_build_run(lst, g_utxo_lst.fz_u, g_utxo_lst.fz_tomb_buf, g_utxo_lst.fz_tomb_n, g_utxo_lst.fz_gen, g_utxo_lst.fz_run_no);
         _exit(cr == 1 ? 0 : cr == 0 ? 3 : 2);
     }
@@ -1256,7 +1338,117 @@ void utxo_live_set_coinstats(csi_coin_fn add, csi_coin_fn rm,
  * invalid) until it fires. NULL outside the worker. */
 
 extern long utxo_store_wal_drain(void* st);
+
+/* ---- STO-A / STO-C (formal/storage, 2026-10-23): the durable prefix ----
+ *
+ * THE HOLES. The undo store was synced only at the checkpoint (ST2-4), the
+ * archive's index.dat record never on the store_append path. But a block's
+ * spends reach the disk long before its checkpoint: every memtable flush
+ * fsyncs a run holding them, and the kernel may write the WAL's pages back
+ * at any moment after the drain's write(2). After a power loss the ghost
+ * guard (undo_exists) could not see such a block, recovery left its spends
+ * in place, and the catch-up rejected -- and invalidated -- the valid block
+ * on BIP30 (STO-A). And the checkpoint could make an applied height durable
+ * whose archive record was not: boot then refused to start until a reindex
+ * (STO-C), and a ghost block whose record was lost could not be read back
+ * for its rollback.
+ *
+ * THE ORDER, Core's (Chainstate::FlushStateToDisk: the block and undo files,
+ * then the block index, then the coins): before any byte of the UTXO state
+ * can reach the disk, the archive records and blocks it was applied from
+ * and the undo that reverses it are durable. "Can reach the disk" is the
+ * WAL's write(2), not its fsync -- so this runs as the store's pre-drain
+ * hook (bitcoin_utxo_store.asm mac_wal_predrain), i.e. before EVERY drain:
+ * the buffer filling, the freeze or inline flush (which drain before they
+ * build a run), the checkpoint, the rollback's discard, a reload, a close.
+ *
+ * THE COST is per drain, not per block: the block-end drain is gone (the
+ * buffer lands when it fills or at a checkpoint), so a drain carries many
+ * blocks and one prefix covers them all. Nothing is synced when no block
+ * was applied since the last prefix (g_pfx_dirty).
+ *
+ * The archive part fdatasyncs the blk files the applied heights' records
+ * name, then index.dat: the bytes before the records that point at them,
+ * STO-11's order, which the download committer (store_set_sync(0), one
+ * sync per chunk) would otherwise leave to the end of its chunk. */
+static int  g_pfx_dirty = 0;
+static long g_pfx_lo = 1, g_pfx_hi = 0;      /* the heights applied since the last prefix */
+static unsigned long g_pfx_count = 0;        /* prefixes made durable (tests, benchlog) */
+static void pfx_note(long lo, long hi){
+    if (lo < 0) lo = 0;
+    if (g_pfx_lo > g_pfx_hi){ g_pfx_lo = lo; g_pfx_hi = hi; }
+    else {
+        if (lo < g_pfx_lo){ g_pfx_lo = lo; }
+        if (hi > g_pfx_hi){ g_pfx_hi = hi; }
+    }
+    g_pfx_dirty = 1;
+}
+static int archive_sync_heights(long lo, long hi){
+    int ifd = open("index.dat", O_RDONLY | O_CLOEXEC);
+    if (ifd < 0) return 0;                   /* no archive here: blocks handed in directly (tests, tools) */
+    static unsigned char rb[48 * 1024];
+    unsigned fmin = ~0u, fmax = 0;
+    for (long h = lo; h <= hi; ){
+        long n = hi - h + 1; if (n > 1024) n = 1024;
+        ssize_t r = pread(ifd, rb, (size_t)n * 48, (off_t)h * 48);
+        if (r < 48) break;                   /* past the archive's end: not archived blocks */
+        for (long i = 0; i < r / 48; i++){
+            unsigned f, sz; memcpy(&f, rb + i * 48 + 32, 4); memcpy(&sz, rb + i * 48 + 44, 4);
+            if (sz == 0) continue;           /* a hole: no block there */
+            if (f < fmin){ fmin = f; }
+            if (f > fmax){ fmax = f; }
+        }
+        h += r / 48; if (r / 48 < n) break;
+    }
+    for (unsigned f = fmin; fmin != ~0u && f <= fmax; f++){
+        char nm[32]; snprintf(nm, sizeof nm, "blk%05u.dat", f);
+        int bfd = open(nm, O_RDONLY | O_CLOEXEC);
+        if (bfd < 0) continue;
+        int r = fdatasync(bfd); close(bfd);
+        if (r != 0){ close(ifd); return -1; }
+    }
+    int r = fdatasync(ifd); close(ifd);
+    return r == 0 ? 0 : -1;
+}
+static long live_durable_prefix(void){
+    if (!g_pfx_dirty) return 0;
+    if (archive_sync_heights(g_pfx_lo, g_pfx_hi) != 0){
+        fprintf(stderr, "[utxo_live] fdatasync of the archive (blocks %ld..%ld) failed: %s -- refusing to write UTXO state those blocks' records may not back\n",
+                g_pfx_lo, g_pfx_hi, strerror(errno));
+        return -1;
+    }
+    if (undo_sync() != 0){
+        fprintf(stderr, "[utxo_live] fdatasync of the undo store failed: %s -- refusing to write UTXO state its undo may not back\n", strerror(errno));
+        return -1;
+    }
+    g_pfx_dirty = 0; g_pfx_lo = 1; g_pfx_hi = 0; g_pfx_count++;
+    return 0;
+}
+/* STO-B: undo_discard's hook. The caller has queued a block's reversal in
+ * the WAL buffer; it is on the disk before the slot that says the block's
+ * effects are there goes. */
+static long live_before_discard(void){
+    if (utxo_store_wal_drain(&g_utxo_lst) != 0) return -1;
+    if (g_utxo_lst.log_fd >= 0 && fsync((int)g_utxo_lst.log_fd) != 0){
+        fprintf(stderr, "[utxo_live] fsync of the WAL before an undo discard failed: %s -- the undo slot stays (the reversal repeats on the next boot)\n", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+unsigned long utxo_live_test_prefix_count(void){ return g_pfx_count; }
+/* TEST-ONLY (tests/test_sto_crash.c): land the WAL buffer now, as a full
+ * buffer does in the middle of a long batch */
+long utxo_live_test_wal_drain(void){ return utxo_store_wal_drain(&g_utxo_lst); }
+/* TEST-ONLY: called after tx 0 (the coinbase) of every block's mutation
+ * walk, i.e. after the coinbase's outputs and before the first spend. Off
+ * (one pointer compare per block) outside tests. */
+static void (*g_test_after_tx0)(long h) = 0;
+void utxo_live_test_set_after_tx0(void (*fn)(long h)){ g_test_after_tx0 = fn; }
+
 static int persist_applied_height(long h){
+    /* STO-A/STO-C: the archive and the undo the WAL's ops depend on first */
+    int pfx_ran = g_pfx_dirty;
+    if (live_durable_prefix() != 0) return 0;
     /* the height claims every op through h is in the WAL: land the buffer first */
     if (utxo_store_wal_drain(&g_utxo_lst) != 0) return 0;
     /* ---- UTX-4 (audit 2026-09-03): and make it DURABLE before claiming it.
@@ -1287,8 +1479,11 @@ static int persist_applied_height(long h){
      * cache. Undo before WAL, at the checkpoint only: one or two fdatasyncs
      * per checkpoint (every 1,024 blocks or 60 s in bulk mode), not per
      * block. A WAL page the kernel writes back on its own between two
-     * checkpoints is not ordered by this; see the commit for that window. */
-    if (g_undo_enabled && undo_sync() != 0){
+     * checkpoints is not ordered by this; see the commit for that window.
+     * (STO-A closed that window: the prefix above runs before every drain.
+     * This call stays for a checkpoint with no block since the last prefix:
+     * a rollback's or a disconnect's slot clears.) */
+    if (g_undo_enabled && !pfx_ran && undo_sync() != 0){
         fprintf(stderr, "[utxo_live] fdatasync of the undo store before checkpoint failed: %s "
                         "-- refusing to record an applied height its undo may not back\n",
                 strerror(errno));
@@ -1314,8 +1509,14 @@ static int persist_applied_height(long h){
         fprintf(stderr, "[utxo_live] rename height file failed: %s\n", strerror(errno));
         return 0;
     }
-    int dfd = open(".", O_RDONLY);
-    if (dfd >= 0) { fsync(dfd); close(dfd); }
+    /* STO-D (formal/storage, 2026-10-23): this result was ignored. It costs
+     * redo only: a height whose rename is lost after a power loss is the
+     * previous checkpoint's, every block above it has its undo durable (the
+     * prefix), and recovery rolls them back and applies them again. Said, not
+     * acted on. */
+    if (lsm_dir_sync() != 0)
+        fprintf(stderr, "[utxo_live] WARNING: fsync of the chain directory after the checkpoint at %ld failed (%s): a power loss may bring back the previous checkpoint (the blocks after it are re-applied)\n",
+                h, strerror(errno));
     /* the coinstats index persists at the SAME durability point, so its
      * stored height can only ever match or trail the applied height by a
      * crash window -- which boot detects and re-seeds */
@@ -2921,6 +3122,14 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
      * already-parsed tx array instead of re-parsing. A failure HERE is the
      * only case that still needs rollback_partial_apply -- everything above
      * ran before any put/del happened. ---- */
+    /* STO-A: the block is in the next durable prefix, and its undo slot
+     * exists, before its first op can enter the WAL buffer (the coinbase's
+     * outputs come before any spend registers the slot). */
+    pfx_note(g_apply_height, g_apply_height);
+    if (g_undo_enabled && g_apply_height >= 0 && undo_begin(g_apply_height) != 1){
+        fprintf(stderr, "[utxo_live] could not open the undo run for height %ld: %s\n", g_apply_height, strerror(errno));
+        return 0;                    /* no reason: a store error, the block is not at fault */
+    }
     apply_ctx_t ctx = { 0, 0, 0, 0, 0, 0 };
     ctx.ledger = (g_resolved_height == g_apply_height && g_resolved_gen == txvb_last_resolve_gen());
     /* put = the walk minus the flushes and the coinstats folds inside it */
@@ -2934,6 +3143,7 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
         int wok = utxo_walk_tx_io(txs[t].ptr, txs[t].ptr+txs[t].len, &ctx, live_on_input, live_on_output, &wnin, &wnout);
         if (!wok || ctx.fatal) { rollback_partial_apply(blockbuf, blocklen, t); return 0; }
         if (wnin != txs[t].pn_in || wnout != pn_outs[t]) { rollback_partial_apply(blockbuf, blocklen, t); return 0; }
+        if (t == 0 && g_test_after_tx0) g_test_after_tx0(g_apply_height);
     }
     {   u64 span = tm_now() - tm_p0;
         if (g_tm_on) tm_add(TM_CSI, (u64)undo_coin_observer_ns() - tm_o0);   /* the remove-side folds */
@@ -2978,11 +3188,20 @@ long utxo_live_dryrun_block(const u8* blockbuf, u64 blocklen, long height){
 
 extern void undo_close_current(void);
 static int apply_block_at_inner(const u8* blockbuf, u64 blocklen, long height);
-/* Block boundary = WAL drain + undo file close (2026-09-01): the WAL is
- * buffered in the store (one write per block instead of one per record)
- * and the block's undo file stays open across its inputs. Both land here,
- * success or failure, so everything after this point -- the checkpoint, a
- * rollback, the next block's undo file -- sees a complete on-disk record. */
+/* Block boundary = undo file close (2026-09-01): the block's undo file stays
+ * open across its inputs and is closed here, success or failure.
+ *
+ * The block-end WAL drain that stood here is gone (STO-A, formal/storage
+ * 2026-10-23). A drain is the point where the block's ops can reach the
+ * disk, so the durable prefix (undo + archive records) has to precede it,
+ * and one drain per block meant one prefix -- three or four fdatasyncs --
+ * per block. The buffer now lands when it fills, at a flush, and at the
+ * checkpoint (which drains before it claims a height); nothing reads the
+ * WAL file before those points but a reload, which drains first. A process
+ * death loses the buffered suffix of the op stream, which is what it always
+ * could lose: the ghost guard rolls the blocks since the checkpoint back
+ * from their undo (a coin whose delete never landed is still there and is
+ * not restored; an output that never landed is not there to delete). */
 static int apply_block_at(const u8* blockbuf, u64 blocklen, long height){
     int r = apply_block_at_inner(blockbuf, blocklen, height);
     if (r && g_csi_block) g_csi_block(height);
@@ -2996,16 +3215,8 @@ static int apply_block_at(const u8* blockbuf, u64 blocklen, long height){
         r = 0;
     }
     undo_close_current();
-    u64 tm_w0 = g_cfg.benchlog ? tm_now() : 0;
-    if (g_cfg.benchlog) g_tmp_total[TMP_UNDO] += tm_w0 - tm_d0;
-    int drain_bad = (utxo_store_wal_drain(&g_utxo_lst) != 0);
-    tm_lap(TM_PUT, tm_d0);           /* the block-end WAL write is part of put */
-    if (g_cfg.benchlog) g_tmp_total[TMP_WAL] += tm_now() - tm_w0;
-    if (drain_bad) {
-        fprintf(stderr, "[utxo_live] FATAL: WAL drain failed after height %ld\n", height);
-        g_last_fail_kind = UTXO_FAIL_STORE; g_last_fail_height = height;
-        return 0;
-    }
+    if (g_cfg.benchlog) g_tmp_total[TMP_UNDO] += tm_now() - tm_d0;
+    tm_lap(TM_PUT, tm_d0);           /* the block-end undo close is part of put */
     if (!r) {
         /* apply_block_inner clears g_last_reject at entry and sets it on
          * every verification refusal; a failure with it still empty came
@@ -3295,6 +3506,10 @@ static void del_created_on_output(void* ctxv, u32 out_index, u64 value,
  * Discards the undo file on success so a fresh apply starts clean.
  * Returns 1 rolled back / 0 failed (undo file left in place). */
 static int rollback_unapplied_block(const u8* blockbuf, u64 blocklen, long h){
+    /* STO-A: the undo this reversal reads may be a dead process's page cache
+     * only; the restores it queues must not reach the disk before it does */
+    undo_mark_dirty_heights(h, h); pfx_note(h, h);
+    if (live_durable_prefix() != 0) return 0;
     long saved_apply = g_apply_height;
     g_apply_height = h;
     int saved = g_undo_enabled;
@@ -3409,6 +3624,12 @@ long utxo_live_recover_partial_block(void* store_buf){
         hi = h;
     }
     if (hi < lo) return 0;
+    /* STO-A: every ghost's undo durable before the first restore can reach
+     * the WAL. A restore of block h re-creates a coin an earlier ghost made;
+     * if that ghost's slot were lost after the restore landed, nothing would
+     * delete the coin again. */
+    undo_mark_dirty_heights(lo, hi); pfx_note(lo, hi);
+    if (live_durable_prefix() != 0) return -1;
 
     static u8 blockbuf[8<<20];
     long rolled = 0;
@@ -3770,6 +3991,12 @@ int utxo_live_init(const char* dir){
     g_utxo_lst.manifest_buf = manifest_buf; g_utxo_lst.manifest_cap = manifest_cap;
     g_utxo_lst.scratch_buf = scratch_buf; g_utxo_lst.scratch_cap = scratch_cap;
     utxo_lsm_set_flush_hook(compact_flush_hook);   /* see "compaction in the background" */
+    utxo_store_set_predrain_hook(live_durable_prefix);   /* STO-A/STO-C */
+    undo_set_discard_hook(live_before_discard);          /* STO-B */
+    g_pfx_dirty = 0; g_pfx_lo = 1; g_pfx_hi = 0;
+    /* the WAL buffer now holds many blocks between drains: a child of this
+     * process (a flush writer, a compaction, a reader) must never land it */
+    { static int atfork_set = 0; if (!atfork_set && pthread_atfork(0, 0, utxo_store_forget_buffer) == 0) atfork_set = 1; }
     /* plan B3: the frozen copy (the applier's half of a flush copies into it)
      * and the spare tombstone list. Anonymous and private: the writer is a
      * forked child that reads it, nobody else maps it. Untouched until the
@@ -3815,9 +4042,18 @@ int utxo_live_init(const char* dir){
     /* utxo_lsm_init(lst) -> 1 ok / -1 err, but utxo_lsm_reload(lst,u) ->
      * REPLAYED RECORD COUNT / -1 err (not literally 1) -- different
      * contracts, so they need different success checks. */
-    long r = have_prior_state
-        ? (g_utxo_in_reload = 1, utxo_lsm_reload(&g_utxo_lst, g_utxo_table), g_utxo_in_reload = 0)
-        : utxo_lsm_init(&g_utxo_lst);
+    /* Statements, not a comma expression: `(flag = 1, reload(), flag = 0)`
+     * has the value of its LAST operand, so from TXOQ-1 (2026-09-05) until
+     * 2026-10-23 r was 0 on every reload and the UTX-2 and UTX-6 checks
+     * below never saw a failure (tests/test_sto_crash UTX-2, UTX-6). */
+    long r;
+    if (have_prior_state){
+        g_utxo_in_reload = 1;
+        r = utxo_lsm_reload(&g_utxo_lst, g_utxo_table);
+        g_utxo_in_reload = 0;
+    } else {
+        r = utxo_lsm_init(&g_utxo_lst);
+    }
     /* UTX-2 (audit 2026-09-03): ANY negative reload is fatal, not just -1.
      *
      * utxo_store_reload returns -2 when the WAL replay hits utxo_put == 2 --
@@ -3842,9 +4078,24 @@ int utxo_live_init(const char* dir){
      * the only safe answer, so the message names the two ways out rather than
      * leaving an operator to guess. */
     int ok = have_prior_state ? (r >= 0) : (r == 1);
+    if (ok && utxo_store_logoff_healed){
+        fprintf(stderr, "[utxo_live] WARNING: utxo.dat ended %llu byte(s) below utxo.idx's log_off (a WAL length lost to a crash, STO-E): "
+                        "extended to log_off so new records land where the replay reads them\n", utxo_store_logoff_healed);
+        utxo_store_logoff_healed = 0;
+    }
     if (!ok) {
         fprintf(stderr, "[utxo_live] utxo_lsm_%s failed (r=%ld)\n",
                 have_prior_state ? "reload" : "init", r);
+        /* A store that exists and will not reload (UTX-2's full memtable,
+         * UTX-6's unreadable manifest, any other reload error) fails HALTED,
+         * as a missing run does below: the untracked mode a failed init
+         * otherwise leaves would advertise the stored tip, blocks this node
+         * never connected. A fresh store that fails to init has no set to
+         * protect and keeps the untracked mode. */
+        if (have_prior_state){
+            g_applied_height = read_applied_height();
+            g_halted = 1;
+        }
         if (have_prior_state && r == -2)
             fprintf(stderr,
                 "[utxo_live] FATAL: the WAL tail does not fit this memtable "
@@ -3879,6 +4130,29 @@ int utxo_live_init(const char* dir){
                 (unsigned)UTXO_LIVE_MANIFEST_CAP);
         return 0;
     }
+    /* A manifest that names a run file which is not there (deleted, or a
+     * create lost to a power cut on a file system without the STO-W
+     * directory fsync) reloads fine: the runs are opened by name on lookup.
+     * Booting on it would answer every lookup that reaches that run with an
+     * error, and the next compaction or flush would publish a manifest that
+     * drops it. Core refuses to start on a damaged coins database; so does
+     * this. HALTED, not merely failed: a failed init alone is the untracked
+     * mode, whose public tip is the stored tip (utxo_live_public_tip), so
+     * the node would advertise blocks it never connected. Halted keeps the
+     * public and RPC tips at the persisted applied height and nothing is
+     * applied (main gates the catch-up on a successful init). */
+    { long mr = manifest_missing_run();
+      if (mr >= 0){
+          g_applied_height = read_applied_height();
+          g_halted = 1;
+          fprintf(stderr,
+              "[utxo_live] FATAL: utxo_manifest.dat names utxo_run_%06u.dat, which is not in %s "
+              "(%lu run(s) named). The coin set is incomplete. Refusing to start.\n"
+              "[utxo_live]   Fix: restore the run file from a backup, or rebuild the chainstate "
+              "(-reindex-chainstate).\n",
+              (unsigned)mr, dir, (unsigned long)g_utxo_lst.manifest_n);
+          return 0;
+      } }
     if (g_fz_table){
         /* plan B3: from here a threshold crossing freezes and forks instead
          * of flushing inline. The unretired generations start at the
@@ -3928,6 +4202,7 @@ int utxo_live_init(const char* dir){
      * background merges). Guarded: refuses unless file and memory agree. */
     { int sw = lsm_manifest_sweep_orphans(&g_utxo_lst);
       if (sw > 0) fprintf(stderr, "[utxo_live] init: swept %d orphan file(s) the manifest does not name\n", sw);
+      else if (sw == -2) fprintf(stderr, "[utxo_live] init: orphan sweep skipped -- fsync of the chain directory failed (%s)\n", strerror(errno));
       else if (sw < 0) fprintf(stderr, "[utxo_live] init: orphan sweep skipped -- manifest file and memory disagree\n"); }
     /* M1 (2026-10-06): the worker's anonymous memory by purpose, for
      * /proc/PID/maps, smaps and the [mem] line. The memtable's table and
@@ -4719,5 +4994,6 @@ void utxo_live_close(void){
     if (g_ckpt_since) ckpt_now();            /* a clean close mid-batch persists */
     utxo_live_compact_shutdown();
     utxo_lsm_close(&g_utxo_lst);
+    utxo_store_set_predrain_hook(0); undo_set_discard_hook(0);
     g_recovery_checked = 0;
 }

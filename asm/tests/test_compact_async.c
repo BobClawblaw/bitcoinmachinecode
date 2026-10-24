@@ -225,6 +225,49 @@ int main(void){
     still = 0; for (int i = 0; i < nin; i++) still += run_exists(in[i]);
     ok(cr > 0 && still == 0, "with defer_unlink clear, compaction unlinked its inputs itself");
     utxo_lsm_close(&lst);
+
+    printf("== 7. formal/parsers F7: an entry whose gen or run number is 2^64-1 ==\n");
+    /* advance_counters set next_gen/next_run_no to 1 + each entry with no
+     * guard: an entry of 2^64-1 wrapped that to 0 and left the counter at
+     * whatever it was (7 in the confirmation driver), so a later run could be
+     * given a generation no newer than an existing one. Such a manifest is
+     * refused; one entry short of it (2^64-2) still reads, and its successor
+     * is 2^64-1. The adopter refuses a child manifest holding one before it
+     * publishes anything. Hand-written manifests: nothing here opens a run. */
+    { struct { const char* what; uint64_t g, r; int ok; } cs[] = {
+        { "gen 2^64-1",                     UINT64_MAX,     5,              0 },
+        { "run number 2^64-1",              3,              UINT64_MAX,     0 },
+        { "(control) gen and run 2^64-2",   UINT64_MAX - 1, UINT64_MAX - 1, 1 } };
+      for (unsigned k = 0; k < sizeof cs / sizeof cs[0]; k++){
+          unsigned char h[12]; uint32_t mg = 0x4E414D55u; uint64_t n = 2;   /* MAGIC_MANIFEST, two entries */
+          memcpy(h, &mg, 4); memcpy(h + 4, &n, 8);
+          uint64_t e[4] = { 3, 4, cs[k].g, cs[k].r };
+          FILE* f = fopen("f7_manifest.dat", "wb"); fwrite(h, 1, 12, f); fwrite(e, 8, 4, f); fclose(f);
+          struct lsm_state m; memset(&m, 0, sizeof m);
+          m.manifest_buf = malloc(4 * 16); m.manifest_cap = 4; m.next_gen = 7; m.next_run_no = 7;
+          int r = lsm_manifest_read_file("f7_manifest.dat", &m, 0);
+          char l[160]; snprintf(l, sizeof l, "F7 a manifest entry with %s: %s (r=%d)", cs[k].what, cs[k].ok ? "read" : "refused", r);
+          ok(cs[k].ok ? (r == 0 && m.next_gen == UINT64_MAX && m.next_run_no == UINT64_MAX) : r == -1, l);
+          free(m.manifest_buf);
+      }
+      unlink("f7_manifest.dat");
+      /* the adopter: memory names runs 10 and 11; the child merged input 10
+       * into run 12 */
+      for (int bad = 0; bad < 2; bad++){
+          struct lsm_state m; memset(&m, 0, sizeof m);
+          m.manifest_buf = malloc(4 * 16); m.manifest_cap = 4;
+          uint64_t cur[4] = { 1, 10, 2, 11 }; memcpy(m.manifest_buf, cur, 32); m.manifest_n = 2; m.next_gen = 3; m.next_run_no = 12;
+          unsigned char h[12]; uint32_t mg = 0x4E414D55u; uint64_t n = 2;
+          memcpy(h, &mg, 4); memcpy(h + 4, &n, 8);
+          uint64_t ch[4] = { bad ? UINT64_MAX : 5, 12, 2, 11 };
+          FILE* f = fopen(LSM_MANIFEST_CHILD, "wb"); fwrite(h, 1, 12, f); fwrite(ch, 8, 4, f); fclose(f);
+          uint64_t inputs[1] = { 10 }, nb = 0;
+          int r = lsm_manifest_adopt_child(&m, inputs, 1, 0, ~0ULL, &nb);
+          if (!bad) ok(r >= 0 && m.manifest_n == 2 && m.next_gen == 6, "F7 (control) the adopter takes a child whose merged run has gen 5");
+          else      ok(r == -1 && m.manifest_n == 2 && !memcmp(m.manifest_buf, cur, 32), "F7 the adopter refuses a child whose merged run has gen 2^64-1, memory untouched");
+          free(m.manifest_buf); unlink(LSM_MANIFEST_CHILD);
+      } }
+
     printf("\n%s (%d failure%s)\n", fails?"TESTS FAILED":"ALL TESTS PASSED", fails, fails==1?"":"s");
     return fails ? 1 : 0;
 }

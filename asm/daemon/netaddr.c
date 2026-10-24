@@ -207,14 +207,18 @@ static long put_csize(unsigned char* o, unsigned long long v){
     if (v <= 0xffffffffULL){ o[0] = 0xfe; for (int i = 0; i < 4; i++) o[1+i] = (unsigned char)(v >> (8*i)); return 5; }
     o[0] = 0xff; for (int i = 0; i < 8; i++) o[1+i] = (unsigned char)(v >> (8*i)); return 9;
 }
+/* A CompactSize as Core's ReadCompactSize reads it: -1 when truncated or
+ * spelled in more bytes than the value needs ("non-canonical
+ * ReadCompactSize()", formal/parsers F2, 2026-10-23 -- this took fd 0100 as
+ * 1). The callers bound the value themselves. */
 static long get_csize(const unsigned char* p, long len, unsigned long long* v){
     if (len < 1) return -1;
     if (p[0] < 0xfd){ *v = p[0]; return 1; }
-    if (p[0] == 0xfd){ if (len < 3) return -1; *v = (unsigned long long)p[1] | ((unsigned long long)p[2] << 8); return 3; }
-    if (p[0] == 0xfe){ if (len < 5) return -1; *v = 0; for (int i = 0; i < 4; i++) *v |= (unsigned long long)p[1+i] << (8*i); return 5; }
+    if (p[0] == 0xfd){ if (len < 3) return -1; *v = (unsigned long long)p[1] | ((unsigned long long)p[2] << 8); return *v < 0xfd ? -1 : 3; }
+    if (p[0] == 0xfe){ if (len < 5) return -1; *v = 0; for (int i = 0; i < 4; i++) *v |= (unsigned long long)p[1+i] << (8*i); return *v <= 0xffff ? -1 : 5; }
     if (len < 9) return -1;
     *v = 0; for (int i = 0; i < 8; i++) *v |= (unsigned long long)p[1+i] << (8*i);
-    return 9;
+    return *v <= 0xffffffffULL ? -1 : 9;
 }
 long bmc_addr_encode_v2(unsigned char* out, long cap, const bmc_addr_t* a, unsigned long long services, unsigned time){
     int al = bmc_net_addrlen(a->net); if (!al || a->len != al) return 0;
@@ -241,7 +245,14 @@ long bmc_addr_decode_v2(bmc_addr_t* a, unsigned long long* services, unsigned* t
     if (o + al + 2 > len) return -1;
     memset(a, 0, sizeof *a);
     int want = bmc_net_addrlen(net);
-    if (!want || want != al){ *consumed = o + al + 2; return -2; }   /* unknown/odd: skip it, as Core does */
+    /* Core's SetNetFromBIP155Network THROWS for a known network id with the
+     * wrong length ("BIP155 IPv4 address with length 5 (should be 4)"), so
+     * the whole message fails to deserialize; only an UNKNOWN id is skipped
+     * (s.ignore). This skipped both (formal/parsers F2d). TORv2 (id 3) has no
+     * case in Core's switch any more: unknown, skipped, as bmc_net_addrlen's
+     * 0 for it says. */
+    if (want && want != al) return -1;
+    if (!want){ *consumed = o + al + 2; return -2; }                   /* unknown network: skip it, as Core does */
     a->net = (unsigned char)net; a->len = (unsigned char)al; memcpy(a->addr, p + o, (size_t)al); o += al;
     a->port = (unsigned short)((p[o] << 8) | p[o+1]); o += 2;
     if (net == BMC_NET_CJDNS && a->addr[0] != 0xfc){ *consumed = o; return -2; }  /* Core: CJDNS must be fc00::/8 */

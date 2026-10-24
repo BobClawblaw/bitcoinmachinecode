@@ -118,6 +118,22 @@ long undo_sync(void){
     return 0;
 }
 int undo_exists(long height){ return us_exists(height); }
+/* STO-A (formal/storage, 2026-10-23): register block `height`'s run (its
+ * undo.idx slot) BEFORE the block's first put or del. The slot used to be
+ * written at the first spend, after the coinbase's outputs were already in
+ * the WAL buffer, and for a block that spends nothing only at undo_commit:
+ * a drain in between could put outputs on disk that no slot accounts for,
+ * and recovery would never delete them. 1 ok, -1 failure. */
+long undo_begin(long height){ return undo_fd_for(height) >= 0 ? 1 : -1; }
+/* the rev files holding heights lo..hi join the next undo_sync's set (boot
+ * recovery: what a previous process wrote is in the page cache only) */
+void undo_mark_dirty_heights(long lo, long hi){
+    for (long h = lo; h <= hi; h++){
+        undo_slot_t s; if (us_slot_get(h, &s) != 1) continue;
+        if (g_undo_dirty_lo > g_undo_dirty_hi){ g_undo_dirty_lo = g_undo_dirty_hi = s.file; }
+        else { if (s.file < g_undo_dirty_lo) g_undo_dirty_lo = s.file; if (s.file > g_undo_dirty_hi) g_undo_dirty_hi = s.file; }
+    }
+}
 /* close block `height`'s run with the END marker (creating the run if the
  * block spent nothing). 1 ok, -1 write failure. */
 /* 2026-10-05 (bmc.benchlog): the split of undo_capture_and_del + undo_commit,
@@ -258,15 +274,28 @@ long undo_replay_tolerant(long height, undo_replay_cb cb, void* ctx, int* torn){
     return undo_replay_impl(height, cb, ctx, 1, torn);
 }
 
-/* undo_discard(height) -> 1 removed / 0 nothing there.
+/* undo_discard(height) -> 1 removed / 0 nothing there / -1 the discard hook
+ * failed and the slot stays (STO-B, below).
  * Drops one height's undo file once it has been consumed by a disconnect --
  * that data describes a block that is no longer on our chain, so keeping it
  * around could only ever mislead a later disconnect at the same height (a
  * reconnected block at height H writes its OWN undo_<H>.dat, and
  * undo_append_record opens with O_APPEND, so a stale file left in place
  * would be silently PREPENDED to the new block's records). */
+/* STO-B (formal/storage, 2026-10-23): the slot is the only record that a
+ * block's effects are on disk, and every caller has just queued the
+ * reversal of those effects (restores, deletes) in the WAL's process
+ * buffer. Clearing the slot first left a window -- a SIGKILL, or a power
+ * loss before the WAL reached the disk -- in which the block's effects
+ * stayed while the record of them was gone; the next boot re-applied the
+ * block onto them and rejected it (BIP30). The hook (utxo_live.c) drains
+ * and fsyncs the WAL; when it fails the slot stays, -1, and the next
+ * recovery repeats the (idempotent) reversal. */
+static long (*g_undo_discard_hook)(void) = 0;
+void undo_set_discard_hook(long (*fn)(void)){ g_undo_discard_hook = fn; }
 long undo_discard(long height){
     if (g_undo_fd_height == height) undo_close_current();
+    if (g_undo_discard_hook && us_exists(height) && g_undo_discard_hook() != 0) return -1;
     return us_slot_clear(height) == 1 ? 1 : 0;
 }
 

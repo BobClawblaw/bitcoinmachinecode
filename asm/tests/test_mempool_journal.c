@@ -15,6 +15,7 @@
  *   - a foreign or future file is REFUSED, never rewritten.
  */
 #include <stdio.h>
+#include <signal.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -54,7 +55,13 @@ static int count_cb(void* c, const mpj_rec* r){ (void)r; (*(long*)c)++; return 1
 typedef struct { mpj_rec* v; long n, cap; } vec;
 static int collect_cb(void* c, const mpj_rec* r){ vec* v = c; if (v->n < v->cap) v->v[v->n++] = *r; return 1; }
 
+static void f5_watchdog(int sig){ (void)sig;
+    static const char m[] = "FAIL: F5 mpj_stats with next_seq 0 is still walking after 10 s\n";
+    if (write(1, m, sizeof m - 1) < 0) _exit(2);
+    _exit(1); }
+
 int main(void){
+    setbuf(stdout, NULL);                         /* the F5 watchdog's _exit must not lose earlier lines */
     snprintf(PATH, sizeof PATH, "/tmp/bmc_mpj_test_%d.dat", (int)getpid());
     unlink(PATH);
 
@@ -208,6 +215,42 @@ int main(void){
       ck("a configured capacity past an off_t is refused", ok == 0);
       if (ok) mpj_close();
       unlink(p6); }
+
+    /* ---- formal/parsers F5: next_seq == 0 ----
+     * mpj_stats computed written = next - 1 with no guard, so a header whose
+     * next_seq is 0 walked seq from 2^64 - 1 down to 1 (bmcgetmempooljournal
+     * never returned). mpj_open adopted next_seq unchecked. Now open refuses
+     * such a file, and stats stops at next <= 1 as recent/lookup do -- the
+     * second checked through the live mapping, where a writer's bump is the
+     * one way the counter can read 0. A watchdog turns a runaway walk into a
+     * FAIL line instead of a hung gate. */
+    { char p7[256]; snprintf(p7, sizeof p7, "/tmp/bmc_mpj_seq0_%d.dat", (int)getpid());
+      unlink(p7);
+      int was_open = mpj_is_open();                 /* leave the state as the next case expects it */
+      mpj_close();
+      ck("F5 fixture: a 2-slot journal is created", mpj_open(p7, 2) == 1);
+      mpj_close();
+      int fd = open(p7, O_RDWR); unsigned char z8[8] = {0};
+      ck("F5 fixture: next_seq zeroed in the file header", fd >= 0 && pwrite(fd, z8, 8, MPJ_HOFF_NEXTSEQ) == 8);
+      if (fd >= 0) close(fd);
+      int ok = mpj_open(p7, 2);
+      ck("F5 a journal whose header says next_seq 0 is REFUSED", ok == 0);
+      if (ok) mpj_close();
+      /* the same through the mapping: open a good file, zero the counter
+       * behind the open journal's back */
+      unlink(p7);
+      ck("F5 fixture: a fresh 2-slot journal opens", mpj_open(p7, 2) == 1);
+      fill(&r, 5, MPJ_MINED); mpj_append(&r);
+      fd = open(p7, O_RDWR);
+      ck("F5 fixture: the live counter is zeroed", fd >= 0 && pwrite(fd, z8, 8, MPJ_HOFF_NEXTSEQ) == 8 && mpj_next_seq() == 0);
+      if (fd >= 0) close(fd);
+      signal(SIGALRM, f5_watchdog); alarm(10);
+      mpj_stats_t st; mpj_stats(&st);
+      alarm(0);
+      ck("F5 mpj_stats with next_seq 0 returns at once, nothing written or held", st.written == 0 && st.held == 0 && st.capacity == 2);
+      { long n = 0; mpj_recent(100, count_cb, &n); ck("F5 ...and recent() sees nothing", n == 0); }
+      mpj_close(); unlink(p7);
+      if (was_open) ck("reopen the main journal", mpj_open(PATH, 8) == 1); }
 
     /* ---- a zero capacity is a refusal, not a divide-by-zero ---- */
     { char p2[256]; snprintf(p2, sizeof p2, "/tmp/bmc_mpj_zero_%d.dat", (int)getpid());

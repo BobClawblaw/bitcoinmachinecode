@@ -1077,9 +1077,11 @@ static void txr_orphan_expire(void){
 extern long addr_ingest_msg_n(void* ab, const char* cmd, const unsigned char* pl, long plen, long limit);
 extern long addr_ingest_msg_v(void* ab, const char* cmd, const unsigned char* pl, long plen, long limit, int* viol);
 extern long p2p_addr_count(const void* pl, long plen);
-/* audit 2026-09-02 N3: a malformed addr/addrv2, or one declaring more than
- * MAX_ADDR_TO_SEND entries, is misbehaviour (Core: Misbehaving "addr message
- * size = %u"). The worker knows the peer only by fd; main.c owns the leg
+/* audit 2026-09-02 N3: an addr/addrv2 holding more than MAX_ADDR_TO_SEND
+ * entries is misbehaviour (Core: Misbehaving "addr message size = %u").
+ * A MALFORMED one is not (formal/parsers F2, 2026-10-23): Core's
+ * deserializer throws and the message is dropped unscored, and so is it here.
+ * The worker knows the peer only by fd; main.c owns the leg
  * table and the shared misbehaviour table, so it supplies the strong
  * definition. A weak reference resolves to NULL in the standalone tests. */
 extern void txr_report_violation_fd(int fd, const char* reason) __attribute__((weak));
@@ -1089,7 +1091,11 @@ extern void txr_report_violation_fd(int fd, const char* reason) __attribute__((w
 extern unsigned txr_source_group_fd(int fd) __attribute__((weak));
 extern long addr_ingest_msg_vg(void* ab, const char* cmd, const unsigned char* pl, long plen,
                                long limit, int* viol, unsigned src_group) __attribute__((weak));
-#define TXR_ADDR_VIOL_REASON "malformed addr/addrv2 payload or count above MAX_ADDR_TO_SEND"
+/* daemon/addr_ingest.c: the record count of a payload Core deserializes
+ * whole, or -1 (F2). Weak: targets without addr_ingest.c fall back to the
+ * count prefix below. */
+extern long addr_msg_records(const char* cmd, const unsigned char* pl, long plen) __attribute__((weak));
+#define TXR_ADDR_VIOL_REASON "addr/addrv2 message size above MAX_ADDR_TO_SEND"
 /* weak default: targets that link tx_relay.c without daemon/addr_ingest.c
  * (a strong definition anywhere in the link wins) */
 __attribute__((weak)) long addr_ingest_msg_n(void* ab, const char* cmd, const unsigned char* pl, long plen, long limit){
@@ -1104,9 +1110,11 @@ __attribute__((weak)) long addr_ingest_msg_v(void* ab, const char* cmd, const un
 static struct { int fd; double tokens; long long t_ms; } txr_addr_bucket[TXR_ADDR_LEGS];
 long txr_addr_gossip_added, txr_addr_gossip_msgs, txr_addr_gossip_limited;
 
-/* number of entries a payload declares (v1: 30-byte records; v2: CompactSize
- * count only -- the parser validates the rest) */
+/* number of entries in a payload that deserializes as Core reads it, or -1
+ * (addr_msg_records; without it, v1: 30-byte records; v2: CompactSize count
+ * only) */
 static long txr_addr_declared(const char* cmd, const u8* pl, unsigned plen){
+    if (addr_msg_records) return addr_msg_records(cmd, pl, (long)plen);
     if (!memcmp(cmd, "addrv2", 7)){
         if (plen < 1) return -1;
         if (pl[0] < 0xfd) return pl[0];
@@ -1118,7 +1126,8 @@ static long txr_addr_declared(const char* cmd, const u8* pl, unsigned plen){
 
 static long txr_addr_ingest(int fd, const char* cmd, const u8* pl, unsigned plen){
     long n = txr_addr_declared(cmd, pl, plen);
-    if (n < 0 || n > 1000){                          /* malformed, or Core: > MAX_ADDR_TO_SEND misbehaves */
+    if (n < 0) return 0;                             /* Core: does not deserialize -- dropped, unscored (F2) */
+    if (n > 1000){                                   /* Core: > MAX_ADDR_TO_SEND misbehaves */
         if (txr_report_violation_fd) txr_report_violation_fd(fd, TXR_ADDR_VIOL_REASON);
         return 0;
     }
