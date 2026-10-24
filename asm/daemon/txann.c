@@ -171,9 +171,19 @@ long txann_tick(int fd, long long now, unsigned long long peer_feefilter){
     return n;
 }
 
-long txann_wait(int fd, unsigned long long peer_feefilter){
+/* The serve loop's tip-watch (bitcoin_serve.asm .next) ran only after a
+ * message from the peer, so a new block reached an idle inbound peer when
+ * that peer next sent something -- its ping, two minutes later (the regtest
+ * e2e, 2026-10-24: a Core peer that had synced from bmc never heard of the
+ * next block). Core announces from its send loop within ~100 ms. The wait
+ * now ends with 2 when the public tip has passed what this connection last
+ * announced, and the loop runs its tip-watch. Weak: a harness that links
+ * no serve_invbounds.c has no tip to watch. */
+extern long serve_public_tip(const void* st) __attribute__((weak));
+long txann_wait(int fd, unsigned long long peer_feefilter, const void* st, long announced_tip){
     if (!g_enabled || !g_st || fd < 0) return 1;                /* pre-CC-1 behaviour: straight to the blocking read */
     for (;;){
+        if (st && serve_public_tip && serve_public_tip(st) > announced_tip) return 2;
         long long now = now_ms();
         long long idle_deadline = c_last_msg + (long long)g_idle_secs * 1000;
         if (now >= idle_deadline) return 0;

@@ -21,7 +21,7 @@ void txann_push(const unsigned char txid[32], unsigned long long fee, unsigned l
 void txann_note_block(void);                       /* CC-3: a novel block arrived from this child's peer */
 
 void txann_child_init(int slot, int relay_ok);     /* after the handshake, before the serve loop */
-long txann_wait(int fd, unsigned long long peer_feefilter);   /* asm: 1 = readable, 0 = idle bound hit */
+long txann_wait(int fd, unsigned long long peer_feefilter, const void* st, long announced_tip);   /* asm: 1 = readable, 0 = idle bound hit, 2 = the public tip passed announced_tip */
 long txann_tick(int fd, long long now_ms, unsigned long long peer_feefilter);  /* returns txids announced */
 
 long txann_worker_drain(void (*announce)(const unsigned char txid[32]));

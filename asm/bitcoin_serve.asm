@@ -422,12 +422,18 @@ node_serve_loop:
     ; through to the read exactly as before) or 0 when the NET-3 idle bound
     ; expired with nothing to read -- the same outcome the SO_RCVTIMEO on the
     ; socket used to produce from inside p2p_read, so .done is the right exit.
-    ; txann_wait(fd, peer_feefilter)
+    ; 2 when the public tip passed s_lasttip: the tip-watch at .next
+    ; announces it now, not after the peer's next message (2026-10-24).
+    ; txann_wait(fd, peer_feefilter, st, announced_tip)
     mov  rdi, r12
     mov  rsi, [s_peerfee]
+    mov  rdx, [s_st]
+    mov  rcx, [s_lasttip]
     call txann_wait
     test rax, rax
     jz   .done
+    cmp  rax, 2
+    je   .next
     ; ---- read a message ----
     mov  qword [s_plen], 0
     mov  rdi, r12
