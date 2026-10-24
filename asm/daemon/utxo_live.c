@@ -180,12 +180,11 @@ void utxo_live_test_capture_counts(long* resolved, long* sampled, long* unresolv
 }
 extern void block_hash(u8 out[32], const u8 hdr[80]);
 
-/* Rolling undo-data retention window. Stage A's own design note calls for
- * ~100-200 blocks; 200 is the top of that range, chosen because it is also
- * comfortably deeper than any reorg this node would apply automatically
- * (see REORG_MAX_DEPTH in daemon/reorg.c, which refuses to go deeper than
- * the undo data can actually support). */
-#define UTXO_UNDO_WINDOW    200   /* 2026-09-08: no longer a retention window (undo is kept for every block); kept as the reorg-depth reference REORG_MAX_DEPTH compares against */
+/* Formerly the rolling undo-data retention window (Stage A: ~100-200
+ * blocks). Since 2026-09-08 undo is kept for every block, and since CON-10
+ * (2026-10-23) there is no reorg depth cap either; the constant is kept only
+ * as the reference archive_verify.c's prune floor comment cites. */
+#define UTXO_UNDO_WINDOW    200
 /* Heights examined per prune sweep. Bounds the cold-start cost on a deep
  * store (a fresh boot starts the cursor at 0) without ever stalling the
  * download worker's loop; the cursor resumes on the next block. */
@@ -961,9 +960,11 @@ static void bench_block_line(long h, const u64* v0, const u64* p0, u64 t0, u64 t
 extern void tx_verify_set_script_checks(int on);
 static long g_assumevalid_height = -1;
 static int  g_av_announced_end = 0;
+static unsigned char g_av_hash[32];     /* the assumed-valid block's hash (wire order) */
+static int  g_av_src = 0;               /* where it was found: 1 headers.dat, 2 index.dat */
 extern const chainparams_t* g_chainp;
 static void utxo_live_resolve_assumevalid(void){
-    g_assumevalid_height = -1;
+    g_assumevalid_height = -1; g_av_src = 0;
     unsigned char want[32];
     if (g_cfg.assumevalid_mode == 2) return;                       /* assumevalid=0 */
     if (g_cfg.assumevalid_mode == 1) memcpy(want, g_cfg.assumevalid, 32);
@@ -1000,12 +1001,52 @@ static void utxo_live_resolve_assumevalid(void){
         while (fread(rec, 1, 48, f) == 48){ if (!memcmp(rec, want, 32)){ g_assumevalid_height = h; break; } h++; }
         fclose(f);
     }
+    if (g_assumevalid_height >= 0){
+        memcpy(g_av_hash, want, 32);
+        g_av_src = !strcmp(src, "the header chain") ? 1 : 2;
+    }
     if (g_assumevalid_height >= 0)
-        fprintf(stderr, "[utxo_live] assumevalid: block found at height %ld on %s -- script evaluation skipped through it, resumed above\n", g_assumevalid_height, src);
+        fprintf(stderr, "[utxo_live] assumevalid: block found at height %ld on %s -- script evaluation skipped through its ancestors, resumed above\n", g_assumevalid_height, src);
     else
         fprintf(stderr, "[utxo_live] assumevalid: block not on the header chain yet -- every script is evaluated; re-checked every 1,000 blocks\n");
 }
 long utxo_live_assumevalid_resolve_now(void){ utxo_live_resolve_assumevalid(); return g_assumevalid_height; }
+
+/* 1 = the hash recorded at `h` in `file` (records of `rec` bytes, hash at
+ * `off`) is `hash`. Read per call, never cached: headers.dat is truncated
+ * and re-appended on a header reorg. */
+static int av_hash_at(const char* file, long rec, long off, long h, const unsigned char hash[32]){
+    int fd = open(file, O_RDONLY);
+    if (fd < 0) return 0;
+    unsigned char got[32];
+    int ok = pread(fd, got, 32, (off_t)h * rec + off) == 32 && !memcmp(got, hash, 32);
+    close(fd);
+    return ok;
+}
+/* CON-7 (audit 2026-10-23): may block (h, hash) skip script evaluation?
+ *
+ * Core's ConnectBlock skips scripts only for a block that is an ANCESTOR of
+ * the assumed-valid block on the best header chain (pindexBestHeader->
+ * GetAncestor(h) == pindex, and the assumed-valid block's own ancestor at h
+ * is the block). This decided by height alone (h <= the resolved height),
+ * so a block on a side branch below that height -- reconnected through a
+ * reorg -- or a block applied after the header chain moved, had its
+ * scripts skipped too. Now: the assumed-valid block must still sit at its
+ * height on the chain it was found on, and this block's hash must be that
+ * chain's hash at h, i.e. the block is its ancestor. The header chain is
+ * headers.dat (112-byte records, hash at +80); the fallback for a datadir
+ * with no header mirror is the archive index (48-byte records, hash at +0).
+ * Core's -minimumchainwork condition holds for anything in headers.dat (the
+ * header phase's low-work hold); its two-weeks-of-work-on-top condition is
+ * not modelled (see the CON-7 commit). A dry run never comes here. */
+int utxo_live_assumevalid_skips(long h, const unsigned char hash[32]){
+    if (g_assumevalid_height < 0 || h < 0 || h > g_assumevalid_height) return 0;
+    const char* file = g_av_src == 1 ? "headers.dat" : g_av_src == 2 ? "index.dat" : 0;
+    if (!file) return 0;
+    long rec = g_av_src == 1 ? 112 : 48, off = g_av_src == 1 ? 80 : 0;
+    return av_hash_at(file, rec, off, g_assumevalid_height, g_av_hash)
+        && av_hash_at(file, rec, off, h, hash);
+}
 
 
 
@@ -1582,13 +1623,18 @@ typedef struct {
  * prefix of table gets refilled with the empty sentinel -- correct even
  * when the arena is larger (from an earlier, bigger block) than tcap,
  * since every lookup/insert masks its hash into exactly [0,tcap). */
-static void bidx_reset(bidx_t* bx, u64 nout_hint){
+/* CON-12 (audit 2026-10-23): 1 ok / 0 an arena could not grow. The result
+ * of grow_arena was ignored, and the new mask then indexed the OLD, smaller
+ * table -- a heap overflow on a failed realloc. The caller fails the block
+ * with no reason, i.e. as a store error (the block is not at fault). */
+static int bidx_reset(bidx_t* bx, u64 nout_hint){
     u64 tcap = next_pow2_u64((nout_hint ? nout_hint : 1) * 2);
-    grow_arena((void**)&bx->table, &bx->table_cap, tcap * sizeof(bidx_slot_t));
+    if (!grow_arena((void**)&bx->table, &bx->table_cap, tcap * sizeof(bidx_slot_t))) return 0;
+    if (!grow_arena((void**)&bx->outs, &bx->outs_cap, (nout_hint ? nout_hint : 1) * sizeof(bidx_out_t))) return 0;
     bx->mask = tcap - 1;
     for (u64 i=0;i<tcap;i++) bx->table[i].out_idx = (u64)-1;
-    grow_arena((void**)&bx->outs, &bx->outs_cap, (nout_hint ? nout_hint : 1) * sizeof(bidx_out_t));
     bx->outs_n = 0;
+    return 1;
 }
 static void bidx_insert(bidx_t* bx, const u8 key[36], u64 value, const u8* spk, u32 spklen,
                         u32 creating_tx, u8 is_coinbase){
@@ -1629,12 +1675,13 @@ long bidx_get(void* bxv, u32 caller_tx_index, const u8 txid[32], u32 index,
 }
 
 typedef struct { u8* used; u64 used_cap; u8* keys; u64 keys_cap; u64 mask; } bspent_t;
-static void bspent_reset(bspent_t* bs, u64 nin_hint){
+static int bspent_reset(bspent_t* bs, u64 nin_hint){   /* 1 ok / 0 no memory (CON-12, see bidx_reset) */
     u64 tcap = next_pow2_u64((nin_hint ? nin_hint : 1) * 2);
-    grow_arena((void**)&bs->used, &bs->used_cap, tcap);
+    if (!grow_arena((void**)&bs->used, &bs->used_cap, tcap)) return 0;
+    if (!grow_arena((void**)&bs->keys, &bs->keys_cap, tcap * 36)) return 0;
     memset(bs->used, 0, tcap);   /* active tcap-sized prefix only -- see bidx_reset */
-    grow_arena((void**)&bs->keys, &bs->keys_cap, tcap * 36);
     bs->mask = tcap - 1;
+    return 1;
 }
 /* Returns 1 the first time this exact outpoint is claimed, 0 if it was
  * already claimed earlier in this same block (an in-block double-spend). */
@@ -1824,6 +1871,12 @@ static int bip30_enforced(long height, const u8 hash32[32])
  * Reset on entry; only meaningful right after a 0 return. */
 static const char* g_last_reject = "";
 const char* utxo_live_last_reject(void){ return g_last_reject; }
+/* The reason filed for a block whose bytes do not decode the way Core's
+ * deserializer requires (non-canonical CompactSize, a superfluous witness
+ * record, a truncated transaction). Core never gets as far as validating
+ * such a block -- the block message throws while it is read and nothing is
+ * marked -- so it is always filed with g_last_mutated set (CON-1/CON-9). */
+#define VAL_DECODE_FAILED "block-decode-failed"
 
 /* ---- failure classification + honest recovery (incident 2026-09-01) ----
  * utxo_live_catchup() used to fail with a bare -1 and daemon/main.c treated
@@ -1850,6 +1903,9 @@ const char* utxo_live_last_reject(void){ return g_last_reject; }
 #define UTXO_FAIL_MUTATED 4  /* the bytes are not the block their header names (witness mutation): Core BLOCK_MUTATED */
 static int  g_last_fail_kind = UTXO_FAIL_NONE;
 static int  g_last_mutated = 0;     /* set by the witness-commitment phase; classifies the failure */
+/* Whether the last apply/dry-run failure was a mutation (tests; a dry run
+ * leaves it set until the next call). */
+long utxo_live_last_mutated(void){ return g_last_mutated; }
 long utxo_live_store_inconsistencies(void){ return g_store_inconsistent; }
 static long g_last_fail_height = -1;
 long utxo_live_last_fail_kind(void){ return g_last_fail_kind; }
@@ -2264,12 +2320,19 @@ static int val_build_height_push(u64 h, u8* want){
 
 static int apply_block_inner(const u8* blockbuf, u64 blocklen){
     g_last_reject = ""; g_last_mutated = 0;
-    if (blocklen < 81) return 0;
+    /* CON-9 (audit 2026-10-23): a block that does not decode -- too short,
+     * a non-canonical or truncated tx count, a transaction tx_parse refuses
+     * -- is Core's deserialization failure: nothing is marked, the bytes are
+     * simply not a block. These returned 0 with no reason, which classifies
+     * as a STORE error: the applier halted and retried the same bytes for
+     * ever. They are filed as MUTATED (dropped and fetched again). */
+    #define VAL_DECODE_FAIL() do { g_last_reject = VAL_DECODE_FAILED; g_last_mutated = 1; return 0; } while (0)
+    if (blocklen < 81) VAL_DECODE_FAIL();
     const u8* p = blockbuf + 80;
     const u8* blkend = blockbuf + blocklen;
     u64 consumed;
     u64 ntx = utxo_walk_read_varint(p, blkend, &consumed);
-    if (!consumed) return 0;
+    if (!consumed) VAL_DECODE_FAIL();
     p += consumed;
     g_blk_ntx = ntx; g_blk_nin = 0;   /* bmc.benchlog's per-block counts (nin filled by Phase 0) */
     if (ntx == 0) return 1;   /* matches the old loop's own (never actually
@@ -2330,7 +2393,7 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
     for (u64 t=0; t<ntx; t++){
         u8 info[64];
         int ok = tx_parse(info, q, (unsigned long)(blkend - q));
-        if (!ok) return 0;
+        if (!ok) VAL_DECODE_FAIL();
         u64 txlen; memcpy(&txlen, info, 8);
         u32 pn_in, pn_out; memcpy(&pn_in, info+12, 4); memcpy(&pn_out, info+16, 4);
         txs[t].ptr = q; txs[t].len = txlen; txs[t].pn_in = pn_in;
@@ -2366,7 +2429,23 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
      * Context-free, so it runs on the dry run too: submitblock and a GBT
      * proposal answer Core's exact reason without touching state. Placed
      * before Phase 0.15 because a block that fails a size rule should be
-     * refused on that rule, the way Core orders CheckBlock. ---- */
+     * refused on that rule, the way Core orders CheckBlock.
+     *
+     * CON-1 (audit 2026-10-23): only the two CheckBlock rules stay here.
+     * Both measure the stripped serialization, which the txids -- and so the
+     * header's merkle root -- commit to, so a peer cannot make a real block
+     * fail them. The WEIGHT rule counts the witness bytes, which nothing has
+     * proven yet at this point: junk witness items appended to a real block
+     * pushed it over 4,000,000 here, the block was REJECTED, and the reject
+     * hook invalidated the real block's hash. Core runs bad-blk-weight in
+     * ContextualCheckBlock only AFTER CheckWitnessMalleation (validation.cpp
+     * "before we've checked the coinbase witness, it would be possible for
+     * the weight to be too large by filling up the coinbase witness, which
+     * doesn't change the block hash"), so the weight check now sits after
+     * Phase 0.25 below. And a transaction that does not decode here is a
+     * deserialization failure in Core (the block message is dropped, the
+     * hash is never marked), so it is filed as MUTATED, not as a reject. ---- */
+    u64 stripped = 0;
     {
         const u64 MAX_BLOCK_WEIGHT = 4000000ULL;
         const u64 WITNESS_SCALE_FACTOR = 4ULL;
@@ -2379,11 +2458,13 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
 
         /* header + CompactSize(ntx); `consumed` is that CompactSize's width,
          * read at the top of this function. */
-        u64 stripped = 80 + consumed;
+        stripped = 80 + consumed;
         val_txinfo_t vw;
         for (u64 t = 0; t < ntx; t++){
             if (!val_read_tx(txs[t].ptr, txs[t].len, &vw)){
-                g_last_reject = "bad-txns-prevout-null"; return 0;   /* same reason Phase 0.15 gives */
+                fprintf(stderr, "[utxo_live] MUTATED h=%ld: tx %llu does not decode\n",
+                        g_apply_height, (unsigned long long)t);
+                g_last_reject = VAL_DECODE_FAILED; g_last_mutated = 1; return 0;
             }
             stripped += vw.stripped_len;
         }
@@ -2392,13 +2473,6 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
             fprintf(stderr, "[utxo_live] REJECT h=%ld: bad-blk-length (stripped %llu B)\n",
                     g_apply_height, (unsigned long long)stripped);
             g_last_reject = "bad-blk-length"; return 0;
-        }
-
-        u64 weight = 3ULL * stripped + blocklen;
-        if (weight > MAX_BLOCK_WEIGHT){
-            fprintf(stderr, "[utxo_live] REJECT h=%ld: bad-blk-weight (%llu > 4000000)\n",
-                    g_apply_height, (unsigned long long)weight);
-            g_last_reject = "bad-blk-weight"; return 0;
         }
     }
 
@@ -2414,10 +2488,18 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
         if (!val_read_tx(txs[0].ptr, txs[0].len, &vi0) || !vi0.coinbase_shape){
             g_last_reject = "bad-cb-missing"; return 0;
         }
+        /* CON-3 (audit 2026-10-23): CheckTransaction's bad-txns-vout-empty
+         * (consensus/tx_check.cpp), for every transaction, the coinbase
+         * included. Only submitblock's own walk refused a zero-output tx;
+         * on the connect path one was accepted. The output count is part
+         * of the txid, so this is a refusal of the block as committed. */
+        if (vi0.out_count == 0){ g_last_reject = "bad-txns-vout-empty"; return 0; }
         for (u64 t=1; t<ntx; t++){
-            if (!val_read_tx(txs[t].ptr, txs[t].len, &vix) || vix.null_prevout){
+            if (!val_read_tx(txs[t].ptr, txs[t].len, &vix)){
                 g_last_reject = "bad-txns-prevout-null"; return 0;
             }
+            if (vix.out_count == 0){ g_last_reject = "bad-txns-vout-empty"; return 0; }
+            if (vix.null_prevout){ g_last_reject = "bad-txns-prevout-null"; return 0; }
         }
         /* CheckBlock: coinbase scriptSig 2..100 bytes (pre-BIP34 history
          * included -- 2 is the floor even for the genesis-era free-form
@@ -2454,15 +2536,41 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
         long wr = block_check_witness_commitment(txs, ntx, sizeof(block_tx_t), segwit_active,
                                                  txid_scratch, sizeof txid_scratch, &wreason);
         if (wr != 1) {
-            fprintf(stderr, "[utxo_live] %s h=%ld: %s\n", wr == 0 ? "MUTATED" : "REJECT", g_apply_height, wreason);
-            /* wr == 0: the witness does not match the commitment, i.e. these
-             * bytes are not the block -- a MUTATION, never a rejection (see
-             * utxo_live_set_mutated_fn); wr == -1: malformed, a real refusal */
+            /* Every outcome here is a MUTATION, never a rejection (see
+             * utxo_live_set_mutated_fn): wr == 0 is Core's BLOCK_MUTATED
+             * (nonce size, commitment mismatch, unexpected witness); wr == -1
+             * is a transaction whose witness section does not decode -- in
+             * Core that is a deserialization failure of the block message,
+             * which marks nothing either (CON-1, audit 2026-10-23: it was
+             * filed as a real refusal and the reject hook invalidated the
+             * block). The one exception is the internal scratch bound, which
+             * says nothing about the block: no reason, so it classifies as a
+             * store error and the pass retries. */
+            if (wr != 0 && !strcmp(wreason, "witness-commitment: scratch too small")){
+                fprintf(stderr, "[utxo_live] h=%ld: %s\n", g_apply_height, wreason);
+                return 0;
+            }
+            fprintf(stderr, "[utxo_live] MUTATED h=%ld: %s\n", g_apply_height, wreason);
             g_last_reject = wr == 0 && !strcmp(wreason, "bad-witness-nonce-size") ? "bad-witness-nonce-size"
                           : wr == 0 && !strcmp(wreason, "unexpected-witness")      ? "unexpected-witness"
-                          : "bad-witness-merkle-match";
-            if (wr == 0) g_last_mutated = 1;
+                          : wr == 0                                                 ? "bad-witness-merkle-match"
+                          : VAL_DECODE_FAILED;
+            g_last_mutated = 1;
             return 0;
+        }
+    }
+
+    /* ---- Phase 0.27 (CON-1): ContextualCheckBlock's weight rule, AFTER the
+     * witness has been proven by Phase 0.25 -- exactly Core's order. Past
+     * that check the coinbase witness is one 32-byte item and every other
+     * witness byte is committed through the wtxids, so an overweight block
+     * here is overweight as mined: a real refusal. ---- */
+    {
+        u64 weight = 3ULL * stripped + blocklen;
+        if (weight > 4000000ULL){
+            fprintf(stderr, "[utxo_live] REJECT h=%ld: bad-blk-weight (%llu > 4000000)\n",
+                    g_apply_height, (unsigned long long)weight);
+            g_last_reject = "bad-blk-weight"; return 0;
         }
     }
 
@@ -2580,8 +2688,11 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
      * freed+reallocated) every block. ---- */
     static bidx_t bx = {0};
     static bspent_t bs = {0};
-    bidx_reset(&bx, total_nout);
-    bspent_reset(&bs, total_nin);
+    if (!bidx_reset(&bx, total_nout) || !bspent_reset(&bs, total_nin)){
+        fprintf(stderr, "[utxo_live] h=%ld: out of memory sizing the in-block index (%llu outputs, %llu inputs)\n",
+                g_apply_height, (unsigned long long)total_nout, (unsigned long long)total_nin);
+        return 0;                    /* no reason: a store error, the block is not at fault */
+    }
     /* VAL-1 fees ledger: per-tx output totals (sum(out) side; the sum(in)
      * side arrives from tx_verify.c's export). Persistent arena like bx/bs. */
     static u64* g_ptx_out = 0; static u64 g_ptx_out_cap = 0;
@@ -2831,6 +2942,7 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
     if (!ctx.fatal && g_mined_cb)
         for (u64 t=0; t<ntx; t++) g_mined_cb(txs[t].txid);
     return ctx.fatal ? 0 : 1;
+    #undef VAL_DECODE_FAIL
 }
 
 /* apply_block_at(buf, len, height): apply_block_inner, but with this block's
@@ -2910,9 +3022,13 @@ static int apply_block_at_inner(const u8* blockbuf, u64 blocklen, long height){
     /* headers arrive after init on a fresh sync: while unresolved, look again
      * every 1,000 blocks (one scan of headers.dat, ~100 MB at the tip) */
     if (g_assumevalid_height < 0 && g_cfg.assumevalid_mode != 2 && height > 0 && height % 1000 == 0) utxo_live_resolve_assumevalid();
-    { int on = (g_assumevalid_height < 0 || height > g_assumevalid_height);
+    { int on = 1;
+      if (g_assumevalid_height >= 0 && height <= g_assumevalid_height && blocklen >= 80){
+          unsigned char bh[32]; block_hash(bh, blockbuf);
+          on = !utxo_live_assumevalid_skips(height, bh);      /* CON-7: ancestry, not height */
+      }
       tx_verify_set_script_checks(on);
-      if (on && g_assumevalid_height >= 0 && !g_av_announced_end){ g_av_announced_end = 1;
+      if (on && g_assumevalid_height >= 0 && height > g_assumevalid_height && !g_av_announced_end){ g_av_announced_end = 1;
           fprintf(stderr, "[utxo_live] assumevalid: above height %ld -- script evaluation resumed\n", g_assumevalid_height); } }
     /* GHOST GUARD (closes the multi-block WAL-vs-checkpoint window, 2026-08-25):
      * an undo_<h>.dat here can only mean h was applied -- partially or fully --
@@ -3953,6 +4069,20 @@ long utxo_live_catchup_bounded(void* store_buf, long max_ms, int stop_at_hole){
  * consensus failure -- it is a not-ready archive -- so it stops the pass like
  * a hole and the next pass retries. One pread of a cached page per block. */
 #define UTXO_ARCH_RETRY 4       /* fresh re-reads of one height before the pass gives up */
+/* P2P-1 (audit 2026-10-23): a mismatch that outlives the re-reads pass after
+ * pass is not a stale reader. A writer that filed one block's body under
+ * another block's hash (the keep-up pass did, until that fix) leaves an
+ * archive this loop can never get past: it stopped at that height, "it
+ * retries", forever, across restarts -- index.dat is durable. After
+ * UTXO_ARCH_STUCK_PASSES passes giving up at the same height, the bytes are
+ * dropped the way a MUTATED block's are (the mutated hook: the archive back
+ * to h-1, nothing marked, the delivering peer scored) so the next fetch
+ * delivers the block the headers name. */
+#define UTXO_ARCH_STUCK_PASSES 3
+static long g_arch_stuck_h = -1;
+static int  g_arch_stuck_passes = 0;
+static unsigned long long g_arch_dropped = 0;
+unsigned long long utxo_live_archive_mismatch_drops(void){ return g_arch_dropped; }
 static unsigned long long g_arch_mismatch = 0;
 unsigned long long utxo_live_archive_mismatches(void){ return g_arch_mismatch; }
 /* Opened per call, NOT cached in a static: a cached descriptor outlives the
@@ -4073,6 +4203,20 @@ static long catchup_run(void* store_buf, long max_ms, int stop_at_hole){
                       h--;                            /* re-read this height with fresh handles */
                       continue;
                   }
+                  if (h == g_arch_stuck_h) g_arch_stuck_passes++; else { g_arch_stuck_h = h; g_arch_stuck_passes = 1; }
+                  if (g_arch_stuck_passes >= UTXO_ARCH_STUCK_PASSES && g_mutated_fn && !g_halted){
+                      fprintf(stderr, "[utxo_live] archive body at height %ld is not the block its index records, across %d passes "
+                                      "of fresh re-reads: dropping it (the archive back to %ld, nothing marked) so the next fetch "
+                                      "delivers the block the headers name (mismatch #%llu)\n",
+                              h, g_arch_stuck_passes, h - 1, (unsigned long long)g_arch_mismatch);
+                      g_arch_stuck_h = -1; g_arch_stuck_passes = 0;
+                      if (g_mutated_fn(store_buf, h, want32, "archive body is not the block its index records") == 1){
+                          g_arch_dropped++;
+                          g_last_stop_reason = UTXO_STOP_FAIL;
+                          store_reload(store_buf);          /* the archive was truncated to h-1 under us */
+                          break;
+                      }
+                  }
                   fprintf(stderr, "[utxo_live] archive not ready at height %ld after %d fresh re-reads: the body is not the "
                                   "block the index records -- stopping this pass, it retries (mismatch #%llu)\n",
                           h, UTXO_ARCH_RETRY, (unsigned long long)g_arch_mismatch);
@@ -4080,6 +4224,7 @@ static long catchup_run(void* store_buf, long max_ms, int stop_at_hole){
                   break;
               }
               arch_retry = 0;
+              if (h == g_arch_stuck_h){ g_arch_stuck_h = -1; g_arch_stuck_passes = 0; }
           } }
         if (!apply_block_at(blockbuf, (u64)len, h)) {
             /* a MUTATED block (Core BLOCK_MUTATED): the bytes are dropped and

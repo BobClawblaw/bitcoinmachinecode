@@ -174,6 +174,37 @@ int main(void){
         }
     }
 
+    /* ---- CON-2 (audit 2026-10-23): Core's standard flags carry
+     * DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM, so a spend of an unknown
+     * witness version (here OP_2 <0x0001>, program true) is consensus-valid
+     * and NON-STANDARD. This path had no such bit: it accepted and relayed
+     * them. The false-program form is refused by consensus itself. */
+    printf("\n== CON-2: unknown witness versions under the standard flags ==\n");
+    {
+        static const u8 SPK_V2T[4] = { 0x52, 0x02, 0x00, 0x01 };
+        static const u8 SPK_V2F[4] = { 0x52, 0x02, 0x00, 0x00 };
+        u8 tx[256]; u64 len = build_tx(tx, NULL, 0);
+        g_spk = SPK_V2T; g_spklen = 4;
+        reason = NULL;
+        ck("CON-2 OP_2 <0x0001>: consensus ACCEPTS (anyone-can-spend, as in Core)",
+           tx_verify_at_height(tx, len, 900000, resolve_cfg, NULL, &reason) == 1);
+        txv_set_mempool_standard(1);
+        reason = NULL; int mp = tx_verify_mempool(tx, len, 900000, resolve_cfg, NULL, &reason);
+        ck("CON-2 OP_2 <0x0001>: standard mempool REJECTS (DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM)",
+           mp == 0 && reason && !strcmp(reason, "Witness version reserved for soft-fork upgrades"));
+        if (mp == 0 && reason) printf("      (reason: %s)\n", reason);
+        txv_set_mempool_standard(0);
+        reason = NULL;
+        ck("CON-2 OP_2 <0x0001>: acceptnonstdtxn ACCEPTS",
+           tx_verify_mempool(tx, len, 900000, resolve_cfg, NULL, &reason) == 1);
+        txv_set_mempool_standard(1);
+        g_spk = SPK_V2F; g_spklen = 4;
+        reason = NULL; int cf = tx_verify_at_height(tx, len, 900000, resolve_cfg, NULL, &reason);
+        ck("CON-2 OP_2 <0x0000>: consensus REJECTS (EVAL_FALSE)",
+           cf == 0 && reason && !strcmp(reason, "witness program evaluates false (EVAL_FALSE)"));
+        if (cf == 0 && reason) printf("      (reason: %s)\n", reason);
+    }
+
     printf("\n%s (%d checks, %d failures)\n",
            fails ? "TESTS FAILED" : "ALL TESTS PASSED", checks, fails);
     return fails ? 1 : 0;
