@@ -225,6 +225,13 @@ static int parse_header(lsm_run_t *s){
     /* Bounds: every region we will touch must lie inside the mapping.
      * A malformed/truncated run falls back rather than reading OOB. */
     if (s->records_start > s->len) return -1;
+    /* ST2-8 (audit 2026-10-23): sparse_off is also the END of the records
+     * (lsm_run_lookup_mm's rec_end), so it is checked whatever sparse_n says.
+     * The flush and the compaction write it even with no samples (it is then
+     * the file length); 0 means "no trailer" (URUN, rec_end = len). Unchecked
+     * with sparse_n == 0, a sparse_off past the file let the scan run off the
+     * mapping (SIGBUS) and one inside the header ended it before it began. */
+    if (s->sparse_off && (s->sparse_off < s->records_start || s->sparse_off > s->len)) return -1;
     if (s->sparse_n) {
         u64 end;
         if (__builtin_mul_overflow(s->sparse_n, (u64)SPARSE_ENT_SIZE, &end)) return -1;

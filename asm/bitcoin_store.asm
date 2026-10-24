@@ -252,6 +252,8 @@ open_file:
     mov  rdi, rax
     mov  eax, 3              ; close
     syscall
+    mov  qword [r12], -1      ; ST2-5: if the open below fails, no caller may see
+                              ; the number just closed as an open fd
 .noclose:
     ; fmt name into rbp-0x40
     lea  rdi, [rbp-0x40]
@@ -1128,7 +1130,7 @@ store_append:
     mov  rdi, [r12]
     mov  eax, 3
     syscall
-    mov  dword [r12+0], -1
+    mov  qword [r12+0], -1   ; ST2-5: all 64 bits -- a dword -1 reads as fd 4294967295
     mov  eax, [r12+28]
     add  eax, 1
     mov  [r12+28], eax       ; cur_file_no++
@@ -1410,7 +1412,9 @@ store_append_shared_x:
     mov  rdi, [r12]
     mov  eax, 3
     syscall
-    mov  dword [r12], -1
+    mov  qword [r12], -1     ; ST2-5: all 64 bits (a dword -1 is a positive qword,
+                             ; and every reader tests the sign: a failed open below
+                             ; then left every later append lseeking fd 4294967295)
     mov  eax, [r12+28]
     add  eax, 1
     mov  [r12+28], eax
