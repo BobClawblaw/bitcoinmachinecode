@@ -11,6 +11,11 @@ faithful model; four are reproduced on the real code (section "Findings"). With
 five candidate changes switched on in the model, every property holds under both
 file-system models.
 
+Answer for main (since #431 and #432): the code now makes each of the six
+switches' changes (section "Re-run on main"), and every crash scenario heals
+on the real code. The holes are gone from every trace this harness has.
+Everything below that section describes b841251b.
+
 * `PROTOCOL.md` — the protocol as the code implements it, step by step, with
   file:line citations, the abstraction, and the mutation list.
 * `tla/StorageCrash.tla` — the TLA+ model.
@@ -24,10 +29,87 @@ file-system models.
 * TLC2 2.19 (08 Aug 2024, rev 5a47802) on Temurin OpenJDK 21.0.13, `-workers 4 -Xmx6g`.
 * gcc with the flags of `asm/Makefile`'s `tests/test_utxo_ghost_resume` rule; the
   crash driver uses that rule's exact link set (`crash/build.sh`).
+* `STORAGE_EXPECT=fixed` (the default) checks the fixed code: see "Re-run on
+  main". `STORAGE_EXPECT=found` checks b841251b: `crash/` must reproduce each
+  hole. The TLC checks are the same in both modes.
 * `FORMAL_TOOLS=$HOME/.local/opt/formal SCRATCH=<dir> formal/storage/run.sh` —
   every process runs under `systemd-run --user --scope -p MemoryMax=8G
   -p MemorySwapMax=0 nice -n15 timeout`. Total: **617 s** (the largest
   configuration, 81 M states, is 370 s of it). `ONLY=<regex>` selects checks.
+
+## Re-run on main (2026-10-24)
+
+The fixes landed in #431 (STO-A, B, C, E: 235a0b77) and #432 (STO-D, W:
+e76a76c2). This branch merged main (7260022e), and `run.sh` defaults to
+`STORAGE_EXPECT=fixed`.
+
+**Where each model switch is in the code.** Paths are relative to `asm/`.
+
+| switch | where main implements it |
+|---|---|
+| `FixUndo` | `mac_wal_predrain` (`bitcoin_utxo_store.asm:315`) calls `live_durable_prefix` (`daemon/utxo_live.c:1413`, registered at 3994) before every WAL drain, so the undo is fdatasync'd before any record reaches the page cache. `undo_begin` (`daemon/undo_log.c:127`, called at `utxo_live.c:3129`) registers a block's slot before its first op. |
+| `FixRecov` | `live_before_discard` (`utxo_live.c:1430`, registered at 3995): the WAL is drained and fsynced before `undo_discard` clears a slot. |
+| `FixArch` | `archive_sync_heights` in the same prefix (`utxo_live.c:1386`, 1415), which `persist_applied_height` runs before it claims a height (1451). |
+| `FixLogOff` | `fz_retire_wal` fsyncs the WAL before `utxo.idx` names a `log_off` in it (`utxo_live.c:814-826`). A reload that finds the WAL below `log_off` extends it there (`bitcoin_utxo_store.asm:1063`). |
+| `FixDir` | `lsm_manifest_publish` reports a failed directory fsync (`daemon/lsm_manifest.c:113`). `fz_retire_wal` retries it and retires nothing while it fails (`utxo_live.c:807`). A merge keeps its inputs (537). `mac_dirsync` covers the asm sites (`bitcoin_utxo_lsm.asm:491`). |
+| `FixWeakDir` | A directory fsync before every manifest rename: `lsm_manifest.c:100`, `bitcoin_utxo_lsm.asm:3234` (mac_flush), 5176 (the compaction). The sweep syncs before it unlinks (`lsm_manifest.c:223`). |
+
+Two of these differ from their switch:
+
+* `FixArch` syncs later than the switch says. The switch syncs the record
+  before the block is applied; the code syncs it before the first drain or
+  checkpoint that covers the block. `ArchiveCovers` depends only on the order
+  against the durable applied height, and C1 and C2 below pin that order on
+  the code. The model was not re-run with the code's timing.
+* `FixLogOff` comes with a second defence the model does not have: the reload
+  heal. Either half alone keeps E closed; the mutant below removes both.
+
+The TLC rows above do not depend on a commit: T5 and T11-T13 are the fixed
+protocol, and they hold.
+
+**Crash injection.** `crash/` does not carry over to the fixed code, so on main
+it has been replaced. Run on main, it gives results that look right and are
+not:
+
+* `walwb` "heals" with nothing at stake. The fix removed the block-end WAL
+  drain, so the image holds no record of blocks 151..152 to lose.
+* `archive` still "reproduces" its hole. It cuts the last `index.dat` record
+  by hand, but the fix now syncs that record, so the state it builds is one the
+  code no longer reaches.
+
+`tests/test_sto_crash` (in the gate since #431) is the same trace set
+rewritten for the fixed code. Where a full buffer would land, it drains
+explicitly. The archive image comes from the recorded syncs alone. It also adds
+the D, W, M and UTX scenarios.
+
+In fixed mode, `run.sh` copies the tracked `asm/` into SCRATCH, builds the test
+there, and requires every one of its 42 checks (21 scenarios, each with a
+control) to heal. It then runs six mutants on the copy, each removing one fix
+piece; each must fail the scenarios listed. The worktree itself is never edited.
+
+| mutant | removes | must fail | also failed |
+|---|---|---|---|
+| `pre-drain-hook` | the prefix before every drain (STO-A) | A1 flushundo, A2 walwb, A3 cbflush | D1, W1, W2 and their controls |
+| `discard-hook` | the WAL fsync before a slot is cleared (STO-B) | B ghostkill | — |
+| `archive-sync` | the archive's fdatasync in the prefix (STO-C) | C1 archive, C2 archive-nosync | — |
+| `logoff-fsync+heal` | the WAL fsync before `utxo.idx` and the reload heal (STO-E) | E logoff | — |
+| `retire-dir-retry` | the retried directory fsync before a retire (STO-D) | D1 dirpub | — |
+| `publish-pre-rename-fsync` | the directory fsync before the manifest rename (STO-W) | W1 runcreate | — |
+
+Without the pre-drain hook, the D1, W1 and W2 controls fail too. Those
+scenarios lose a name op, and they rely on the undo being durable before the
+WAL lands. A control isolates only the one write its crash loses, so this is
+expected and still counts as caught. The WAL fsync alone, without the heal,
+was also removed and kept E closed, as the fix commit states.
+
+`STORAGE_EXPECT=found` was run with this `run.sh` on 288d23d2 (b841251b): all
+five holes were reproduced and all five controls were clean.
+
+The full `run.sh` on this branch exits 0 in 498 s. All 30 TLC checks end as
+expected: the T rows, V1, and the six model mutations, with the same verdicts
+as the table below; the state counts of the bounded-OK rows are unchanged. On
+the crash side, `test_sto_crash` heals in 42 of 42 checks, and all 6 of 6
+mutants are caught.
 
 ## The model (summary; details in PROTOCOL.md and the spec's comments)
 
