@@ -16,13 +16,17 @@
  * with -EIO and every other one with a real fdatasync(fd) (syscall 75, not
  * filtered). Each scenario runs in its own forked child and directory.
  *
- * WHAT IS ASSERTED, for k = 1, 2, 3 (each fsync site of the operation):
+ * STO-W (formal/storage, 2026-10-23) added a fourth site to each: a directory
+ * fsync between the run's create and the manifest rename, so the sites are
+ * now the run, the directory, the manifest tmp, the directory.
+ *
+ * WHAT IS ASSERTED, for k = 1..4 (each fsync site of the operation):
  *   flush:      returns -1; the WAL is not truncated (log_len and the file's
- *               size unchanged); for k = 1, 2 no manifest has been published.
- *   compaction: returns -1; both input runs are still on disk; for k = 1, 2
+ *               size unchanged); for k = 1..3 no manifest has been published.
+ *   compaction: returns -1; both input runs are still on disk; for k = 1..3
  *               the on-disk manifest still lists the two input runs.
  * And the controls: with no failure armed the flush and the compaction each
- * issue exactly three fsyncs (so k names the site the comment says it does)
+ * issue exactly four fsyncs (so k names the site the comment says it does)
  * and succeed. */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -146,17 +150,17 @@ static int flush_case(int k){
     int seen = disarm();
     if (k == 0){
         ck("control: the flush succeeds", r == 1);
-        ck("control: the flush issues exactly three fsyncs (run, manifest, dir)", seen == 3);
-        if (seen != 3) printf("      saw %d\n", seen);
+        ck("control: the flush issues exactly four fsyncs (run, dir, manifest, dir)", seen == 4);
+        if (seen != 4) printf("      saw %d\n", seen);
         ck("control: the manifest is published with one run", disk_manifest_n() == 1);
         return fails;
     }
-    printf("  flush, fsync %d of 3 fails:\n", k);
+    printf("  flush, fsync %d of 4 fails:\n", k);
     ck("  the flush reports failure", r == -1);
     if (r != -1) printf("      got %ld\n", r);
     ck("  log_len is not cleared", lst.log_len == log_before);
     ck("  the WAL file holds the whole batch (drained, not truncated)", file_size("utxo.dat") == (long)log_before);
-    if (k < 3){
+    if (k < 4){
         ck("  no manifest was published", disk_manifest_n() == -1);
         if (disk_manifest_n() != -1) printf("      on-disk manifest_n %ld\n", disk_manifest_n());
     }
@@ -181,17 +185,17 @@ static int compact_case(int k){
     int seen = disarm();
     if (k == 0){
         ck("control: the compaction succeeds", r == 1);
-        ck("control: the compaction issues exactly three fsyncs (run, manifest, dir)", seen == 3);
-        if (seen != 3) printf("      saw %d\n", seen);
+        ck("control: the compaction issues exactly four fsyncs (run, dir, manifest, dir)", seen == 4);
+        if (seen != 4) printf("      saw %d\n", seen);
         ck("control: the inputs are unlinked", !file_exists(r1) && !file_exists(r2));
         ck("control: the manifest names one run", disk_manifest_n() == 1);
         return fails;
     }
-    printf("  compaction, fsync %d of 3 fails:\n", k);
+    printf("  compaction, fsync %d of 4 fails:\n", k);
     ck("  the compaction reports failure", r == -1);
     if (r != -1) printf("      got %ld\n", r);
     ck("  both input runs are still on disk", file_exists(r1) && file_exists(r2));
-    if (k < 3){
+    if (k < 4){
         ck("  the on-disk manifest still names both inputs", disk_manifest_n() == 2);
         if (disk_manifest_n() != 2) printf("      on-disk manifest_n %ld\n", disk_manifest_n());
     }
@@ -213,8 +217,8 @@ int main(void){
     tt_isolate();
     if (install_trap()){ printf("FAIL: seccomp filter: %s\n", strerror(errno)); return 1; }
     int bad = 0;
-    for (int k = 0; k <= 3; k++) bad += in_child(flush_case, k);
-    for (int k = 0; k <= 3; k++) bad += in_child(compact_case, k);
+    for (int k = 0; k <= 4; k++) bad += in_child(flush_case, k);
+    for (int k = 0; k <= 4; k++) bad += in_child(compact_case, k);
     if (bad){ printf("\nTESTS FAILED (%d scenario(s))\n", bad); return 1; }
     printf("\nALL TESTS PASSED (0 failures)\n");
     return 0;

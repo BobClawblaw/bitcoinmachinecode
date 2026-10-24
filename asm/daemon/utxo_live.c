@@ -497,13 +497,26 @@ static int manifest_names(u64 run_no){
     for (u64 i = 0; i < g_utxo_lst.manifest_n; i++){ u64 r; memcpy(&r, e + i*16 + 8, 8); if (r == run_no) return 1; }
     return 0;
 }
+/* the first run the reloaded manifest names that is not a regular file in
+ * the store directory, or -1 if every one is there */
+static long manifest_missing_run(void){
+    const unsigned char* e = (const unsigned char*)g_utxo_lst.manifest_buf;
+    for (u64 i = 0; i < g_utxo_lst.manifest_n; i++){
+        u64 r; memcpy(&r, e + i*16 + 8, 8);
+        char n[64]; snprintf(n, sizeof n, "utxo_run_%06u.dat", (unsigned)r);
+        struct stat sb;
+        if (stat(n, &sb) != 0 || !S_ISREG(sb.st_mode)) return (long)r;
+    }
+    return -1;
+}
 static unsigned long g_cmp_deferred = 0;   /* merges deferred because the apply was behind (2026-09-09) */
 static void compact_adopt(int st){
     struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
     double secs = (t1.tv_sec - g_cmp_t0.tv_sec) + (t1.tv_nsec - g_cmp_t0.tv_nsec) / 1e9;
     if (WIFEXITED(st) && WEXITSTATUS(st) == 0){
         u64 nbase = ~0ULL;
-        if (lsm_manifest_adopt_child(&g_utxo_lst, g_cmp_inputs, g_cmp_nin, g_cmp_is_full, g_cmp_old_base, &nbase) != 0){
+        int ar = lsm_manifest_adopt_child(&g_utxo_lst, g_cmp_inputs, g_cmp_nin, g_cmp_is_full, g_cmp_old_base, &nbase);
+        if (ar < 0){
             /* keep the old manifest: its runs are all still on disk (unlink
              * was deferred), so this process stays consistent. The child's
              * output is an orphan; drop it now rather than at next boot.
@@ -521,7 +534,16 @@ static void compact_adopt(int st){
         } else {
             lsm_mm_invalidate_all();
             int gone = 0;
-            for (int i = 0; i < g_cmp_nin; i++) if (!manifest_names(g_cmp_inputs[i])){ unlink_run(g_cmp_inputs[i]); gone++; }
+            /* STO-D (formal/storage, 2026-10-23): the inputs go only once the
+             * manifest that drops them is durable. ar = 1: its directory
+             * fsync failed, a power loss may bring back the manifest that
+             * names them, so they stay -- orphans to the boot sweep, which
+             * makes the manifest durable before it unlinks anything. */
+            if (ar == 0){
+                for (int i = 0; i < g_cmp_nin; i++) if (!manifest_names(g_cmp_inputs[i])){ unlink_run(g_cmp_inputs[i]); gone++; }
+            } else
+                fprintf(stderr, "[utxo_live] WARNING: fsync of the chain directory after the merge's manifest failed (%s): its %d input run(s) stay on disk until the next boot's sweep\n",
+                        strerror(errno), g_cmp_nin);
             long interim = (long)g_utxo_lst.manifest_n - ((long)g_cmp_n_before - g_cmp_nin + 1);   /* runs flushed since fork */
             fprintf(stderr, "[utxo_live] compaction done in %.1fs (%s; started at height %ld): manifest_n %lu -> %lu, merged into run %lu, %ld flushed meanwhile, %d input run(s) unlinked; apply never waited; %lu merge(s) deferred so far\n",
                     secs, g_cmp_desc, g_cmp_height, (unsigned long)g_cmp_n_before, (unsigned long)g_utxo_lst.manifest_n, (unsigned long)g_cmp_child_run, interim, gone, g_cmp_deferred);
@@ -764,6 +786,7 @@ static int    g_fz_delta_known = 0;
 static u64    g_wal_live_start = 0;    /* utxo.idx's log_off: the first byte of the unretired generations */
 static int    g_fz_punch_ok = -1;      /* -1 untested, 1 the WAL's filesystem punches holes, 0 it does not */
 static int    g_fz_fatal = 0;          /* an adopt failed: the next threshold crossing returns -1 (fatal, as a flush error) */
+static int    g_fz_dir_unsynced = 0;   /* STO-D: a manifest was renamed, its directory fsync failed (see fz_retire_wal) */
 static unsigned long g_fz_count = 0, g_fz_waits = 0, g_fz_inline = 0, g_fz_bytes_retired = 0;
 #define FZ_FALLOC_KEEP_SIZE  0x01      /* linux/falloc.h: FALLOC_FL_KEEP_SIZE */
 #define FZ_FALLOC_PUNCH_HOLE 0x02      /* FALLOC_FL_PUNCH_HOLE (needs KEEP_SIZE) -- by raw syscall, as the ioprio call above, so no feature macro is needed */
@@ -776,6 +799,18 @@ static u64 clock_ns(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t)
  * a replay of bytes the run also holds. */
 static void fz_retire_wal(void){
     u64 off = g_utxo_lst.fz_wal_end;
+    /* STO-D (formal/storage, 2026-10-23): the generations retired here must
+     * be in a run a durable manifest names. When the directory fsync after
+     * the manifest's rename failed, it is retried here, and while it fails
+     * nothing is retired: the next call (the next adopt, or one with nothing
+     * to publish) retires these generations with its own. */
+    if (g_fz_dir_unsynced){
+        if (lsm_dir_sync() != 0){
+            fprintf(stderr, "[utxo_live] WARNING: fsync of the chain directory failed again (%s): utxo.idx keeps its log_off, the unretired generations replay on the next boot (duplicates, not a loss)\n", strerror(errno));
+            return;
+        }
+        g_fz_dir_unsynced = 0;
+    }
     /* STO-E (formal/storage, 2026-10-23): utxo.idx below names a log_off,
      * and a reload writes at the WAL's physical end. Without this fsync the
      * WAL's durable length could be below log_off after a power loss, and
@@ -801,9 +836,20 @@ static void fz_retire_wal(void){
     if (rename("utxo.idx.tmp", "utxo.idx") != 0){
         fprintf(stderr, "[utxo_live] WARNING: rename utxo.idx.tmp -> utxo.idx failed (%s)\n", strerror(errno)); unlink("utxo.idx.tmp"); return;
     }
-    { int dfd = open(".", O_RDONLY); if (dfd >= 0){ fsync(dfd); close(dfd); } }
+    /* STO-D (formal/storage, 2026-10-23): this result was ignored, and the
+     * punch below frees the bytes the OLD log_off points at. The punch is the
+     * WAL's own metadata, durable at its next fsync; the rename is durable
+     * only at a directory fsync. With the fsync failed, a power loss could
+     * keep the hole and the old utxo.idx: the reload would start at zeros,
+     * stop there and truncate the live generation behind them. So no punch
+     * until a rename is known durable: the next retire punches the whole
+     * range (g_wal_live_start stays). */
+    int dir_ok = lsm_dir_sync() == 0;
+    if (!dir_ok)
+        fprintf(stderr, "[utxo_live] WARNING: fsync of the chain directory after the utxo.idx rename failed (%s): the retired WAL bytes keep their disk space until the next retire\n", strerror(errno));
     { int nfd = open("utxo.idx", O_RDWR); if (nfd >= 0){ if (g_utxo_lst.idx_fd >= 0) close((int)g_utxo_lst.idx_fd); g_utxo_lst.idx_fd = nfd; } }
     g_utxo_lst.ckpt_log_off = off; g_utxo_lst.ckpt_n = 0;
+    if (!dir_ok) return;
     if (off > g_wal_live_start && g_fz_punch_ok != 0){
         if (syscall(SYS_fallocate, (int)g_utxo_lst.log_fd, FZ_FALLOC_PUNCH_HOLE | FZ_FALLOC_KEEP_SIZE, (off_t)g_wal_live_start, (off_t)(off - g_wal_live_start)) == 0){
             g_fz_punch_ok = 1; g_fz_bytes_retired += (unsigned long)(off - g_wal_live_start);
@@ -845,11 +891,23 @@ static void fz_adopt(int how){
         g_utxo_lst.manifest_n++;
         u64 base = lsm_manifest_persisted_live();
         u64 persist = (base != ~0ULL && g_fz_delta_known) ? base + g_fz_delta : ~0ULL;
-        if (lsm_manifest_publish(&g_utxo_lst, persist) != 0){
+        int pr = lsm_manifest_publish(&g_utxo_lst, persist);
+        if (pr < 0){
             g_utxo_lst.manifest_n--; g_fz_fatal = 1;
             fprintf(stderr, "[utxo_live] FATAL: could not publish the manifest with run %lu (%s) -- the run is an orphan, the generation stays in the WAL; halting at the next put\n", (unsigned long)g_utxo_lst.fz_run_no, strerror(errno));
             return;
         }
+        /* STO-D (formal/storage, 2026-10-23): the manifest is renamed but its
+         * directory fsync failed (this result was ignored). Retiring the WAL
+         * on top of it would let a power loss keep the utxo.idx rename and
+         * lose this one: the generation in no named run and past log_off.
+         * fz_retire_wal retries the directory fsync first and keeps the old
+         * log_off if that fails too (a replay over the run, not a loss). */
+        if (pr == 1){
+            g_fz_dir_unsynced = 1;
+            fprintf(stderr, "[utxo_live] WARNING: fsync of the chain directory after the manifest with run %lu failed (%s): retrying it before the WAL generation is retired\n",
+                    (unsigned long)g_utxo_lst.fz_run_no, strerror(errno));
+        } else g_fz_dir_unsynced = 0;
     }
     fz_retire_wal();
     g_utxo_lst.fz_active = 0; g_utxo_lst.fz_tomb_n = 0;
@@ -1451,8 +1509,14 @@ static int persist_applied_height(long h){
         fprintf(stderr, "[utxo_live] rename height file failed: %s\n", strerror(errno));
         return 0;
     }
-    int dfd = open(".", O_RDONLY);
-    if (dfd >= 0) { fsync(dfd); close(dfd); }
+    /* STO-D (formal/storage, 2026-10-23): this result was ignored. It costs
+     * redo only: a height whose rename is lost after a power loss is the
+     * previous checkpoint's, every block above it has its undo durable (the
+     * prefix), and recovery rolls them back and applies them again. Said, not
+     * acted on. */
+    if (lsm_dir_sync() != 0)
+        fprintf(stderr, "[utxo_live] WARNING: fsync of the chain directory after the checkpoint at %ld failed (%s): a power loss may bring back the previous checkpoint (the blocks after it are re-applied)\n",
+                h, strerror(errno));
     /* the coinstats index persists at the SAME durability point, so its
      * stored height can only ever match or trail the applied height by a
      * crash window -- which boot detects and re-seeds */
@@ -3978,9 +4042,18 @@ int utxo_live_init(const char* dir){
     /* utxo_lsm_init(lst) -> 1 ok / -1 err, but utxo_lsm_reload(lst,u) ->
      * REPLAYED RECORD COUNT / -1 err (not literally 1) -- different
      * contracts, so they need different success checks. */
-    long r = have_prior_state
-        ? (g_utxo_in_reload = 1, utxo_lsm_reload(&g_utxo_lst, g_utxo_table), g_utxo_in_reload = 0)
-        : utxo_lsm_init(&g_utxo_lst);
+    /* Statements, not a comma expression: `(flag = 1, reload(), flag = 0)`
+     * has the value of its LAST operand, so from TXOQ-1 (2026-09-05) until
+     * 2026-10-23 r was 0 on every reload and the UTX-2 and UTX-6 checks
+     * below never saw a failure (tests/test_sto_crash UTX-2, UTX-6). */
+    long r;
+    if (have_prior_state){
+        g_utxo_in_reload = 1;
+        r = utxo_lsm_reload(&g_utxo_lst, g_utxo_table);
+        g_utxo_in_reload = 0;
+    } else {
+        r = utxo_lsm_init(&g_utxo_lst);
+    }
     /* UTX-2 (audit 2026-09-03): ANY negative reload is fatal, not just -1.
      *
      * utxo_store_reload returns -2 when the WAL replay hits utxo_put == 2 --
@@ -4013,6 +4086,16 @@ int utxo_live_init(const char* dir){
     if (!ok) {
         fprintf(stderr, "[utxo_live] utxo_lsm_%s failed (r=%ld)\n",
                 have_prior_state ? "reload" : "init", r);
+        /* A store that exists and will not reload (UTX-2's full memtable,
+         * UTX-6's unreadable manifest, any other reload error) fails HALTED,
+         * as a missing run does below: the untracked mode a failed init
+         * otherwise leaves would advertise the stored tip, blocks this node
+         * never connected. A fresh store that fails to init has no set to
+         * protect and keeps the untracked mode. */
+        if (have_prior_state){
+            g_applied_height = read_applied_height();
+            g_halted = 1;
+        }
         if (have_prior_state && r == -2)
             fprintf(stderr,
                 "[utxo_live] FATAL: the WAL tail does not fit this memtable "
@@ -4047,6 +4130,29 @@ int utxo_live_init(const char* dir){
                 (unsigned)UTXO_LIVE_MANIFEST_CAP);
         return 0;
     }
+    /* A manifest that names a run file which is not there (deleted, or a
+     * create lost to a power cut on a file system without the STO-W
+     * directory fsync) reloads fine: the runs are opened by name on lookup.
+     * Booting on it would answer every lookup that reaches that run with an
+     * error, and the next compaction or flush would publish a manifest that
+     * drops it. Core refuses to start on a damaged coins database; so does
+     * this. HALTED, not merely failed: a failed init alone is the untracked
+     * mode, whose public tip is the stored tip (utxo_live_public_tip), so
+     * the node would advertise blocks it never connected. Halted keeps the
+     * public and RPC tips at the persisted applied height and nothing is
+     * applied (main gates the catch-up on a successful init). */
+    { long mr = manifest_missing_run();
+      if (mr >= 0){
+          g_applied_height = read_applied_height();
+          g_halted = 1;
+          fprintf(stderr,
+              "[utxo_live] FATAL: utxo_manifest.dat names utxo_run_%06u.dat, which is not in %s "
+              "(%lu run(s) named). The coin set is incomplete. Refusing to start.\n"
+              "[utxo_live]   Fix: restore the run file from a backup, or rebuild the chainstate "
+              "(-reindex-chainstate).\n",
+              (unsigned)mr, dir, (unsigned long)g_utxo_lst.manifest_n);
+          return 0;
+      } }
     if (g_fz_table){
         /* plan B3: from here a threshold crossing freezes and forks instead
          * of flushing inline. The unretired generations start at the
@@ -4096,6 +4202,7 @@ int utxo_live_init(const char* dir){
      * background merges). Guarded: refuses unless file and memory agree. */
     { int sw = lsm_manifest_sweep_orphans(&g_utxo_lst);
       if (sw > 0) fprintf(stderr, "[utxo_live] init: swept %d orphan file(s) the manifest does not name\n", sw);
+      else if (sw == -2) fprintf(stderr, "[utxo_live] init: orphan sweep skipped -- fsync of the chain directory failed (%s)\n", strerror(errno));
       else if (sw < 0) fprintf(stderr, "[utxo_live] init: orphan sweep skipped -- manifest file and memory disagree\n"); }
     /* M1 (2026-10-06): the worker's anonymous memory by purpose, for
      * /proc/PID/maps, smaps and the [mem] line. The memtable's table and

@@ -37,9 +37,21 @@ int irs_open_run(const irunset_t* s, irun_t* r){
     if (memcmp(b, s->magic, 8)){ munmap(m, (size_t)sb.st_size); return 0; }
     unsigned long long n = rd64(b + 8), so = rd64(b + 16), ns = rd64(b + 24);
     long from = (long)rd32(b + 32), to = (long)rd32(b + 36);
-    /* a header that describes more than the file holds is a torn build */
-    if (so + ns * (unsigned long long)s->sparse > (unsigned long long)sb.st_size
-        || IRS_HDR + n * (unsigned long long)s->rec != so || to < from){
+    /* a header that describes more than the file holds is a torn build.
+     * formal/parsers F4 (2026-10-23): this was `so + ns*sparse > size ||
+     * IRS_HDR + n*rec != so` in 64-bit arithmetic, which wraps -- a 68-byte
+     * run with nsparse 2^60 (16 * 2^60 == 0 mod 2^64) was accepted, and the
+     * reader's binary search (rpc_chain.c txi_lookup_locked) then read 2^63
+     * bytes past the mapping; n + 2^62 passed the record equation the same
+     * way. Each term is now bounded by what is left of the file before it is
+     * scaled, by division, which cannot wrap. */
+    unsigned long long size = (unsigned long long)sb.st_size;
+    unsigned long long rec = (unsigned long long)s->rec, sp = (unsigned long long)s->sparse;
+    if (s->rec <= 0 || s->sparse <= 0
+        || so < IRS_HDR || so > size
+        || (so - IRS_HDR) % rec != 0 || (so - IRS_HDR) / rec != n    /* records exactly [48, so) */
+        || ns > (size - so) / sp                                     /* sparse table inside the file */
+        || to < from){
         munmap(m, (size_t)sb.st_size); return 0; }
     r->map = b; r->len = (size_t)sb.st_size; r->ino = sb.st_ino;
     r->n = n; r->sparse_off = so; r->nsparse = ns; r->from = from; r->to = to;

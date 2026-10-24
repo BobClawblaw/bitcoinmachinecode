@@ -1937,3 +1937,182 @@ that survive. Nothing in them is new measurement.
 - #403 (the B3 reap-at-tip test) and #404 (B12, the header leader switch)
   landed after this deploy without a redeploy. #403 is test-only, and B12 only
   matters for fresh syncs.
+
+## 2026-10-09 20:53Z — `deploy-20261009a`: the heap, the merge budget, the header ranges, `-maxtxfee` (PRs #403–#415)
+
+These two entries (09a and 10a) were written on 2026-10-24 from the
+production log, the session notes of the day and the build worktrees, which
+were still on disk. Nothing in them is new measurement.
+
+- **Why:** the operator asked for main to go live once #413–#415 were merged.
+  Run 45, the from-genesis benchmark sync that had just ended, had passed
+  with MuHash identical to Core's at 970,572.
+- **What:** `main` at `92c9f24a`, clean.
+  - #407 (M2): no fork copies of the memtable; `dbcache` is the whole UTXO
+    heap.
+  - #408 (M3): a deferred merge obeys the run budget at any run count.
+  - #405 (B13): a staller is banned on its second stall, not its first.
+  - #409 (B14): the dead-weight rule judges only the time a worker was free
+    to fetch.
+  - #404, #410, #412, #413 (B12): the header leader switch, then the header
+    chain in parallel ranges from anchor hashes, ended when every range is
+    settled, with their children reaped.
+  - #414: the wallet reads `-maxtxfee` from the config; it had been capped at
+    a constant 0.1 BTC.
+  - #403 (test only, the B3 reap at the tip) and docs PRs #401, #406, #411,
+    #415.
+
+  The snapshot is byte-identical to the binary in the build worktree
+  `.claude/worktrees/deploy-20261009a`, which is clean at `92c9f24a`. Only
+  the daemon was swapped; the helpers stayed as they were.
+- **Started:** 20:53:19Z, at tip 970,676. `deploy-20261007a` stopped at
+  20:53:16Z after 2 days 2 hours with no restart.
+- **Verified live:**
+  - RPC answering, and the tip and its hash identical to the Core v31.1
+    oracle's, a minute after the start.
+  - New block 970,677 applied at 21:21Z, hash-identical to the oracle's; the
+    heartbeat read `tip=970677`.
+  - `active`, same pid and `NRestarts=0` at 28 minutes; 57 fds.
+  - The heartbeat's `sync_failing=1` was the old build's reading as well. It
+    counts outbound peers with a recently failed block request (1 of 8), and
+    it did not hold the tip back.
+- **Restarts on the same snapshot:** none. It ran until the next deploy.
+- **Rollback:** `deploy-20261007a`, with the notes under it. That was true
+  until `deploy-20261010a` wrote its first run; it no longer holds (see
+  10a's rollback note).
+
+## 2026-10-10 04:28Z — `deploy-20261010a`: the frozen copy's pages, Bloom filters sized to the run (PRs #416, #417)
+
+- **Why:** run 46, a from-genesis sync of these two changes, passed with
+  MuHash identical to Core's at 970,710. It was ready in 3:17:55, 47 minutes
+  ahead of run 45. The operator approved the deploy at 03:17Z, and it ran at
+  04:28Z.
+- **What:** `main` at `a79bcdca`, clean. Its code tree is the one run 46
+  built (`48c2f958`).
+  - #416: the frozen memtable copy keeps its pages, so a freeze no longer
+    waits on memory compaction (2.4 s a freeze in run 45; 136 ms mean in run
+    46).
+  - #417: a run's Bloom filter is sized to its records, at 10 bits each up
+    to 256 MiB. It had been capped at 4 MiB, which passed 55% of absent keys
+    on a bulk flush run.
+  - Docs PR #418 landed right after, at 2337f1da.
+
+  The snapshot is byte-identical to the binary in the build worktree
+  `.claude/worktrees/deploy-20261010a`, which is clean at `a79bcdca`, built
+  at 02:47Z. Only the daemon was swapped. The helpers were judged safe as
+  they were: `bmc_build_addr_hist` and `bmc_cli` link the changed UTXO code
+  but never read UTXO runs.
+- **Started:** 04:28:20Z, at tip 970,721. `deploy-20261009a` stopped at
+  04:28:19Z.
+- **Verified live,** later than the rule asks:
+  - `active` with `NRestarts=0` five seconds after the start.
+  - The checks that followed were refused by the session's permission
+    classifier. So the next-block check was not made at the deploy, and was
+    first made at 10:04Z.
+  - At 10:04Z, 5.5 hours in: same pid, `NRestarts=0`, tip 970,749 equal to
+    the oracle's, the hashes of 970,749 and 970,730 identical to the
+    oracle's, and 64 fds.
+- **Restarts on the same snapshot:** none. It ran until `deploy-20261011a`,
+  stopping at 2026-10-11 20:25:27Z at tip 970,980.
+- **A helper changed under it.** At 2026-10-11 17:32Z, `bmc_build_addr_hist`
+  in `asm/daemon/` was rebuilt in place by a build in the main checkout,
+  alongside `undo_log.o`, during the B16 work. It is byte-identical to a
+  build of `7f822deb`, the B16 commit on #423, which is not merged. The
+  daemon execs it from beside the resolved binary. So from then until
+  `deploy-20261024a` replaced it, production's addr-history builder was the
+  #423 branch's, not main's. It is kept as
+  `bmc_build_addr_hist.pre-20261024a`.
+- **Rollback:** `deploy-20261009a` only until 10a's first run with a filter
+  over 4 MiB was written. After that, no build before 10a is safe on this
+  datadir.
+  - A build before 10a reads a run's filter into a 4 MiB per-thread buffer
+    whenever the mmap lookup hands a run back to the assembly path. That
+    happens when a run cannot be mapped, the lookup is disabled, or a script
+    is over 64 KiB. #417's `test_lsm_bloom_sized` crashes on exactly this
+    when 10a's skip is removed.
+  - Production's datadir now holds `utxo_run_001616.dat` (written
+    2026-10-16, a 2^30-bit, 128 MiB filter) and `utxo_run_001762.dat`
+    (written 2026-10-24, 16 MiB).
+
+## 2026-10-11 20:25Z — `deploy-20261011a`: the memtable hash spread and the coinstats fold ring (PRs #419, #420)
+
+- **What:** `main` at `fc5e56a2`.
+  - #419: a transaction's outputs are spread across the memtable, tombstone
+    and in-block hashes, with a faster copy and compare.
+  - #420: the coinstats fold ring holds a burst of heavy blocks (64k to 512k
+    records), with release/acquire fences in place of two `mfence`s a record.
+  - Docs PR #421.
+
+  The snapshot's provenance was checked on 2026-10-24: a rebuild of
+  `fc5e56a2` matches it byte for byte except the compiler's `__DATE__` and
+  `__TIME__` strings (20:25:09 on Oct 11), a pointer to them, and the build
+  ID. `.text` and `.data` are identical. It carries none of B15 or B16
+  (#423, unmerged).
+- **Started:** 20:25:29Z, at tip 970,980. No verification record was kept for
+  this deploy. The log shows the tip advancing on it from 970,980 to 972,729.
+- **Restarts on the same snapshot** (`bmcbitcoind.live` was not relinked
+  between 10-11 and 10-24):
+  - 20:38Z and 20:39Z on 10-11;
+  - 01:32Z to 01:33Z and 01:40Z on 10-12;
+  - 10-20, stopped 17:34Z and started 19:46Z.
+
+  The reasons are not recorded here.
+- **Stopped:** 2026-10-23 06:56Z at 972,729, by the operator, for the duration
+  of the 2026-10-23 security review and its fixes.
+- **Helpers:** not replaced. From 10-11 17:32Z, before this deploy,
+  `bmc_build_addr_hist` was the #423 branch's build (see `deploy-20261010a`),
+  so this deploy ran with it too.
+- **Rollback:** `deploy-20261010a` only. Correction, 2026-10-24: this entry
+  first also named `deploy-20261007a`. That is not safe: this datadir holds
+  runs whose Bloom filters are over 4 MiB, and builds before 10a cannot read
+  them (see 10a's rollback note).
+
+## 2026-10-24 00:54Z — `deploy-20261024a`: the 2026-10-23 security review and its fixes (PRs #424–#436)
+
+- **Why:** the 2026-10-23 review found 9 HIGH findings, five of them
+  consensus splits from Core. Formal verification then found a critical
+  UTXO-store durability hole (STO-E), and two boot checks that had been dead
+  since 2026-09-05. Production was down from 10-23 06:56Z until this deploy.
+  The full account is `docs/history/2026-10-23-the-review/`.
+- **What:** `main` at `d8d7f32c`.
+  - The twelve fix PRs #424–#435, merged in order. Their code tree is
+    byte-identical to the integration build that passed the full gate (474
+    tests, gate-log audit clean) and a from-genesis mainnet sync: PASS at
+    972,848, MuHash identical to Core v31.1's.
+  - Docs PR #436.
+
+  Built in a clean worktree at the merge commit, with no compiler warnings.
+- **Helpers replaced as well.** The daemon execs its index builders from
+  beside the resolved binary, and main changes several of them (the addr_hist
+  merge, the index-run header checks, exec with fds 0–2 only).
+  `bmc_build_tx_index`, `bmc_build_txospender_index`, `bmc_build_addr_hist`,
+  `bmc_build_coinstats_hist` and `bmc_merge_index_runs` in `asm/daemon/` are
+  main's. The ones they replaced are kept as `<name>.pre-20261024a`. The
+  replaced `bmc_build_addr_hist` was the #423 branch's build, not main's (see
+  `deploy-20261010a`).
+- **Wallet** files were copied before the deploy, with the daemon stopped,
+  since the wallet code changed (CRY-1..8).
+- **Started:** 00:54:45Z, at tip 972,729. `bitcoin.conf` loaded with no error
+  under the new Core-grammar reader (18 settings).
+- **Verified live:**
+  - Caught up to the oracle's tip, 972,854, by 00:57:03Z, hash-identical.
+  - New block 972,855 applied at 01:07:50Z, hash-identical to the Core v31.1
+    oracle's (`00000000000000000001ee4e278473b9d30b596b458d53e8075348a3bcdd8e5a`).
+    The heartbeat then read `tip=972855`.
+  - `NRestarts=0` and `active` at 19 minutes; no `[crash]` line.
+  - fd count flat at 139–140 across facade traffic.
+  - mempool backend and Esplora facade traffic back. The backend logged errors
+    only while the node was starting (00:55Z).
+- **Behaviour changes** are listed in Appendix B of the review. In short:
+  - config errors are fatal at boot;
+  - Tor needs SAFECOOKIE;
+  - no wildcard CORS on Esplora;
+  - unknown-witness spends are non-standard;
+  - no reorg depth cap;
+  - a store that will not reload halts the boot;
+  - about 2 extra syncs per block at the tip.
+- **Rollback:** relink to `deploy-20261011a` AND restore the five
+  `.pre-20261024a` helpers. Rolling back reopens every finding fixed here,
+  including the dead UTX-2/UTX-6 boot checks. Going by the diff, no on-disk
+  format changed: the store changes add syncs, order them and tighten the
+  readers. A boot of 11a on a datadir this build has written was not tested.

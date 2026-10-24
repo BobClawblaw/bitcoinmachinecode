@@ -24,9 +24,15 @@ int lsm_manifest_read(struct lsm_state* lst, uint64_t* persisted_live);
 /* Just the header's persisted count (~0ULL if none/unreadable). */
 uint64_t lsm_manifest_persisted_live_file(const char* path);
 uint64_t lsm_manifest_persisted_live(void);
-/* Write lst's in-memory manifest crash-safely (tmp + fsync + rename + dir
- * fsync). persisted_live ~0ULL writes an OLD-format header so the next
- * reload recounts instead of trusting a number we could not derive. */
+/* fsync of the working directory (the chain directory): 0 ok / -1, errno set */
+int lsm_dir_sync(void);
+/* Write lst's in-memory manifest crash-safely (dir fsync, tmp + fsync +
+ * rename + dir fsync). persisted_live ~0ULL writes an OLD-format header so the
+ * next reload recounts instead of trusting a number we could not derive.
+ * 0 = published and durable; -1 = not published (the old manifest stands);
+ * 1 = renamed into place but the directory fsync after it failed: the next
+ * process reads the new manifest, a power loss may bring the old one back,
+ * so no step may yet depend on it (STO-D). */
 int lsm_manifest_publish(const struct lsm_state* lst, uint64_t persisted_live);
 /* The parent's half of a background compaction. inputs[k] are the run_nos the
  * child merged (the oldest k at fork); is_full says k was the whole manifest
@@ -34,14 +40,18 @@ int lsm_manifest_publish(const struct lsm_state* lst, uint64_t persisted_live);
  * utxo_manifest.child, checks it against lst's current manifest, builds
  * [child's entries] + [runs lst flushed since fork], heals lst->total_live,
  * publishes, deletes the child file. 0 ok / -1 (lst untouched: the child's
- * output run is then an orphan for the boot sweep). */
+ * output run is then an orphan for the boot sweep) / 1 (adopted, but the
+ * publish's directory fsync failed: lsm_manifest_publish's 1 -- the inputs
+ * must stay on disk). */
 int lsm_manifest_adopt_child(struct lsm_state* lst, const uint64_t* inputs, int k,
                              int is_full, uint64_t base_at_fork, uint64_t* new_persisted);
 /* Boot only, before any writer: delete run files the manifest does not name
  * (crash leftovers of publish-before-unlink and of background merges) plus a
  * stale utxo_manifest.child/.pub. Guard: the on-disk manifest must exist and
  * match lst's in-memory entries byte for byte, else nothing is touched and -1
- * is returned -- a sweep against an unloaded state would delete the store. */
+ * is returned -- a sweep against an unloaded state would delete the store.
+ * The directory is fsynced before the first unlink (that manifest's rename
+ * durable first); -2 = that fsync failed, nothing touched. */
 int lsm_manifest_sweep_orphans(const struct lsm_state* lst);
 /* Leveled compaction's choice. sizes[i] = bytes of manifest entry i (oldest
  * first). Walking from the newest run backwards, a run joins the batch while

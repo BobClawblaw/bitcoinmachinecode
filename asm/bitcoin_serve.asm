@@ -130,6 +130,8 @@ cn_feeflt: db "feefilter",0
 viol_txrelay: db "transaction sent in violation of protocol",0          ; Core net_processing.cpp
 viol_invtx:   db "transaction inv sent in violation of protocol",0
 viol_mempool: db "mempool request with bloom filters disabled",0
+viol_ghlocsz: db "getheaders locator size > MAX_LOCATOR_SZ (101)",0        ; Core: fDisconnect
+viol_gblocsz: db "getblocks locator size > MAX_LOCATOR_SZ (101)",0         ; Core: fDisconnect
 viol_gbtidx:  db "getblocktxn with malformed or out-of-bounds tx indices",0  ; Core: Misbehaving(100)
 ; BIP152 output buffer (blocktxn / cmpctblock assembly) + per-connection state.
 align 16
@@ -207,6 +209,9 @@ align 16
 s_plen:   dq 0
 s_fh:     dq 0
 s_ghstop: dq -1        ; NET-8: hashStop height for getheaders, -1 = absent/unknown
+s_gbstop: times 32 db 0 ; getblocks: the hashStop hash itself (wire order)
+s_gbcont: times 32 db 0 ; getblocks: Core's m_continuation_block (wire order)
+s_gbcont_set: dq 0      ; 1 while s_gbcont holds one (per connection)
 s_cmd:    times 16 db 0
 s_cnt:    dq 0
 s_nf:     dq 0        ; notfound entries accumulated for THIS getdata
@@ -371,6 +376,7 @@ node_serve_loop:
     ; send the peer OUR `feefilter` (advertise min-relay-feerate so it skips
     ; low-fee relay to us). This is the outbound feefilter leg.
     mov  qword [s_shdr], 0
+    mov  qword [s_gbcont_set], 0   ; no getblocks continuation yet
     mov  qword [s_peerfee], 0
     mov  byte [s_feesent], 0
     mov  byte [s_addrsent], 0
@@ -1108,7 +1114,7 @@ node_serve_loop:
     call p2p_write
     mov  rbx, [s_ptr]
     add  qword [s_served], 1
-    jmp  .gd_next
+    jmp  .gd_cont
     ; ---- serve a full block (type 2) ----
 .gd_block:
     ; hash at rbx+4; idx_get(ht_idx, hash, &fh)
@@ -1197,7 +1203,7 @@ node_serve_loop:
     call p2p_write
     mov  rbx, [s_ptr]
     add  qword [s_served], 1
-    jmp  .gd_next
+    jmp  .gd_cont
 .gdb_send_full:
     mov  r8d, eax           ; block length (p2p_write arg5 = r8)
     ; p2p_write(fd,"block",5,sb_buf,len)
@@ -1210,6 +1216,38 @@ node_serve_loop:
     mov  rbx, [s_ptr]
     ; served++
     add  qword [s_served], 1
+    mov  rbx, [s_ptr]
+.gd_cont:
+    ; ---- the getblocks continuation (Core ProcessGetBlockData,
+    ; net_processing.cpp 2480-2492): a block was just sent; if it is the one
+    ; the last 500-entry getblocks stopped at, send inv(MSG_BLOCK, connected
+    ; tip) immediately -- "even if redundant", and right after the block --
+    ; then forget it. Every served block form reaches here (full, stripped,
+    ; compact), as every form reaches that code in Core.
+    cmp  qword [s_gbcont_set], 0
+    je   .gd_next
+    mov  rbx, [s_ptr]
+    mov  rax, [rbx+4]
+    cmp  rax, [s_gbcont]
+    jne  .gd_next
+    mov  rax, [rbx+12]
+    cmp  rax, [s_gbcont + 8]
+    jne  .gd_next
+    mov  rax, [rbx+20]
+    cmp  rax, [s_gbcont + 16]
+    jne  .gd_next
+    mov  rax, [rbx+28]
+    cmp  rax, [s_gbcont + 24]
+    jne  .gd_next
+    mov  qword [s_gbcont_set], 0
+    ; node_announce_tip(fd, st, ht_idx, use_headers=0): the inv form whatever
+    ; sendheaders said, as Core's is. It reloads sb_buf/hp_buf, both free
+    ; here (the block is sent; the next entry reloads sb_buf).
+    mov  rdi, r12
+    mov  rsi, [s_st]
+    mov  rdx, [s_htidx]
+    xor  ecx, ecx
+    call node_announce_tip
     mov  rbx, [s_ptr]
     jmp  .gd_next
 
@@ -1370,15 +1408,21 @@ node_serve_loop:
     ; serve_locator_from does the CompactSize, the bounds and the walk (Core's
     ; FindForkInGlobalIndex), in C for the same reason serve_inv_bounds is:
     ; hand-writing a second varint walk in assembly is how the first one went
-    ; wrong. rax = 1 ok / 0 malformed.
+    ; wrong. rax = 1 ok / 2 ok, empty locator / 0 malformed (dropped) /
+    ; -1 more than MAX_LOCATOR_SZ entries (disconnected).
     lea  rdi, [pl_buf]
     mov  rsi, [s_plen]
     mov  rdx, [s_htidx]
     lea  rcx, [s_fh]         ; out_from
     lea  r8,  [s_ghstop]     ; out_stop (-1 = none/unknown)
+    xor  r9d, r9d            ; out_stop_hash: not needed here
     call serve_locator_from
+    cmp  eax, -1
+    je   .gh_locsz           ; > MAX_LOCATOR_SZ: Core disconnects
     test eax, eax
     jz   .next               ; malformed: drop, as the inv path does
+    cmp  eax, 2
+    je   .gh_nolocator       ; empty locator: the hashStop header alone
 .gh_build:
     ; tip = the CONNECTED tip (3.1), not st[24]: a peer is never told
     ; about a block this node has stored but not validated
@@ -1522,6 +1566,34 @@ node_serve_loop:
     call p2p_write
     jmp  .next
 
+.gh_nolocator:
+    ; An EMPTY locator (Core GETHEADERS, net_processing.cpp 4426-4436) asks
+    ; for the hashStop header alone: unknown (or all-zero) -> no reply at
+    ; all; otherwise exactly that one header, since the walk breaks on
+    ; hashStop. Core also refuses a stop it may not serve (BlockRequestAllowed);
+    ; here that is a stored block above the CONNECTED tip. This used to serve
+    ; from genesis, up to 2000 headers, as if the locator were unknown.
+    mov  rdi, r14
+    call serve_public_tip
+    mov  [s_cnt], rax
+    mov  rax, [s_ghstop]
+    test rax, rax
+    js   .next               ; stop unknown: nothing is sent
+    cmp  rax, [s_cnt]
+    jg   .next               ; above the connected tip: not served
+    mov  [s_fh], rax         ; from = to = the stop's height
+    mov  [s_cnt], rax
+    jmp  .gh_nostop
+.gh_locsz:
+    ; A complete locator of more than MAX_LOCATOR_SZ (101) entries: Core sets
+    ; fDisconnect, unscored (net_processing.cpp 4399 getheaders, 4272
+    ; getblocks). Both used to be dropped and the connection kept.
+    lea  rdi, [viol_ghlocsz]
+    jmp  .viol_disconnect
+.gb_locsz:
+    lea  rdi, [viol_gblocsz]
+    jmp  .viol_disconnect
+
 .maybe_getb:
     ; "getb..." splits into "getblocks" (cmd[4..7]=="lock" then cmd[8..11]==0)
     ; and "getblocktxn" (cmd[4..7]=="lock", cmd[8..11]=="txn\0" -> 0x006e7874).
@@ -1531,32 +1603,38 @@ node_serve_loop:
     ; else must be the classic getblocks -> require "lock" at cmd[4..7]
     cmp  dword [s_cmd+4], 0x6b636f6c ; "lock"
     jne  .next
-    ; payload: version(4) count(1) locator-hash(32) stop(32) ; locator at pl+5
-    mov  rax, [s_plen]
-    cmp  rax, 37
-    jb   .gb_from0
-    mov  rdi, [s_htidx]
-    lea  rsi, [pl_buf+5]
-    lea  rdx, [s_fh]
-    call idx_get
-    test rax, rax
-    jz   .gb_from0
-    mov  rax, [s_fh]
-    inc  rax
-    jmp  .gb_havefrom
-.gb_from0:
-    xor  eax, eax
-.gb_havefrom:
-    mov  [s_fh], rax        ; from
+    ; payload: version(4) | CompactSize count | count*32 locator | 32 stop,
+    ; the same CBlockLocator body getheaders carries. formal/parsers F1
+    ; (2026-10-23): this read the first hash at pl+5 whatever the count said
+    ; -- a non-canonical count (fd 0100), a short message or a multi-byte
+    ; count was served from a misread hash or from genesis, where Core's
+    ; ReadCompactSize throws and the message is dropped. serve_locator_from
+    ; parses it as getheaders does (canonical count, <= 101, length checked)
+    ; and walks the whole locator (FindForkInGlobalIndex). rax = 1 or 2 ok
+    ; (2 = empty locator, served like any unknown one) / 0
+    ; malformed (dropped) / -1 more than MAX_LOCATOR_SZ entries
+    ; (disconnected); s_fh = the height to serve from, s_gbstop = the stop
+    ; hash.
+    lea  rdi, [pl_buf]
+    mov  rsi, [s_plen]
+    mov  rdx, [s_htidx]
+    lea  rcx, [s_fh]         ; out_from
+    lea  r8,  [s_ghstop]     ; out_stop height (unused: the walk compares hashes)
+    lea  r9,  [s_gbstop]     ; out_stop_hash
+    call serve_locator_from
+    cmp  eax, -1
+    je   .gb_locsz           ; > MAX_LOCATOR_SZ: Core disconnects
+    test eax, eax
+    jz   .next               ; malformed: drop, as getheaders does
     ; tip = the CONNECTED tip (3.1); s_fh is a static, survives the call
     mov  rdi, r14
     call serve_public_tip
     mov  [s_cnt], rax
     mov  rax, [s_fh]
     cmp  rax, [s_cnt]
-    ja   .gb_empty
+    ja   .next               ; nothing past the fork point: no inv (see .gb_done)
     ; build inv: reserve 3 bytes for count varint at hp_buf[0..2], entries at
-    ; hp_buf[3..]. Each entry = type u32 (2=MSG_BLOCK) + hash32 (LE wire order).
+    ; hp_buf[3..]. Each entry = type u32 (2=MSG_BLOCK) + hash32 (wire order).
     mov  qword [s_p], 3
     mov  qword [s_n], 0
 .gbl_loop:
@@ -1578,35 +1656,79 @@ node_serve_loop:
     lea  rdi, [sb_buf+0x200000]  ; scratch hash slot inside sb_buf (see below)
     lea  rsi, [sb_buf]
     call block_hash
-    ; reverse the hash into hp_buf at offset [s_p]+4 (after the type u32)
+    ; hashStop. Core (net_processing.cpp GETBLOCKS) walks the active chain
+    ; from the fork point's successor and breaks BEFORE queueing the block
+    ; whose hash is hashStop: the stop block itself is not announced. A stop
+    ; at or below the start, off this chain, unknown or all-zero is never met
+    ; and limits nothing. This handler ignored hashStop (2026-10-23) and
+    ; always sent up to 500. Compared by hash, not by the index's height for
+    ; it: the walk is over the blocks actually served, so a stale index entry
+    ; (a child that has not yet seen a reorg) cannot stop it early.
+    mov  rax, [sb_buf + 0x200000]
+    cmp  rax, [s_gbstop]
+    jne  .gbl_nostop
+    mov  rax, [sb_buf + 0x200000 + 8]
+    cmp  rax, [s_gbstop + 8]
+    jne  .gbl_nostop
+    mov  rax, [sb_buf + 0x200000 + 16]
+    cmp  rax, [s_gbstop + 16]
+    jne  .gbl_nostop
+    mov  rax, [sb_buf + 0x200000 + 24]
+    cmp  rax, [s_gbstop + 24]
+    je   .gb_done            ; this block is hashStop: stop before it
+.gbl_nostop:
+    ; entry at hp_buf+[s_p]: type u32 = 2 (MSG_BLOCK), then the hash in
+    ; INTERNAL order -- block_hash's sha256d output as-is, the bytes a getdata
+    ; carries back and the order idx_get is keyed on. 2026-10-23: this copied
+    ; the hash byte-reversed (display order), so every getblocks reply named
+    ; 500 blocks nobody has; the tip announce (node_announce_tip) had the same
+    ; bug until 2026-09-19.
     mov  rdx, [s_p]
-    add  rdx, 4
-    ; type = 2 (MSG_BLOCK) at hp_buf[rdx-4 .. rdx-1]
-    mov  dword [hp_buf + rdx - 4], 2
-    lea  r10, [sb_buf + 0x200000 + 31]  ; last byte of the hash output
-    lea  r11, [hp_buf + rdx]            ; dest base (type u32 already written)
-    xor  ecx, ecx
-.gbl_rev:
-    cmp  rcx, 32
-    jae  .gbl_rev_done
-    mov  r9, rcx
-    neg  r9                  ; -rcx
-    mov  al, [r10 + r9]      ; sb_buf+0x200000+31-rcx  (base + index)
-    mov  [r11 + rcx], al     ; hp_buf+rdx+rcx
-    inc  rcx
-    jmp  .gbl_rev
-.gbl_rev_done:
+    mov  dword [hp_buf + rdx], 2
+    mov  rax, [sb_buf + 0x200000]
+    mov  [hp_buf + rdx + 4], rax
+    mov  rax, [sb_buf + 0x200000 + 8]
+    mov  [hp_buf + rdx + 12], rax
+    mov  rax, [sb_buf + 0x200000 + 16]
+    mov  [hp_buf + rdx + 20], rax
+    mov  rax, [sb_buf + 0x200000 + 24]
+    mov  [hp_buf + rdx + 28], rax
     add  qword [s_p], 36
     mov  rax, [s_n]
     inc  rax
     mov  [s_n], rax
+    ; The 500th entry: Core (GETBLOCKS, `if (--nLimit <= 0)`) remembers it as
+    ; the peer's m_continuation_block and stops. When the peer later asks for
+    ; that block, .gd_cont sends inv(tip) right after it, which is what makes
+    ; an old-style getblocks sync ask for the next batch. Without it the peer
+    ; stalls after the first 500. Set only at the limit; a shorter reply
+    ; leaves an earlier continuation in place, as Core's does.
+    cmp  rax, 500
+    jb   .gbl_next
+    mov  rax, [sb_buf + 0x200000]
+    mov  [s_gbcont], rax
+    mov  rax, [sb_buf + 0x200000 + 8]
+    mov  [s_gbcont + 8], rax
+    mov  rax, [sb_buf + 0x200000 + 16]
+    mov  [s_gbcont + 16], rax
+    mov  rax, [sb_buf + 0x200000 + 24]
+    mov  [s_gbcont + 24], rax
+    mov  qword [s_gbcont_set], 1
+    jmp  .gb_done
+.gbl_next:
     mov  rax, [s_fh]
     inc  rax
     mov  [s_fh], rax
     jmp  .gbl_loop
 .gb_done:
-    ; emit canonical count varint from [s_n]
+    ; Nothing to announce (the peer is at our tip, or hashStop is the first
+    ; block): Core queues nothing and its SendMessages pushes no inv for an
+    ; empty m_blocks_for_inv_relay, so there is no reply at all. This sent an
+    ; empty inv (count 0) until 2026-10-23.
     mov  rax, [s_n]
+    test rax, rax
+    jz   .next
+    ; emit canonical count varint from [s_n]
     cmp  rax, 253
     jae  .gb_varint16
     ; compact entries from hp_buf+3 down to hp_buf+1, count byte at [0]
@@ -1650,16 +1772,6 @@ node_serve_loop:
     mov  rax, [s_served]
     add  rax, [s_n]
     mov  [s_served], rax
-    jmp  .next
-.gb_empty:
-    ; send empty inv (count 0)
-    mov  byte [hp_buf], 0
-    mov  r8d, 1
-    mov  rdi, r12
-    lea  rsi, [cn_inv]
-    mov  rdx, 3
-    lea  rcx, [hp_buf]
-    call p2p_write
     jmp  .next
 
 .maybe_sendcmpct:
