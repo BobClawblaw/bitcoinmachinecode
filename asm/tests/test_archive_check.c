@@ -34,6 +34,8 @@ extern long archive_first_hole(long upto);
 extern long archive_prune_height_for_budget(long long budget_bytes);
 #include "archive_verify.h"
 extern void block_hash(unsigned char out[32], const unsigned char hdr[80]);
+extern void sha256d(unsigned char out[32], const void* msg, long len);
+extern long merkle_root(unsigned char out[32], unsigned char* hashes, unsigned long long n);   /* in place */
 
 static int failures = 0;
 static void cki(const char* lbl, long got, long exp){
@@ -456,6 +458,43 @@ int main(void){
       ph=-7;
       cki("verdict: OK again once the archive is repaired",
           archive_prune_decide(285, &ph, &det), ARCHIVE_PRUNE_OK);
+    }
+
+    /* CON-14 (audit 2026-10-23): level 4 gave cons_verify 64 txid slots, so
+     * every block of more than 64 transactions was reported as failing
+     * PoW/merkle. A real-PoW (0x207fffff) block of 100 transactions, alone
+     * in its own archive, must check clean. */
+    {
+        tt_subdir("con14");
+        enum { NT = 100 };
+        static unsigned char blk[80 + 1 + NT * 60], ids[NT * 32];
+        unsigned char* q = blk + 80; *q++ = NT;
+        for (int t = 0; t < NT; t++){
+            unsigned char* tx = q;
+            *q++ = 1; *q++ = 0; *q++ = 0; *q++ = 0; *q++ = 1;
+            if (t == 0){ memset(q, 0, 32); q += 32; memset(q, 0xff, 4); q += 4; }
+            else { memset(q, 0x6d, 32); q[0] = (unsigned char)t; q += 32; memset(q, 0, 4); q += 4; }
+            *q++ = 0; memset(q, 0xff, 4); q += 4;
+            *q++ = 1; memset(q, 0, 8); q += 8; *q++ = 0;
+            memset(q, 0, 4); q += 4;
+            sha256d(ids + t * 32, tx, (long)(q - tx));
+        }
+        unsigned dsz = (unsigned)(q - blk);
+        memset(blk, 0, 80); blk[0] = 1;
+        merkle_root(blk + 36, ids, NT);
+        blk[72] = 0xff; blk[73] = 0xff; blk[74] = 0x7f; blk[75] = 0x20;
+        unsigned nonce = 0;
+        for (;;){ unsigned char hh[32]; sha256d(hh, blk, 80); if (hh[31] < 0x7f) break; nonce++; memcpy(blk + 76, &nonce, 4); }
+        unsigned char bh[32]; block_hash(bh, blk);
+        int bf2 = open("blk00000.dat", O_RDWR|O_CREAT|O_TRUNC, 0644);
+        long wr = bf2 >= 0 ? write_framed(bf2, 0, blk, dsz) : -1;
+        if (bf2 >= 0) close(bf2);
+        unsigned char rr[48]; put_rec(rr, bh, 0, 0, dsz);
+        int xf2 = open("index.dat", O_RDWR|O_CREAT|O_TRUNC, 0644);
+        long wi = xf2 >= 0 ? write(xf2, rr, 48) : -1;
+        if (xf2 >= 0) close(xf2);
+        cki("CON-14 fixture written", wr > 0 && wi == 48, 1);
+        cki("CON-14 checklevel=4 on a 100-transaction block is clean", archive_check(0, 4), 0);
     }
 
     /* The fixture is removed by tt_isolate()'s exit/signal cleanup; leaving it

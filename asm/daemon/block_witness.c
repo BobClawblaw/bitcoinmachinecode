@@ -138,8 +138,21 @@ long block_check_witness_commitment(const void* txs, u64 ntx, u64 stride,
         if (scratch_cap < ntx * 32){ *reason = "witness-commitment: scratch too small"; return -1; }
         memset(scratch, 0, 32);
         /* wtxid = sha256d over the full witness serialization, i.e. the raw
-         * bytes as stored (bitcoin_cmpct.asm's tx_wtxid is the same call). */
-        for (u64 t = 1; t < ntx; t++) sha256d(scratch + t*32, TX(t)->ptr, (int64_t)TX(t)->len);
+         * bytes as stored (bitcoin_cmpct.asm's tx_wtxid is the same call).
+         *
+         * CON-4 (audit 2026-10-23): every transaction is walked here too, not
+         * only the coinbase. bw_walk_tx is where VAL-10's "Superfluous
+         * witness record" (marker + flag with every stack empty) and the
+         * canonical-CompactSize rule live; with a commitment present they
+         * used to run on the coinbase alone, so a block whose commitment
+         * covers a tx serialized that way -- which Core cannot even
+         * deserialize -- was accepted. -1: the caller files it as a decode
+         * failure (Core marks nothing for a block that does not decode). */
+        for (u64 t = 1; t < ntx; t++){
+            int hw; u64 a, b; const u8* c; const u8* d;
+            if (!bw_walk_tx(TX(t)->ptr, TX(t)->len, &hw, &a, &b, &c, &d)){ *reason = "malformed tx"; return -1; }
+            sha256d(scratch + t*32, TX(t)->ptr, (int64_t)TX(t)->len);
+        }
         u8 root[32], buf[64], h[32];
         merkle_root(root, scratch, ntx);
         memcpy(buf, root, 32); memcpy(buf + 32, cb_item, 32);

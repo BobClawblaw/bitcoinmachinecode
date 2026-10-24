@@ -63,6 +63,7 @@ uint64_t mpj_capacity(void){ return g_mpj_cap; }
 int mpj_open(const char* path, uint64_t capacity){
     if (g_mpj) return 1;                       /* already open */
     if (!path || !*path || capacity == 0) return 0;
+    if (capacity > ((uint64_t)INT64_MAX - MPJ_HDR_BYTES) / MPJ_REC_BYTES) return 0;   /* ST2-6: the file size must be an off_t */
 
     uint64_t want = MPJ_FILE_BYTES(capacity);
     int fd = open(path, O_RDWR | O_CREAT, 0644);
@@ -85,7 +86,12 @@ int mpj_open(const char* path, uint64_t capacity){
             close(fd); return 0;               /* foreign or future file: refuse, never rewrite */
         }
         uint64_t filecap = ld64(hdr + MPJ_HOFF_CAPACITY);
-        if (filecap == 0 || (uint64_t)sb.st_size < MPJ_FILE_BYTES(filecap)){ close(fd); return 0; }
+        /* ST2-6 (audit 2026-10-23): bound the capacity by what the file holds
+         * BEFORE any multiply. MPJ_FILE_BYTES(filecap) wraps for a capacity
+         * near 2^64/152, so a small file could pass a size check made with
+         * it; the ring was then mapped at the small size and slot_at() walked
+         * past the mapping by the huge capacity. Division cannot wrap. */
+        if (filecap == 0 || filecap > ((uint64_t)sb.st_size - MPJ_HDR_BYTES) / MPJ_REC_BYTES){ close(fd); return 0; }
         capacity = filecap;
         want = MPJ_FILE_BYTES(capacity);
     } else {

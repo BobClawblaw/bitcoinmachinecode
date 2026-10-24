@@ -7,6 +7,14 @@
 #include <string.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <errno.h>
+#include <stddef.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <linux/audit.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
 #include "../daemon/addr_hist_fmt.h"
 #include "test_tmpdir.h"
 typedef unsigned char u8; typedef unsigned int u32; typedef unsigned long long u64;
@@ -25,6 +33,77 @@ static int bucket_files_left(void){
     DIR* d = opendir("."); if (!d) return -1;
     int n = 0; struct dirent* e;
     while ((e = readdir(d))) if (!strncmp(e->d_name, "aho_b", 5) || !strncmp(e->d_name, "ahs_b", 5)) n++;
+    closedir(d); return n;
+}
+/* ST2-2: run the merger; fail_unlink puts it under a seccomp filter that
+ * answers unlink/unlinkat with EPERM (inherited across the exec) */
+static int run_ah_merger(const char* merger, int fail_unlink){
+    fflush(stdout);
+    pid_t p = fork();
+    if (p == 0){
+        if (fail_unlink){
+            struct sock_filter f[] = {
+                BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
+                BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0),
+                BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+                BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+                BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_unlink, 1, 0),
+                BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_unlinkat, 0, 1),
+                BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+                BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            };
+            struct sock_fprog pr = { (unsigned short)(sizeof f / sizeof f[0]), f };
+            if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) || prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &pr)) _exit(126);
+        }
+        execl(merger, "bmc_merge_index_runs", ".", "addr_hist", (char*)0); _exit(127);
+    }
+    int st = 0; waitpid(p, &st, 0);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 255;
+}
+/* ST2-7: a hostile/corrupt addr_hist.dat. hdr fields as given; one group of
+ * key (3, 00 00 01 ..) claiming `gn` events with ONE event actually present.
+ * Returns ah_lookup's answer for that key from a forked child (so an
+ * out-of-bounds read is a FAIL, not the end of the test); 99 = it died. */
+extern void ah_reset_for_test(void);
+static long hostile_lookup(u64 body_len_override, u64 sparse_n_override, u32 gn, int* available){
+    FILE* f = fopen(AH_FILE, "wb"); ah_header hd; memset(&hd, 0, sizeof hd);
+    hd.magic = AH_MAGIC; hd.version = AH_VERSION; hd.to_height = 9; hd.body_off = AH_HDR_BYTES;
+    u8 zero[AH_HDR_BYTES] = {0}; fwrite(zero, 1, AH_HDR_BYTES, f);
+    ah_group_hdr g; g.type = 3; memset(g.hash, 0, 32); g.hash[2] = 1; g.n = gn;
+    fwrite(&g, 1, AH_GROUP_HDR, f);
+    ah_event e = { AH_FUND, 1, 0, 0, 1000 }; fwrite(&e, 1, AH_EVENT_BYTES, f);
+    ah_sparse sp; sp.type = 3; memcpy(sp.hash, g.hash, 32); sp.off = 0; fwrite(&sp, 1, AH_SPARSE_BYTES, f);
+    hd.n_keys = 1; hd.n_events = 1; hd.body_len = AH_GROUP_HDR + AH_EVENT_BYTES; hd.sparse_off = AH_HDR_BYTES + hd.body_len; hd.sparse_n = 1;
+    if (body_len_override) hd.body_len = body_len_override;
+    if (sparse_n_override) hd.sparse_n = sparse_n_override;
+    fseek(f, 0, SEEK_SET); fwrite(&hd, 1, sizeof hd, f); fclose(f);
+    ah_reset_for_test();
+    fflush(stdout);
+    int pf[2]; if (pipe(pf)) return 98;
+    pid_t p = fork();
+    if (p == 0){
+        close(pf[0]);
+        int av = ah_available();
+        u8 h[32]; memset(h, 0, 32); h[2] = 1; const ah_event* ev = 0;
+        long r = av ? ah_lookup(3, h, &ev) : 0;
+        long out[2] = { av, r };
+        if (write(pf[1], out, sizeof out) != (ssize_t)sizeof out) _exit(3);
+        _exit(0);
+    }
+    close(pf[1]);
+    long out[2] = { -1, 99 };
+    if (read(pf[0], out, sizeof out) != (ssize_t)sizeof out){ out[0] = -1; out[1] = 99; }
+    close(pf[0]);
+    int st = 0; waitpid(p, &st, 0);
+    if (!WIFEXITED(st)) printf("      (lookup child died, signal %d)\n", WIFSIGNALED(st) ? WTERMSIG(st) : 0);
+    unlink(AH_FILE); ah_reset_for_test();
+    *available = (int)out[0];
+    return out[1];
+}
+static int ah_dat_files(void){
+    DIR* d = opendir("."); if (!d) return -1;
+    int n = 0; struct dirent* e;
+    while ((e = readdir(d))){ size_t l = strlen(e->d_name); if (!strncmp(e->d_name, "addr_hist", 9) && l > 4 && !strcmp(e->d_name + l - 4, ".dat")) n++; }
     closedir(d); return n;
 }
 /* tx: version | nin inputs (prevout, empty scriptSig, seq) | nout outputs (value, P2WPKH to `who`) | locktime */
@@ -108,9 +187,21 @@ int main(void){
               printf("\n"); }
           n = ah_lookup(2, keyB, &e);
           ck("B over two runs: the same 3 events", n == nB && nB == 3 && !memcmp(e, wholeB, (size_t)nB * AH_EVENT_BYTES)); }
-        /* the merger folds the two runs into one; the reader sees one run with the same answers */
-        { char cmd[4400]; snprintf(cmd, sizeof cmd, "%s . addr_hist", merger_path);
-          ck("merger ran", system(cmd) == 0); }
+        /* the merger folds the two runs into one; the reader sees one run with the same answers.
+         * ST2-2 (audit 2026-10-23): first with every unlink refused -- the merge
+         * must report it (it printed and exited 0), and what it leaves is what a
+         * crash between its rename and its unlinks leaves: both inputs beside the
+         * merged run. The reader must not count their events twice. */
+        ck("a merge whose unlinks fail exits non-zero", run_ah_merger(merger_path, 1) != 0);
+        ck("...and leaves the merged run beside both inputs", ah_dat_files() == 3);
+        ah_reset_for_test();
+        ck("inputs left inside the merged range: the reader sees one run", ah_available() && ah_run_count() == 1 && ah_to_height() == 2);
+        { const ah_event* e; long n = ah_lookup(2, keyA, &e);
+          ck("...and A's 4 events once, not 8", n == 4 && !memcmp(e, wholeA, 4 * AH_EVENT_BYTES));
+          if (n != 4) printf("      A: %ld events\n", n);
+          n = ah_lookup(2, keyB, &e); ck("...and B's 3 events once", n == 3); }
+        ck("merger ran: the leftovers are removed, exit 0", run_ah_merger(merger_path, 0) == 0);
+        ck("...only the merged run is left", ah_dat_files() == 1);
         ah_reset_for_test();
         ck("after the merge: one run, to_height 2", ah_available() && ah_run_count() == 1 && ah_to_height() == 2);
         { const ah_event* e; long n = ah_lookup(2, keyA, &e);
@@ -137,6 +228,18 @@ int main(void){
       { u8 h[32]; memset(h, 0, 32); ck("a key below the first: 0", ah_lookup(3, h, &ev) == 0); }
       ck("a rebuilt file is picked up (to_height changed 2 -> 7)", ah_to_height() == 7);
       unlink(AH_FILE); }
+    /* ---- ST2-7 (audit 2026-10-23): the reader trusts no on-disk count ---- */
+    { int av; long r;
+      r = hostile_lookup(0, 0, 1, &av);
+      ck("control: the well-formed one-group file answers its one event", av == 1 && r == 1);
+      r = hostile_lookup(~0ULL - 10, 0, 1, &av);          /* body_off + body_len wraps to 53 */
+      ck("a body_len whose sum with body_off wraps is refused", av == 0 && r == 0);
+      r = hostile_lookup(0, ~0ULL / AH_SPARSE_BYTES + 1, 1, &av);   /* sparse_n * 41 wraps */
+      ck("a sparse_n whose byte size wraps is refused", av == 0 && r == 0);
+      r = hostile_lookup(0, 0, 0xFFFFFFFFu, &av);          /* a group claiming 4 billion events */
+      ck("a group whose count overruns the body is not returned", av == 1 && r == 0);
+      if (r != 0) printf("      got %ld\n", r); }
+
     /* the builder's bucket order (2026-09-08) -- last, its fixture replaces the file */
     { FILE* f; ah_header hd; u8 zero[AH_HDR_BYTES] = {0}; u64 body; ah_sparse sp[8]; int nsp;
       /* 2026-09-08: the file as the builder writes it -- buckets by hash[0]

@@ -179,6 +179,36 @@ int main(void){
       ck("a future-version journal is REFUSED, not written into", mpj_open(p4, 8) == 0);
       unlink(p4); }
 
+    /* ---- ST2-6: a header capacity whose byte size WRAPS is refused. With
+     * cap = 2^64/152 + 1, MPJ_FILE_BYTES(cap) is a few hundred bytes mod 2^64,
+     * so a file of exactly that size passed the old size check and the ring
+     * was mapped small with a capacity of ~1.2e17 slots. ---- */
+    { char p5[256]; snprintf(p5, sizeof p5, "/tmp/bmc_mpj_wrap_%d.dat", (int)getpid());
+      uint64_t cap = UINT64_MAX / MPJ_REC_BYTES + 1;
+      uint64_t wrapped = MPJ_FILE_BYTES(cap);           /* deliberately the wrapped value */
+      ck("the wrapping capacity really wraps to a small size", wrapped >= MPJ_HDR_BYTES && wrapped < 4096);
+      int fd = open(p5, O_RDWR | O_CREAT | O_TRUNC, 0644);
+      unsigned char h[MPJ_HDR_BYTES]; memset(h, 0, sizeof h);
+      memcpy(h, MPJ_MAGIC, 8);
+      h[MPJ_HOFF_VERSION] = (unsigned char)MPJ_VERSION;
+      h[MPJ_HOFF_RECBYTES] = (unsigned char)MPJ_REC_BYTES;
+      for (int i = 0; i < 8; i++) h[MPJ_HOFF_CAPACITY + i] = (unsigned char)(cap >> (8 * i));
+      h[MPJ_HOFF_NEXTSEQ] = 1;
+      ck("wrote a journal whose capacity wraps", write(fd, h, sizeof h) == (ssize_t)MPJ_HDR_BYTES);
+      ck("...sized to the wrapped byte count", ftruncate(fd, (off_t)wrapped) == 0);
+      close(fd);
+      int ok = mpj_open(p5, 8);
+      ck("a journal whose capacity wraps is REFUSED", ok == 0);
+      if (ok) mpj_close();
+      unlink(p5); }
+    /* and a capacity no file could hold is refused before the ftruncate */
+    { char p6[256]; snprintf(p6, sizeof p6, "/tmp/bmc_mpj_huge_%d.dat", (int)getpid());
+      unlink(p6);
+      int ok = mpj_open(p6, UINT64_MAX / MPJ_REC_BYTES + 1);
+      ck("a configured capacity past an off_t is refused", ok == 0);
+      if (ok) mpj_close();
+      unlink(p6); }
+
     /* ---- a zero capacity is a refusal, not a divide-by-zero ---- */
     { char p2[256]; snprintf(p2, sizeof p2, "/tmp/bmc_mpj_zero_%d.dat", (int)getpid());
       ck("capacity 0 is refused", mpj_open(p2, 0) == 0); unlink(p2); }

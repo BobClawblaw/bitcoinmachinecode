@@ -3102,11 +3102,19 @@ mac_build_run:
     test rax, rax
     jnz  .fl_err_close
 
+    ; ST2-1 (audit 2026-10-23): the run's fsync result decides the flush. A
+    ; writeback error (EIO/ENOSPC) here used to fall through to "run written",
+    ; and the manifest was then published naming a run the kernel had just
+    ; said it could not make durable. rdx survives close (syscall clobbers
+    ; rax/rcx/r11 only).
     mov  rdi, [rbp-0x88]
     call mac_fsync2
+    mov  rdx, rax
     mov  rdi, [rbp-0x88]
     mov  eax, 3
     syscall
+    test rdx, rdx
+    js   .fl_err
 
     mov  rax, 1
     jmp  .fl_ret
@@ -3248,8 +3256,12 @@ mac_flush:
     call mac_write_exact
     test rax, rax
     jnz  .fl_merr_close
+    ; ST2-1: a failed fsync of the tmp manifest is a failed publish -- the
+    ; rename below would put a manifest of unknown durability over the old one
     mov  rdi, rbx
     call mac_fsync2
+    test rax, rax
+    js   .fl_merr_close
     mov  rdi, rbx
     mov  eax, 3
     syscall
@@ -3261,6 +3273,9 @@ mac_flush:
     test rax, rax
     jl   .fl_err
 
+    ; ST2-1: and a failed directory fsync fails the flush BEFORE the WAL
+    ; reset below: the rename may not be durable, so the WAL stays the copy
+    ; of this generation (a reload replays it over the old manifest)
     lea  rdi, [rel dot_name]
     xor  esi, esi
     mov  eax, 2
@@ -3270,9 +3285,12 @@ mac_flush:
     mov  rbx, rax
     mov  rdi, rbx
     call mac_fsync2
+    mov  rdx, rax
     mov  rdi, rbx
     mov  eax, 3
     syscall
+    test rdx, rdx
+    js   .fl_err
 
 .fl_finish_reset:
     ; ---- plan B3 (2026-10-06): the checkpoint offset retires WITH the WAL.
@@ -5102,11 +5120,20 @@ utxo_lsm_compact:
     test rax, rax
     jnz  .cc_err_close
 
+    ; ST2-1: the merged run's fsync result decides the compaction (a failure
+    ; used to publish the merge and unlink its inputs). The fd is closed here
+    ; and marked -1: .cc_dirsync_skip and .cc_err_close close it again, and by
+    ; then the number may belong to another thread's open (inline compaction
+    ; runs in the daemon process).
     mov  rdi, [rbp-0x58]
     call mac_fsync2
+    mov  rdx, rax
     mov  rdi, [rbp-0x58]
     mov  eax, 3
     syscall
+    mov  qword [rbp-0x58], -1
+    test rdx, rdx
+    js   .cc_err
 
     ; ---- write the merged (OLDEST surviving generation) entry FIRST, at
     ;      index 0, then shift the surviving (newer, un-merged) entries
@@ -5280,8 +5307,10 @@ utxo_lsm_compact:
     call mac_write_exact
     test rax, rax
     jnz  .cc_merr_close
-    mov  rdi, rbx
+    mov  rdi, rbx                           ; ST2-1: checked, as the flush's
     call mac_fsync2
+    test rax, rax
+    js   .cc_merr_close
     mov  rdi, rbx
     mov  eax, 3
     syscall
@@ -5303,10 +5332,13 @@ utxo_lsm_compact:
     jl   .cc_dirsync_skip
     mov  rbx, rax
     mov  rdi, rbx
-    call mac_fsync2
-    mov  rdi, rbx
-    mov  eax, 3
+    call mac_fsync2                         ; ST2-1: a failed dir fsync keeps
+    mov  rdx, rax                           ; the inputs (the rename may not
+    mov  rdi, rbx                           ; be durable, the old manifest
+    mov  eax, 3                             ; may come back naming them)
     syscall
+    test rdx, rdx
+    js   .cc_err
 .cc_dirsync_skip:
 
     ; ---- close output fd, close+unlink old input runs, free scratch ----
