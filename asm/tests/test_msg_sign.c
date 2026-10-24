@@ -21,6 +21,15 @@ extern int  msg_verify_core(const char* address, const char* message,
 extern void scalar_to_pubkey(unsigned char pub[33], const unsigned char k[32]);
 extern void sha256d(unsigned char out[32], const void* msg, long len);
 
+/* the signer's refusal (rc 0) on demand, through -Wl,--wrap=wallet_ecdsa_sign */
+#include <stdint.h>
+static int g_sign_refuses = 0;
+extern int __real_wallet_ecdsa_sign(uint64_t r[4], uint64_t s[4], const unsigned char z[32], const unsigned char d[32]);
+int __wrap_wallet_ecdsa_sign(uint64_t r[4], uint64_t s[4], const unsigned char z[32], const unsigned char d[32]){
+    if (g_sign_refuses) return 0;
+    return __real_wallet_ecdsa_sign(r, s, z, d);
+}
+
 static int failures = 0;
 static void ck(const char* lbl, int got, int exp){
     if (got == exp) printf("PASS %s\n", lbl);
@@ -231,6 +240,17 @@ int main(void){
         ck("CRY-7: an ordinary z still signs", wallet_ecdsa_sign(r2, s2, zord, priv), 1);
         ck("CRY-7: ...and gives a DIFFERENT signature than the reduced one",
            memcmp(r, r2, 32) != 0, 1);
+    }
+
+    /* msg_sign and msg_sign_core ignored wallet_ecdsa_sign's return, so a
+     * refused signature (uninitialised r/s) was emitted as a signature */
+    {
+        char rs2[129], b64[96];
+        g_sign_refuses = 1;
+        ck("a refused ECDSA signature fails msg_sign", msg_sign(priv, "hello world", rs2), -1);
+        ck("...and msg_sign_core", msg_sign_core(priv, "hello world", b64), -1);
+        g_sign_refuses = 0;
+        ck("control: with the signer working, msg_sign signs again", msg_sign(priv, "hello world", rs2), 0);
     }
 
     printf("\n%s (%d failures)\n", failures?"TESTS FAILED":"ALL TESTS PASSED", failures);

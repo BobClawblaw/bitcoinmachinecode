@@ -117,6 +117,30 @@ int main(void){
     ck("missing ancestor -> -1", pow_check_bits(50, hdr, get_hdr,0, 0,0,0,MAIN_LIM) == -1);
     ck("genesis is never evaluated -> 1", pow_check_bits(0, hdr, get_hdr,0, 0,0,0,MAIN_LIM) == 1);
 
+    printf("\n== 7: compact encoding of small targets (F1) ==\n");
+    /* Core's GetCompact for a target that fits in 64 bits, written out here
+     * independently of bitcoin_pow_rules.c. A base of exponent 3 and mantissa
+     * m is the target m; a retarget at ts = T/4 (the fast clamp) divides it by
+     * 4, so these walk the encoder through 0-, 1-, 2- and 3-byte results. */
+    {
+        static const u32 mant[] = { 0x000001, 0x000004, 0x00007f, 0x000100, 0x0001fc,
+                                    0x000200, 0x007fff, 0x00ffff, 0x010000, 0x03fffc,
+                                    0x040000, 0x7fffff };
+        int bad = 0;
+        for (unsigned k = 0; k < sizeof mant / sizeof mant[0]; k++){
+            unsigned long long v = mant[k] / 4;
+            int sz = 0; while (sz < 8 && (v >> (8*sz))) sz++;
+            u32 c = sz <= 3 ? (u32)(v << (8*(3-sz))) : (u32)(v >> (8*(sz-3)));
+            if (c & 0x00800000){ c >>= 8; sz++; }
+            u32 core = ((u32)sz << 24) | c;
+            u32 got = pow_retarget_bits(0x03000000u | mant[k], 1209600L/4, MAIN_LIM);
+            if (got != core){ printf("    target %#llx: got %08x, Core %08x\n", v, got, core); bad++; }
+        }
+        ck("every small target encodes as Core's GetCompact does", bad == 0);
+        ck("64 -> 0x01400000 (the F1 counterexample)",
+           pow_retarget_bits(0x03000100, 1209600L/4, MAIN_LIM) == 0x01400000);
+    }
+
     printf("\n%s (%d failures)\n", fails?"TESTS FAILED":"ALL TESTS PASSED", fails);
     return fails?1:0;
 }

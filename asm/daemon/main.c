@@ -3718,7 +3718,9 @@ static void leg_hb_note_block(int k){
 }
 extern long blk_submit_evaluate_ex(const unsigned char*, unsigned long, const unsigned char*, long, int, char*, unsigned long);
 extern long cmpct_recv_cmpctblock(int fd, void* mp, const unsigned char* pl, unsigned long plen, unsigned char* out, unsigned long cap, const unsigned char want[32]);
-extern long cmpct_recv_blocktxn(int fd, const unsigned char* pl, unsigned long plen, unsigned char* out, unsigned long cap);
+extern long cmpct_recv_blocktxn(int fd, const unsigned char* pl, unsigned long plen, unsigned char* out, unsigned long cap, const unsigned char want[32]);
+extern int  hdr_accept_check(void* st, const unsigned char* hdr80);   /* serve_hdrctx.c: 1 accept, 12 punish, 13 refuse unscored */
+extern int  pow_check(const unsigned char hdr[80]);
 static unsigned char g_push_blk[4u << 20];
 static unsigned char g_push_hash[32]; static int g_push_pending = 0, g_push_leg = -1;
 /* a block that arrived through the sweep: on our tip, PoW and consensus
@@ -3745,22 +3747,39 @@ static long dl_store_pushed_block(int k, const unsigned char* blk, unsigned long
     leg_hb_note_block(k);
     return 1;
 }
+/* P2P-2 (audit 2026-10-23): an unsolicited cmpctblock from any outbound leg
+ * went straight to the reconstruction -- a walk of every mempool slot and a
+ * SipHash per entry -- with nothing but "extends our tip" checked first, so
+ * a header with no real work behind it bought a full pool scan. Core
+ * accepts a cmpctblock from any peer too, but only after the header passes
+ * ProcessNewBlockHeaders: PoW (CheckBlockHeader) and the contextual rules
+ * (ContextualCheckBlockHeader: the nBits schedule above all), and a header
+ * that fails them is BLOCK_INVALID_HEADER and the peer is Misbehaving. With
+ * the schedule enforced, a header that reaches the scan costs a real block's
+ * work. Core also calls READ_STATUS_INVALID indexes Misbehaving (P2P-3). A
+ * reconstruction that then fails consensus is NOT scored: Core passes
+ * via_compact_block and exempts it. */
 static long leg_on_cmpctblock(int fd, const unsigned char* pl, unsigned long plen){
     int k = leg_of_fd(fd); if(k < 0 || plen < 88) return -1;
     unsigned char bh[32]; sha256d(bh, pl, 80); g_push_n++;
+    if(!pow_check(pl)){ txr_report_violation_fd(fd, "cmpctblock header: high-hash"); return -1; }
     long h; if(ht_idx && idx_get(ht_idx, bh, &h)){ g_push_skipped_n++; return 0; }
     unsigned char tiph[32];
     if(store_get_tip_hash(store_buf, tiph) != 1 || memcmp(pl + 4, tiph, 32) != 0){ leg_on_block_announce(fd, bh, "a compact block off our tip"); return 0; }   /* behind, or a fork: the pass sorts it out */
+    { int hc = hdr_accept_check(store_buf, pl);
+      if(hc == 12){ txr_report_violation_fd(fd, "cmpctblock header: invalid for its height"); return -1; }
+      if(hc != 1) return 0; }                                           /* time-too-new: refused, not scored (Core BLOCK_TIME_FUTURE) */
     if(!inflight_claim(&g_inflight, bh, k, (long long)time(NULL))) return 0;   /* another leg is fetching it */
     if(g_push_pending){ inflight_release_leg(&g_inflight, g_push_leg); g_push_pending = 0; }   /* an older push never completed */
     long n = cmpct_recv_cmpctblock(fd, txsub_worker_ready() ? txsub_pool() : NULL, pl, plen, g_push_blk, sizeof g_push_blk, bh);
     if(n > 0){ long r = dl_store_pushed_block(k, g_push_blk, (unsigned long)n, bh, "pushed compact block"); inflight_release_leg(&g_inflight, k); return r; }
     if(n == 0){ g_push_pending = 1; g_push_leg = k; memcpy(g_push_hash, bh, 32); return 0; }   /* getblocktxn (or a full-block getdata) is out; the reply comes through the sweep */
+    if(n == CMPCT_INVALID) txr_report_violation_fd(fd, "invalid compact block");
     inflight_release_leg(&g_inflight, k); return -1;
 }
 static long leg_on_blocktxn(int fd, const unsigned char* pl, unsigned long plen){
     int k = leg_of_fd(fd); if(k < 0 || !g_push_pending || k != g_push_leg) return -1;
-    long n = cmpct_recv_blocktxn(fd, pl, plen, g_push_blk, sizeof g_push_blk);
+    long n = cmpct_recv_blocktxn(fd, pl, plen, g_push_blk, sizeof g_push_blk, g_push_hash);
     if(n > 0){ g_push_pending = 0; long r = dl_store_pushed_block(k, g_push_blk, (unsigned long)n, g_push_hash, "pushed compact block + blocktxn"); inflight_release_leg(&g_inflight, k); return r; }
     if(n == 0) return 0;                                                /* the receiver fell back to a full-block getdata: the `block` comes through the sweep */
     g_push_pending = 0; inflight_release_leg(&g_inflight, k); return -1;
@@ -3861,6 +3880,21 @@ static int reorg_probe_host_silent(void){ return legs_heard_within(-1, PROBE_SIL
 static void pass_fail_bookkeeping(int i, long ok, int fail_code, double sync_s){
     anchor_locator(mux_out_loc[i]);
     if(ok == 1){ g_sync_fail_streak[i] = 0; return; }   /* peer had nothing: normal at tip */
+    /* P2P-1/P2P-3 (audit 2026-10-23): the peer sent what Core calls
+     * misbehaviour -- the block it named in its own headers carried a header
+     * Core refuses (where=12: high-hash, bad-diffbits, time-too-old,
+     * bad-version; BLOCK_INVALID_HEADER), or a compact block with bogus
+     * indexes (where=14: READ_STATUS_INVALID). Core's Misbehaving discourages
+     * and disconnects at once; not a strike out of three. In a pass helper
+     * the parent replays this from the report, so the score is taken once. */
+    if((fail_code == 12 || fail_code == 14) && !g_pass_in_child){
+        const char* why = fail_code == 12 ? "invalid block header" : "invalid compact block";
+        if(mux_out_fd[i] >= 0) txr_report_violation_fd(mux_out_fd[i], why);
+        char d[96]; snprintf(d, sizeof d, "%s (where=%d)", why, fail_code);
+        leg_close_ours(i, "misbehaving", d);
+        g_sync_fail_streak[i] = 0;
+        return;
+    }
     if(fail_code == 4 && sync_s < 0.5){   /* EOF before the peer said anything: it hung up */
         leg_close_theirs(i, "EOF on the first read", "(nothing)");
         g_sync_fail_streak[i] = 0;
@@ -4154,6 +4188,7 @@ static int dh_start_slot(const char* host, int out_port, int want_slot){
         }
         (void)!sendmsg(sp[1], &mh, 0);
         if(r.v2_len){ unsigned long off = 0; while(off < r.v2_len){ ssize_t w = write(sp[1], blob + off, r.v2_len - off); if(w <= 0) break; off += (unsigned long)w; } }
+        secure_zero(blob, r.v2_len);   /* CRY-4: the session keys, handed over; this child lingers until the worker has the fd */
         /* Hold on until the worker has the fd: dh_poll writes one byte and
          * closes its end after the recvmsg, and the byte wakes this poll even
          * when another process still holds that end (2026-09-25; the close
@@ -4351,7 +4386,7 @@ static int dh_poll(dh_result_t* out, int* fd_out, char* host_out, size_t hcap){
                 if(out->v2_len > DH_V2_BLOB_CAP){ out->ok = 0; snprintf(out->why, sizeof out->why, "v2 session too large"); }
                 else { unsigned long off = 0; struct pollfd pf = { g_dh[i].sp, POLLIN, 0 };
                        while(off < out->v2_len){ if(poll(&pf, 1, 2000) <= 0) break; ssize_t r = read(g_dh[i].sp, g_dh_v2_blob + off, out->v2_len - off); if(r <= 0) break; off += (unsigned long)r; }
-                       if(off == out->v2_len) g_dh_v2_len = off; else { out->ok = 0; snprintf(out->why, sizeof out->why, "v2 session truncated on the socketpair"); } }
+                       if(off == out->v2_len) g_dh_v2_len = off; else { secure_zero(g_dh_v2_blob, off); out->ok = 0; snprintf(out->why, sizeof out->why, "v2 session truncated on the socketpair"); } }
                 if(!out->ok && *fd_out >= 0){ close(*fd_out); *fd_out = -1; }
             }
         } else if(n != (ssize_t)sizeof *out){ out->ok = 0; snprintf(out->why, sizeof out->why, "helper exited without a result"); }
@@ -4373,12 +4408,14 @@ static int dh_poll(dh_result_t* out, int* fd_out, char* host_out, size_t hcap){
 }
 /* install a helper-dialled leg exactly as the inline fill does */
 static int dh_install_leg(const char* host, int fd, const dh_result_t* r){
-    for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && !strcmp(mux_out_host[k], host)){ close(fd); return 0; }   /* already a leg */
+    for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && !strcmp(mux_out_host[k], host)){ secure_zero(g_dh_v2_blob, g_dh_v2_len); g_dh_v2_len = 0; close(fd); return 0; }   /* already a leg (CRY-4: its session copy goes too) */
     if(r->v2_len){                                     /* the helper's v2 session: ours now, before the first write (2026-09-10) */
         if(g_dh_v2_len != r->v2_len || !bmc_v2_import(fd, g_dh_v2_blob, g_dh_v2_len)){
             fprintf(stderr, "[dial] %s: the helper's v2 session could not be imported -- leg not installed\n", host);
+            secure_zero(g_dh_v2_blob, g_dh_v2_len);
             g_dh_v2_len = 0; close(fd); return 0;
         }
+        secure_zero(g_dh_v2_blob, g_dh_v2_len);   /* CRY-4: imported; the copy goes */
         g_dh_v2_len = 0;
     }
     g_peer_version_len = r->vlen; if(r->vlen) memcpy(g_peer_version_payload, r->vpayload, (size_t)r->vlen);
@@ -5914,19 +5951,31 @@ for(; i < cnt; i++){
              * At the very start of a fetch the parent is whatever the
              * store already holds; within a page it is the window this
              * loop has just appended. hst_median_time_past reads the
-             * store, so it is only consulted for a height whose 11
-             * ancestors are already there -- otherwise the floor is
-             * skipped for that header rather than evaluated against a
-             * window that does not exist. The ceiling and the version
-             * rules need no ancestors and always run. */
+             * store, the window shortened to the ancestors that exist
+             * below height 11 exactly as Core's GetMedianTimePast is.
+             * CON-13 (audit 2026-10-23): the floor used to be skipped
+             * below height 11 and whenever the window could not be read;
+             * Core evaluates it for every header but genesis, and an
+             * unreadable parent window now refuses the page instead of
+             * accepting the header unevaluated. The ceiling and the
+             * version rules need no ancestors and always run; BIP94's
+             * timewarp rule (CON-8) reads the parent header. */
             { long hh = pos + (long)i;
               const char* why = "?";
               unsigned long pmtp = 0;
-              if (hh >= 11) (void)hst_median_time_past(hst, hh - 1, &pmtp);
+              unsigned char prec[112];
+              if (hh >= 1 && (!hst_median_time_past(hst, hh - 1, &pmtp)
+                              || hst_get_at(hst, (unsigned long long)(hh - 1), prec) != 1)){
+                  fprintf(stderr,"[dlc] header at height %ld from %s: the parent's median-time-past window is unreadable -- discarding the page\n",
+                          hh, cand);
+                  dlc_headers_rollback(hst, have0); return -1;
+              }
               unsigned long long hflags =
                   script_flags_for_block((unsigned long long)hh, bh);
+              extern const chainparams_t* g_chainp;
               if(!hdr_contextual_ok(hh, h, pmtp, (long)time(NULL),
-                                    hflags, dlc_bip34_height(), &why)){
+                                    hflags, dlc_bip34_height(), &why)
+                 || (hh >= 1 && !hdr_timewarp_ok(hh, h, prec, g_chainp && g_chainp->enforce_bip94, &why))){
                   fprintf(stderr,"[dlc] header at height %ld from %s rejected: %s -- discarding the page\n",
                           hh, cand, why);
                   dlc_headers_rollback(hst, have0); return -1;
@@ -7639,7 +7688,8 @@ static int leg_pass_start(int i, unsigned budget_s){
         if(mux_out_fd[i] >= 0 && bmc_v2_is_active(mux_out_fd[i])){ long b = bmc_v2_export(mux_out_fd[i], blob, sizeof blob); r.v2_len = b > 0 ? (unsigned long)b : 0; if(b <= 0){ r.fail_code = 99; long nd = bmc_v2_export_need(mux_out_fd[i]); r.v2_need = nd > 0 ? (unsigned long)nd : 0; } }
         unsigned long off = 0; const unsigned char* q = (const unsigned char*)&r;
         while(off < sizeof r){ ssize_t w = write(pp[1], q + off, sizeof r - off); if(w <= 0) _exit(1); off += (unsigned long)w; }
-        off = 0; while(off < r.v2_len){ ssize_t w = write(pp[1], blob + off, r.v2_len - off); if(w <= 0) _exit(1); off += (unsigned long)w; }
+        off = 0; while(off < r.v2_len){ ssize_t w = write(pp[1], blob + off, r.v2_len - off); if(w <= 0){ secure_zero(blob, r.v2_len); _exit(1); } off += (unsigned long)w; }
+        secure_zero(blob, r.v2_len);   /* CRY-4 */
         _exit(0);
     }
     close(pp[1]);
@@ -7733,6 +7783,7 @@ static long leg_pass_poll(int* stored_leg, const char* srcpool[], int nsrc, int 
         if(good && r.v2_len){ if(r.v2_len > DH_V2_BLOB_CAP) good = 0; else while(got < r.v2_len){ ssize_t n = read(g_pass[i].fd, blob + got, r.v2_len - got); if(n <= 0) break; got += (unsigned long)n; } }
         int st = 0; if(!dl_reap_bounded(g_pass[i].pid, &st, 5000)) dl_kill_reap(g_pass[i].pid, &st, "pass helper"); close(g_pass[i].fd); g_pass[i].pid = 0;
         if(!good || (r.v2_len && got != r.v2_len)){
+            secure_zero(blob, got);        /* CRY-4: a partial session is still key material */
             g_pass_crashed++;
             char d[96];
             if(WIFSIGNALED(st)) snprintf(d, sizeof d, "the pass helper died on signal %d without a report", WTERMSIG(st));
@@ -7742,6 +7793,7 @@ static long leg_pass_poll(int* stored_leg, const char* srcpool[], int nsrc, int 
             continue;
         }
         if(r.budget_fired){
+            secure_zero(blob, got);        /* CRY-4 */
             char d[80]; snprintf(d, sizeof d, "the pass exceeded %us%s (where=%d)", g_pass[i].budget_s, g_pass[i].budget_s > (unsigned)DL_BUDGET_SECS ? ", the only-leg budget" : "", r.fail_code);
             leg_close_ours(i, "sync-budget", d);
             mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i] = dh_now_ms() + redial_gap_ms();
@@ -7749,6 +7801,7 @@ static long leg_pass_poll(int* stored_leg, const char* srcpool[], int nsrc, int 
         }
         inflight_release_leg(&g_inflight, i);            /* the announced block's claim, if this pass carried one */
         long n = leg_pass_finish(i, &r, blob, got);
+        secure_zero(blob, got);            /* CRY-4: imported (or refused); the parent's copy of the session keys goes */
         if(n > 0){ stored += n; if(stored_leg) *stored_leg = i; }
         else if(mux_out_fd[i] < 0){ mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i] = dh_now_ms() + redial_gap_ms(); }   /* the bookkeeping closed it */
     }
@@ -9836,6 +9889,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
       g_cmpct_hook_type = (void*)cmpct_getdata_type; g_cmpct_hook_cmpct = (void*)cmpct_recv_cmpctblock; g_cmpct_hook_blocktxn = (void*)cmpct_recv_blocktxn; }
       { extern void* g_cmpct_hook_fallback; extern void cmpct_recv_note_fallback(void); g_cmpct_hook_fallback = (void*)cmpct_recv_note_fallback; }
       { extern void (*txrelay_on_pong)(int, const unsigned char*); txrelay_on_pong = leg_on_pong; inflight_init(&g_inflight); g_block_fetch_hook = (void*)block_fetch_gate; }
+      { extern void* g_block_ctx_hook; g_block_ctx_hook = (void*)hdr_accept_check; }   /* P2P-1: the pass's block passes Core's header rules before it is stored */
       { extern void (*txrelay_on_block_inv)(int, const unsigned char*); extern void (*txrelay_on_headers)(int, const unsigned char*, unsigned long);
         extern long (*txrelay_on_cmpctblock)(int, const unsigned char*, unsigned long); extern long (*txrelay_on_blocktxn)(int, const unsigned char*, unsigned long); extern long (*txrelay_on_block)(int, const unsigned char*, unsigned long);
         txrelay_on_block_inv = leg_on_block_inv; txrelay_on_headers = leg_on_headers; txrelay_on_cmpctblock = leg_on_cmpctblock; txrelay_on_blocktxn = leg_on_blocktxn; txrelay_on_block = leg_on_block;
@@ -11924,7 +11978,7 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
           } else {
               fprintf(stderr, "[rpc] encrypted wallet adopted (locked -- use walletpassphrase)\n");
           }
-          memset(boot_pass, 0, sizeof boot_pass);
+          secure_zero(boot_pass, sizeof boot_pass);   /* CRY-3: a memset of a dead local is deleted at -O2 */
       } else {
     { extern int wallet_store_load(const char*, char*, int, char*, int);
       extern long wallet_mnemonic_seed(unsigned char seed[64], const char* mn,
@@ -11956,7 +12010,12 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
                               "(encrypted? set BMC_WALLET_PASS or walletpassfile=)\n", cand[wi]);
           }
           break;
-      } } } }
+      }
+      /* CRY-3 (audit 2026-10-23): the passphrase stayed in this static for
+       * the life of the process; the copy the provider needs is
+       * g_wallet_bip39pass, which encryptwallet wipes. */
+      secure_zero(wpass, sizeof wpass);
+      secure_zero(mn, sizeof mn); } } }
     /* Hand the RPC layer the SHARED mempool (allocated pre-fork by
      * mempool_configure, written by the worker + inbound children) so
      * getrawmempool/getmempoolinfo report the real pool. All-null when the

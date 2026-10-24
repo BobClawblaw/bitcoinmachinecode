@@ -13,6 +13,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 
 /* core API from asm/wallet_core.c */
 extern void wallet_pubkey(unsigned char pub[33], const unsigned char priv_be[32]);
@@ -677,22 +678,49 @@ static int passfile_read(const char* wallet_path, char* out, int cap) {
     while (l && (out[l-1]=='\n' || out[l-1]=='\r')) out[--l]=0;
     return out[0] ? 1 : 0;
 }
-/* Write the secret to <wallet>.pass with 0600 perms (only if non-empty). */
-static void passfile_write(const char* wallet_path, const char* sec) {
-    if (!sec || !sec[0]) return;
+/* Write the secret to <wallet>.pass with 0600 perms (only if non-empty).
+ * Returns 1 on success (or nothing to write), 0 on failure.
+ *
+ * CRY-6 (audit 2026-10-23): this was fopen("w") + fprintf + chmod 0600. The
+ * file was created 0666 & ~umask (0644 under the usual umask) and the
+ * passphrase written before the chmod, so it was readable by every local
+ * user for that window; an existing .pass kept whatever mode it had through
+ * the write; and fopen followed a symlink planted at the name, writing the
+ * passphrase wherever it pointed. Now: O_NOFOLLOW (a symlink is refused),
+ * created 0600, fchmod 0600 on the fd before the first byte (an existing
+ * file), fsync, as wallet_store.c's store_write_atomic does (WAL-4). */
+static int passfile_write(const char* wallet_path, const char* sec) {
+    if (!sec || !sec[0]) return 1;
     const char* pf = passfile_for(wallet_path);
-    FILE* f = fopen(pf, "w");
-    if (!f) return;
-    fprintf(f, "%s\n", sec);
-    fclose(f);
-    chmod(pf, 0600);
+    int fd = open(pf, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) return 0;
+    int ok = fchmod(fd, 0600) == 0;
+    size_t n = strlen(sec), off = 0;
+    while (ok && off < n){ ssize_t w = write(fd, sec + off, n - off); if (w <= 0) ok = 0; else off += (size_t)w; }
+    if (ok) ok = write(fd, "\n", 1) == 1;
+    if (ok) ok = fsync(fd) == 0;
+    close(fd);
+    return ok;
 }
 
 static int cmd_init(int argc, char** argv) {
     /* create a persistent wallet:
      *   wallet_cli init [passphrase] [path]   (path defaults to data/bmcwallet.dat) */
-    const char* pass = (argc >= 3) ? argv[2] : NULL;
-    const char* path = (argc >= 4) ? argv[3] : default_wallet_path();
+    /* CRY-7 (audit 2026-10-23): the positional arguments were argv[2] and
+     * argv[3] whatever they were, and --force was looked for separately, so
+     * `init --force` encrypted the wallet under the passphrase "--force" (and
+     * stored it in .pass, and used it as the BIP39 passphrase), and
+     * `init <pass> --force` wrote the wallet to a file named "--force".
+     * Flags are taken out first; what is left is [passphrase] [path]. */
+    const char* posv[2] = { NULL, NULL }; int posc = 0, forced = 0;
+    for (int i = 2; i < argc; i++){
+        if (!strcmp(argv[i], "--force")){ forced = 1; continue; }
+        if (posc < 2) posv[posc] = argv[i];
+        posc++;
+    }
+    if (posc > 2){ fprintf(stderr, "init: too many arguments (usage: init [passphrase] [path] [--force])\n"); return 1; }
+    const char* pass = posv[0];
+    const char* path = posv[1] ? posv[1] : default_wallet_path();
 
     /* ---- WAL-5 (audit 2026-09-03): refuse to overwrite an existing wallet.
      *
@@ -710,11 +738,7 @@ static int cmd_init(int argc, char** argv) {
      * Core's equivalent refuses with "Database already exists". --force is
      * the deliberate escape, so scripted re-initialisation is still possible
      * but has to say so. */
-    { const char* fpos = (argc >= 3 && !strcmp(argv[2], "--force")) ? argv[2] : NULL;
-      int forced = 0;
-      for (int i = 2; i < argc; i++) if (!strcmp(argv[i], "--force")) forced = 1;
-      (void)fpos;
-      struct stat wsb;
+    { struct stat wsb;
       if (!forced && stat(path, &wsb) == 0) {
           fprintf(stderr,
               "init: %s already exists -- refusing to overwrite it.\n"
@@ -752,7 +776,9 @@ static int cmd_init(int argc, char** argv) {
         return 1;
     }
     /* persist the secret (dev convenience) in a separate 0600 .pass file */
-    if (pass && pass[0] && !prompted) passfile_write(path, pass);
+    if (pass && pass[0] && !prompted && !passfile_write(path, pass))
+        fprintf(stderr, "init: could not write %s.pass (a symlink there is refused) -- the wallet was\n"
+                        "      created; supply the passphrase with BMC_WALLET_PASS or at the prompt\n", path);
     char addr[64];
     seed_address(mn, pass, addr, (int)sizeof addr, NULL);
     printf("wallet:   %s\n", path);
