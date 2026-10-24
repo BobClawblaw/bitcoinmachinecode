@@ -33,6 +33,7 @@ extern g_peer_wants_addrv2
     extern serve_locator_from
     extern serve_set_locator_store ; daemon/serve_invbounds.c
     extern serve_getheaders_low_work ; daemon/serve_invbounds.c
+    extern serve_cmpct_as_full  ; daemon/serve_hdrctx.c
     extern serve_public_tip     ; 3.1: the CONNECTED tip (daemon/serve_invbounds.c)
 extern node_relay_flag
 extern serve_tx_gate
@@ -1063,6 +1064,41 @@ node_serve_loop:
     test rax, rax
     jle  .gd_miss
     mov  [s_blen_spill], rax
+    ; ---- STO-10, as .gd_block does it: the block read must hash to the one
+    ; requested. A child's index can be a reorg behind (see .gd_block's
+    ; note); this path served whatever block sat at the stale height.
+    mov  [s_ptr], rbx
+    lea  rdi, [s_gdbh]
+    lea  rsi, [sb_buf]
+    call block_hash
+    mov  rbx, [s_ptr]
+    mov  rcx, [s_gdbh]
+    cmp  rcx, [rbx+4]
+    jne  .gd_miss
+    mov  rcx, [s_gdbh+8]
+    cmp  rcx, [rbx+12]
+    jne  .gd_miss
+    mov  rcx, [s_gdbh+16]
+    cmp  rcx, [rbx+20]
+    jne  .gd_miss
+    mov  rcx, [s_gdbh+24]
+    cmp  rcx, [rbx+28]
+    jne  .gd_miss
+    ; Core: compact only for a block at most 5 below a fresh tip, else the
+    ; full block with witness (serve_cmpct_as_full, daemon/serve_hdrctx.c)
+    mov  [s_ptr], rbx
+    mov  rdi, [s_st]
+    call serve_public_tip
+    mov  rdx, rax
+    mov  rdi, [s_st]
+    mov  rsi, [s_fh]
+    call serve_cmpct_as_full
+    mov  rbx, [s_ptr]
+    test eax, eax
+    jz   .gc_compact
+    mov  rax, [s_blen_spill]
+    jmp  .gdb_send_full
+.gc_compact:
     ; ---- NET-14 (audit 2026-09-03): a FRESH nonce per block ----
     ; This was the constant 0x0123456789abcdef, drawn once and then cached in
     ; s_cmpct_nonce for the life of the connection -- so every compact block

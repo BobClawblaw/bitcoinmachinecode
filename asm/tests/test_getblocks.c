@@ -32,6 +32,7 @@ extern int  p2p_read(int, char[12], void*, unsigned, unsigned*);
 extern void idx_init(void* idx, unsigned long slots);
 extern int  idx_put(void* idx, const unsigned char hash[32], long height);
 extern void reorg_set_min_chain_work(const unsigned char be32[32]);
+extern void serve_hdrctx_test_set_now(long t);
 
 /* this connection's permissions, as main.c reports them to the serve gates */
 static unsigned g_perms = 0;
@@ -271,12 +272,14 @@ int main(void){
      * tip) right after it and forgets it (ProcessGetBlockData). That inv is
      * what makes an old-style getblocks sync ask for the next batch. The
      * handler never sent it. Locator [genesis]: the reply is 1..500. Each
-     * block form the getdata path serves is covered: MSG_BLOCK (stripped),
-     * MSG_WITNESS_BLOCK (full) and MSG_CMPCT_BLOCK. */
+     * request form the getdata path serves is covered: MSG_BLOCK (stripped),
+     * MSG_WITNESS_BLOCK (full) and MSG_CMPCT_BLOCK -- which, for blocks 19
+     * and 20 below the tip, Core answers with the full block (more than
+     * MAX_CMPCTBLOCK_DEPTH deep; see "compact only near the tip" below). */
     { static const struct { unsigned type; const char* form; const char* name; } F[] = {
           { 2,          "block",      "MSG_BLOCK" },
           { 0x40000002, "block",      "MSG_WITNESS_BLOCK" },
-          { 4,          "cmpctblock", "MSG_CMPCT_BLOCK" } };
+          { 4,          "block",      "MSG_CMPCT_BLOCK" } };
       for (unsigned k = 0; k < sizeof F / sizeof F[0]; k++){
           int fd = peer_open();
           char lbl[200];
@@ -413,6 +416,47 @@ int main(void){
       cki("no stall: a getheaders and the ping after it are answered within 2 s (log fd -1)",
           pong && count_cmd("headers") == 1 && ms < 2000, 1);
       peer_close(fd); }
+
+    /* ---- getdata(MSG_CMPCT_BLOCK): compact only near a fresh tip ----
+     * Core (ProcessGetBlockData, net_processing.cpp 2463-2477): a compact
+     * block only when CanDirectFetch() (the tip's nTime within 20 block
+     * intervals, 12,000 s, of now) and the block is at most
+     * MAX_CMPCTBLOCK_DEPTH (5) below the tip; otherwise the full block. bmc
+     * built a compact block at any depth. The tip's nTime here is
+     * 1300000000 + 519; the server's clock is set relative to it. */
+    { const long tipt = 1300000000L + TIP;
+      static const struct { long now_off; int h; const char* form; const char* what; } K[] = {
+          { 60,        TIP - 5, "cmpctblock", "fresh tip, block 5 below it: cmpctblock" },
+          { 60,        TIP - 6, "block",      "fresh tip, block 6 below it: the full block" },
+          { 60,        TIP,     "cmpctblock", "fresh tip, the tip itself: cmpctblock" },
+          { 12000 - 1, TIP,     "cmpctblock", "tip 11,999 s old (inside 20 intervals): cmpctblock" },
+          { 12000,     TIP,     "block",      "tip 12,000 s old (CanDirectFetch false): the full block" } };
+      for (unsigned k = 0; k < sizeof K / sizeof K[0]; k++){
+          serve_hdrctx_test_set_now(tipt + K[k].now_off);
+          int fd = peer_open();
+          unsigned char sc[9]; sc[0] = 0; put_u64(sc + 1, 2);
+          p2p_write(fd, "sendcmpct", 9, sc, 9);
+          send_getdata(fd, 4, bhash[K[k].h]);
+          int pong = reply(fd);
+          char lbl[200]; snprintf(lbl, sizeof lbl, "compact near the tip: %s", K[k].what);
+          cki(lbl, pong && got_block_then(K[k].form, K[k].h, 0), 1);
+          peer_close(fd);
+      }
+      /* the compact path serves the block asked for, as the block path does
+       * (STO-10): a hash the child's index maps to a height whose block is
+       * another one (a reorg behind) is notfound, not that block */
+      serve_hdrctx_test_set_now(tipt + 60);
+      unsigned char ghost[32]; memcpy(ghost, bhash[TIP - 1], 32); ghost[0] ^= 0x77;
+      idx_put(idx, ghost, TIP - 1);
+      int fd = peer_open();
+      unsigned char sc[9]; sc[0] = 0; put_u64(sc + 1, 2);
+      p2p_write(fd, "sendcmpct", 9, sc, 9);
+      send_getdata(fd, 4, ghost);
+      int pong = reply(fd);
+      cki("compact near the tip: a stale index entry is notfound, not the block now at that height",
+          pong && count_cmd("cmpctblock") == 0 && count_cmd("block") == 0 && count_cmd("notfound") == 1, 1);
+      peer_close(fd);
+      serve_hdrctx_test_set_now(0); }
 
     /* ---- getheaders below -minimumchainwork: an empty headers message ----
      * Core (GETHEADERS, net_processing.cpp 4410-4422): while the active
