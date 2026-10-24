@@ -83,22 +83,31 @@ int serve_inv_bounds(const unsigned char* pl, long plen,
  *
  * Core's FindForkInGlobalIndex walks every locator entry and serves from the
  * first one on the active chain, falling back to genesis only when none
- * matches, and honours hashStop.
+ * matches -- so an unknown locator is served from height 1, the block after
+ * genesis, not from genesis itself -- and honours hashStop.
  *
  * Payload: version(4) | CompactSize(count) | count*32 locator | 32 stop.
  *
- * Returns 1 with *out_from set to the height to serve FROM, and *out_stop set
- * to the stop hash's height or -1 when the stop hash is zero/unknown.
- * Returns 0 when the message is malformed, which the caller drops. In C for
+ * Returns 1 with *out_from set to the height to serve FROM, or 2 with the same
+ * outputs when the locator is EMPTY (Core's getheaders answers that with the
+ * hashStop header alone; getblocks treats it as 1), and *out_stop set
+ * to the stop hash's height or -1 when the stop hash is zero/unknown. When
+ * out_stop_hash is not NULL the stop hash itself is copied there (getblocks
+ * compares it against each block it walks, as Core does; zeroed on a
+ * malformed message).
+ * Returns 0 when the message is malformed, which the caller drops, and -1
+ * when it is well formed but carries more than MAX_LOCATOR_SZ (101) entries,
+ * for which Core disconnects the peer. In C for
  * the same reason the inv bounds are: a second hand-written varint walk in
  * assembly is how the first one went wrong.
  */
 extern int idx_get(void* idx, const unsigned char hash[32], long* height);
 
 int serve_locator_from(const unsigned char* pl, unsigned long plen, void* htidx,
-                       long* out_from, long* out_stop){
+                       long* out_from, long* out_stop, unsigned char* out_stop_hash){
     *out_from = 0;
     *out_stop = -1;
+    if (out_stop_hash) for (int i = 0; i < 32; i++) out_stop_hash[i] = 0;
     if (!pl || !htidx) return 0;
     if (plen < 4 + 1) return 0;
 
@@ -126,13 +135,26 @@ int serve_locator_from(const unsigned char* pl, unsigned long plen, void* htidx,
     if ((p == 4 + 3 && n < 0xfd) || (p == 4 + 5 && n <= 0xffff) ||
         (p == 4 + 9 && n <= 0xffffffffULL)) return 0;
 
-    /* Core's MAX_LOCATOR_SZ is 101; anything larger is a malformed request.
-     * The bound also stops an absurd count from making the walk expensive. */
-    if (n > 101) return 0;
+    /* Core reads the whole CBlockLocator and the stop hash before it looks
+     * at the count, so the order of these three matters (2026-10-23):
+     *  - above MAX_SIZE (serialize.h 32), ReadCompactSize throws "size too
+     *    large": dropped, like any parse failure;
+     *  - fewer bytes than count*32 + 32: the vector read throws at the end
+     *    of the message: dropped;
+     *  - a complete locator of more than MAX_LOCATOR_SZ (101) entries:
+     *    GETBLOCKS and GETHEADERS both set fDisconnect (net_processing.cpp
+     *    4272, 4399). This returned 0 for it, so the peer was only ignored.
+     * The 101 bound also keeps the walk below cheap. */
+    if (n > 0x02000000ULL) return 0;
     if (plen < p + n * 32u + 32u) return 0;    /* locator + the stop hash */
+    if (n > 101) return -1;
 
     /* first locator entry we know wins, in the order the peer sent them --
-     * they run newest-first, so this is the most recent common block */
+     * they run newest-first, so this is the most recent common block. None
+     * known: FindForkInGlobalIndex returns genesis (validation.cpp 127-143)
+     * and both handlers serve from its successor, height 1. This said 0 and
+     * sent genesis, which no peer lacks (2026-10-23). */
+    *out_from = 1;
     for (unsigned long long i = 0; i < n; i++){
         long h = 0;
         if (idx_get(htidx, pl + p + i * 32u, &h) == 1){ *out_from = h + 1; break; }
@@ -140,10 +162,11 @@ int serve_locator_from(const unsigned char* pl, unsigned long plen, void* htidx,
 
     /* hashStop: all-zero means "as many as you have" */
     { const unsigned char* stop = pl + p + n * 32u;
+      if (out_stop_hash) for (int i = 0; i < 32; i++) out_stop_hash[i] = stop[i];
       int zero = 1;
       for (int i = 0; i < 32; i++) if (stop[i]){ zero = 0; break; }
       if (!zero){ long sh = 0; if (idx_get(htidx, stop, &sh) == 1) *out_stop = sh; } }
-    return 1;
+    return n == 0 ? 2 : 1;
 }
 
 /* ---- 3.1 (UTXO_INLINE_CONNECT_SCOPE, 2026-09-06): the tip bitcoin_serve.asm
