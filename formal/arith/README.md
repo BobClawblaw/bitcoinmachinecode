@@ -6,6 +6,15 @@ not. The code under test is the security integration branch
 `integ/2026-10-23-sec-all` (b841251b; rebased onto fc2c2756 after F1 was
 fixed there). The reference is Core v31.1's source.
 
+**Re-run on main (2026-10-24).** This branch merged main (7260022e, which has
+F1's fix from #424), and `run.sh` was run again on the merge: ALL PASS,
+142 PASS and 0 FAIL in 1669 s (money 222 s, locks 448 s, pow 950 s, limits
+36 s, scriptnum 13 s). P3 holds for every target, the `P3-F1` mutant is
+caught, and `F1 confirm` passes. P4 is still OPEN (see `pow/NOTES.md`). Of
+the files the harnesses read, only `asm/daemon/utxo_live.c` changed between
+95b11830 and main. The times in the group sections below are from the
+earlier runs.
+
 `run.sh` runs every group and exits 0 only if every proof holds, every
 REACH witness is found and every mutant is caught. Each group also has its
 own `run.sh` and notes:
