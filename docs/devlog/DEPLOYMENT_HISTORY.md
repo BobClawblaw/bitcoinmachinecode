@@ -1937,3 +1937,79 @@ that survive. Nothing in them is new measurement.
 - #403 (the B3 reap-at-tip test) and #404 (B12, the header leader switch)
   landed after this deploy without a redeploy. #403 is test-only, and B12 only
   matters for fresh syncs.
+
+## 2026-10-11 20:25Z — `deploy-20261011a`: the memtable hash spread and the coinstats fold ring (PRs #419, #420)
+
+- **What:** `main` at `fc5e56a2`.
+  - #419: a transaction's outputs are spread across the memtable, tombstone
+    and in-block hashes, with a faster copy and compare.
+  - #420: the coinstats fold ring holds a burst of heavy blocks (64k to 512k
+    records), with release/acquire fences in place of two `mfence`s a record.
+  - Docs PR #421.
+
+  The snapshot's provenance was checked on 2026-10-24: a rebuild of
+  `fc5e56a2` matches it byte for byte except the compiler's `__DATE__` and
+  `__TIME__` strings (20:25:09 on Oct 11), a pointer to them, and the build
+  ID. `.text` and `.data` are identical. It carries none of B15 or B16
+  (#423, unmerged).
+- **Started:** 20:25:29Z, at tip 970,980. No verification record was kept for
+  this deploy. The log shows the tip advancing on it from 970,980 to 972,729.
+- **Restarts on the same snapshot** (`bmcbitcoind.live` was not relinked
+  between 10-11 and 10-24):
+  - 20:38Z and 20:39Z on 10-11;
+  - 01:32Z to 01:33Z and 01:40Z on 10-12;
+  - 10-20, stopped 17:34Z and started 19:46Z.
+
+  The reasons are not recorded here.
+- **Stopped:** 2026-10-23 06:56Z at 972,729, by the operator, for the duration
+  of the 2026-10-23 security review and its fixes.
+- **Rollback:** `deploy-20261010a`, or `deploy-20261007a`. The rollback notes
+  under `deploy-20261007a` still apply to everything before it.
+
+## 2026-10-24 00:54Z — `deploy-20261024a`: the 2026-10-23 security review and its fixes (PRs #424–#436)
+
+- **Why:** the 2026-10-23 review found 9 HIGH findings, five of them
+  consensus splits from Core. Formal verification then found a critical
+  UTXO-store durability hole (STO-E), and two boot checks that had been dead
+  since 2026-09-05. Production was down from 10-23 06:56Z until this deploy.
+  The full account is `docs/history/2026-10-23-the-review/`.
+- **What:** `main` at `d8d7f32c`.
+  - The twelve fix PRs #424–#435, merged in order. Their code tree is
+    byte-identical to the integration build that passed the full gate (474
+    tests, gate-log audit clean) and a from-genesis mainnet sync: PASS at
+    972,848, MuHash identical to Core v31.1's.
+  - Docs PR #436.
+
+  Built in a clean worktree at the merge commit, with no compiler warnings.
+- **Helpers replaced as well.** The daemon execs its index builders from
+  beside the resolved binary, and main changes several of them (the addr_hist
+  merge, the index-run header checks, exec with fds 0–2 only).
+  `bmc_build_tx_index`, `bmc_build_txospender_index`, `bmc_build_addr_hist`,
+  `bmc_build_coinstats_hist` and `bmc_merge_index_runs` in `asm/daemon/` are
+  main's. The ones they replaced are kept as `<name>.pre-20261024a`.
+- **Wallet** files were copied before the deploy, with the daemon stopped,
+  since the wallet code changed (CRY-1..8).
+- **Started:** 00:54:45Z, at tip 972,729. `bitcoin.conf` loaded with no error
+  under the new Core-grammar reader (18 settings).
+- **Verified live:**
+  - Caught up to the oracle's tip, 972,854, by 00:57:03Z, hash-identical.
+  - New block 972,855 applied at 01:07:50Z, hash-identical to the Core v31.1
+    oracle's (`00000000000000000001ee4e278473b9d30b596b458d53e8075348a3bcdd8e5a`).
+    The heartbeat then read `tip=972855`.
+  - `NRestarts=0` and `active` at 19 minutes; no `[crash]` line.
+  - fd count flat at 139–140 across facade traffic.
+  - mempool backend and Esplora facade traffic back. The backend logged errors
+    only while the node was starting (00:55Z).
+- **Behaviour changes** are listed in Appendix B of the review. In short:
+  - config errors are fatal at boot;
+  - Tor needs SAFECOOKIE;
+  - no wildcard CORS on Esplora;
+  - unknown-witness spends are non-standard;
+  - no reorg depth cap;
+  - a store that will not reload halts the boot;
+  - about 2 extra syncs per block at the tip.
+- **Rollback:** relink to `deploy-20261011a` AND restore the five
+  `.pre-20261024a` helpers. Rolling back reopens every finding fixed here,
+  including the dead UTX-2/UTX-6 boot checks. Going by the diff, no on-disk
+  format changed: the store changes add syncs, order them and tighten the
+  readers. A boot of 11a on a datadir this build has written was not tested.
