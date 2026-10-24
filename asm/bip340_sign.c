@@ -9,6 +9,7 @@
  * storage: it links and runs on any thread. */
 #include <string.h>
 #include <stdint.h>
+#include "daemon/secure_zero.h"
 typedef unsigned char u8;
 extern void sha256_full(u8 out[32], const void* msg, unsigned long len);
 extern void point_scalar_mul_gen_ct(uint64_t r[12], const uint64_t k[4]);   /* k*G, constant time: the cmov-scanned comb (2026-09-28), 9 us for the ladder's 52 */
@@ -17,6 +18,9 @@ extern void fe_sqr(uint64_t r[4], const uint64_t a[4]);
 extern void fe_inv(uint64_t r[4], const uint64_t a[4]);
 extern void sc_add(uint64_t r[4], const uint64_t a[4], const uint64_t b[4]);
 extern void sc_mul(uint64_t r[4], const uint64_t a[4], const uint64_t b[4]);
+extern void fe_sub(uint64_t r[4], const uint64_t a[4], const uint64_t b[4]);
+extern void point_scalar_mul(uint64_t r[12], const uint64_t xy[8], const uint64_t k[4]);   /* variable time: public inputs only */
+extern void point_add(uint64_t r[12], const uint64_t p[12], const uint64_t q[12]);
 
 static const uint64_t N_LIMBS[4] = { 0xBFD25E8CD0364141ULL, 0xBAAEDCE6AF48A03BULL, 0xFFFFFFFFFFFFFFFEULL, 0xFFFFFFFFFFFFFFFFULL };
 
@@ -32,18 +36,53 @@ static int limb_cmp(const uint64_t a[4], const uint64_t b[4]){
     return 0;
 }
 static int is_zero(const uint64_t a[4]){ return (a[0] | a[1] | a[2] | a[3]) == 0; }
-/* r = a mod n for a < 2n (a sha256 output or a 256-bit key) */
-static void reduce_n(uint64_t r[4], const uint64_t a[4]){
-    memcpy(r, a, 32);
-    if (limb_cmp(r, N_LIMBS) >= 0){
-        uint64_t c = 0;
-        for (int i = 0; i < 4; i++){ uint64_t s = r[i] - N_LIMBS[i] - c; c = (r[i] < N_LIMBS[i] + c) ? 1 : 0; r[i] = s; }
-    }
-}
-/* r = n - a  (a in [1, n)) */
-static void neg_n(uint64_t r[4], const uint64_t a[4]){
+/* ---------------------------------------------------------------- CRY-2
+ * (audit 2026-10-23) neg_n computed each limb's borrow as
+ * `N_LIMBS[i] < a[i] + c`. When a[i] is all ones and c is 1, a[i] + c wraps
+ * to 0 and the borrow is lost, so n - a came out wrong by 2^(64(i+1)). For a
+ * private key or nonce with an all-ones limb (one in ~2^64 per limb, but any
+ * caller can choose one) bip340_sign returned 1 with a signature that does
+ * not verify. reduce_n has the same expression; there the only wrapping limb
+ * is the top one, whose borrow-out is discarded, so its value was right, but
+ * it and the parity negations branched on secret data.
+ *
+ * Both now subtract through a 128-bit difference, whose high half is the
+ * borrow and cannot wrap, and select results with masks instead of
+ * branches. libsecp256k1's secp256k1_scalar_negate / _cond_negate have the
+ * same shape. */
+typedef unsigned __int128 u128;
+/* r = a - b over four limbs; returns the borrow out (0 or 1) */
+static uint64_t sub4(uint64_t r[4], const uint64_t a[4], const uint64_t b[4]){
     uint64_t c = 0;
-    for (int i = 0; i < 4; i++){ uint64_t s = N_LIMBS[i] - a[i] - c; c = (N_LIMBS[i] < a[i] + c) ? 1 : 0; r[i] = s; }
+    for (int i = 0; i < 4; i++){
+        u128 t = (u128)a[i] - b[i] - c;
+        r[i] = (uint64_t)t;
+        c = (uint64_t)(t >> 64) & 1;
+    }
+    return c;
+}
+/* r = mask ? a : b, mask all ones or zero */
+static void sel4(uint64_t r[4], uint64_t mask, const uint64_t a[4], const uint64_t b[4]){
+    for (int i = 0; i < 4; i++) r[i] = (a[i] & mask) | (b[i] & ~mask);
+}
+/* r = a mod n for a < 2^256 (< 2n): a sha256 output or a 256-bit key */
+static void reduce_n(uint64_t r[4], const uint64_t a[4]){
+    uint64_t s[4];
+    uint64_t borrow = sub4(s, a, N_LIMBS);     /* 1 iff a < n */
+    sel4(r, borrow - 1, s, a);                 /* no borrow -> a - n */
+}
+/* r = flag ? n - a : a, for a in [1, n); flag 0 or 1. No secret branch. */
+static void cneg_n(uint64_t r[4], const uint64_t a[4], int flag){
+    uint64_t neg[4];
+    (void)sub4(neg, N_LIMBS, a);
+    sel4(r, (uint64_t)0 - (uint64_t)(flag & 1), neg, a);
+}
+/* affine (x, y) of a Jacobian point with Z != 0 */
+static void jac_to_affine(uint64_t x[4], uint64_t y[4], const uint64_t J[12]){
+    uint64_t z2[4], z3[4], zi2[4], zi3[4];
+    fe_sqr(z2, J + 8); fe_mul(z3, z2, J + 8);
+    fe_inv(zi2, z2); fe_inv(zi3, z3);
+    fe_mul(x, J, zi2); fe_mul(y, J + 4, zi3);
 }
 /* affine (x, y-parity) of a Jacobian point */
 static void jac_to_x_parity(u8 x32[32], int* odd, const uint64_t J[12]){
@@ -82,6 +121,35 @@ static int tagged(u8 out[32], const char* tag, const u8* a, unsigned long al, co
     return 1;
 }
 
+/* ---------------------------------------------------------------- CRY-2
+ * Verify-after-sign: the signer checks its own output before returning it,
+ * and fails closed. Core's libsecp256k1 does not (it relies on its proofs and
+ * tests); this node's arithmetic is its own, and a wrong signature that a
+ * wallet broadcasts is at best a stuck spend. The check is BIP340 Verify's
+ * equation with the values the signer already has: P = (px, even y) from
+ * the public key it computed, R' = s*G - e*P, and R' must be finite with
+ * even y and x == r. Only public values (s, e, P) enter the variable-time
+ * multiply. */
+static int self_verify(const uint64_t Pjac[12], const u8 rx[32], const uint64_t e[4], const uint64_t s[4]){
+    static const uint64_t ZERO[4] = {0, 0, 0, 0};
+    uint64_t pxy[8], sG[12], eP[12], Rv[12], ne[4], x[4], y[4];
+    jac_to_affine(pxy, pxy + 4, Pjac);
+    if (pxy[4] & 1) fe_sub(pxy + 4, ZERO, pxy + 4);    /* lift_x: the even-y point (public) */
+    point_scalar_mul_gen_ct(sG, s);
+    if (is_zero(e)){
+        memcpy(Rv, sG, sizeof Rv);
+    } else {
+        (void)sub4(ne, N_LIMBS, e);                    /* n - e, e in [1, n) */
+        point_scalar_mul(eP, pxy, ne);
+        point_add(Rv, sG, eP);
+    }
+    if (is_zero(Rv + 8)) return 0;                     /* infinity */
+    jac_to_affine(x, y, Rv);
+    if (y[0] & 1) return 0;
+    u8 xb[32]; limbs_to_be32(xb, x);
+    return memcmp(xb, rx, 32) == 0;
+}
+
 /* x-only public key of a private key, and whether its Y was odd (the
  * caller negates the key for signing then, as BIP340 does) */
 int bip340_pubkey(u8 xonly[32], const u8 priv_be[32]){
@@ -95,42 +163,57 @@ int bip340_pubkey(u8 xonly[32], const u8 priv_be[32]){
 /* BIP340 Sign(sk, m, a): 64-byte signature. Messages may be any length.
  * Returns 1, or 0 for an invalid key or a (negligible) zero nonce. */
 int bip340_sign(u8 sig[64], const u8* msg, unsigned long msglen, const u8 priv_be[32], const u8 aux[32]){
-    uint64_t d0[4], d[4], J[12]; be32_to_limbs(d0, priv_be);
-    if (is_zero(d0) || limb_cmp(d0, N_LIMBS) >= 0) return 0;
+    /* every secret lives in this frame and is wiped on every exit (CRY-3) */
+    uint64_t d0[4], d[4], J[12], k0r[4], k0[4], k[4], R[12], er[4], e[4], ed[4], s[4];
+    u8 px[32], dbe[32], t[32], kh[32], rx[32], eh[32];
+    int podd, rodd, ok = 0;
+    be32_to_limbs(d0, priv_be);
+    if (is_zero(d0) || limb_cmp(d0, N_LIMBS) >= 0) goto out;
     point_scalar_mul_gen_ct(J, d0);
-    u8 px[32]; int podd; jac_to_x_parity(px, &podd, J);
-    if (podd) neg_n(d, d0); else memcpy(d, d0, 32);
-    u8 dbe[32]; limbs_to_be32(dbe, d);
+    jac_to_x_parity(px, &podd, J);
+    cneg_n(d, d0, podd);
+    limbs_to_be32(dbe, d);
     /* t = d xor TaggedHash("BIP0340/aux", a) */
-    u8 t[32]; if (!tagged(t, "BIP0340/aux", aux, 32, NULL, 0, NULL, 0)) return 0;
+    if (!tagged(t, "BIP0340/aux", aux, 32, NULL, 0, NULL, 0)) goto out;
     for (int i = 0; i < 32; i++) t[i] ^= dbe[i];
     /* k0 = int(TaggedHash("BIP0340/nonce", t || P || m)) mod n */
-    u8 kh[32]; if (!tagged(kh, "BIP0340/nonce", t, 32, px, 32, msg, msglen)) return 0;
-    uint64_t k0r[4], k0[4]; be32_to_limbs(k0r, kh); reduce_n(k0, k0r);
-    if (is_zero(k0)) return 0;
-    uint64_t R[12]; point_scalar_mul_gen_ct(R, k0);
-    u8 rx[32]; int rodd; jac_to_x_parity(rx, &rodd, R);
-    uint64_t k[4]; if (rodd) neg_n(k, k0); else memcpy(k, k0, 32);
+    if (!tagged(kh, "BIP0340/nonce", t, 32, px, 32, msg, msglen)) goto out;
+    be32_to_limbs(k0r, kh); reduce_n(k0, k0r);
+    if (is_zero(k0)) goto out;
+    point_scalar_mul_gen_ct(R, k0);
+    jac_to_x_parity(rx, &rodd, R);
+    cneg_n(k, k0, rodd);
     /* e = int(TaggedHash("BIP0340/challenge", R || P || m)) mod n */
-    u8 eh[32]; if (!tagged(eh, "BIP0340/challenge", rx, 32, px, 32, msg, msglen)) return 0;
-    uint64_t er[4], e[4]; be32_to_limbs(er, eh); reduce_n(e, er);
+    if (!tagged(eh, "BIP0340/challenge", rx, 32, px, 32, msg, msglen)) goto out;
+    be32_to_limbs(er, eh); reduce_n(e, er);
     /* s = (k + e*d) mod n */
-    uint64_t ed[4], s[4]; sc_mul(ed, e, d); sc_add(s, k, ed);
-    memcpy(sig, rx, 32); limbs_to_be32(sig + 32, s);
-    return 1;
+    sc_mul(ed, e, d); sc_add(s, k, ed);
+    ok = self_verify(J, rx, e, s);                     /* CRY-2: fail closed */
+    if (ok){ memcpy(sig, rx, 32); limbs_to_be32(sig + 32, s); }
+out:
+    if (!ok) memset(sig, 0, 64);
+    secure_zero(d0, sizeof d0); secure_zero(d, sizeof d); secure_zero(dbe, sizeof dbe);
+    secure_zero(t, sizeof t); secure_zero(kh, sizeof kh); secure_zero(k0r, sizeof k0r);
+    secure_zero(k0, sizeof k0); secure_zero(k, sizeof k); secure_zero(R, sizeof R);
+    secure_zero(ed, sizeof ed);
+    return ok;
 }
 
 /* the BIP341 key-path signing key for internal key `priv` under `tweak`
  * (TapTweak(P || root)): d' = (d if P even else n-d) + t mod n. Returns 1,
  * or 0 for a bad key/tweak. */
 int bip340_tweak_privkey(u8 out_priv[32], const u8 priv_be[32], const u8 tweak[32]){
-    uint64_t d0[4], d[4], J[12], t[4], r[4]; be32_to_limbs(d0, priv_be);
-    if (is_zero(d0) || limb_cmp(d0, N_LIMBS) >= 0) return 0;
+    uint64_t d0[4], d[4], J[12], t[4], r[4]; int ok = 0;
+    be32_to_limbs(d0, priv_be);
+    if (is_zero(d0) || limb_cmp(d0, N_LIMBS) >= 0) goto out;
     point_scalar_mul_gen_ct(J, d0);
     u8 px[32]; int podd; jac_to_x_parity(px, &podd, J);
-    if (podd) neg_n(d, d0); else memcpy(d, d0, 32);
-    be32_to_limbs(t, tweak); if (limb_cmp(t, N_LIMBS) >= 0) return 0;
-    sc_add(r, d, t); if (is_zero(r)) return 0;
+    cneg_n(d, d0, podd);
+    be32_to_limbs(t, tweak); if (limb_cmp(t, N_LIMBS) >= 0) goto out;
+    sc_add(r, d, t); if (is_zero(r)) goto out;
     limbs_to_be32(out_priv, r);
-    return 1;
+    ok = 1;
+out:
+    secure_zero(d0, sizeof d0); secure_zero(d, sizeof d); secure_zero(r, sizeof r);
+    return ok;
 }

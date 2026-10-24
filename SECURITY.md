@@ -46,6 +46,15 @@ way to reach JSON-RPC or the wallet through them is in scope.
 Out of scope: the harnesses and oracles under `validation/` and `scripts/`,
 and third-party services run beside the node (mempool.space, BlockYard).
 
+## Known weaknesses in old files
+
+Wallet mnemonic files in the legacy `BMCWAL v2` format, and extra-key blobs
+in the same legacy shape, can be decrypted without the passphrase (CRY-1,
+audit 2026-10-23). No build since 2026-09-02 writes them; current builds
+still read them to migrate them, and warn on every open. Treat any such file
+and its copies as plaintext and move the funds: see "Legacy BMCWAL v2 wallet
+files" in `docs/OPERATIONS.md`.
+
 ## Disclosure
 
 Reports are handled on the private advisory. The fix is developed there or

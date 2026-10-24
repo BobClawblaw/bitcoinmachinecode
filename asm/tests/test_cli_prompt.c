@@ -91,6 +91,42 @@ int main(void){
       snprintf(cmd, sizeof cmd, "cd %s && printf 's3cret\\n' | %s getaddress 2>&1", d2, WCLI);
       rc = run_sh(cmd, out, sizeof out);
       ck("it opens with the typed passphrase", rc == 0 && strstr(out, "bc1q") != NULL); }
+    printf("== CRY-7: init's flags are not positional arguments ==\n");
+    { char d3[900]; snprintf(d3, sizeof d3, "%s/force", DIR); mkdir(d3, 0700); snprintf(path, sizeof path, "%s/data", d3); mkdir(path, 0700);
+      snprintf(cmd, sizeof cmd, "cd %s && %s init --force </dev/null 2>&1", d3, WCLI);
+      rc = run_sh(cmd, out, sizeof out);
+      ck("`init --force` (no passphrase, no terminal) succeeds", rc == 0 && strstr(out, "mnemonic:") != NULL);
+      snprintf(path, sizeof path, "%s/data/bmcwallet.dat", d3);
+      snprintf(cmd, sizeof cmd, "head -c 9 %s", path); run_sh(cmd, out, sizeof out);
+      ck("...and writes a PLAINTEXT wallet, not one encrypted under \"--force\"", !strncmp(out, "BMCWAL v1", 9));
+      snprintf(path, sizeof path, "%s/data/bmcwallet.dat.pass", d3);
+      ck("...with no .pass file holding \"--force\"", access(path, F_OK) != 0);
+      snprintf(cmd, sizeof cmd, "cd %s && %s init pw7 --force </dev/null 2>&1", d3, WCLI);
+      rc = run_sh(cmd, out, sizeof out);
+      snprintf(path, sizeof path, "%s/--force", d3);
+      ck("`init <pass> --force` does not write a wallet named \"--force\"", rc == 0 && access(path, F_OK) != 0);
+      snprintf(path, sizeof path, "%s/data/bmcwallet.dat", d3);
+      snprintf(cmd, sizeof cmd, "head -c 9 %s", path); run_sh(cmd, out, sizeof out);
+      ck("...it replaced the default wallet, encrypted", !strncmp(out, "BMCWAL v3", 9));
+      snprintf(cmd, sizeof cmd, "cd %s && printf 'pw7\\n' | BMC_WALLET_PASS= %s getaddress 2>&1", d3, WCLI);
+      rc = run_sh(cmd, out, sizeof out);
+      ck("...under the passphrase given, \"pw7\"", rc == 0 && strstr(out, "bc1q") != NULL);
+      /* CRY-6: the .pass file is 0600 and a symlink at its name is refused */
+      snprintf(path, sizeof path, "%s/data/bmcwallet.dat.pass", d3);
+      struct stat psb;
+      ck("CRY-6 the .pass file is mode 0600", stat(path, &psb) == 0 && (psb.st_mode & 0777) == 0600);
+      char d4[900]; snprintf(d4, sizeof d4, "%s/link", DIR); mkdir(d4, 0700); snprintf(path, sizeof path, "%s/data", d4); mkdir(path, 0700);
+      char victim[1000]; snprintf(victim, sizeof victim, "%s/victim.txt", d4);
+      FILE* vf = fopen(victim, "w"); if (vf){ fputs("untouched\n", vf); fclose(vf); }
+      chmod(victim, 0644);
+      snprintf(path, sizeof path, "%s/data/bmcwallet.dat.pass", d4);
+      ck("CRY-6 (setup) a symlink planted at the .pass name", symlink(victim, path) == 0);
+      snprintf(cmd, sizeof cmd, "cd %s && %s init pw-cry6-secret </dev/null 2>&1", d4, WCLI);
+      rc = run_sh(cmd, out, sizeof out);
+      ck("CRY-6 init still creates the wallet", rc == 0 && strstr(out, "mnemonic:") != NULL);
+      ck("CRY-6 ...and says the .pass file was not written", strstr(out, "could not write") != NULL);
+      snprintf(cmd, sizeof cmd, "cat %s", victim); run_sh(cmd, out, sizeof out);
+      ck("CRY-6 the symlink's target did NOT receive the passphrase", strstr(out, "pw-cry6-secret") == NULL && strstr(out, "untouched") != NULL); }
     printf("== bmc_cli: -stdinwalletpassphrase / -stdin (Core semantics) ==\n");
     snprintf(cmd, sizeof cmd, "printf 'hunter2\\n' | BMC_CLI_DRYRUN=1 %s -stdinwalletpassphrase -rpcport=1 -rpcuser=u -rpcpassword=p walletpassphrase 60 2>&1", BCLI);
     rc = run_sh(cmd, out, sizeof out);

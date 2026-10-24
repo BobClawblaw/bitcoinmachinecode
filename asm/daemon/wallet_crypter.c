@@ -122,7 +122,7 @@ void wcrypt_derive_legacy96(const char* pass, long passlen, const u8 salt[WC_SAL
 }
 
 static int wc_rand(u8* out, long n){
-    int fd = open("/dev/urandom", O_RDONLY);
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
     if (fd < 0) return 0;
     long got = 0;
     while (got < n){ long r = read(fd, out + got, n - got); if (r <= 0){ close(fd); return 0; } got += r; }
@@ -139,11 +139,18 @@ long wcrypt_seal(const char* pass, long passlen, const u8* seed, long seedlen,
     u8 kek[32], kek_iv[16];
     wcrypt_derive(pass, passlen, salt, WC_ITERS, kek, kek_iv);
 
+    /* CRY-3 (audit 2026-10-23): the wipe at the end was a plain memset of
+     * dead locals, which gcc -O2 deletes, and the early returns skipped it.
+     * Every exit now goes through wc_seal_wipe. */
+#define wc_seal_wipe() do { secure_zero(mk, sizeof mk); secure_zero(kek, sizeof kek); \
+                            secure_zero(kek_iv, sizeof kek_iv); } while (0)
     static u8 wrapped[64];
     long wl = aes256_cbc_encrypt(kek, kek_iv, mk, WC_MKLEN, wrapped, sizeof wrapped);
-    if (wl < 0) return -1;
+    if (wl < 0){ wc_seal_wipe(); return -1; }
     static u8 seedct[4096];
     long sl = aes256_cbc_encrypt(mk, seed_iv, seed, seedlen, seedct, sizeof seedct);
+    wc_seal_wipe();
+#undef wc_seal_wipe
     if (sl < 0) return -1;
 
     u8* p = out;
@@ -158,8 +165,6 @@ long wcrypt_seal(const char* pass, long passlen, const u8* seed, long seedlen,
     u32 sl32 = (u32)sl; memcpy(p, &sl32, 4); p += 4;
     memcpy(p, seedct, sl); p += sl;
     sha256_full(p, out, (unsigned long)(p - out)); p += 32;
-    /* wipe secrets */
-    memset(mk, 0, sizeof mk); memset(kek, 0, sizeof kek);
     return p - out;
 }
 
@@ -172,21 +177,38 @@ int wcrypt_is_encrypted(const u8* blob, long len){
     return memcmp(want, blob + len - 32, 32) == 0;
 }
 
-/* Recover the seed bytes from the container under `pass`.
- * Returns seed length, 0 = wrong passphrase, -1 = malformed. */
-long wcrypt_open(const char* pass, long passlen, const u8* blob, long len,
-                 u8* seed_out, long cap){
-    if (!wcrypt_is_encrypted(blob, len)) return -1;
+/* ---------------------------------------------------------------- CRY-5
+ * (audit 2026-10-23) wcrypt_open and wcrypt_rewrap each parsed the container
+ * by hand, and only wcrypt_open applied the WAL-16 bound on the stored KDF
+ * count (and checked that the seed ciphertext fits inside the blob). A
+ * tampered container with iters = 0xffffffff therefore still wedged the RPC
+ * thread for hours through walletpassphrasechange, and rewrap read sl and
+ * the seed ciphertext without checking either against the blob's length.
+ * Both now go through this one parser, with the same bounds. Returns 1, or
+ * 0 for a malformed or out-of-bounds container. */
+typedef struct {
+    const u8* salt;        /* WC_SALT bytes */
+    u32 iters;
+    unsigned short wl;     /* wrapped master key length, 1..64 */
+    const u8* wrapped;
+    const u8* seed_iv;     /* 16 bytes */
+    u32 sl;
+    const u8* seedct;
+} wc_container_t;
+
+static int wc_parse(const u8* blob, long len, wc_container_t* c){
+    if (!wcrypt_is_encrypted(blob, len)) return 0;
+    const u8* end = blob + len - 32;          /* the checksum follows the body */
     const u8* p = blob + 8;
-    u8 salt[WC_SALT]; memcpy(salt, p, WC_SALT); p += WC_SALT;
-    u32 iters; memcpy(&iters, p, 4); p += 4;
-    unsigned short wl; memcpy(&wl, p, 2); p += 2;
-    if (wl == 0 || wl > 64 || p + wl + 16 + 4 > blob + len - 32) return -1;
-    const u8* wrapped = p; p += wl;
-    u8 seed_iv[16]; memcpy(seed_iv, p, 16); p += 16;
-    u32 sl; memcpy(&sl, p, 4); p += 4;
-    if (p + sl > blob + len - 32) return -1;
-    const u8* seedct = p;
+    c->salt = p; p += WC_SALT;
+    memcpy(&c->iters, p, 4); p += 4;
+    memcpy(&c->wl, p, 2); p += 2;
+    if (c->wl == 0 || c->wl > 64 || (long)(end - p) < (long)c->wl + 16 + 4) return 0;
+    c->wrapped = p; p += c->wl;
+    c->seed_iv = p; p += 16;
+    memcpy(&c->sl, p, 4); p += 4;
+    if ((unsigned long)(end - p) < (unsigned long)c->sl) return 0;
+    c->seedct = p;
 
     /* WAL-16 (audit 2026-09-03): `iters` comes straight out of the FILE. An
      * attacker with write access to bmcwallet.enc could set it to 0xffffffff
@@ -200,21 +222,33 @@ long wcrypt_open(const char* pass, long passlen, const u8* blob, long len,
      * silently downgraded: deriving with a DIFFERENT count than the file
      * states would produce the wrong key and report it as a wrong
      * passphrase, which is a far more confusing failure than saying so. */
-    if (iters == 0 || iters > WC_ITERS_MAX){
+    if (c->iters == 0 || c->iters > WC_ITERS_MAX){
         fprintf(stderr,
             "[wallet]  refusing this container: it states %u KDF iterations, outside the\n"
             "[wallet]           accepted range 1..%u. A tampered file can make unlocking\n"
             "[wallet]           spin for hours; if this container is genuine, re-encrypt it\n"
             "[wallet]           with a build that wrote a sane count.\n",
-            (unsigned)iters, (unsigned)WC_ITERS_MAX);
-        return -1;
+            (unsigned)c->iters, (unsigned)WC_ITERS_MAX);
+        return 0;
     }
+    return 1;
+}
+
+/* Recover the seed bytes from the container under `pass`.
+ * Returns seed length, 0 = wrong passphrase, -1 = malformed. */
+long wcrypt_open(const char* pass, long passlen, const u8* blob, long len,
+                 u8* seed_out, long cap){
+    wc_container_t c;
+    if (!wc_parse(blob, len, &c)) return -1;
+    const u8* salt = c.salt; u32 iters = c.iters; unsigned short wl = c.wl;
+    const u8* wrapped = c.wrapped; const u8* seed_iv = c.seed_iv;
+    u32 sl = c.sl; const u8* seedct = c.seedct;
 
     u8 kek[32], kek_iv[16];
     wcrypt_derive(pass, passlen, salt, iters, kek, kek_iv);
     u8 mk[64];
     long mkl = aes256_cbc_decrypt(kek, kek_iv, wrapped, wl, mk, sizeof mk);
-    memset(kek, 0, sizeof kek);
+    secure_zero(kek, sizeof kek); secure_zero(kek_iv, sizeof kek_iv);
     if (mkl != WC_MKLEN && passlen > 96){
         /* WAL-7 compatibility: this container may have been written before
          * the truncation was fixed, in which case its key came from the first
@@ -225,10 +259,10 @@ long wcrypt_open(const char* pass, long passlen, const u8* blob, long len,
          * Only for passlen > 96: at or below it the two derivations are
          * identical, so a failure there is simply a wrong passphrase and
          * retrying would be pointless work on every bad attempt. */
-        memset(mk, 0, sizeof mk);
+        secure_zero(mk, sizeof mk);
         wcrypt_derive_legacy96(pass, passlen, salt, iters, kek, kek_iv);
         mkl = aes256_cbc_decrypt(kek, kek_iv, wrapped, wl, mk, sizeof mk);
-        memset(kek, 0, sizeof kek);
+        secure_zero(kek, sizeof kek); secure_zero(kek_iv, sizeof kek_iv);
         if (mkl == WC_MKLEN)
             fprintf(stderr,
                 "[wallet]  WARNING: this wallet's key was derived from only the first 96 bytes\n"
@@ -236,9 +270,9 @@ long wcrypt_open(const char* pass, long passlen, const u8* blob, long len,
                 "[wallet]           the 96th byte is currently ignored. Re-encrypt the wallet to\n"
                 "[wallet]           use the whole passphrase.\n");
     }
-    if (mkl != WC_MKLEN){ memset(mk, 0, sizeof mk); return 0; }   /* wrong passphrase: pad check failed */
+    if (mkl != WC_MKLEN){ secure_zero(mk, sizeof mk); return 0; }   /* wrong passphrase: pad check failed */
     long out = aes256_cbc_decrypt(mk, seed_iv, seedct, sl, seed_out, cap);
-    memset(mk, 0, sizeof mk);
+    secure_zero(mk, sizeof mk);
     if (out < 0) return 0;   /* master key wrong (shouldn't happen if wrap decrypted) */
     return out;
 }
@@ -247,32 +281,27 @@ long wcrypt_open(const char* pass, long passlen, const u8* blob, long len,
  * Returns new blob length, 0 = old passphrase wrong, -1 = malformed/cap. */
 long wcrypt_rewrap(const char* oldp, long oldlen, const char* newp, long newlen,
                    const u8* blob, long len, u8* out, long cap){
-    if (!wcrypt_is_encrypted(blob, len)) return -1;
+    wc_container_t c;
+    if (!wc_parse(blob, len, &c)) return -1;      /* CRY-5: the same bounds as wcrypt_open */
     /* recover the master key via the old passphrase */
-    const u8* p = blob + 8;
-    u8 salt[WC_SALT]; memcpy(salt, p, WC_SALT); p += WC_SALT;
-    u32 iters; memcpy(&iters, p, 4); p += 4;
-    unsigned short wl; memcpy(&wl, p, 2); p += 2;
-    if (wl == 0 || wl > 64) return -1;
-    const u8* wrapped = p;
     u8 kek[32], kek_iv[16];
-    wcrypt_derive(oldp, oldlen, salt, iters, kek, kek_iv);
+    wcrypt_derive(oldp, oldlen, c.salt, c.iters, kek, kek_iv);
     u8 mk[64];
-    long mkl = aes256_cbc_decrypt(kek, kek_iv, wrapped, wl, mk, sizeof mk);
-    memset(kek, 0, sizeof kek);
-    if (mkl != WC_MKLEN){ memset(mk, 0, sizeof mk); return 0; }
+    long mkl = aes256_cbc_decrypt(kek, kek_iv, c.wrapped, c.wl, mk, sizeof mk);
+    secure_zero(kek, sizeof kek); secure_zero(kek_iv, sizeof kek_iv);
+    if (mkl != WC_MKLEN){ secure_zero(mk, sizeof mk); return 0; }
 
     /* new salt + new wrap; seed_iv and seed ct copied verbatim */
-    const u8* seed_iv = p + wl;
-    u32 sl; memcpy(&sl, seed_iv + 16, 4);
-    const u8* seedct = seed_iv + 16 + 4;
+    const u8* seed_iv = c.seed_iv;
+    u32 sl = c.sl;
+    const u8* seedct = c.seedct;
 
-    u8 nsalt[WC_SALT]; if (!wc_rand(nsalt, WC_SALT)){ memset(mk,0,sizeof mk); return -1; }
+    u8 nsalt[WC_SALT]; if (!wc_rand(nsalt, WC_SALT)){ secure_zero(mk, sizeof mk); return -1; }
     u8 nkek[32], nkek_iv[16];
     wcrypt_derive(newp, newlen, nsalt, WC_ITERS, nkek, nkek_iv);
     static u8 nwrap[64];
     long nwl = aes256_cbc_encrypt(nkek, nkek_iv, mk, WC_MKLEN, nwrap, sizeof nwrap);
-    memset(mk, 0, sizeof mk); memset(nkek, 0, sizeof nkek);
+    secure_zero(mk, sizeof mk); secure_zero(nkek, sizeof nkek); secure_zero(nkek_iv, sizeof nkek_iv);
     if (nwl < 0) return -1;
 
     long need = 8 + WC_SALT + 4 + 2 + nwl + 16 + 4 + sl + 32;
