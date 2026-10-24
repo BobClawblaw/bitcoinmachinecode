@@ -48,6 +48,7 @@ extern int ts_agg_hashes_export(const void* c, const void* t, uint8_t hp[32],
                                 uint8_t ha[32], uint8_t hs[32], uint8_t hq[32],
                                 const uint8_t** sp, uint64_t* sl);
 extern int ts_tx_parse_export(void* t, uint32_t* off);
+extern void sha256_full(uint8_t out[32], const void* msg, int64_t len);
 
 static int failures=0;
 static void ckh(const char* l, const uint8_t got[32], const uint8_t exp[32]){
@@ -143,6 +144,47 @@ int main(void){
         uint8_t hp3[32]; const uint8_t* sp3=NULL; uint64_t sl3=0;
         ck("reader REJECTS num_inputs != tx nin",
            ts_agg_hashes_export(&c3, &t, hp3,ha,hs,hq,&sp3,&sl3), 0);
+    }
+
+    /* ---- CON-6 (audit 2026-10-23): the run is as long as the inputs make
+     * it. 500 inputs each spending a MAX_SCRIPT_SIZE (10,000-byte) script
+     * make a 5,001,500-byte run; Core hashes it whole (no cap). The reader
+     * had a fixed 4 MiB ceiling and refused it -- a valid taproot spend
+     * rejected. */
+    {
+        enum { NBIG = 500, SBIG = 10000 };
+        static uint8_t brun[NBIG * (3 + SBIG)];
+        size_t bn = 0;
+        for (int i = 0; i < NBIG; i++){
+            brun[bn++] = 0xfd; brun[bn++] = (uint8_t)(SBIG & 0xff); brun[bn++] = (uint8_t)(SBIG >> 8);
+            for (int k = 0; k < SBIG; k++) brun[bn++] = (uint8_t)(i + k);
+        }
+        static uint8_t btx[16 + NBIG * 41 + 64]; int bt = 0;
+        btx[bt++]=2; btx[bt++]=0; btx[bt++]=0; btx[bt++]=0;
+        btx[bt++]=0xfd; btx[bt++]=(uint8_t)(NBIG & 0xff); btx[bt++]=(uint8_t)(NBIG >> 8);
+        static uint8_t bpo[NBIG * 36], bam[NBIG * 8];
+        for (int i = 0; i < NBIG; i++){
+            memset(bpo + i*36, 0, 36); bpo[i*36] = (uint8_t)i; bpo[i*36+1] = (uint8_t)(i >> 8);
+            memcpy(btx + bt, bpo + i*36, 36); bt += 36;
+            btx[bt++] = 0; btx[bt++]=0xff; btx[bt++]=0xff; btx[bt++]=0xff; btx[bt++]=0xff;
+            memset(bam + i*8, 0, 8); bam[i*8] = 1;
+        }
+        btx[bt++]=1; for (int i=0;i<8;i++) btx[bt++]=0; btx[bt++]=1; btx[bt++]=0x51;
+        btx[bt++]=0; btx[bt++]=0; btx[bt++]=0; btx[bt++]=0;
+        static uint32_t boff[4096];
+        txview_local_t bt_v; memset(&bt_v, 0, sizeof bt_v); bt_v.tx = btx; bt_v.txlen = bt;
+        ck("CON-6 the 500-input txview parses", ts_tx_parse_export(&bt_v, boff), 1);
+        tapctx_local_t bc; memset(&bc, 0, sizeof bc);
+        bc.tx = btx; bc.txlen = bt; bc.n_in = NBIG - 1;
+        bc.prevouts = bpo; bc.amounts = bam; bc.spks = brun; bc.num_inputs = NBIG;
+        bc.codesep_pos = 0xffffffffu;
+        uint8_t bhp[32], bha[32], bhs[32], bhq[32]; const uint8_t* bsp = NULL; uint64_t bsl = 0;
+        ck("CON-6 a 5,001,500-byte spent-script run (> 4 MiB) is hashed, not refused",
+           ts_agg_hashes_export(&bc, &bt_v, bhp, bha, bhs, bhq, &bsp, &bsl), 1);
+        ck("CON-6 ...and the last input's script is located",
+           (long)(bsp == brun + (size_t)(NBIG-1) * (3 + SBIG) + 3 && bsl == SBIG), 1);
+        uint8_t want[32]; sha256_full(want, brun, (int64_t)bn);
+        ckh("CON-6 h_spk == sha256 over the whole run", bhs, want);
     }
 
     printf("\n%s (%d failures)\n", failures?"TESTS FAILED":"ALL TESTS PASSED", failures);

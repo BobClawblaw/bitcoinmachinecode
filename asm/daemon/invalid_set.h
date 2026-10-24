@@ -6,10 +6,10 @@
  * chain that avoids it is heavier. */
 #ifndef INVALID_SET_H
 #define INVALID_SET_H
-#define INVSET_MAX 64
+/* No capacity limit (CON-11, audit 2026-10-23: it was 64). */
 long invset_load(const char* path);                    /* count, 0 if absent, -1 if unreadable (then empty) */
 long invset_save(const char* path);                    /* 0 ok */
-int  invset_add(const unsigned char hash[32]);         /* 1 added, 0 already, -1 full */
+int  invset_add(const unsigned char hash[32]);         /* 1 added, 0 already, -1 out of memory */
 int  invset_remove(const unsigned char hash[32]);      /* 1 removed, 0 absent */
 int  invset_has(const unsigned char hash[32]);
 long invset_count(void);

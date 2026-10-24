@@ -144,7 +144,7 @@ static void ckm(const char* l, int cond){
 #define MAXTX      6
 #define TXCAP      512
 #define BLKCAP     8192
-#define MAXBLK     48
+#define MAXBLK     112   /* CON-10's depth-101 case needs 101 losing + 102 winning blocks per branch */
 
 typedef struct {
     u8  raw[TXCAP];
@@ -690,8 +690,11 @@ static int lock_is_free(void){
     return WIFEXITED(st) && WEXITSTATUS(st) == 0;
 }
 
-/* Run one full reorg and verify everything. */
-static void do_reorg_case(long nbase, long nlose, long nwin, u32 winbits, const char* label){
+/* Run one full reorg and verify everything. `pre` > 0 makes the candidate
+ * start with base[nbase-pre..nbase-1] -- the overlap a real peer sends when
+ * it answers from a locator entry below the fork (pre = nbase-1 is the
+ * answer from genesis, the one locator entry every chain has). */
+static void do_reorg_case_pre(long nbase, long nlose, long nwin, u32 winbits, const char* label, long pre){
     build_base(nbase, 0x207fffffu);
     build_branch(lose, nlose, nbase, 0x20000000u, 0x207fffffu);
     build_branch(win,  nwin,  nbase, 0x30000000u, winbits);
@@ -709,7 +712,12 @@ static void do_reorg_case(long nbase, long nlose, long nwin, u32 winbits, const 
     static reorg_cand_t c;
     memset(&c,0,sizeof c);
     ckm("build locator", reorg_build_locator(store_buf, &c) > 0);
-    cand_from_blocks(&c, win, nwin);
+    if (pre > 0){
+        static blk_t cb[MAXBLK * 2];
+        for (long k = 0; k < pre; k++) cb[k] = base[nbase - pre + k];
+        for (long i = 0; i < nwin; i++) cb[pre + i] = win[i];
+        cand_from_blocks(&c, cb, pre + nwin);
+    } else cand_from_blocks(&c, win, nwin);
 
     long v = reorg_analyze(store_buf, &c);
     snprintf(lbuf,sizeof lbuf,"%s analyze -> fork AND heavier", label);
@@ -717,7 +725,7 @@ static void do_reorg_case(long nbase, long nlose, long nwin, u32 winbits, const 
     snprintf(lbuf,sizeof lbuf,"%s fork point located correctly", label);
     ck(lbuf, c.fork_height, nbase-1);
     snprintf(lbuf,sizeof lbuf,"%s first new header index", label);
-    ck(lbuf, c.first_new, 0);
+    ck(lbuf, c.first_new, pre);
 
     memsrc_t src = { win, nwin };
     snprintf(lbuf,sizeof lbuf,"%s reorg_execute", label);
@@ -749,9 +757,17 @@ static void do_reorg_case(long nbase, long nlose, long nwin, u32 winbits, const 
     utxo_live_close();
 }
 
+static void do_reorg_case(long nbase, long nlose, long nwin, u32 winbits, const char* label){
+    do_reorg_case_pre(nbase, nlose, nwin, winbits, label, 0);
+}
 static void case_reorg_depth1(void){ do_reorg_case(6, 1, 2, 0x207fffffu, "depth1"); }
 static void case_reorg_depth3(void){ do_reorg_case(8, 3, 4, 0x207fffffu, "depth3"); }
 static void case_reorg_depth12(void){ do_reorg_case(10, 12, 13, 0x207fffffu, "depth12"); }
+/* CON-10 (audit 2026-10-23): Core has no reorg depth limit; this node refused
+ * anything past 100 (REORG_MAX_DEPTH) in both reorg_analyze and
+ * reorg_execute. A 101-deep reorg onto a heavier chain now goes through,
+ * with the full UTXO-model and on-disk verification. */
+static void case_reorg_depth101(void){ do_reorg_case_pre(4, 101, 102, 0x207fffffu, "depth101", 3); }
 /* Shorter branch, MORE work: 5 easy blocks lose to 1 hard one. A height-based
  * fork choice would get this backwards; a work-based one must not. */
 static void case_reorg_shorter_but_heavier(void){ do_reorg_case(6, 5, 1, 0x1f00ffffu, "heavier-but-shorter"); }
@@ -963,11 +979,10 @@ static void case_invalid_candidates(void){
         ck("unattachable chain REJECTED", reorg_analyze(store_buf,&c), -1);
     }
 
-    /* (d) TOO DEEP: forks below REORG_MAX_DEPTH from our tip are refused
-     * outright (checked here through reorg_execute's own guard, which is the
-     * last line of defence before anything destructive happens). */
-    ck("reorg_execute refuses an over-deep disconnect",
-       reorg_execute(store_buf, tip_before - (REORG_MAX_DEPTH+1), 1, memsrc, &(memsrc_t){win,1}), 0);
+    /* (d) a fork height below genesis is refused (there was a depth cap
+     * here, REORG_MAX_DEPTH; CON-10 removed it, Core has none) */
+    ck("reorg_execute refuses a fork height below genesis",
+       reorg_execute(store_buf, -2, 1, memsrc, &(memsrc_t){win,1}), 0);
     ck("reorg_execute refuses a fork height above our tip",
        reorg_execute(store_buf, tip_before + 5, 1, memsrc, &(memsrc_t){win,1}), 0);
     ck("reorg_execute refuses an empty replacement branch",
@@ -1236,8 +1251,8 @@ static void restamp_branch(blk_t* b, long n, const u8 prev0[32], unsigned t0){
 
 static void case_reorg_header_rules(void){
     /* 14 base blocks so a candidate at height 15 has a full 11-header window
-     * behind it -- rg_mtp_at returns 0 for a short window and the floor is
-     * then skipped, which would make the time-too-old assertion vacuous. */
+     * behind it (the short window below height 11 has its own case,
+     * case_reorg_short_window_mtp). */
     const long nbase = 14, nlose = 2, nwin = 3;
     build_base(nbase, 0x207fffffu);
     build_branch(lose, nlose, nbase, 0x20000000u, 0x207fffffu);
@@ -1303,6 +1318,53 @@ static void case_reorg_header_rules(void){
            reorg_analyze(store_buf,&c), 2);
     }
 
+    utxo_live_close();
+}
+
+/* CON-13 (audit 2026-10-23): below height 11 Core's GetMedianTimePast is
+ * the median of the ancestors that exist, and time-too-old applies to every
+ * header but genesis. rg_mtp_at returned 0 for a short window, and a 0 floor
+ * disables the rule, so a candidate at height 4 at its parent's MTP was
+ * accepted. */
+static void case_reorg_short_window_mtp(void){
+    const long nbase = 4, nlose = 1, nwin = 2;
+    build_base(nbase, 0x207fffffu);              /* heights 0..3 at 1600000000+h */
+    build_branch(lose, nlose, nbase, 0x20000000u, 0x207fffffu);
+    build_branch(win,  nwin,  nbase, 0x30000000u, 0x207fffffu);
+    unsigned base_t = 1600000000u + (unsigned)nbase;
+    restamp_branch(lose, nlose, base[nbase-1].hash, base_t + 1);
+    harness_open();
+    store_chain(nbase, nlose);
+    reorg_set_header_rules(1000000);
+
+    unsigned good_t = (unsigned)time(NULL) - 3600u;
+    restamp_branch(win, nwin, base[nbase-1].hash, good_t);
+    {
+        static reorg_cand_t c; memset(&c,0,sizeof c);
+        reorg_build_locator(store_buf, &c);
+        cand_from_blocks(&c, win, nwin);
+        ck("CON-13 control: a well-formed candidate at height 4 is accepted",
+           reorg_analyze(store_buf,&c), 2);
+    }
+    /* the first candidate header (height 4) EQUAL to the median of the four
+     * headers below it (1600000000..3 -> 1600000002): time-too-old exactly
+     * at the boundary */
+    { mk_block(&win[0], base[nbase-1].hash, 1600000002u);
+      mk_block(&win[1], win[0].hash, good_t + 1);
+      static reorg_cand_t c; memset(&c,0,sizeof c);
+      reorg_build_locator(store_buf, &c);
+      cand_from_blocks(&c, win, nwin);
+      ck("CON-13 a height-4 header at its short-window MTP is REJECTED time-too-old",
+         reorg_analyze(store_buf,&c), -1); }
+    /* one second above it is fine */
+    { mk_block(&win[0], base[nbase-1].hash, 1600000003u);
+      mk_block(&win[1], win[0].hash, good_t + 1);
+      static reorg_cand_t c; memset(&c,0,sizeof c);
+      reorg_build_locator(store_buf, &c);
+      cand_from_blocks(&c, win, nwin);
+      ck("CON-13 one second above the short-window MTP is accepted",
+         reorg_analyze(store_buf,&c), 2); }
+    reorg_set_header_rules(-1);
     utxo_live_close();
 }
 
@@ -1948,6 +2010,7 @@ int main(void){
     total += run_case("reorg depth 1",                  case_reorg_depth1);
     total += run_case("reorg depth 3",                  case_reorg_depth3);
     total += run_case("reorg depth 12 (undo window)",   case_reorg_depth12);
+    total += run_case("reorg depth 101 (no depth cap, CON-10)", case_reorg_depth101);
     total += run_case("reorg shorter-but-heavier",      case_reorg_shorter_but_heavier);
     total += run_case("fork above the applied height",  case_fork_above_applied);
     total += run_case("competing chain not heavier",    case_not_heavier);
@@ -1958,6 +2021,7 @@ int main(void){
     total += run_case("mempool reconcile is WIRED (STO-7)", case_mempool_wired);
     total += run_case("reconcile leaves no ghosts (MEM-8)", case_mempool_ghosts);
     total += run_case("reorg header rules (VAL-5 rest)", case_reorg_header_rules);
+    total += run_case("reorg short-window MTP (CON-13)", case_reorg_short_window_mtp);
     total += run_case("fake peer locator + reorg",      case_fakepeer_locator_and_reorg);
     total += run_case("fake peer handoff (long replacement)", case_fakepeer_handoff);
     total += run_case("fake peer lighter chain retained", case_fakepeer_lighter_retained);
