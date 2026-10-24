@@ -31,6 +31,7 @@ extern g_peer_wants_addrv2
     extern idx_get
     extern serve_inv_bounds
     extern serve_locator_from
+    extern serve_set_locator_store ; daemon/serve_invbounds.c
     extern serve_public_tip     ; 3.1: the CONNECTED tip (daemon/serve_invbounds.c)
 extern node_relay_flag
 extern serve_tx_gate
@@ -310,6 +311,10 @@ node_serve_loop:
     mov  [s_lfd], rsi        ; stable lfd copy
     mov  [s_htidx], rcx      ; keep a stable copy (a downstream callee clobbers r15)
     mov  [s_st], rdx         ; stable copy of st
+    ; the locator walk checks each hash-index hit against index.dat
+    ; (serve_locator_from): a child's index can be a reorg behind
+    mov  rdi, rdx
+    call serve_set_locator_store
     mov  qword [s_served], 0 ; served count
     ; NET-1: one-past-the-end of the blocktxn assembly buffer, checked by the
     ; writer below before every append.

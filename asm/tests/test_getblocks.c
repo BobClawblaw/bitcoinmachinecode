@@ -409,6 +409,43 @@ int main(void){
           pong && count_cmd("headers") == 1 && ms < 2000, 1);
       peer_close(fd); }
 
+    /* ---- a hash index a reorg behind: the archive decides ----
+     * A serve child keeps its own hash index; after a reorg it maps the
+     * losing branch's hashes to their heights until serve_reorg_check
+     * rebuilds it, and getheaders reached that check only after the locator
+     * walk. Here index.dat's records 510..519 are rewritten to another
+     * branch's hashes and the child's index is left as it was. Core walks
+     * the locator against its active chain (FindForkInGlobalIndex,
+     * chain.Contains): an entry off it is skipped, a stop hash off it is
+     * never met. getdata is untouched: it serves by height from the index.
+     * Kept last: nothing after this needs the old records. */
+    { FILE* f = fopen("index.dat", "r+b");
+      int ok = f != 0;
+      for (int h = 510; ok && h <= TIP; h++){
+          unsigned char rec[48];
+          ok = fseek(f, (long)h * 48, SEEK_SET) == 0 && fread(rec, 1, 48, f) == 48;
+          rec[31] ^= 0x5a;                                /* branch B's block at h */
+          ok = ok && fseek(f, (long)h * 48, SEEK_SET) == 0 && fwrite(rec, 1, 48, f) == 48;
+      }
+      if (f) fclose(f);
+      cki("stale index: index.dat 510..519 rewritten to another branch", ok, 1);
+
+      int fd = peer_open();
+      unsigned char loc[2][32]; memcpy(loc[0], bhash[515], 32); memcpy(loc[1], bhash[505], 32);
+      send_getheaders(fd, (const unsigned char (*)[32])loc, 2, 0);
+      int pong = reply(fd);
+      const msg_t* m = first_cmd("headers"); unsigned off = 0; long n = vec_count(m, &off);
+      cki("stale index: locator [old 515, 505] serves from 506 (the stale entry skipped), 14 headers",
+          pong && n == TIP - 505 && m->len >= off + 81 && !memcmp(m->p + off, blk[506], 80), 1);
+
+      memcpy(loc[0], bhash[3], 32);
+      send_getheaders(fd, (const unsigned char (*)[32])loc, 1, bhash[512]);
+      pong = reply(fd);
+      m = first_cmd("headers"); off = 0; n = vec_count(m, &off);
+      cki("stale index: a stop hash off the active chain caps nothing (4..519, 516 headers)",
+          pong && n == TIP - 3, 1);
+      peer_close(fd); }
+
     close(ls);
     printf("\n%s (%d failures)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED", failures);
     return failures ? 1 : 0;
