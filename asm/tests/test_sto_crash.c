@@ -1,5 +1,6 @@
 /* test_sto_crash.c -- crash consistency of the UTXO store under SIGKILL and
- * power loss: STO-A, STO-B, STO-C and STO-E (formal/storage, 2026-10-23).
+ * power loss: STO-A, STO-B, STO-C, STO-E, STO-D and STO-W (formal/storage,
+ * 2026-10-23).
  *
  * The formal model (formal/storage/tla/StorageCrash.tla) found four classes
  * of hole and its crash driver reproduced each on the real code. This test is
@@ -31,6 +32,31 @@
  *                    that drains (a reader's reload drains first) must not
  *                    land its parent's buffered records
  *
+ * STO-D and STO-W hold only on a file system weaker than ext4, which orders
+ * nothing between two name ops of a directory: these run durable_image.h's
+ * weak mode (a name op durable only at a directory fsync, any subset of the
+ * rest kept by the power loss), and inject a failed directory fsync (EIO) or
+ * a failed open(".") (EMFILE) through the same seccomp trap.
+ *   D1  dirpub       the manifest's directory fsync fails at an async adopt,
+ *                    a power loss keeps the utxo.idx rename and not the
+ *                    manifest's: no retire before a directory fsync works
+ *   D2  dirretire    the directory fsync after the utxo.idx rename fails:
+ *                    the WAL must not be punched under the old log_off
+ *   D3  dirmerge     the directory fsync after a merge's manifest fails: its
+ *                    inputs must stay on disk
+ *   D4  opendot      the inline flush cannot open the directory: the WAL
+ *                    reset must wait for a directory fsync that happened
+ *   D5  dirckpt      the checkpoint's directory fsync fails: redo only (the
+ *                    previous checkpoint, the blocks after it re-applied);
+ *                    no fix, this pins the claim
+ *   W1  runcreate    an async flush's run, the manifest rename kept and the
+ *                    run's create lost: the create durable before the rename
+ *   W2  runcreate-inline  the same in mac_flush
+ *   W3  runcreate-merge   the same for the inline compaction's merged run
+ *   W4  sweep        the boot sweep unlinks a merge's inputs on the strength
+ *                    of a manifest whose rename is not durable: the rename
+ *                    durable before the first unlink
+ *
  * Every crash scenario has a control: the same trace with the one write its crash
  * loses kept (taken from the live directory, as if the kernel had written it
  * back), which heals with or without the fix -- so a failure is the lost
@@ -42,6 +68,7 @@
 #define _GNU_SOURCE
 #include "durable_image.h"
 #include "test_tmpdir.h"
+#include "../daemon/node_config.h"
 #include <sys/wait.h>
 
 typedef unsigned char u8;
@@ -71,6 +98,13 @@ extern long utxo_live_test_wal_drain(void);
 extern long utxo_store_wal_drain(void* st);
 extern void utxo_live_test_set_after_tx0(void (*fn)(long h));
 extern const char* utxo_live_last_reject(void);
+extern void utxo_live_bg_poll(void);
+extern void utxo_live_set_run_budget(unsigned long long bytes);
+extern void utxo_live_test_set_apply_lag(long lag);
+extern int  utxo_live_test_compact_nowait(void);
+extern int  utxo_live_test_compact_pid(void);
+extern void* utxo_live_test_lst(void);
+extern long utxo_lsm_compact_range(void* lst, unsigned long lo, unsigned long k);
 extern long utxo_live_lsm_get(const u8 txid_wire[32], unsigned int vout, u64* value, unsigned long* height,
                               unsigned long* is_coinbase, const u8** script, unsigned long* slen);
 
@@ -148,7 +182,7 @@ static void build_ghosts(int to){
     append(151, to);
     for (int h = 151; h <= to; h++)
         if (utxo_live_apply_block(g_blk[h], (u64)g_len[h], h) != 1){ printf("  apply %d failed\n", h); _exit(9); }
-    printf("  p1: applied 151..%d without a checkpoint\n", to);
+    if (to >= 151) printf("  p1: applied 151..%d without a checkpoint\n", to);
 }
 typedef void (*proc_fn)(void* arg);
 static int run(const char* dir, proc_fn fn, void* arg){
@@ -417,6 +451,206 @@ static int sc_fork(int control){
     return control ? v[2] > v[0] : v[1] == v[0];
 }
 
+/* ===== STO-D / STO-W: the weak file system ===== */
+static const char* const g_arch[] = { "blk", "index.dat", 0 };
+/* the runner's half of a weak power loss: the image with the `kept` name ops */
+static int weak_image(const char* live, const char* img, const char* const* kept){
+    if (chdir(live) != 0) return 0;
+    di_print_log(); di->armed = 0;
+    if (di_build_image_weak(img, g_arch, kept) != 0) return 0;
+    printf("  POWER LOSS -> image (name ops kept beyond the last directory fsync:");
+    for (int i = 0; kept[i]; i++) printf(" %s*", kept[i]);
+    printf("%s)\n", kept[0] ? "" : " none");
+    return 1;
+}
+static int weak_recover(const char* live, const char* img, const char* const* kept, int to){
+    if (!weak_image(live, img, kept)) return 0;
+    run(img, p_recover_catchup, 0);
+    return healed_to(img, to);
+}
+/* recovery + catch-up, then which of C (spent by 153) and D (created by 153) is there */
+static void p_recover_cd(void* a){
+    (void)a; boot();
+    long rb = utxo_live_recover_at_boot(store_buf);
+    long r = rb < 0 ? -9 : utxo_live_catchup(store_buf);
+    int c = has(152), d = has(153);
+    printf("  recover_at_boot -> %ld; catch-up -> %ld; applied %ld; C present %d, D present %d; count %ld\n",
+           rb, r, utxo_live_applied_height(), c, d, utxo_live_count());
+    FILE* f = fopen("result.txt", "w"); if (f){ fprintf(f, "%ld %d %d %ld\n", utxo_live_applied_height(), c, d, utxo_live_count()); fclose(f); }
+}
+static void p1_weak(int to, int async){
+    g_cfg.async_flush = async;
+    di_arm(); build_ghosts(to);
+}
+
+/* D1: the publish's directory fsync fails; a later utxo.idx rename survives alone */
+static void p1_dirpub(void* a){
+    (void)a; p1_weak(152, 1);
+    di_fail_dir_after("utxo_manifest.dat.pub", 1);   /* the directory fsync after the manifest's rename */
+    di_lose_dir_after("utxo.idx.tmp", 1);            /* the power goes before the one after utxo.idx's */
+    printf("  p1: utxo_live_flush_now -> %ld (the manifest's directory fsync answers EIO)\n", utxo_live_flush_now());
+}
+static int sc_dirpub(int control){
+    static const char* const k[]  = { "utxo.idx", 0 };
+    static const char* const kc[] = { "utxo.idx", "utxo_manifest.dat", "utxo_run_", 0 };
+    char live[640], img[640], snap[640]; paths("dirpub", control, live, img, snap);
+    if (di_install(snap) != 0) return 0;
+    di_set_weak();
+    if (run(live, p1_dirpub, 0) != 0) return 0;
+    return weak_recover(live, img, control ? kc : k, 152);
+}
+
+/* D2: the directory fsync after the utxo.idx rename fails; the checkpoint's
+ * height rename survives, the utxo.idx rename does not */
+static void p1_dirretire(void* a){
+    (void)a; p1_weak(152, 1);
+    di_fail_dir_after("utxo.idx.tmp", 1);
+    printf("  p1: utxo_live_flush_now -> %ld (the directory fsync after utxo.idx's rename answers EIO)\n", utxo_live_flush_now());
+    append(153, 153);
+    utxo_live_test_set_ckpt_batch(1000);              /* one checkpoint, at the catch-up's end */
+    di_lose_dir_after("utxo_applied_height.dat.tmp", 1);
+    long r = utxo_live_catchup(store_buf);
+    printf("  p1: catch-up to 153 (spends C, creates D) -> %ld, checkpointed: the WAL fsynced, the power goes before the directory fsync\n", r);
+}
+static int sc_dirretire(int control){
+    static const char* const k[]  = { "utxo_applied_height.dat", 0 };
+    static const char* const kc[] = { "utxo_applied_height.dat", "utxo.idx", 0 };
+    char live[640], img[640], snap[640]; paths("dirretire", control, live, img, snap);
+    if (di_install(snap) != 0) return 0;
+    di_set_weak();
+    if (run(live, p1_dirretire, 0) != 0) return 0;
+    if (!weak_image(live, img, control ? kc : k)) return 0;
+    run(img, p_recover_cd, 0);
+    long v[4]; if (read_res(img, v)) return 0;
+    return v[0] == 153 && v[1] == 0 && v[2] == 1 && v[3] == 154;
+}
+
+static int count_runs(void){
+    DIR* d = opendir("."); struct dirent* e; int n = 0;
+    while (d && (e = readdir(d))) if (!strncmp(e->d_name, "utxo_run_", 9)) n++;
+    if (d) closedir(d);
+    return n;
+}
+/* two runs of a size (the leveled pick merges only those), blocks 151..152
+ * applied without a checkpoint, then a background merge of both */
+static void p1_tworuns(void){
+    g_cfg.async_flush = 1;
+    di_arm(); boot();
+    append(0, 75);
+    long r1 = utxo_live_catchup(store_buf), f1 = utxo_live_flush_now();
+    append(76, 150);
+    long r2 = utxo_live_catchup(store_buf), f2 = utxo_live_flush_now();
+    printf("  p1: catch-up 0..75 -> %ld, flush -> %ld; catch-up 76..150 -> %ld, flush -> %ld; %d run files\n", r1, f1, r2, f2, count_runs());
+    append(151, 152);
+    for (int h = 151; h <= 152; h++)
+        if (utxo_live_apply_block(g_blk[h], (u64)g_len[h], h) != 1){ printf("  apply %d failed\n", h); _exit(9); }
+    printf("  p1: applied 151..152 without a checkpoint\n");
+}
+/* D3/W4: the merge's manifest renamed, the directory fsync after it fails */
+static void p1_dirmerge(void* a){
+    (void)a; p1_tworuns();
+    utxo_live_set_run_budget(1); utxo_live_test_set_apply_lag(0);
+    di_fail_dir_after("utxo_manifest.dat.pub", 1);
+    int st = utxo_live_test_compact_nowait();
+    while (utxo_live_test_compact_pid()){ utxo_live_bg_poll(); usleep(2000); }
+    printf("  p1: background merge started (%d) and adopted, the directory fsync after its manifest answered EIO; %d run files\n", st, count_runs());
+}
+static int sc_dirmerge(int control){
+    static const char* const k[]  = { "utxo_run_", 0 };
+    static const char* const kc[] = { "utxo_run_", "utxo_manifest.dat", 0 };
+    char live[640], img[640], snap[640]; paths("dirmerge", control, live, img, snap);
+    if (di_install(snap) != 0) return 0;
+    di_set_weak();
+    if (run(live, p1_dirmerge, 0) != 0) return 0;
+    return weak_recover(live, img, control ? kc : k, 152);
+}
+static void p2_boot_sweep(void* a){
+    (void)a; boot();
+    printf("  p2: boot (the orphan sweep ran); %d run files\n", count_runs());
+}
+static int sc_sweep(int control){
+    static const char* const k[]  = { "utxo_run_", 0 };
+    static const char* const kc[] = { "utxo_run_", "utxo_manifest.dat", 0 };
+    char live[640], img[640], snap[640]; paths("sweep", control, live, img, snap);
+    if (di_install(snap) != 0) return 0;
+    di_set_weak();
+    if (run(live, p1_dirmerge, 0) != 0) return 0;
+    if (run(live, p2_boot_sweep, 0) != 0) return 0;
+    return weak_recover(live, img, control ? kc : k, 152);
+}
+
+/* D4: mac_flush's open(".") after the manifest rename fails */
+static void p1_opendot(void* a){
+    (void)a; p1_weak(152, 0);
+    append(153, 153);
+    di_fail_open_dot_after("utxo_manifest.tmp", 1);
+    printf("  p1: inline flush -> %ld (its open(\".\") after the manifest rename fails)\n", utxo_live_flush_now());
+    di_lose_dir_after("utxo_applied_height.dat.tmp", 1);
+    long r = utxo_live_catchup(store_buf);
+    printf("  p1: catch-up to 153 -> %ld, checkpointed: the WAL fsynced, the power goes before the directory fsync\n", r);
+}
+static int sc_opendot(int control){
+    static const char* const k[]  = { 0 };
+    static const char* const kc[] = { "utxo_manifest.dat", 0 };
+    char live[640], img[640], snap[640]; paths("opendot", control, live, img, snap);
+    if (di_install(snap) != 0) return 0;
+    di_set_weak();
+    if (run(live, p1_opendot, 0) != 0) return 0;
+    return weak_recover(live, img, control ? kc : k, 153);
+}
+
+/* D5: the checkpoint's directory fsync fails, the power goes later */
+static void p1_dirckpt(void* a){
+    (void)a; p1_weak(150, 1);
+    append(151, 152);
+    utxo_live_test_set_ckpt_batch(1000);              /* one checkpoint, at the catch-up's end */
+    di_fail_dir_after("utxo_applied_height.dat.tmp", 1);
+    long r = utxo_live_catchup(store_buf);
+    printf("  p1: catch-up 151..152 -> %ld, applied %ld (its checkpoint's directory fsync answers EIO)\n", r, utxo_live_applied_height());
+}
+static int sc_dirckpt(int control){
+    static const char* const k[]  = { 0 };
+    static const char* const kc[] = { "utxo_applied_height.dat", 0 };
+    char live[640], img[640], snap[640]; paths("dirckpt", control, live, img, snap);
+    if (di_install(snap) != 0) return 0;
+    di_set_weak();
+    if (run(live, p1_dirckpt, 0) != 0) return 0;
+    return weak_recover(live, img, control ? kc : k, 152);
+}
+
+/* W1/W2: a flush's manifest rename survives, its run's create does not */
+static void p1_runcreate(void* a){
+    int async = *(int*)a;
+    p1_weak(152, async);
+    di_lose_dir_after(async ? "utxo_manifest.dat.pub" : "utxo_manifest.tmp", 1);
+    printf("  p1: %s flush -> %ld (the power goes at the directory fsync after the manifest's rename)\n", async ? "async" : "inline", utxo_live_flush_now());
+}
+static int sc_runcreate(int async, int control){
+    static const char* const k[]  = { "utxo_manifest.dat", 0 };
+    static const char* const kc[] = { "utxo_manifest.dat", "utxo_run_", 0 };
+    char live[640], img[640], snap[640]; paths(async ? "runcreate" : "runcreate-inline", control, live, img, snap);
+    if (di_install(snap) != 0) return 0;
+    di_set_weak();
+    if (run(live, p1_runcreate, &async) != 0) return 0;
+    return weak_recover(live, img, control ? kc : k, 152);
+}
+/* W3: the inline compaction's merged run */
+static void p1_runcreate_merge(void* a){
+    (void)a; p1_tworuns();
+    di_lose_dir_after("utxo_manifest.tmp", 1);
+    printf("  p1: inline merge of both runs -> %ld (the power goes at the directory fsync after the manifest's rename)\n",
+           utxo_lsm_compact_range(utxo_live_test_lst(), 0, 2));
+}
+static int sc_runcreate_merge(int control){
+    static const char* const k[]  = { "utxo_manifest.dat", 0 };
+    static const char* const kc[] = { "utxo_manifest.dat", "utxo_run_", 0 };
+    char live[640], img[640], snap[640]; paths("runcreate-merge", control, live, img, snap);
+    if (di_install(snap) != 0) return 0;
+    di_set_weak();
+    if (run(live, p1_runcreate_merge, 0) != 0) return 0;
+    return weak_recover(live, img, control ? kc : k, 152);
+}
+
 /* ---- the runner: each scenario in its own process (the seccomp filter and
  * the recorder are per scenario) ---- */
 static int g_which, g_ctl;
@@ -431,6 +665,15 @@ static int scenario(void){
     case 6: return sc_archive(0, g_ctl);
     case 7: return sc_archive(1, g_ctl);
     case 8: return sc_fork(g_ctl);
+    case 9: return sc_dirpub(g_ctl);
+    case 10: return sc_dirretire(g_ctl);
+    case 11: return sc_dirmerge(g_ctl);
+    case 12: return sc_opendot(g_ctl);
+    case 13: return sc_dirckpt(g_ctl);
+    case 14: return sc_runcreate(1, g_ctl);
+    case 15: return sc_runcreate(0, g_ctl);
+    case 16: return sc_runcreate_merge(g_ctl);
+    case 17: return sc_sweep(g_ctl);
     }
     return 0;
 }
@@ -441,10 +684,12 @@ int main(int argc, char** argv){
     if (snprintf(g_base, sizeof g_base, "%s", tt_workdir()) >= (int)sizeof g_base){ printf("FAIL work dir path too long\n"); return 1; }
     static const char* names[] = { "STO-B ghostkill", "STO-A1 flushundo", "STO-A2 walwb", "STO-A3 cbflush",
                                    "STO-A4 ghostchain", "STO-E logoff", "STO-C1 archive", "STO-C2 archive-nosync",
-                                   "STO-A fork" };
+                                   "STO-A fork", "STO-D1 dirpub", "STO-D2 dirretire", "STO-D3 dirmerge",
+                                   "STO-D4 opendot", "STO-D5 dirckpt", "STO-W1 runcreate", "STO-W2 runcreate-inline",
+                                   "STO-W3 runcreate-merge", "STO-W4 sweep" };
     int only = argc > 1 ? atoi(argv[1]) : -1;
     int failures = 0;
-    for (int w = 0; w < 9; w++){
+    for (int w = 0; w < 18; w++){
         if (only >= 0 && w != only) continue;
         for (int c = 0; c <= 1; c++){
             printf("--- %s%s\n", names[w], c ? (w == 8 ? " (control: the bytes were pending)" : " (control: the lost write kept)") : "");
