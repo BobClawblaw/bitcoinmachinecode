@@ -80,10 +80,11 @@ static long mk(u8* out, const u8 prev[32], u64 invalue, u64 fee){
 /* N must exceed 65,536 for the test to mean anything; the headroom is so the
  * blob fills (and eviction is forced) with the entry count already past it. */
 /* Sized so the entry count is past 65,536 BEFORE the blob fills, while the
- * number of evictions stays small. worst_chunk walks every cluster on every
- * call, so evictions * entries is the cost: ~1,300 x 68,000 here (seconds),
- * against ~20,000 x 90,000 (minutes) for a fixture that evicts aggressively.
- * The ceiling is what is under test, not the eviction rate. */
+ * number of evictions stays small. Each eviction still sweeps the node array
+ * (remove_node, and since MPL-3 a pass over the cached chunk feerates), so
+ * evictions * entries is the cost: ~1,300 x 68,000 here (seconds), against
+ * ~20,000 x 90,000 for a fixture that evicts aggressively. The ceiling is
+ * what is under test, not the eviction rate. */
 #define NSEED   68000
 #define SLOTS   131072
 
