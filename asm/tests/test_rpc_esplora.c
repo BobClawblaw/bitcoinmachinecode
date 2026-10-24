@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 #include "../rpc_esplora.h"
 #include "../rpc_json.h"
 #include "../rpc_node.h"           /* rpc_mp_item, for the batched mempool read */
@@ -37,7 +38,20 @@ static int g_batch_on = 0, g_pool_takes = 0;
 static const char* MPX[] = { "4444444444444444444444444444444444444444444444444444444444444444",
                              "6666666666666666666666666666666666666666666666666666666666666666",
                              "7777777777777777777777777777777777777777777777777777777777777777" };
+/* RPC-23: a wide batch -- every "aa.." txid is in the pool and spends
+ * WIDE_IN distinct confirmed "bb.." parents that no index knows */
+static int g_wide = 0, g_mp_big = 0, g_hash_calls = 0;
+#define WIDE_IN 40
 long rpc_node_mempool_many(const unsigned char (*w)[32], long n, rpc_mp_item* out){
+    if (g_wide){
+        long found = 0;
+        for (long i = 0; i < n; i++){
+            char d[65]; for (int b = 0; b < 32; b++) snprintf(d + 2*b, 3, "%02x", w[i][31 - b]);
+            out[i].present = 0; out[i].raw = 0; out[i].len = 0; out[i].fee = 0;
+            if (!strncmp(d, "aa", 2)){ out[i].raw = (unsigned char*)malloc(64); memcpy(out[i].raw, d, 64); out[i].len = 64; out[i].present = 1; out[i].fee = 100; found++; }
+        }
+        return found;
+    }
     if (!g_batch_on) return -1;
     g_pool_takes += (int)((n + 255) / 256);                 /* one pool-lock hold per slice */
     long found = 0;
@@ -95,6 +109,17 @@ static void write_base(void){
     ah_sparse sp; sp.type = 2; memcpy(sp.hash, g.hash, 32); sp.off = 0; fwrite(&sp, AH_SPARSE_BYTES, 1, f);
     fseek(f, 0, SEEK_SET); fwrite(&hd, 1, sizeof hd, f); fclose(f);
 }
+/* RPC-23: an address with a long, fully spent history -- n funding events at
+ * n distinct heights, each spent in the same block */
+static void write_base_long(int n){
+    FILE* f = fopen(AH_FILE, "wb"); ah_header hd; memset(&hd, 0, sizeof hd); hd.magic = AH_MAGIC; hd.version = AH_VERSION; hd.to_height = 700000; hd.body_off = AH_HDR_BYTES;
+    unsigned char zero[AH_HDR_BYTES] = {0}; fwrite(zero, 1, AH_HDR_BYTES, f);
+    ah_group_hdr g; g.type = 2; memset(g.hash, 0, 32); memcpy(g.hash, KEY_A, 20); g.n = (unsigned)(2 * n); fwrite(&g, 1, AH_GROUP_HDR, f);
+    for (int h = 1; h <= n; h++){ ah_event e1 = { AH_FUND, (unsigned)h, 0, 0, 1000 }; ah_event e2 = { AH_SPEND, (unsigned)h, 1, 0, 1000 }; fwrite(&e1, 1, AH_EVENT_BYTES, f); fwrite(&e2, 1, AH_EVENT_BYTES, f); }
+    hd.n_keys = 1; hd.n_events = (unsigned long)(2 * n); hd.body_len = AH_GROUP_HDR + (unsigned long)(2 * n) * AH_EVENT_BYTES; hd.sparse_off = AH_HDR_BYTES + hd.body_len; hd.sparse_n = 1;
+    ah_sparse sp; sp.type = 2; memcpy(sp.hash, g.hash, 32); sp.off = 0; fwrite(&sp, AH_SPARSE_BYTES, 1, f);
+    fseek(f, 0, SEEK_SET); fwrite(&hd, 1, sizeof hd, f); fclose(f);
+}
 static rj_val* J(const char* lit){ return rj_parse(lit, strlen(lit)); }
 static void tlock(void){ g_locks++; } static void tunlock(void){ g_unlocks++; }
 int rpc_dispatch(const char* method, const rj_val* params, const rpc_wallet* w, rj_val** result, long* ec, const char** em){
@@ -116,7 +141,7 @@ int rpc_dispatch(const char* method, const rj_val* params, const rpc_wallet* w, 
         if (t == 7)        { *result = J("{\"feerate\":0.00000000,\"blocks\":7}");   return 1; }
         *result = J("{\"errors\":[\"Insufficient data or no feerate found\"],\"blocks\":0}"); return 1; }
     if (!strcmp(method, "getblockchaininfo")){ *result = rj_parse("{\"blocks\":700000,\"bestblockhash\":\"" BH "\"}", strlen("{\"blocks\":700000,\"bestblockhash\":\"" BH "\"}")); return 1; }
-    if (!strcmp(method, "getblockhash")){ if (p0 && !strcmp(p0, "700000")){ *result = rj_str(BH); return 1; } *ec = -8; *em = "Block height out of range"; return 0; }
+    if (!strcmp(method, "getblockhash")){ g_hash_calls++; if (p0 && !strcmp(p0, "700000")){ *result = rj_str(BH); return 1; } *ec = -8; *em = "Block height out of range"; return 0; }
     if (!strcmp(method, "getblockheader")){ if (!p0 || strcmp(p0, BH)){ *ec = -5; *em = "Block not found"; return 0; }
         if (params->nitems > 1 && params->items[1]->typ == RJ_BOOL && params->items[1]->str[0] == '0'){ *result = rj_str("00e0ff2f" "aa"); return 1; }
         *result = J("{\"height\":700000,\"time\":1631000000}"); return 1; }
@@ -139,6 +164,12 @@ int rpc_dispatch(const char* method, const rj_val* params, const rpc_wallet* w, 
         int ok2 = rpc_dispatch("getrawtransaction", a, w, result, ec, em); rj_free(a); return ok2; }
     if (!strcmp(method, "getrawtransaction") && params && params->nitems < 3) g_pool_takes++;   /* mempool first: a pool-lock take */
     if (!strcmp(method, "getmempoolentry")) g_pool_takes++;
+    if (!strcmp(method, "getrawtransaction") && g_wide && p0 && !strncmp(p0, "aa", 2)){
+        long t = strtol(p0 + 2, 0, 16); size_t cap = 512 + WIDE_IN * 160; char* b = malloc(cap);
+        int o = snprintf(b, cap, "{\"txid\":\"%s\",\"version\":2,\"locktime\":0,\"size\":100,\"weight\":400,\"vin\":[", p0);
+        for (int k = 0; k < WIDE_IN; k++) o += snprintf(b + o, cap - (size_t)o, "%s{\"txid\":\"bb%062lx\",\"vout\":0,\"scriptSig\":{\"hex\":\"\"},\"sequence\":0}", k ? "," : "", t * WIDE_IN + k);
+        snprintf(b + o, cap - (size_t)o, "],\"vout\":[{\"value\":0.0001,\"n\":0,\"scriptPubKey\":{\"hex\":\"51\",\"type\":\"nonstandard\"}}]}");
+        *result = J(b); free(b); return 1; }
     if (!strcmp(method, "getrawtransaction")){
         if (p0 && !strcmp(p0, "7777777777777777777777777777777777777777777777777777777777777777")){   /* unconfirmed, spends the unconfirmed 0x44..:0 */
             const char* t = "{\"txid\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"version\":2,\"locktime\":0,\"size\":110,\"weight\":440,\"vin\":[{\"txid\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"vout\":0,\"scriptSig\":{\"hex\":\"\"},\"sequence\":0}],\"vout\":[{\"value\":0.029,\"n\":0,\"scriptPubKey\":{\"hex\":\"0014dd\",\"type\":\"witness_v0_keyhash\",\"address\":\"bc1qnext\"}}]}";
@@ -177,6 +208,9 @@ int rpc_dispatch(const char* method, const rj_val* params, const rpc_wallet* w, 
             rj_arr_push(arr, o);
         }
         *result = arr; return 1; }
+    if (!strcmp(method, "getrawmempool") && g_mp_big){   /* RPC-23: more than ESP_BATCH_MAX in the pool */
+        rj_val* a = rj_arr(); for (int i = 0; i < 10050; i++) rj_arr_push(a, rj_str("4444444444444444444444444444444444444444444444444444444444444444"));
+        *result = a; return 1; }
     if (!strcmp(method, "getrawmempool") && g_mp_on){ *result = J("[\"6666666666666666666666666666666666666666666666666666666666666666\"]"); return 1; }
     if (!strcmp(method, "getrawmempool")){ if (params->items[0]->str[0] == '1'){ *result = J("{\"4444444444444444444444444444444444444444444444444444444444444444\":{\"vsize\":110,\"fees\":{\"base\":0.000005}}}"); return 1; }
         *result = J("[\"4444444444444444444444444444444444444444444444444444444444444444\"]"); return 1; }
@@ -359,6 +393,50 @@ int main(void){
       ok(p7 && rj_obj_get(p7, "prevout") && !strcmp(S(rj_obj_get(p7, "prevout"), "value"), "3000000"), "...0x77..'s prevout came from its unconfirmed parent in the pool (3,000,000 sat)");
       rj_free(a); rj_free(b); free(sa); free(sb);
       g_batch_on = 0; g_mp_on = 0; }
+
+    /* ---- RPC-23 (audit 2026-10-23): bounded work on the unauthenticated routes ---- */
+    { /* batch lists: ESP_BATCH_MAX (10,000) is accepted, one more is refused */
+      size_t cap = 10001 * 67 + 16; char* body = malloc(cap); size_t o = 0;
+      body[o++] = '[';
+      for (int i = 0; i < 10001; i++) o += (size_t)snprintf(body + o, cap - o, "%s\"" TX1 "\"", i ? "," : "");
+      body[o++] = ']'; body[o] = 0;
+      POST("/internal/txs", body);
+      ok(g_status == 400 && g_out && strstr(g_out, "too many txids"), "POST /internal/txs with 10,001 txids -> 400");
+      POST("/internal/mempool/txs", body);
+      ok(g_status == 400, "POST /internal/mempool/txs with 10,001 txids -> 400");
+      POST("/internal/txs/outspends/by-txid", body);
+      ok(g_status == 400, "POST /internal/txs/outspends/by-txid with 10,001 txids -> 400");
+      body[o - 1 - 67] = ']'; body[o - 67] = 0;             /* drop the last one: 10,000 */
+      rj_val* m = POST("/internal/txs", body);
+      ok(g_status == 200 && m && m->typ == RJ_ARR, "...10,000 (mempool.space asks for 200..5,000) is served");
+      rj_free(m); free(body); }
+    { g_mp_big = 1; rj_val* m = GET("/internal/mempool/txs?max_txs=1000000"); g_mp_big = 0;
+      ok(m && m->nitems == 10000, "GET /internal/mempool/txs?max_txs=1000000 is clamped to 10,000 per page");
+      if (!(m && m->nitems == 10000)) printf("      got %zu\n", m ? m->nitems : 0);
+      rj_free(m); }
+    { /* parents by hash: 1,000 transactions x 40 distinct parents. A linear
+       * scan per input (dedup, then the prevout match) is ~2.4e9 compares. */
+      size_t cap = 1000 * 67 + 16; char* body = malloc(cap); size_t o = 0; body[o++] = '[';
+      for (int i = 0; i < 1000; i++) o += (size_t)snprintf(body + o, cap - o, "%s\"aa%062x\"", i ? "," : "", i);
+      body[o++] = ']'; body[o] = 0;
+      struct timespec c0, c1; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c0);
+      g_wide = 1; rj_val* m = POST("/internal/mempool/txs", body); g_wide = 0;
+      clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c1);
+      double cpu = (double)(c1.tv_sec - c0.tv_sec) + (double)(c1.tv_nsec - c0.tv_nsec) / 1e9;
+      ok(m && m->nitems == 1000, "a 1,000-transaction batch with 40,000 distinct parents is answered whole");
+      ok(cpu < 1.0, "...in under 1 s of CPU (parents found by hash, not by a scan per input)");
+      printf("      batch CPU %.3f s\n", cpu);
+      rj_free(m); free(body); }
+    { write_base_long(2500); g_hash_calls = 0;
+      GET("/address/bc1qaddrA/utxo");
+      ok(g_status == 400 && g_out && !strcmp(g_out, "Too many history entries"), "GET /address/utxo with 2,500 funding blocks to read (all spent) -> 400 'Too many history entries'");
+      ok(g_hash_calls == 0, "...refused before a single block lookup");
+      if (g_hash_calls) printf("      %d getblockhash calls\n", g_hash_calls);
+      unlink(AH_FILE);
+      write_base_long(300); g_hash_calls = 0;
+      rj_val* u = GET("/address/bc1qaddrA/utxo");
+      ok(g_status == 200 && u && u->typ == RJ_ARR && g_hash_calls == 300, "...300 funding blocks is served (one lookup per block, as before)");
+      rj_free(u); unlink(AH_FILE); }
 
     free(g_out);
     printf("\n%s (%d checks, %d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", checks, fails);

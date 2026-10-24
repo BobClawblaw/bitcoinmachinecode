@@ -97,6 +97,33 @@ static long g_req_deadline_s = RPC_REQ_DEADLINE_DEFAULT;
 #define RPC_EXEC_LOG_MS_DEFAULT 2000   /* BMC_RPC_EXEC_LOG_MS: log an execution-lock wait or hold this long (0 = off) */
 #define RPC_QUEUE_CAP 4096
 static int g_q[RPC_QUEUE_CAP]; static int g_q_head, g_q_tail, g_q_n;
+/* RPC-24 (audit 2026-10-23): the residual RPC-4 named. Requests are read on
+ * the -rpcthreads intake workers (4 by default), so a few allowed sockets
+ * dribbling their headers still held all of them until the 60 s deadline.
+ * Two bounds, both on the read before dispatch:
+ *   - the HEADERS must arrive within RPC_HDR_DEADLINE_S (the body, which
+ *     can be an 8 MB submitblock, keeps the whole g_req_deadline_s);
+ *   - one source address reads on at most g_threads - 1 workers at once
+ *     (RPC_PER_IP_READERS), so a remote allowed host cannot take them all;
+ *     past it the connection gets 503. 127.0.0.1 and ::1 are exempt: every
+ *     local client (the CLI, mempool's backend) shares that address, and a
+ *     cap there would turn one local dribbler into 503s for all of them.
+ * g_q_src[] carries each queued connection's source key (0 = exempt) and
+ * g_rd_src[] what each worker is reading from. */
+#define RPC_HDR_DEADLINE_S 15
+static unsigned long long g_q_src[RPC_QUEUE_CAP];
+static unsigned long long g_rd_src[256];
+static pthread_mutex_t g_rd_src_mu = PTHREAD_MUTEX_INITIALIZER;
+static int rpc_per_ip_readers(void){ return g_threads > 1 ? g_threads - 1 : 1; }
+static unsigned long long rpc_src_key(const struct sockaddr_storage* ss){
+    const unsigned char* b; size_t n;
+    static const unsigned char v6lo[16] = { 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,1 };
+    if (ss->ss_family == AF_INET6){ b = ((const struct sockaddr_in6*)ss)->sin6_addr.s6_addr; n = 16; if (!memcmp(b, v6lo, 16)) return 0; }
+    else { b = (const unsigned char*)&((const struct sockaddr_in*)ss)->sin_addr.s_addr; n = 4; if (b[0] == 127 && b[1] == 0 && b[2] == 0 && b[3] == 1) return 0; }
+    unsigned long long h = 1469598103934665603ULL ^ (unsigned long long)ss->ss_family;
+    for (size_t i = 0; i < n; i++){ h ^= b[i]; h *= 1099511628211ULL; }
+    return h ? h : 1;
+}
 static pthread_mutex_t g_q_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_q_cond = PTHREAD_COND_INITIALIZER;
 static pthread_t g_workers[256]; static int g_n_workers;
@@ -1054,8 +1081,22 @@ void rpc_exec_current_label(char* out, size_t cap){
 }
 void rpc_exec_set_context(const char* who, const char* verb, size_t vlen, const char* path, size_t plen){
     if (!who){ g_exec_ctx[0] = 0; return; }
+    /* RPC-26: the verb and path come from an unauthenticated request and end
+     * up on stderr; anything outside printable ASCII is written as \xNN so a
+     * request cannot forge or split a log line. */
+    size_t o = (size_t)snprintf(g_exec_ctx, sizeof g_exec_ctx, "%s ", who);
+    if (o >= sizeof g_exec_ctx) return;
     if (plen > 120) plen = 120;
-    snprintf(g_exec_ctx, sizeof g_exec_ctx, "%s %.*s %.*s", who, (int)vlen, verb, (int)plen, path);
+    for (int part = 0; part < 2; part++){
+        const char* p = part ? path : verb; size_t n = part ? plen : vlen;
+        if (part && o + 1 < sizeof g_exec_ctx) g_exec_ctx[o++] = ' ';
+        for (size_t i = 0; p && i < n; i++){
+            unsigned char c = (unsigned char)p[i];
+            if (c >= 0x20 && c < 0x7f){ if (o + 1 >= sizeof g_exec_ctx) break; g_exec_ctx[o++] = (char)c; }
+            else { if (o + 5 >= sizeof g_exec_ctx) break; o += (size_t)snprintf(g_exec_ctx + o, 5, "\\x%02x", c); }
+        }
+    }
+    g_exec_ctx[o < sizeof g_exec_ctx ? o : sizeof g_exec_ctx - 1] = 0;
 }
 /* Test hooks: the threshold, how many lines went out, and the last four. */
 void rpc_exec_set_log_ms(long ms){ g_exec_log_ms = ms < 0 ? 0 : ms; }
@@ -1165,8 +1206,16 @@ int rpc_body_fast(const char* body, unsigned long blen){ return rpc_body_is_fast
 
 typedef struct { int cfd; char* buf; size_t body_off, blen; unsigned char prev[32]; int have_prev; } lp_req_t;
 
-static void* lp_waiter(void* arg){
-    lp_req_t* r = (lp_req_t*)arg;
+/* The longpoll waiters run on a FIXED pool of LP_MAX_WAITERS threads, started
+ * on first use and never exiting (audit 2026-10-23, the RPC-21 follow-up).
+ * They used to be one detached thread per request: the getblocktemplate it
+ * rendered allocates per-thread heap scratch (static __thread buffers, the
+ * RPC-21 class) that nothing frees when a thread exits, so a miner
+ * long-polling every block leaked that scratch once per block, for as long as
+ * the node ran. A fixed set of threads holds it at most LP_MAX_WAITERS times.
+ * lp_waiters_take() already caps the requests in flight at LP_MAX_WAITERS, so
+ * the queue below (the same size) always has room for an admitted request. */
+static void lp_serve(lp_req_t* r){
     if (r->have_prev){
         for (int waited = 0; waited < LP_MAX_WAIT_S * 1000; waited += LP_POLL_MS){
             unsigned char cur[32];
@@ -1179,8 +1228,57 @@ static void* lp_waiter(void* arg){
     char* lp_resp = render_request(r->buf + r->body_off, r->blen, &lp_len);
     send_response(r->cfd, lp_resp, lp_len);        /* socket write, lock released */
     free(r->buf); free(r);
-    lp_waiters_release();                          /* RPC-5 */
+}
+static void (*g_lp_serve_fn)(lp_req_t*) = lp_serve;   /* test seam: rpc_lp_set_serve_for_test */
+static pthread_mutex_t g_lp_q_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_lp_q_cv   = PTHREAD_COND_INITIALIZER;
+static lp_req_t* g_lp_q[LP_MAX_WAITERS];
+static int g_lp_q_head, g_lp_q_n, g_lp_pool_n;
+static pthread_once_t g_lp_pool_once = PTHREAD_ONCE_INIT;
+static void* lp_pool_thread(void* arg){
+    (void)arg;
+    for (;;){
+        pthread_mutex_lock(&g_lp_q_lock);
+        while (g_lp_q_n == 0) pthread_cond_wait(&g_lp_q_cv, &g_lp_q_lock);
+        lp_req_t* r = g_lp_q[g_lp_q_head];
+        g_lp_q_head = (g_lp_q_head + 1) % LP_MAX_WAITERS; g_lp_q_n--;
+        pthread_mutex_unlock(&g_lp_q_lock);
+        g_lp_serve_fn(r);
+        lp_waiters_release();                      /* RPC-5 */
+    }
     return NULL;
+}
+static void lp_pool_start(void){
+    for (int i = 0; i < LP_MAX_WAITERS; i++){
+        pthread_t th;
+        if (bmc_pthread_create(&th, lp_pool_thread, 0) != 0) break;
+        pthread_detach(th);
+        g_lp_pool_n++;
+    }
+}
+/* 0: queued (the pool owns r, its buf and its fd); -1: no pool thread, or the
+ * queue is full -- the caller answers serially */
+static int lp_submit(lp_req_t* r){
+    pthread_once(&g_lp_pool_once, lp_pool_start);
+    int ok = -1;
+    pthread_mutex_lock(&g_lp_q_lock);
+    if (g_lp_pool_n > 0 && g_lp_q_n < LP_MAX_WAITERS){
+        g_lp_q[(g_lp_q_head + g_lp_q_n) % LP_MAX_WAITERS] = r; g_lp_q_n++;
+        pthread_cond_signal(&g_lp_q_cv); ok = 0;
+    }
+    pthread_mutex_unlock(&g_lp_q_lock);
+    return ok;
+}
+/* test_rpc_server: replace what a pool thread does with a request, and submit
+ * one, so the pool's thread reuse is measured without a chain behind it */
+void rpc_lp_set_serve_for_test(void (*fn)(void* req)){ g_lp_serve_fn = fn ? (void (*)(lp_req_t*))fn : lp_serve; }
+int rpc_lp_submit_for_test(void* tag){
+    if (!lp_waiters_take()) return -1;
+    lp_req_t* r = calloc(1, sizeof *r);
+    if (!r){ lp_waiters_release(); return -1; }
+    r->cfd = -1; r->buf = (char*)tag;
+    if (lp_submit(r) != 0){ free(r); lp_waiters_release(); return -1; }
+    return 0;
 }
 
 /* extract the 64-hex prev-tip embedded in the request's longpollid ("<tip
@@ -1273,7 +1371,9 @@ static void service_conn(int cfd) {
         if (g_req_deadline_s > 0){
             struct timespec now_ts; clock_gettime(CLOCK_MONOTONIC, &now_ts);
             long elapsed = (long)(now_ts.tv_sec - t_start.tv_sec);
-            long left = g_req_deadline_s - elapsed;
+            long budget = g_req_deadline_s;
+            if (!hdrend && budget > RPC_HDR_DEADLINE_S) budget = RPC_HDR_DEADLINE_S;   /* RPC-24 */
+            long left = budget - elapsed;
             if (left <= 0){
                 const char* e = "HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\n\r\n";
                 (void)write_all(cfd, e, strlen(e));
@@ -1357,7 +1457,7 @@ static void service_conn(int cfd) {
           (void)write_all(cfd, e, strlen(e)); free(buf); close(cfd); return;
       } }
     /* longpoll: a getblocktemplate carrying a longpollid waits OFF-THREAD
-     * (see the block comment above lp_waiter) */
+     * (see the block comment above lp_serve) */
     { int is_lp = 0;
       for (size_t i = 0; !is_lp && i + 12 <= blen; i++)
           if (!memcmp(body + i, "\"longpollid\"", 12)) is_lp = 1;
@@ -1373,11 +1473,7 @@ static void service_conn(int cfd) {
               if (r){
                   r->cfd = cfd; r->buf = buf; r->body_off = (size_t)(body - buf); r->blen = blen;
                   r->have_prev = lp_extract_prev(body, blen, r->prev);
-                  pthread_t th;
-                  if (bmc_pthread_create(&th, lp_waiter, r) == 0){
-                      pthread_detach(th);
-                      return;                        /* r owns buf + cfd now */
-                  }
+                  if (lp_submit(r) == 0) return;      /* the pool owns r, buf and cfd now */
                   free(r);                           /* fall through: serial */
               }
               lp_waiters_release();                  /* RPC-5: spawn failed */
@@ -1405,44 +1501,120 @@ static void service_conn(int cfd) {
  * A second port, no authentication (Esplora has none; mempool.space's client
  * sends none), every request routed to rpc_esplora.c under the same
  * g_exec_lock the JSON-RPC path holds, so the handlers never run twice at
- * once. One thread per connection, capped. */
+ * once. A fixed pool of threads serves the connections (RPC-21, below). */
 #include "rpc_esplora.h"
 static int g_esp_fd = -1;
-static volatile int g_esp_live = 0;
+/* RPC-21 (audit 2026-10-23): a FIXED pool of ESP_MAX_CONN threads, not a
+ * detached thread per connection. Handlers keep per-thread heap scratch
+ * (static __thread buffers malloc'd on first use: rpc_chain's undo tables,
+ * 24 MB between them, the message decoder's buffer, BMC_TLS_BUF in the
+ * verifier, ...) that no thread exit releases, so every connection's thread
+ * leaked them -- one unauthenticated GET /block/<h>/txs at a time. Pool
+ * threads never exit: the scratch is allocated at most ESP_MAX_CONN times
+ * however many requests arrive, and nothing in the call graph has to name
+ * its buffers for a destructor. Accepted connections queue for a worker;
+ * past ESP_QUEUE_CAP waiting they get 503, as the old cap did.
+ *
+ * RPC-22: the read has a TOTAL deadline (the JSON-RPC intake's, RPC-4) on
+ * top of the per-read timeout, and the response a total write deadline, so a
+ * client that dribbles its request or reads its response a byte at a time
+ * holds a worker for a bounded time. The header scan resumes where the last
+ * read stopped instead of rescanning the buffer (quadratic up to 8 MB). */
 #define ESP_MAX_CONN 16
-static void* esp_conn_thread(void* arg){
-    int cfd = (int)(long)arg;
-    struct timeval tv = { 60, 0 }; setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv); setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
-    size_t cap = 65536, got = 0; char* buf = malloc(cap); const char* hdrend = 0;
-    if (!buf){ close(cfd); __sync_fetch_and_sub(&g_esp_live, 1); return 0; }
+#define ESP_QUEUE_CAP 64
+#define ESP_REQ_MAX (8u << 20)
+#define ESP_IO_TIMEOUT_S 60          /* per read / per write, as before */
+#define ESP_WRITE_DEADLINE_S 120     /* the whole response */
+static int g_esp_q[ESP_QUEUE_CAP]; static int g_esp_q_head, g_esp_q_tail, g_esp_q_n;
+static pthread_mutex_t g_esp_q_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_esp_q_cond = PTHREAD_COND_INITIALIZER;
+static int g_esp_workers;
+static long g_esp_read_deadline_s = -1;      /* test seam; -1 = the JSON-RPC intake's g_req_deadline_s */
+static long g_esp_write_deadline_s = ESP_WRITE_DEADLINE_S;
+void rpc_esplora_set_deadlines_for_test(long read_s, long write_s){ g_esp_read_deadline_s = read_s; g_esp_write_deadline_s = write_s; }
+static long esp_secs_left(const struct timespec* t0, long budget){
+    struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+    return budget - (long)(now.tv_sec - t0->tv_sec);
+}
+/* write all of p within the deadline that started at t0; 0 = sent */
+static int esp_write_by(int fd, const char* p, size_t n, const struct timespec* t0){
+    while (n){
+        long left = esp_secs_left(t0, g_esp_write_deadline_s);
+        if (left <= 0) return -1;
+        struct timeval tv = { left < ESP_IO_TIMEOUT_S ? left : ESP_IO_TIMEOUT_S, 0 };
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+        ssize_t w = write(fd, p, n);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) return -1;
+        p += w; n -= (size_t)w;
+    }
+    return 0;
+}
+static void esp_serve(int cfd){
+    long rd_budget = g_esp_read_deadline_s >= 0 ? g_esp_read_deadline_s : g_req_deadline_s;
+    struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+    struct timeval tv = { ESP_IO_TIMEOUT_S, 0 }; setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    size_t cap = 65536, got = 0, scanned = 0; char* buf = malloc(cap); const char* hdrend = 0;
+    if (!buf){ close(cfd); return; }
     for (;;){
-        if (got + 1 >= cap){ if (cap >= (8u << 20)) break; size_t hoff = hdrend ? (size_t)(hdrend - buf) : 0; char* nb = realloc(buf, cap * 2); if (!nb) break; buf = nb; cap *= 2; if (hdrend) hdrend = buf + hoff; }
+        if (got + 1 >= cap){ if (cap >= ESP_REQ_MAX) break; size_t hoff = hdrend ? (size_t)(hdrend - buf) : 0; char* nb = realloc(buf, cap * 2); if (!nb) break; buf = nb; cap *= 2; if (hdrend) hdrend = buf + hoff; }
+        if (rd_budget > 0){
+            long left = esp_secs_left(&t0, rd_budget);
+            if (left <= 0){
+                const char* e = "HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
+                (void)esp_write_by(cfd, e, strlen(e), &t1);
+                free(buf); close(cfd); return;
+            }
+            if (left < ESP_IO_TIMEOUT_S){ struct timeval t2 = { left, 0 }; setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &t2, sizeof t2); }
+        }
         ssize_t n = read(cfd, buf + got, cap - 1 - got);
+        if (n < 0 && errno == EINTR) continue;
         if (n <= 0) break;
         got += (size_t)n; buf[got] = 0;
-        if (!hdrend){ char* e = strstr(buf, "\r\n\r\n"); if (e) hdrend = e; }
+        if (!hdrend){
+            size_t start = scanned > 3 ? scanned - 3 : 0;
+            for (size_t i = start; i + 3 < got; i++)
+                if (buf[i] == '\r' && buf[i+1] == '\n' && buf[i+2] == '\r' && buf[i+3] == '\n'){ hdrend = buf + i; break; }
+            scanned = got;
+        }
         if (hdrend){
             const char* cl = find_header(buf, (size_t)(hdrend - buf), "Content-Length", 14);
             long nv = cl ? strtol(cl, NULL, 10) : 0;
             if ((long)(got - ((size_t)(hdrend - buf) + 4)) >= nv) break;
         }
     }
+    struct timespec tw; clock_gettime(CLOCK_MONOTONIC, &tw);      /* the write deadline starts with the response */
     const char *m, *path, *body; size_t mlen, plen, blen;
     if (got == 0 || !http_request_parse(buf, got, &m, &mlen, &path, &plen, &body, &blen)){
-        const char* e = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"; (void)write_all(cfd, e, strlen(e));
-        free(buf); close(cfd); __sync_fetch_and_sub(&g_esp_live, 1); return 0;
+        const char* e = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"; (void)esp_write_by(cfd, e, strlen(e), &tw);
+        free(buf); close(cfd); return;
     }
     char* out = 0; size_t outlen = 0; int status = 500; const char* ctype = "text/plain";
     /* the lock is taken per dispatch inside the facade (esplora_set_exec_lock),
      * so a batch route cannot starve the JSON-RPC callers */
     esplora_handle(m, mlen, path, plen, body, blen, g_wallet, &out, &outlen, &status, &ctype);
+    rpc_exec_set_context(NULL, NULL, 0, NULL, 0);   /* the route is over; this pool thread serves the next one */
+    clock_gettime(CLOCK_MONOTONIC, &tw);
+    /* RPC-23: no Access-Control-Allow-Origin. A wildcard let any web page a
+     * user of this host opened drive the unauthenticated routes and read the
+     * answers; mempool.space's backend is a server-side client and needs no
+     * CORS, and electrs sends the header only when --cors is configured. */
     char hdr[256];
-    int hl = snprintf(hdr, sizeof hdr, "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
+    int hl = snprintf(hdr, sizeof hdr, "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
                       status, status_text(status), ctype, outlen);
-    (void)write_all(cfd, hdr, (size_t)hl);
-    if (out && outlen) (void)write_all(cfd, out, outlen);
+    if (esp_write_by(cfd, hdr, (size_t)hl, &tw) == 0 && out && outlen) (void)esp_write_by(cfd, out, outlen, &tw);
     free(out); free(buf); close(cfd);
-    __sync_fetch_and_sub(&g_esp_live, 1);
+}
+static void* esp_worker_thread(void* arg){
+    (void)arg;
+    for (;;){
+        pthread_mutex_lock(&g_esp_q_lock);
+        while (g_esp_q_n == 0) pthread_cond_wait(&g_esp_q_cond, &g_esp_q_lock);
+        int c = g_esp_q[g_esp_q_head]; g_esp_q_head = (g_esp_q_head + 1) % ESP_QUEUE_CAP; g_esp_q_n--;
+        pthread_mutex_unlock(&g_esp_q_lock);
+        esp_serve(c);
+    }
     return 0;
 }
 static void* esp_server_thread(void* arg){
@@ -1451,11 +1623,15 @@ static void* esp_server_thread(void* arg){
         struct sockaddr_storage cli; socklen_t cl = sizeof cli;
         int c = accept(g_esp_fd, (struct sockaddr*)&cli, &cl);
         if (c < 0){ if (errno == EMFILE || errno == ENFILE){ struct timespec ts = { 0, 50 * 1000 * 1000 }; nanosleep(&ts, NULL); } continue; }
-        if (g_esp_live >= ESP_MAX_CONN){ const char* e = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"; (void)write_all(c, e, strlen(e)); close(c); continue; }
-        __sync_fetch_and_add(&g_esp_live, 1);
-        pthread_t th;
-        if (bmc_pthread_create(&th, esp_conn_thread, (void*)(long)c) != 0){ close(c); __sync_fetch_and_sub(&g_esp_live, 1); continue; }
-        pthread_detach(th);
+        pthread_mutex_lock(&g_esp_q_lock);
+        if (g_esp_q_n >= ESP_QUEUE_CAP){
+            pthread_mutex_unlock(&g_esp_q_lock);
+            struct timeval tv = { 1, 0 }; setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+            const char* e = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"; (void)write_all(c, e, strlen(e)); close(c); continue;
+        }
+        g_esp_q[g_esp_q_tail] = c; g_esp_q_tail = (g_esp_q_tail + 1) % ESP_QUEUE_CAP; g_esp_q_n++;
+        pthread_cond_signal(&g_esp_q_cond);
+        pthread_mutex_unlock(&g_esp_q_lock);
     }
     return 0;
 }
@@ -1485,7 +1661,13 @@ int rpc_esplora_start(const char* bind_addr, int port, char* errmsg, size_t errc
     if (bind(fd, (struct sockaddr*)&a, sizeof a) < 0){ snprintf(errmsg, errcap, "bind %s:%d: %s", bind_addr, port, strerror(errno)); close(fd); return -1; }
     if (listen(fd, 64) < 0){ snprintf(errmsg, errcap, "listen: %s", strerror(errno)); close(fd); return -1; }
     g_esp_fd = fd;
-    pthread_t th; if (bmc_pthread_create(&th, esp_server_thread, 0) != 0){ snprintf(errmsg, errcap, "thread: %s", strerror(errno)); close(fd); g_esp_fd = -1; return -1; }
+    pthread_t th;
+    for (int i = g_esp_workers; i < ESP_MAX_CONN; i++){
+        if (bmc_pthread_create(&th, esp_worker_thread, 0) != 0) break;
+        pthread_detach(th); g_esp_workers++;
+    }
+    if (g_esp_workers == 0){ snprintf(errmsg, errcap, "thread: %s", strerror(errno)); close(fd); g_esp_fd = -1; return -1; }
+    if (bmc_pthread_create(&th, esp_server_thread, 0) != 0){ snprintf(errmsg, errcap, "thread: %s", strerror(errno)); close(fd); g_esp_fd = -1; return -1; }
     pthread_detach(th);
     /* the mempool cache refresher: a request never refreshes inline (2026-09-08) */
     if (esplora_start_refresher(g_wallet) != 0) fprintf(stderr, "[rpc] esplora: the mempool refresher thread did not start; views refresh inline\n");
@@ -1547,21 +1729,35 @@ static void* server_thread(void* arg) {
             (void)write_all(c, e, strlen(e)); close(c);
             continue;
         }
-        g_q[g_q_tail] = c; g_q_tail = (g_q_tail + 1) % RPC_QUEUE_CAP; g_q_n++;
+        g_q[g_q_tail] = c; g_q_src[g_q_tail] = rpc_src_key(&cli); g_q_tail = (g_q_tail + 1) % RPC_QUEUE_CAP; g_q_n++;
         pthread_cond_signal(&g_q_cond);
         pthread_mutex_unlock(&g_q_lock);
     }
     return NULL;
 }
 static void* worker_thread(void* arg){
-    (void)arg;
+    int me = (int)(long)arg;
     for (;;){
         pthread_mutex_lock(&g_q_lock);
         while (g_q_n == 0 && g_run) pthread_cond_wait(&g_q_cond, &g_q_lock);
         if (g_q_n == 0 && !g_run){ pthread_mutex_unlock(&g_q_lock); return NULL; }
-        int c = g_q[g_q_head]; g_q_head = (g_q_head + 1) % RPC_QUEUE_CAP; g_q_n--;
+        int c = g_q[g_q_head]; unsigned long long src = g_q_src[g_q_head]; g_q_head = (g_q_head + 1) % RPC_QUEUE_CAP; g_q_n--;
         pthread_mutex_unlock(&g_q_lock);
+        if (src){                                       /* RPC-24: one source, at most g_threads - 1 readers */
+            int busy = 0;
+            pthread_mutex_lock(&g_rd_src_mu);
+            for (int i = 0; i < g_n_workers; i++) if (i != me && g_rd_src[i] == src) busy++;
+            if (busy < rpc_per_ip_readers()) g_rd_src[me] = src;
+            pthread_mutex_unlock(&g_rd_src_mu);
+            if (busy >= rpc_per_ip_readers()){
+                struct timeval tv = { 1, 0 }; setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+                const char* e = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 35\r\n\r\nToo many connections from this host";
+                (void)write_all(c, e, strlen(e)); close(c);
+                continue;
+            }
+        }
         service_conn(c);
+        if (src){ pthread_mutex_lock(&g_rd_src_mu); g_rd_src[me] = 0; pthread_mutex_unlock(&g_rd_src_mu); }
     }
 }
 
@@ -1683,8 +1879,9 @@ int rpc_server_start(const rpc_server_cfg* cfg, int* actual_port,
     g_xq_head = g_xq_tail = g_xq_n = 0;
     g_run = 1;
     g_n_workers = 0; g_n_xworkers = 0;
+    memset(g_rd_src, 0, sizeof g_rd_src);
     for (int i = 0; i < g_threads; i++)
-        if (bmc_pthread_create(&g_workers[g_n_workers], worker_thread, NULL) == 0) g_n_workers++;
+        if (bmc_pthread_create(&g_workers[g_n_workers], worker_thread, (void*)(long)g_n_workers) == 0) g_n_workers++;
     for (int i = 0; i < g_threads; i++)          /* the execution pool: -rpcthreads of its own */
         if (bmc_pthread_create(&g_xworkers[g_n_xworkers], exec_thread, NULL) == 0) g_n_xworkers++;
     if (g_n_workers == 0 || g_n_xworkers == 0 || bmc_pthread_create(&g_thread, server_thread, NULL) != 0) {

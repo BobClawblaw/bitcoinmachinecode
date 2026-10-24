@@ -25,6 +25,7 @@
 #include <netinet/in.h>
 #include <pthread.h>
 #include <sys/wait.h>
+#include <sys/time.h>
 
 /* wallet-core command layer (asm/wallet_core.c) */
 extern long wallet_derive_p2wpkh_address(char* out, long cap, const unsigned char seed[64], unsigned index);
@@ -58,6 +59,8 @@ static rpc_wallet wallet = { seed, utxo_txid, utxo_idx, utxo_val,
 /* capture the most recent client request for wire-framing assertions */
 static char last_req[65536];
 static size_t last_req_len = 0;
+static char last_raw[65536];            /* the whole request: headers + body */
+static size_t last_raw_len = 0;
 
 /* Split a reply body: returns the JSON (after HTTP body). */
 static void service_conn(int cfd) {
@@ -83,6 +86,7 @@ static void service_conn(int cfd) {
         }
     }
     buf[got] = 0;
+    memcpy(last_raw, buf, got + 1); last_raw_len = got;
     if (got == 0) { close(cfd); return; }
     /* parse HTTP request */
     const char *method, *path, *body; size_t mlen, plen, blen;
@@ -150,6 +154,9 @@ static void* srv_thread(void* arg) {
         struct sockaddr_in cli; socklen_t cl = sizeof cli;
         int c = accept(srv_fd, (struct sockaddr*)&cli, &cl);
         if (c < 0) continue;
+        /* a request that never completes its headers must not hang the test */
+        struct timeval tv = { 2, 0 };
+        setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
         service_conn(c);
     }
     return NULL;
@@ -373,6 +380,40 @@ int main(int argc, char** argv) {
         ck("decode has vin/vout", strstr(out_buf, "\"vin\"") != NULL && strstr(out_buf, "\"vout\"") != NULL);
         ck("decode value 0.001", strstr(out_buf, "\"value\": 0.00100000") != NULL);
         ck("decode address present", strstr(out_buf, "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH") != NULL);
+    }
+
+    /* ---------- 11. RPC-25: credentials longer than the old 512-byte head --
+     * the head was a fixed stack array written with snprintf's unclamped
+     * return: a long rpcuser/rpcpassword cut the Authorization line and sent
+     * bytes from past the array. The whole header must arrive as built. */
+    {
+        char user[701], pass[401];
+        memset(user, 'u', 700); user[700] = 0;
+        memset(pass, 'p', 400); pass[400] = 0;
+        const char* body = "{\"method\":\"getbalance\",\"params\":[],\"id\":\"1\"}";
+        char resp[4096], em[256];
+        last_raw_len = 0; last_raw[0] = 0;
+        long bl = rpc_http_post(srv_port, user, pass, body, (long)strlen(body), resp, sizeof resp - 1, em, sizeof em);
+        /* expected Authorization: base64("uuu...:ppp...") */
+        static const char T[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        char cred[1102]; size_t cl = (size_t)snprintf(cred, sizeof cred, "%s:%s", user, pass);
+        char b64[1600]; size_t o = 0;
+        for (size_t i = 0; i < cl; i += 3) {
+            unsigned v = (unsigned char)cred[i] << 16;
+            if (i + 1 < cl) v |= (unsigned char)cred[i + 1] << 8;
+            if (i + 2 < cl) v |= (unsigned char)cred[i + 2];
+            b64[o++] = T[(v >> 18) & 63]; b64[o++] = T[(v >> 12) & 63];
+            b64[o++] = i + 1 < cl ? T[(v >> 6) & 63] : '=';
+            b64[o++] = i + 2 < cl ? T[v & 63] : '=';
+        }
+        b64[o] = 0;
+        char want[1800]; snprintf(want, sizeof want, "\r\nAuthorization: Basic %s\r\n", b64);
+        ck("long credentials: the full Authorization line arrives", strstr(last_raw, want) != NULL);
+        char cls[64]; snprintf(cls, sizeof cls, "\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", strlen(body));
+        char* hp = strstr(last_raw, cls);
+        ck("long credentials: the rest of the head and the body follow it intact",
+           hp && !strcmp(hp + strlen(cls), body));
+        ck("long credentials: the call completes with a JSON reply", bl > 0 && strstr(resp, "\"result\"") != NULL);
     }
 
     stop_server();

@@ -20,6 +20,8 @@ void esplora_mp_refresh(const rpc_wallet* w, long budget);   /* one bounded refr
 int  esplora_start_refresher(const rpc_wallet* w);           /* the background refresher: after it, requests only read the cache */
 /* the second listener (rpc_server.c): 0 ok, -1 with errmsg */
 int rpc_esplora_start(const char* bind_addr, int port, char* errmsg, size_t errcap);
+/* test seam: the listener's total read and write deadlines in seconds (read -1 = the JSON-RPC intake's) */
+void rpc_esplora_set_deadlines_for_test(long read_s, long write_s);
 /* pure helpers, exported for tests */
 long   esplora_sats_of_amount(const char* dec);                 /* "0.01000000" -> 1000000; -1 on garbage */
 size_t esplora_asm_of_hex(const char* hex, char* out, size_t cap); /* mempool's convertScriptSigAsm */
