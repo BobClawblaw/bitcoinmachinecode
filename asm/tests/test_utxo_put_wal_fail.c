@@ -16,7 +16,8 @@
  *
  * THE INJECTION. After a clean utxo_lsm_init, the WAL descriptor in the state
  * is replaced with a READ-ONLY fd. Nothing else changes. Buffered puts then
- * succeed until the 1 MB write buffer fills; the drain that follows calls
+ * succeed until the write buffer fills (1 MB then, 32 MB since STO-A,
+ * utxo_store_walbuf_cap); the drain that follows calls
  * write() on a read-only fd, gets EBADF, and utxo_store_put fails. This
  * reproduces the audit's scratchpad repro (which used the same read-only-fd
  * trick and saw the drain fail after 16,644 puts) without needing a full disk.
@@ -50,6 +51,7 @@ extern long utxo_lsm_init(void* lst);
 extern long utxo_lsm_put(void* lst, void* u, const u8* txid, unsigned index, u64 value,
                          unsigned long height, unsigned long cb, const u8* script, unsigned slen);
 extern void utxo_lsm_close(void* lst);
+extern const unsigned long long utxo_store_walbuf_cap;
 
 static int fails = 0;
 static void ck(const char* l, int c){ if (c) printf("ok  : %s\n", l); else { printf("FAIL: %s\n", l); fails++; } }
@@ -63,7 +65,7 @@ int main(void){
     char tmpl[] = "/tmp/utxputXXXXXX"; char* dir = mkdtemp(tmpl);
     if (!dir || chdir(dir) != 0){ printf("FAIL: tmpdir\n"); return 1; }
 
-    enum { SLOTS = 262144, TOMBS = 8192 };
+    enum { SLOTS = 1 << 20, TOMBS = 8192 };
     void* blob = malloc(64u << 20);
     void* u = malloc(utxo_struct_size(SLOTS));
     utxo_init(u, SLOTS, blob, 64u << 20);
@@ -87,9 +89,10 @@ int main(void){
 
     long nfail = 0, nbadwidth = 0, nneg = 0;
     long first_fail = -1;
-    /* 40,000 puts is comfortably past the ~16.6k the audit measured for the
-     * first 1 MB drain, so the drain is reached even if record sizes shift. */
-    for (unsigned i = 0; i < 40000; i++){
+    /* a record is at least 59 + 20 bytes, so cap/59 puts is comfortably past
+     * the first drain (~16.6k at the audit's 1 MB) even if record sizes shift. */
+    unsigned nput = (unsigned)(utxo_store_walbuf_cap / 59) + 1000;
+    for (unsigned i = 0; i < nput; i++){
         u8 t[32]; make_txid(t, i);
         long r = utxo_lsm_put(&lst, u, t, i & 3, 1000ULL + i, 100 + i, 0, script, 20 + (i % 20));
         if (r == 1 || r == 0 || r == 2) continue;          /* ok / dup / table full */
