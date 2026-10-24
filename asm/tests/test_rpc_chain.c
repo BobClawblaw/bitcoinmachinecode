@@ -381,6 +381,18 @@ static long usi_stub_run(int want_muhash, void* outv, char* msg, unsigned long m
     return 1;
 }
 
+/* dumptxoutset stub runner (ST2-3): records the path the RPC layer resolved
+ * and returns g_dump_ret (-2 = the runner refused as Core refuses) */
+static char g_dump_path[1100]; static long g_dump_ret = 1;
+static long dump_stub_run(const char* path, int (*hash_at)(long, unsigned char*),
+                          long* h, unsigned long long* coins, char* msg, unsigned long mcap){
+    (void)hash_at;
+    snprintf(g_dump_path, sizeof g_dump_path, "%s", path);
+    if (g_dump_ret == -2){ if (msg && mcap) snprintf(msg, mcap, "%s already exists. If you are sure this is what you want, move it out of the way first", path); return -2; }
+    *h = 3; *coins = 7;
+    return 1;
+}
+
 /* scantxoutset stub scanner: reports one hit for the FIRST target spk at
  * height 2, scan height 3 (the fixture tip, so bestblock/blockhash resolve). */
 static long scan_stub_run(const unsigned char* spks, const unsigned int* spklens, int nspk,
@@ -1688,6 +1700,34 @@ int main(void){
         rj_free(r1); rj_free(p1); }
       g_usi_stub_busy = 0;
       rpc_chain_set_utxosetinfo(0);
+    }
+
+    /* ---- dumptxoutset: the path is resolved as Core resolves it,
+     * AbsPathJoin(GetDataDirNet(), path) -- relative to the per-chain datadir
+     * (the working directory), an absolute one kept -- and the reply's "path"
+     * is the resolved one (ST2-3). The runner's refusal (-2) is Core's
+     * RPC_INVALID_PARAMETER. ---- */
+    {
+      extern void rpc_chain_set_utxodump(long (*)(const char*, int (*)(long, unsigned char*),
+                                          long*, unsigned long long*, char*, unsigned long));
+      rpc_chain_set_utxodump(dump_stub_run);
+      char cwd[1024]; if (!getcwd(cwd, sizeof cwd)) cwd[0] = 0;
+      char want[1100]; snprintf(want, sizeof want, "%s/snap.dat", cwd);
+      g_dump_ret = 1; g_dump_path[0] = 0;
+      r = call("dumptxoutset", "[\"snap.dat\", \"latest\"]", &ec, &em);
+      ck("dumptxoutset: a relative path reaches the runner joined to the datadir", !strcmp(g_dump_path, want));
+      if (strcmp(g_dump_path, want)) printf("      runner got [%s], want [%s]\n", g_dump_path, want);
+      ck_str("dumptxoutset: the reply names the resolved path", r ? S(r,"path") : NULL, want);
+      ck_str("dumptxoutset: coins_written from the runner", r ? S(r,"coins_written") : NULL, "7");
+      rj_free(r);
+      r = call("dumptxoutset", "[\"/abs/where/snap.dat\"]", &ec, &em);
+      ck("dumptxoutset: an absolute path stands", !strcmp(g_dump_path, "/abs/where/snap.dat"));
+      rj_free(r);
+      g_dump_ret = -2;
+      { char msgw[1300]; snprintf(msgw, sizeof msgw, "%s/utxo_manifest.dat already exists. If you are sure this is what you want, move it out of the way first", cwd);
+        expect_err("dumptxoutset: the runner's refusal is RPC_INVALID_PARAMETER with Core's text", "dumptxoutset", "[\"utxo_manifest.dat\"]", -8, msgw); }
+      g_dump_ret = 1;
+      rpc_chain_set_utxodump(0);
     }
 
     /* ---- scantxoutset: dispatch + shape over an injected STUB scanner (the

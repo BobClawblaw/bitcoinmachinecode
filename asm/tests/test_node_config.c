@@ -429,8 +429,8 @@ int main(void){
     if (g_cfg.logtimestamps==0 && g_cfg.logtimemicros==1 && g_cfg.logthreadnames==1 && g_cfg.logsourcelocations==1 && g_cfg.shrinkdebugfile==0)
         printf("PASS: logging options parsed\n");
     else { printf("FAIL: logging options\n"); failures++; }
-    if (g_cfg.rpcthreads==4 && g_cfg.rpcworkqueue==8 && g_cfg.rpcservertimeout==5 && g_cfg.n_rpcwhitelist==1 && g_cfg.rpcwhitelistdefault==0 && g_cfg.rpccookieperms==1)
-        printf("PASS: rpc server options; a whitelist without ':' refused\n");
+    if (g_cfg.rpcthreads==4 && g_cfg.rpcworkqueue==8 && g_cfg.rpcservertimeout==5 && g_cfg.n_rpcwhitelist==2 && g_cfg.rpcwhitelistdefault==0 && g_cfg.rpccookieperms==1)
+        printf("PASS: rpc server options; a whitelist without ':' kept (Core: that user may call nothing -- CFG-2)\n");
     else { printf("FAIL: rpc options (%d %d %d n=%d d=%d p=%d)\n", g_cfg.rpcthreads, g_cfg.rpcworkqueue, g_cfg.rpcservertimeout, g_cfg.n_rpcwhitelist, g_cfg.rpcwhitelistdefault, g_cfg.rpccookieperms); failures++; }
     /* v31.1 (2026-10-01): the cluster limits are their own options; they used
      * to be copied onto the ancestor/descendant limits, a different rule */
@@ -717,6 +717,133 @@ int main(void){
           printf("PASS: zmqpubsequence is accepted and applied, with its hwm\n");
       else { printf("FAIL: zmqpubsequence not applied (address '%s', hwm %d)\n",
                     g_cfg.zmq_sequence, g_cfg.zmq_hwm[4]); failures++; } }
+
+    /* ---- CFG-1 (audit 2026-10-23): rpcport/rpcuser/rpcpassword ----------
+     * read through this parser, with Core's section scoping and precedence
+     * (a [chain] value beats a base value; the FIRST value at a rank wins),
+     * and an invalid rpcport refused as Core's CheckHostPortOptions does. The
+     * old reader in main.c was section-blind: a [regtest] rpcpassword was a
+     * working mainnet credential, and rpcport=70000 wrapped to 4464. */
+#define CK(cond, ...) do{ if (cond) printf("PASS: " __VA_ARGS__); else { printf("FAIL: " __VA_ARGS__); failures++; } }while(0)
+    wr("cfg1_a.conf", "rpcuser=alice   # the operator\nrpcpassword=basepw\n[regtest]\nrpcuser=mallory\nrpcpassword=regtestpw\nrpcport=18999\n");
+    node_config_load("cfg1_a.conf");
+    CK(!node_config_error() && !strcmp(g_cfg.rpcuser, "alice") && !strcmp(g_cfg.rpcpassword, "basepw") && g_cfg.rpcport == 0,
+       "CFG-1: on mainnet a [regtest] rpcuser/rpcpassword/rpcport is inert (user=%s port=%d)\n", g_cfg.rpcuser, g_cfg.rpcport);
+    wr("cfg1_b.conf", "[regtest]\nrpcpassword=regtest-only\n");
+    node_config_load("cfg1_b.conf");
+    CK(g_cfg.rpcpassword[0] == 0, "CFG-1: a password set only under [regtest] is no mainnet credential\n");
+    wr("cfg1_c.conf", "chain=regtest\nrpcpassword=base\nrpcport=18000\n[main]\nrpcpassword=mainpw\n[regtest]\nrpcpassword=sectionpw\nrpcport=18446\nrpcpassword=later\n");
+    node_config_load("cfg1_c.conf");
+    CK(!strcmp(g_cfg.rpcpassword, "sectionpw") && g_cfg.rpcport == 18446,
+       "CFG-1: on regtest the [regtest] value beats the base one and the first wins (pass=%s port=%d)\n", g_cfg.rpcpassword, g_cfg.rpcport);
+    wr("cfg1_d.conf", "chain=regtest\nrpcport=18000\n");
+    node_config_load("cfg1_d.conf");
+    CK(g_cfg.rpcport == 0, "CFG-1: a base-section rpcport is ignored on regtest (NETWORK_ONLY, as Core)\n");
+    wr("cfg1_e.conf", "rpcport=8331\nrpcport=9999\n");
+    node_config_load("cfg1_e.conf");
+    CK(g_cfg.rpcport == 8331, "CFG-1: the first rpcport in a section wins, as in Core (%d)\n", g_cfg.rpcport);
+    { const char* bad[] = { "rpcport=70000\n", "rpcport=0\n", "rpcport=83a1\n", "rpcport=-1\n", "rpcport=\n" };
+      for (unsigned i = 0; i < sizeof bad / sizeof bad[0]; i++){
+          wr("cfg1_f.conf", bad[i]);
+          long r = node_config_load("cfg1_f.conf");
+          CK(r < 0 && node_config_error() && strstr(node_config_error(), "rpcport"),
+             "CFG-1: an invalid rpcport stops the load (%.*s)\n", (int)strlen(bad[i]) - 1, bad[i]);
+      } }
+    wr("cfg1_g.conf", "rpcpassword=abc#def\n");
+    CK(node_config_load("cfg1_g.conf") < 0 && node_config_error(),
+       "CFG-1: a '#' on an rpcpassword line is refused (Core: \"can be ambiguous\")\n");
+    wr("cfg1_inc.conf", "rpcuser=fromincluded\nrpcpassword=incpw\n");
+    wr("cfg1_h.conf", "rpcuser=frommain\nincludeconf=cfg1_inc.conf\n");
+    node_config_load("cfg1_h.conf");
+    CK(!node_config_error() && !strcmp(g_cfg.rpcuser, "frommain") && !strcmp(g_cfg.rpcpassword, "incpw"),
+       "CFG-1: includeconf supplies rpcpassword; the main file's earlier rpcuser keeps precedence\n");
+    wr("cfg1_i.conf", "includeconf=cfg1_missing.conf\n");
+    CK(node_config_load("cfg1_i.conf") < 0, "CFG-1: a missing includeconf file is an error, as in Core\n");
+    node_config_load("/nonexistent/reset.conf");
+    CK(!node_config_error() && g_cfg.rpcport == 0 && !g_cfg.rpcuser[0], "CFG-1: a fresh load clears the error and the RPC keys\n");
+
+    /* ---- CFG-3: an unclosed [section is a parse error (Core refuses it);
+     * so is any line with no '=' and a line with a leading '-'. It used to
+     * warn and apply the following keys to the PREVIOUS section. */
+    wr("cfg3_a.conf", "[regtest\nrpcallowip=0.0.0.0/0\nrpcbind=0.0.0.0\n");
+    CK(node_config_load("cfg3_a.conf") < 0 && node_config_error() && g_cfg.n_rpcallowip == 0,
+       "CFG-3: `[regtest` without ']' stops the load before rpcallowip applies\n");
+    wr("cfg3_b.conf", "listen\n");
+    CK(node_config_load("cfg3_b.conf") < 0, "CFG-3: a line with no '=' is a parse error\n");
+    wr("cfg3_c.conf", "-listen=0\n");
+    CK(node_config_load("cfg3_c.conf") < 0, "CFG-3: a leading '-' is a parse error\n");
+    wr("cfg3_d.conf", "  [regtest]  # dev block\nport=18555\n[main]\nport=8555\n");
+    node_config_load("cfg3_d.conf");
+    CK(!node_config_error() && g_cfg.port == 8555, "CFG-3: a well-formed header with spaces and a comment still scopes (port=%d)\n", g_cfg.port);
+
+    /* ---- CFG-4: a line is a line, however long. fgets(1024) handed the
+     * tail of a long comment back as a new line and parsed it as a key. */
+    { char big[4096]; int o = snprintf(big, sizeof big, "# ");
+      while (o < 1023) big[o++] = 'x';         /* the old 1024-byte fgets ended its "line" here */
+      o += snprintf(big + o, sizeof big - o, "rpcallowip=0.0.0.0/0\nmaxconnections=77\n");
+      wr("cfg4_a.conf", big);
+      node_config_load("cfg4_a.conf");
+      CK(!node_config_error() && g_cfg.n_rpcallowip == 0 && g_cfg.max_connections == 77,
+         "CFG-4: a 1023-char comment's tail is not parsed as rpcallowip (n=%d)\n", g_cfg.n_rpcallowip);
+      o = snprintf(big, sizeof big, "signetchallenge=");
+      while (o < 1600) big[o++] = 'a';
+      o += snprintf(big + o, sizeof big - o, "\nmaxconnections=78\n");
+      wr("cfg4_b.conf", big);
+      node_config_load("cfg4_b.conf");
+      CK(!node_config_error() && strlen(g_cfg.signetchallenge) == 1600 - 16 && g_cfg.max_connections == 78,
+         "CFG-4: a 1600-char value is read whole, not split into a second line\n"); }
+
+    /* ---- CFG-5: bind= parsed as Core's SplitHostPort, bad ports refused. */
+    { struct { const char* v; const char* host; int port; } good[] = {
+          { "::1", "::1", 8333 }, { "[::1]:8555", "::1", 8555 }, { "127.0.0.1:8556", "127.0.0.1", 8556 },
+          { "192.0.2.10", "192.0.2.10", 8333 }, { "[2001:db8::1]", "2001:db8::1", 8333 } };
+      for (unsigned i = 0; i < sizeof good / sizeof good[0]; i++){
+          char b[128]; snprintf(b, sizeof b, "bind=%s\n", good[i].v); wr("cfg5.conf", b);
+          node_config_load("cfg5.conf");
+          CK(!node_config_error() && !strcmp(g_cfg.bind_addr, good[i].host) && g_cfg.port == good[i].port,
+             "CFG-5: bind=%s -> host %s port %d (got %s %d)\n", good[i].v, good[i].host, good[i].port, g_cfg.bind_addr, g_cfg.port);
+      }
+      const char* bad[] = { "127.0.0.1:70000", "127.0.0.1:0", "1.2.3.4:abc", "host.example", "127.0.0.1:8334=onion", "[::1]:", "::1:8333x" };
+      for (unsigned i = 0; i < sizeof bad / sizeof bad[0]; i++){
+          char b[128]; snprintf(b, sizeof b, "bind=%s\n", bad[i]); wr("cfg5.conf", b);
+          CK(node_config_load("cfg5.conf") < 0 && node_config_error(), "CFG-5: bind=%s is refused\n", bad[i]);
+      } }
+
+    /* ---- CFG-6: Core's chain names only; chain=mainnet used to run mainnet
+     * (chainparams) while this parser treated it as not-main and dropped the
+     * base section's bind=, so P2P listened on every interface. */
+    wr("cfg6_a.conf", "chain=mainnet\nbind=192.0.2.10\n");
+    CK(node_config_load("cfg6_a.conf") < 0 && node_config_error() && strstr(node_config_error(), "Unknown chain"),
+       "CFG-6: chain=mainnet is refused\n");
+    wr("cfg6_b.conf", "chain=main\nbind=192.0.2.10\n");
+    node_config_load("cfg6_b.conf");
+    CK(!node_config_error() && !strcmp(g_cfg.bind_addr, "192.0.2.10"), "CFG-6: chain=main keeps the base-section bind=\n");
+    wr("cfg6_c.conf", "chain=regtest\nregtest=1\n");
+    CK(node_config_load("cfg6_c.conf") < 0, "CFG-6: chain= together with regtest=1 is Core's \"Invalid combination\"\n");
+    wr("cfg6_d.conf", "testnet=1\n");
+    node_config_load("cfg6_d.conf");
+    CK(!node_config_error() && !strcmp(g_cfg.chain, "test"), "CFG-6: testnet=1 selects \"test\" (refused by chainparams), not mainnet\n");
+    wr("cfg6_e.conf", "regtest=1\n[regtest]\nchain=main\n");
+    node_config_load("cfg6_e.conf");
+    CK(!node_config_error() && !strcmp(g_cfg.chain, "regtest"), "CFG-6: a chain= inside a section does not switch the chain\n");
+    /* ---- CFG-2: every rpcwhitelist entry is kept -- no ':' (Core: an
+     * empty list), more than 16, longer than 511 bytes. Dropped entries
+     * left no whitelist at all, which lets every user call everything. */
+    { static char big[8192]; int o = 0;
+      o += snprintf(big + o, sizeof big - o, "rpcwhitelist=nobody\n");
+      for (int i = 0; i < 20; i++) o += snprintf(big + o, sizeof big - o, "rpcwhitelist=u%d:help\n", i);
+      o += snprintf(big + o, sizeof big - o, "rpcwhitelist=long:help");
+      for (int i = 0; i < 60; i++) o += snprintf(big + o, sizeof big - o, ",nosuchmethod%02d", i);
+      o += snprintf(big + o, sizeof big - o, "\n");
+      wr("cfg2.conf", big);
+      node_config_load("cfg2.conf");
+      CK(!node_config_error() && g_cfg.n_rpcwhitelist == 22 && !strcmp(g_cfg.rpcwhitelist[0], "nobody")
+         && strlen(g_cfg.rpcwhitelist[21]) > 600,
+         "CFG-2: all 22 rpcwhitelist entries kept, the bare user and the 600+-byte one included (n=%d)\n", g_cfg.n_rpcwhitelist);
+      node_config_load("/nonexistent/reset.conf");
+      CK(g_cfg.n_rpcwhitelist == 0 && g_cfg.rpcwhitelist == NULL, "CFG-2: a fresh load frees the list\n"); }
+    node_config_load("/nonexistent/reset.conf");
+#undef CK
 
     printf("\n");
     node_config_log();

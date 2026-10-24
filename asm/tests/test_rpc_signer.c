@@ -23,6 +23,13 @@ static const char* S(const rj_val* o, const char* k){
     rj_val* v = o ? rj_obj_get((rj_val*)o, k) : NULL; return v ? v->str : NULL;
 }
 
+#include <signal.h>
+#include <sys/wait.h>
+#include <errno.h>
+/* the serve parent's reaper (main.c reap_children): every child, any pid */
+static void greedy_reaper(int sig){
+    (void)sig; int e = errno, st; while (waitpid(-1, &st, WNOHANG) > 0) {} errno = e;
+}
 static void write_script(const char* path, const char* body){
     FILE* f = fopen(path, "w");
     fprintf(f, "#!/bin/sh\n%s", body);
@@ -164,6 +171,45 @@ int main(void){
          rpc_signer_enumerate(&r, &ec, &em) == 0 && ec == -1 &&
          em && strstr(em, "not JSON"));
       rj_free(r); }
+
+    /* ---- HST-1 / HST-3 (audit 2026-10-23): inside the daemon ----
+     * The serve parent reaps every child with waitpid(-1) from its SIGCHLD
+     * handler (main.c reap_children). Under popen that handler could take
+     * the signer's child before pclose did, and a signer that exited 3 was
+     * reported as "could not run the signer: No child processes". And the
+     * child inherited every descriptor the daemon had open. Both reproduced
+     * here with the daemon's own reaper shape and a marker descriptor. */
+    {
+      int marker = open("/dev/null", O_RDONLY);            /* no O_CLOEXEC, like the datadir .lock */
+      if (marker >= 0 && marker != 77){ dup2(marker, 77); close(marker); }
+      write_script("fdlist",
+          "printf '[{\"fingerprint\":\" %s\",\"model\":\"fds\"}]' \"$(ls /proc/$$/fd | tr '\\n' ' ')\"\n");
+      char cmd[1100]; snprintf(cmd, sizeof cmd, "%s/fdlist", tt_workdir());
+      rpc_signer_set_cmd(cmd);
+      r = NULL;
+      int rc = rpc_signer_enumerate(&r, &ec, &em);
+      rj_val* sg = r ? rj_obj_get(r, "signers") : NULL;
+      const char* fds = (sg && sg->typ == RJ_ARR && sg->nitems) ? S(sg->items[0], "fingerprint") : NULL;
+      ck("HST-3: the signer runs and reports its descriptors", rc == 1 && fds);
+      ck("HST-3: ...and the daemon's descriptor 77 is not among them", fds && !strstr(fds, " 77 "));
+      if (fds) printf("      signer fds:%s\n", fds);
+      rj_free(r);
+      close(77); }
+    { struct sigaction sc; memset(&sc, 0, sizeof sc); sc.sa_handler = greedy_reaper;
+      sigemptyset(&sc.sa_mask); sc.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+      sigaction(SIGCHLD, &sc, NULL);
+      write_script("badexit2", "sleep 0.2\nexit 3\n");
+      char cmd[1100]; snprintf(cmd, sizeof cmd, "%s/badexit2", tt_workdir());
+      rpc_signer_set_cmd(cmd);
+      int saw3 = 1;
+      for (int i = 0; i < 5; i++){
+          r = NULL; ec = 0; em = NULL;
+          int rc = rpc_signer_enumerate(&r, &ec, &em);
+          if (!(rc == 0 && em && strstr(em, "exited 3"))){ saw3 = 0; if (em) printf("      got: %s\n", em); }
+          rj_free(r);
+      }
+      ck("HST-1: under the daemon's waitpid(-1) reaper the signer's exit code still arrives (5 of 5)", saw3);
+      signal(SIGCHLD, SIG_DFL); }
 
     rpc_signer_set_cmd(NULL);
     printf("\n%s (%d checks, %d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", checks, fails);

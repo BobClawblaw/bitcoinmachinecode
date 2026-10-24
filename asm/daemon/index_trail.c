@@ -6,6 +6,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <sys/syscall.h>
 #include <errno.h>
 #include <signal.h>
 #include <sys/wait.h>
@@ -45,6 +46,13 @@ static pid_t spawn_real(const itrail_t* t, int kind, long from, long to){
     if (pid == 0){
         setpriority(PRIO_PROCESS, 0, 10);
         setenv("BMC_CHAIN", t->chain, 1);
+        /* HST-4 (audit 2026-10-23): the builder is a separate program that
+         * opens what it needs by path; it inherited every descriptor of the
+         * worker (store files, peer sockets, the datadir .lock), and held
+         * the lock for as long as it ran. Closed here as notify.c does. */
+        { long maxfd = sysconf(_SC_OPEN_MAX); if (maxfd < 0 || maxfd > 65536) maxfd = 65536;
+          if (syscall(SYS_close_range, 3U, ~0U, 0U) != 0)
+              for (long fd = 3; fd < maxfd; fd++) close((int)fd); }
         if (kind == 1){
             const char* base = strrchr(t->builder, '/'); base = base ? base + 1 : t->builder;
             execl(t->builder, base, t->chaindir, from_s, to_s, run, (char*)0);

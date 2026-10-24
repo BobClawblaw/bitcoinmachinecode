@@ -6,6 +6,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include "../daemon/index_repair.h"
 #ifdef __APPLE__
 #define TRUE_BIN "/usr/bin/true"   /* macOS has no /bin/true */
@@ -41,6 +44,26 @@ int main(void){
     ck("repair disabled in the config: DISABLED, no spawn", ir_tick(&d, 1, 10, 0, 1) == IR_DISABLED && spawned == 3);
     ir_t m; ir_configure(&m, "bfilter", "/nonexistent/builder", ".", "main", "", 1); ir_spawn_hook = 0;
     ck("no builder beside the daemon: NO_BUILDER", ir_tick(&m, 1, 10, 0, 1) == IR_NO_BUILDER);
+    /* HST-4 (audit 2026-10-23): the REAL spawn path execs the builder with
+     * fds 0-2 only; it inherited every descriptor of the worker (store
+     * files, peer sockets, the datadir .lock) -- here a marker on fd 77. */
+    { char wd[] = "/tmp/bmc_ir_fds_XXXXXX"; char* d = mkdtemp(wd);
+      char sp[256], out[256]; snprintf(sp, sizeof sp, "%s/fds_builder.sh", d ? d : "/tmp"); snprintf(out, sizeof out, "%s/fds_repair.out", d ? d : "/tmp");
+      FILE* sf = fopen(sp, "w");
+      if (sf){ fputs("#!/bin/sh\nls /proc/$$/fd | tr '\\n' ' ' > \"$1/fds_repair.out\"\nexit 0\n", sf); fclose(sf); }
+      chmod(sp, 0755);
+      int mk = open("/dev/null", O_RDONLY); if (mk >= 0 && mk != 77){ dup2(mk, 77); close(mk); }
+      ir_spawn_hook = 0;
+      ir_t f; ir_configure(&f, "bfilter", sp, d ? d : "/tmp", "main", "", 1);
+      ck("HST-4: the real spawn starts the builder", ir_tick(&f, 1, 10, 0, 500) == IR_RUNNING);
+      for (int i = 0; i < 3000 && ir_tick(&f, 0, 10, 0, 501 + i) == IR_RUNNING; i++) usleep(1000);
+      close(77);
+      char fl[512] = " "; FILE* ff = fopen(out, "r");
+      if (ff){ size_t k = fread(fl + 1, 1, sizeof fl - 3, ff); fl[k + 1] = 0; fclose(ff); }
+      ck("HST-4: the builder ran and listed its fds", strstr(fl, " 0 ") != 0);
+      ck("HST-4: ...and the worker's fd 77 is not among them", strstr(fl, " 77 ") == 0);
+      printf("      builder fds:%s\n", fl);
+      unlink(out); unlink(sp); if (d) rmdir(d); }
     printf("%s (%d failure(s))\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);
     return fails ? 1 : 0;
 }

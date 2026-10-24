@@ -103,10 +103,31 @@ In `backend/mempool-config.json`:
   (HTTP 400 `too many unspent transaction outputs`), Esplora's own
   `utxos_limit` rule: every funding event would need its transaction id,
   one block read each.
+- `/address/:a/utxo` also refuses (HTTP 400 `Too many history entries`)
+  an address with more than 20,000 funding events, or funding events in
+  more than 2,000 blocks: each funding event's transaction id costs a block
+  read before the spender index can say whether it is spent, so a long,
+  fully spent history bounded the answer but not the work.
 - The stats route resolves no transaction ids; a page of `/txs` resolves
   its own 25. The mempool view is a cache refreshed by a background thread
   in bounded slices, so a request only reads it; a fresh node's view is
   complete a minute or two after boot.
+
+## Limits on the batch routes
+
+The facade is unauthenticated, so every request's work is bounded:
+
+- `POST /internal/txs`, `POST /internal/mempool/txs` and
+  `POST /internal/txs/outspends/by-txid` refuse a list of more than 10,000
+  txids (HTTP 400 `too many txids requested`).
+- `GET /internal/mempool/txs?max_txs=N` serves at most 10,000 per page.
+
+mempool.space asks for `ESPLORA.BATCH_QUERY_BASE_SIZE` per batch (1,000 by
+default, 200 on the reference box) and pages the mempool until a page comes
+back empty, so neither limit changes what it sees. The facade sends no
+`Access-Control-Allow-Origin` header (since 2026-10-23): the backend is a
+server-side client and needs none, and electrs sends it only when `--cors`
+is configured.
 
 ## What to expect
 
@@ -118,8 +139,9 @@ from the mempool. Lightning routes are mempool's own lightning backend and
 are unrelated. The genesis coinbase 404s, as on Core.
 
 **If the backend stops advancing while the node's tip does**, check the node
-before the backend. The facade runs one thread per connection
-(`Connection: close`), so every backend request is a new connection, and the
+before the backend. Every backend request is a new connection
+(`Connection: close`), served by a fixed pool of 16 threads (since
+2026-10-23; up to 64 more wait their turn, past that they get 503), and the
 node's descriptor limit (1,024 under the reference unit) is shared with
 everything else it serves. On 2026-10-07 a per-thread leak used up all 1,024.
 The facade and RPC stopped accepting while P2P carried on, and the backend

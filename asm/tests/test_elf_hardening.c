@@ -23,8 +23,22 @@
 static int fails = 0;
 static void ck(const char* l, int c){ if (c) printf("  ok  %s\n", l); else { printf("  FAIL %s\n", l); fails++; } }
 
+/* HST-6 (audit 2026-10-23): every binary named on the command line, not
+ * only the daemon. bmc_wallet_cli -- the one that decrypts the seed -- had
+ * BIND_NOW but no PT_GNU_RELRO (every asm .tbss was declared `nowrite`, so
+ * a link with no C thread-locals put .rodata in the writable segment and ld
+ * dropped RELRO), and seven helpers the daemon execs were linked without
+ * HARDENFLAGS at all. The gate runs this over the whole shipped set. */
+static int check_one(const char* path);
 int main(int argc, char** argv){
-    const char* path = argc > 1 ? argv[1] : "daemon/bmcbitcoind";
+    if (argc < 2) return check_one("daemon/bmcbitcoind");
+    int bad = 0;
+    for (int i = 1; i < argc; i++){ printf("---- %s ----\n", argv[i]); fails = 0; if (check_one(argv[i])) bad++; }
+    if (bad) printf("\nFAILURES: %d of %d binaries\n", bad, argc - 1);
+    else printf("\nALL TESTS PASSED (0 failures, %d binaries)\n", argc - 1);
+    return bad ? 1 : 0;
+}
+static int check_one(const char* path){
     FILE* f = fopen(path, "rb");
     if (!f){ printf("  FAIL cannot open %s\n", path); return 1; }
     if (fseek(f, 0, SEEK_END)) { fclose(f); return 1; }
@@ -73,7 +87,6 @@ int main(int argc, char** argv){
                  "        not a prerequisite, so a stale binary can mask this\n"); }
 
     free(b);
-    if (fails) printf("\nFAILURES: %d\n", fails);
-    else printf("\nALL TESTS PASSED (0 failures)\n");
+    if (fails) printf("  FAILURES: %d in %s\n", fails, path);
     return fails ? 1 : 0;
 }

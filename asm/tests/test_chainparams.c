@@ -162,6 +162,14 @@ int main(void){
     ck("garbage refused",  chainparams_select("florin") == 0);
     ck("a signet-shaped near-miss is refused", chainparams_select("signett") == 0);
     ck("a refused select leaves the previous chain in force", g_chainp->id == CHAIN_MAIN);
+    /* CFG-6 (audit 2026-10-23): Core's -chain takes "main", never "mainnet"
+     * or "" (ChainTypeFromString). Accepting them here while node_config.c
+     * read the same node as not-main dropped bind= and listened everywhere. */
+    chainparams_select("regtest");
+    ck("CFG-6: chain=mainnet is refused (Core's name is main)", chainparams_select("mainnet") == 0);
+    ck("CFG-6: an empty chain name is refused", chainparams_select("") == 0);
+    ck("CFG-6: ...and neither silently switched to mainnet", g_chainp->id == CHAIN_REGTEST);
+    ck("CFG-6: main still selects mainnet", chainparams_select("main") == 1 && g_chainp->id == CHAIN_MAIN);
 
     printf("== genesis hashes differ per chain (what the datadir guard rests on) ==\n");
     /* chain_archive_matches() in main.c refuses to start when block 0 of an

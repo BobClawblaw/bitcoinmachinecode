@@ -12,6 +12,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include "crypto_hkdf.h"
+#include "daemon/secure_zero.h"   /* CRY-4: key material is wiped with a barrier */
 
 extern void sha256_full(unsigned char out[32], const void* msg, long long len);
 
@@ -30,15 +31,20 @@ void hmac_sha256(unsigned char out[32], const unsigned char* key, unsigned long 
         unsigned long n = 64 + msglen;
         unsigned char stackbuf[256];
         unsigned char* b = (n <= sizeof stackbuf) ? stackbuf : (unsigned char*)malloc(n);
-        if (!b){ memset(out, 0, 32); return; }
+        if (!b){ memset(out, 0, 32); secure_zero(k, sizeof k); secure_zero(ipad, sizeof ipad); secure_zero(opad, sizeof opad); return; }
         memcpy(b, ipad, 64);
         if (msglen) memcpy(b + 64, msg, msglen);
         sha256_full(ih, b, (long long)n);
+        secure_zero(b, n);                 /* the keyed pad and the message (an ECDH secret in HKDF-Extract) */
         if (b != stackbuf) free(b);
     }
     unsigned char outer[96];
     memcpy(outer, opad, 64); memcpy(outer + 64, ih, 32);
     sha256_full(out, outer, 96);
+    /* CRY-4 (audit 2026-10-23): the key, both pads, the inner hash and the
+     * outer preimage were all left in the dead frame */
+    secure_zero(k, sizeof k); secure_zero(ipad, sizeof ipad); secure_zero(opad, sizeof opad);
+    secure_zero(ih, sizeof ih); secure_zero(outer, sizeof outer);
 }
 
 void hkdf_sha256_extract(unsigned char prk[32],
@@ -72,7 +78,9 @@ void hkdf_sha256_expand(unsigned char* out, unsigned long outlen,
         memcpy(out + done, t, take);
         done += take;
         ctr++;
+        secure_zero(buf, sizeof buf);      /* CRY-4: T(n-1) is derived key material */
     }
+    secure_zero(t, sizeof t);
 }
 
 void hkdf_sha256(unsigned char* out, unsigned long outlen,
@@ -82,4 +90,5 @@ void hkdf_sha256(unsigned char* out, unsigned long outlen,
     unsigned char prk[32];
     hkdf_sha256_extract(prk, salt, saltlen, ikm, ikmlen);
     hkdf_sha256_expand(out, outlen, prk, info, infolen);
+    secure_zero(prk, sizeof prk);
 }

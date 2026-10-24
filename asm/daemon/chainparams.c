@@ -290,8 +290,15 @@ int chainparams_set_signet_challenge(const char* hex){
     return 1;
 }
 
+/* CFG-6 (audit 2026-10-23): Core's names only (util/chaintype.cpp
+ * ChainTypeFromString: main, test, testnet4, signet, regtest). "mainnet" and
+ * "" used to select mainnet here while node_config.c, which only ever
+ * compares against "main", treated the same node as NOT main -- and dropped
+ * every network-specific base-section key, bind= among them, so the P2P
+ * listener went from one address to all of them. NULL is the in-process
+ * default for tools that never read a config. */
 int chainparams_select(const char* name){
-    if (!name || !*name || !strcmp(name, "main") || !strcmp(name, "mainnet")){
+    if (!name || !strcmp(name, "main")){
         g_chainp = &PARAMS_MAIN;
         net_magic = PARAMS_MAIN.magic;
         sfc_chain = 0;

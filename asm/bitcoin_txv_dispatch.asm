@@ -72,7 +72,7 @@ extern g_txv_script_checks            ; VAL-16: assumevalid short-circuit (daemo
 
 %define BP_BUF        0
 
-section .tbss alloc noexec nowrite tls align=8
+section .tbss nobits alloc noexec write tls align=8
 global ltv_buf                        ; global: ..gottpoff needs a visible symbol
                                       ; (same as bitcoin_interp.asm's tbss slots)
 ltv_buf: resq 1                       ; __thread u8* stripped (lazy malloc)
