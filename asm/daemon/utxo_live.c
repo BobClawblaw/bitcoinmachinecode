@@ -3685,12 +3685,15 @@ long utxo_live_recover_at_boot(void* store_buf){
      * node. At boot no reorg can be in flight, so the condition is
      * unambiguous.
      *
-     * This does NOT fix STO-1. The per-block ordering the audit asks for
-     * (persist_applied_height(h-1) -> unapply(h) -> undo_discard(h), with an
-     * idempotent replay over the retained undo file) is a change to the
-     * durability ordering of the UTXO set and needs a crash-injection test;
-     * it stays open. What this does is turn the silent half into a loud,
-     * fail-closed halt, so the divergence is announced instead of served. */
+     * This guard is not the STO-1 fix; it turns the silent half into a loud,
+     * fail-closed halt. The fix is the per-block ordering the audit asked
+     * for, in reorg_execute (reorg.c, "CLAIM h-1 BEFORE doing the work",
+     * 355c37e): persist_applied_height(h-1) -> unapply(h) -> undo_discard(h),
+     * with an idempotent replay over the retained undo file, and the WAL on
+     * disk before each discard (the STO-B hook). tests/test_reorg_crash_ordering
+     * builds the crash states by hand; tests/test_sto1_crash reaches them
+     * with a real SIGKILL and a power loss at each step (2026-10-24). This
+     * stays as the boot-time check for any other way to get here. */
     {
         long tip = *(int*)((char*)store_buf + 24);
         if (tip >= 0 && g_applied_height > tip){
