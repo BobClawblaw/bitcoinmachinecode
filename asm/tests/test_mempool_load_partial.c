@@ -7,7 +7,11 @@
  * rpc_node_mempool_load collected the whole file first and, on any error,
  * admitted nothing. The worker is a thread here: it answers each submission
  * on the shared status block (tx_submit_seq -> tx_submit_ack) with "accepted"
- * and records the tag of each transaction it was handed. */
+ * and records the tag of each transaction it was handed.
+ *
+ * The importmempool RPC (2026-10-25) answers as Core v31.1's does: -10 in
+ * IBD, and -1 "Unable to import mempool file, see debug.log for details."
+ * for a file it cannot read whole, the ones read before the fault kept. */
 #include "../rpc_node.h"
 #include <stdio.h>
 #include <string.h>
@@ -15,6 +19,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include "test_tmpdir.h"
+#include "../rpc_json.h"
 
 typedef unsigned char u8;
 extern long mempool_dump_write(const char* path, const u8* const* txs,
@@ -31,6 +36,10 @@ long mempool_resolve_confirmed_utxo(void* u, const unsigned char* txid, unsigned
                                     unsigned long* spklen){
     (void)u; (void)txid; (void)index; (void)val; (void)spk; (void)spklen; return 0;
 }
+
+/* rpc_chain.c's IBD answer, which rpc_node.c takes weakly */
+static int g_ibd;
+int rpc_chain_in_ibd(void){ return g_ibd; }
 
 static int fails = 0;
 static void ck(const char* l, long got, long want){
@@ -112,6 +121,31 @@ int main(void){
     ck("torn at transaction 0: nothing read, -1", load("mempool.dat", &seen), -1);
     ck("torn at transaction 0: the worker was handed nothing", seen, 0);
     ck("a missing file: -1", load("no-such-mempool.dat", &seen), -1);
+
+    /* the RPC: rewrite the intact file, then tear it again */
+    if (mempool_dump_write("mempool.dat", txs, lens, times, deltas, N, 0, 0, 0) != N){ printf("FAIL write\n"); return 1; }
+    const char* pj = "[\"mempool.dat\"]";
+    rj_val* params = rj_parse(pj, strlen(pj));
+    rj_val* res; long ec; const char* em;
+    g_ibd = 1; g_seen = 0; res = NULL; ec = 0; em = NULL;
+    int ok = rpc_node_dispatch("importmempool", params, &res, &ec, &em);
+    ck("importmempool in IBD: refused with -10", ok == 0 ? ec : 0, -10);
+    ck("importmempool in IBD: Core's text",
+       em && !strcmp(em, "Can only import the mempool after the block download and sync is done."), 1);
+    ck("importmempool in IBD: the worker was handed nothing", g_seen, 0);
+    g_ibd = 0; g_seen = 0; res = NULL;
+    ok = rpc_node_dispatch("importmempool", params, &res, &ec, &em);
+    ck("importmempool, intact dump: success", ok, 1);
+    ck("importmempool, intact dump: all 5 handed over", g_seen, N);
+    rj_free(res);
+    if (truncate("mempool.dat", cut) != 0){ printf("FAIL truncate\n"); return 1; }
+    g_seen = 0; res = NULL; ec = 0; em = NULL;
+    ok = rpc_node_dispatch("importmempool", params, &res, &ec, &em);
+    ck("importmempool, torn dump: -1", ok == 0 ? ec : 0, -1);
+    ck("importmempool, torn dump: Core's text",
+       em && !strcmp(em, "Unable to import mempool file, see debug.log for details."), 1);
+    ck("importmempool, torn dump: the 3 read before the fault were still handed over", g_seen, 3);
+    rj_free(params);
 
     g_stop = 1; pthread_join(th, 0);
     printf("\n%s (%d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);

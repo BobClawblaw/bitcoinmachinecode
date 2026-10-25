@@ -2889,19 +2889,30 @@ long rpc_node_mempool_load(const char* path){
     return c.accepted;
 }
 
+/* rpc_chain.c; weak so the node-only test binaries link without it (no
+ * chain module: not in IBD) */
+extern int rpc_chain_in_ibd(void) __attribute__((weak));
+/* Core v31.1 (rpc/mempool.cpp): refused in IBD with -10; any load failure is
+ * -1 "Unable to import mempool file, see debug.log for details." with the
+ * reason in the log. As in Core, the transactions read before a mid-file
+ * fault stay admitted. */
 static int cmd_importmempool(const rj_val* params, rj_val** res, long* ec, const char** em){
     const char* path = NULL;
     if (params && params->typ == RJ_ARR && params->nitems > 0 &&
         params->items[0]->typ == RJ_STR) path = params->items[0]->str;
     if (!path || !path[0]){ *ec = -8; *em = "filepath is required"; return 0; }
+    if (rpc_chain_in_ibd && rpc_chain_in_ibd()){
+        *ec = -10; *em = "Can only import the mempool after the block download and sync is done."; return 0; }
     if (!g_status_rw){
         *ec = -4; *em = "no download worker is attached, so nothing can admit these transactions"; return 0; }
     mpd_import_ctx c; memset(&c, 0, sizeof c); c.collecting = 1;
     char err[160]; err[0] = 0;
     long r = mempool_dump_read(path, mpd_import_one, &c, err, sizeof err);
     mpd_retry_passes(&c);
-    if (r < 0){ static char m[200]; snprintf(m, sizeof m, "Unable to import mempool: %s", err[0]?err:"malformed file");
-                *ec = -1; *em = m; return 0; }
+    if (r < 0){
+        fprintf(stderr, "[rpc] importmempool %s: %s (%ld accepted before it)\n",
+                path, err[0] ? err : "malformed file", c.accepted);
+        *ec = -1; *em = "Unable to import mempool file, see debug.log for details."; return 0; }
     fprintf(stderr, "[rpc] importmempool %s: %ld accepted, %ld rejected of %ld\n",
             path, c.accepted, c.rejected, r);
     *res = rj_obj();               /* Core returns an empty object */

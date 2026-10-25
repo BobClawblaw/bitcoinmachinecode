@@ -2035,6 +2035,20 @@ static long long size_on_disk(void){
     if (stat(nm, &sb) != 0) return sod_full_scan();
     return prefix + sb.st_size;
 }
+/* -maxtipage, latched as Core's m_cached_is_ibd: once the node has left IBD
+ * it does not go back (v31.1 UpdateIBDStatus). `tip_time` is the tip
+ * header's nTime. */
+static int ibd_at(u32 tip_time){
+    return !(g_ibd_left && *g_ibd_left) && (time_t)tip_time < time(NULL) - g_maxtipage;
+}
+/* getblockchaininfo's "initialblockdownload", for the node-side RPCs that
+ * Core refuses in IBD (importmempool, 2026-10-25). No tip yet counts as IBD. */
+int rpc_chain_in_ibd(void){
+    long tip = refresh();
+    if (tip < 0) return 1;
+    u8 hdr[80]; if (read_block_prefix(tip, hdr, 80) != 1) return 1;
+    return ibd_at(rd32(hdr + 68));
+}
 static int cmd_getblockchaininfo(rj_val** res, long* ec, const char** em){
     long tip = refresh();
     if (tip < 0){ *ec = -28; *em = "Loading block index..."; return 0; }
@@ -2057,9 +2071,7 @@ static int cmd_getblockchaininfo(rj_val** res, long* ec, const char** em){
     double prog = hh >= 0 ? (double)(tip + 1) / (double)(hh + 1) : 1.0;
     if (prog > 1.0) prog = 1.0;
     rj_obj_set(o, "verificationprogress", rj_double(prog));
-    /* -maxtipage, latched as Core's m_cached_is_ibd: once the node has left
-     * IBD it does not go back (v31.1 UpdateIBDStatus) */
-    rj_obj_set(o, "initialblockdownload", rj_bool(!(g_ibd_left && *g_ibd_left) && (time_t)t < time(NULL) - g_maxtipage));
+    rj_obj_set(o, "initialblockdownload", rj_bool(ibd_at(t)));
     u8 cw[16]; if (chainwork_at(tip, cw)){ chainwork_hex(cw, hx); rj_obj_set(o, "chainwork", rj_str(hx)); }
     rj_obj_set(o, "size_on_disk", rj_numf("%lld", size_on_disk()));
     int pruned = g_prune_mib != 0 || ST_PRUNE_H(CUR_ST) > 0;
