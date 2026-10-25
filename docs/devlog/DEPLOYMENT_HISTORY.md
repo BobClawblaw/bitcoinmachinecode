@@ -2161,3 +2161,52 @@ were still on disk. Nothing in them is new measurement.
   - a failed log open is reported as a failure.
 - **Rollback:** relink to `deploy-20261024a`; the helpers are unchanged.
   Going by the diff, no on-disk format changed.
+
+## 2026-10-25 19:46Z — `deploy-20261025b`: the low-memory mode (off) and three serve/worker fixes (PRs #446, #449)
+
+- **What:** `main` at `1c259a7f`.
+  - #446: `bmc.lsmreads=pread` and `bmc.dropappends=1`, an opt-in
+    low-memory mode, both off by default. Run 51 synced from genesis with
+    both on, on #446's branch before main was merged in (PASS at 973,026).
+  - #449: the reorg probe's silence window is 35 s, above the 30 s between
+    probes; a reorg that ends at the same height is announced at once;
+    `importmempool` answers as Core does. `serve_rules_regtest_e2e.sh`
+    passes 9/9 against Core v31.1 on regtest (8/9 on `deploy-20261025a`),
+    and its reorg step takes 32 s against 122 s. No mainnet sync from
+    genesis was run on #449.
+  - Docs PRs #447 and #448.
+
+  Built from clean (`make -B`) in a worktree at the merge commit, with no
+  compiler warnings. The config line reads `lsmreads=mmap dropappends=0`.
+- **One helper replaced.** `bmc_build_addr_hist` links `undo_log.o` and the
+  UTXO store objects, which #446 changed, so main's build differs from the
+  live one. It is main's now; the one it replaced is kept as
+  `bmc_build_addr_hist.pre-20261025b`. The other four exec'd helpers were
+  byte-identical.
+- **Wallet** files were copied before the deploy. The wallet code did not
+  change.
+- **Started:** 19:46:44Z, at tip 973,116. RPC came up at 19:47:42Z.
+- **Verified live:**
+  - New block 973,117 applied at 19:52:09Z, hash-identical to the Core v31.1
+    oracle's (`0000000000000000000176d8e3b631c730c67f101137920e4fb4ca02a52a80b0`).
+    973,122 matched the oracle at 20:18Z.
+  - `NRestarts=0` and `active` at 10 and 31 minutes; no `[crash]` line.
+  - fd count at 65–68.
+  - RPC and Esplora facade clients back: 102 recent connections on 8331 and
+    53 on 3005.
+  - Outbound peers: 7 live legs from 20 minutes on, against 9–10 after the
+    02:08Z boot. In the first 17 minutes 82 outbound dials failed (mostly
+    10 s connect timeouts) against 41 after that boot, and each failed
+    address waits 10 minutes before it is tried again. The dial and leg code
+    did not change, and no reorg probe ran in the first 31 minutes.
+- **Behaviour changes:**
+  - a reorg that replaces the block at the tip's height is announced to
+    connected peers when it happens, not with the next block;
+  - the reorg probe is deferred only after 35 s with nothing received on
+    any leg (was 20 s);
+  - `importmempool` is refused during initial block download (-10), and a
+    file it cannot read is -1 "Unable to import mempool file, see debug.log
+    for details.", the reason in the log.
+- **Rollback:** relink to `deploy-20261025a` AND restore
+  `bmc_build_addr_hist.pre-20261025b`. Going by the diff, no on-disk format
+  changed: with the two knobs off the stores are read and written as before.
