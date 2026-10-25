@@ -520,7 +520,16 @@ int main(void){
      * the locator against its active chain (FindForkInGlobalIndex,
      * chain.Contains): an entry off it is skipped, a stop hash off it is
      * never met. getdata is untouched: it serves by height from the index.
-     * Kept last: nothing after this needs the old records. */
+     * Kept last: nothing after this needs the old records.
+     *
+     * The same rewrite is a reorg that ends at the same height (2026-10-25):
+     * a peer connected before it was told the old tip, and the tip-watch
+     * compared heights only, so it heard of the new block at TIP only with
+     * the next block. Now it compares the hash at the announced height. The
+     * tip-watch runs after each message, so after the pong; the second
+     * ping's reply collects what it sent. */
+    int tw = peer_open();
+    int tw_ok = reply(tw) && count_cmd("inv") + count_cmd("headers") == 0;
     { FILE* f = fopen("index.dat", "r+b");
       int ok = f != 0;
       for (int h = 510; ok && h <= TIP; h++){
@@ -531,6 +540,23 @@ int main(void){
       }
       if (f) fclose(f);
       cki("stale index: index.dat 510..519 rewritten to another branch", ok, 1);
+
+      tw_ok = tw_ok && reply(tw);
+      int tw_got = 0;
+      if (tw_ok){
+          tw_got = count_cmd("inv") + count_cmd("headers");
+          if (!tw_got && reply(tw)) tw_got = count_cmd("inv") + count_cmd("headers");
+      }
+      cki("same-height reorg: a peer told the old tip is announced the block now at TIP", tw_ok && tw_got == 1, 1);
+      reply(tw);
+      cki("same-height reorg: announced once, not again on the next message",
+          count_cmd("inv") + count_cmd("headers"), 0);
+      peer_close(tw);
+      int tc = peer_open();
+      int tc_ok = reply(tc) && reply(tc);
+      cki("same-height reorg, control: a peer connected after it hears no announcement",
+          tc_ok && count_cmd("inv") + count_cmd("headers") == 0, 1);
+      peer_close(tc);
 
       int fd = peer_open();
       unsigned char loc[2][32]; memcpy(loc[0], bhash[515], 32); memcpy(loc[1], bhash[505], 32);

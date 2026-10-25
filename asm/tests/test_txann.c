@@ -31,9 +31,14 @@ const unsigned char* mpool_get(void* mp, const unsigned char* txid, unsigned lon
  * that says yes for one fd, so txann_wait must not sit in poll for it */
 static int g_v2_buffered_fd = -1;
 int bmc_v2_has_message(int fd){ return fd == g_v2_buffered_fd; }
-/* the serve side's public tip (serve_invbounds.c): here the "store" is the tip itself */
-static long g_test_tip;
-long serve_public_tip(const void* st){ return *(const long*)st; }
+/* the serve side's tip-watch (serve_invbounds.c): here the "store" is the tip
+ * itself, and g_test_replaced says a reorg put another block at its height
+ * (the hash compare is tested on a real index.dat in test_getblocks) */
+static long g_test_tip; static int g_test_replaced;
+int serve_tipwatch_changed(const void* st, long announced){
+    long tip = *(const long*)st;
+    return tip > announced || (tip == announced && g_test_replaced);
+}
 static long long ms(void){ struct timeval t; gettimeofday(&t,0); return t.tv_sec*1000LL + t.tv_usec/1000; }
 int main(void){
     node_status_t* st = calloc(1, sizeof *st); if (!st){ puts("calloc"); return 2; }
@@ -88,6 +93,10 @@ int main(void){
       txann_child_init(5, 1);
       tq = ms(); rq = txann_wait(sq[0], 0, &g_test_tip, 121); dq = ms() - tq;
       ok(rq == 0 && dq >= 1800, "silent peer, tip already announced: the wait runs to the idle bound as before");
+      txann_child_init(5, 1); g_test_replaced = 1;
+      tq = ms(); rq = txann_wait(sq[0], 0, &g_test_tip, 121); dq = ms() - tq;
+      ok(rq == 2 && dq < 200, "silent peer, a reorg replaced the block at the announced 121: wait returns 2 immediately (was: until the next block)");
+      g_test_replaced = 0;
       close(sq[0]); close(sq[1]); }
     printf("== a v2 message already buffered ends the wait at once (poll cannot see it) ==\n");
     { int sq[2]; if (socketpair(AF_UNIX, SOCK_STREAM, 0, sq)){ perror("sp"); return 2; }

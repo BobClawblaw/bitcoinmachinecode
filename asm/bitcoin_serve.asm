@@ -35,6 +35,8 @@ extern g_peer_wants_addrv2
     extern serve_getheaders_low_work ; daemon/serve_invbounds.c
     extern serve_cmpct_as_full  ; daemon/serve_hdrctx.c
     extern serve_public_tip     ; 3.1: the CONNECTED tip (daemon/serve_invbounds.c)
+    extern serve_tipwatch_note  ; the announced tip's hash, and whether it changed (2026-10-25)
+    extern serve_tipwatch_changed
 extern node_relay_flag
 extern serve_tx_gate
 extern serve_inv_gate
@@ -394,6 +396,8 @@ node_serve_loop:
     mov  rdi, r14
     call serve_public_tip
     mov  [s_lasttip], rax
+    mov  rdi, rax             ; and its hash (serve_tipwatch_note, 2026-10-25)
+    call serve_tipwatch_note
     ; feefilter_send(fd) -- 8-byte int64 LE min-relay-feerate (s_myfee)
     cmp  byte [g_serve_send_feefilter], 0
     je   .ff_skip                ; -blocksonly / forcerelay peer: Core sends none
@@ -422,8 +426,9 @@ node_serve_loop:
     ; through to the read exactly as before) or 0 when the NET-3 idle bound
     ; expired with nothing to read -- the same outcome the SO_RCVTIMEO on the
     ; socket used to produce from inside p2p_read, so .done is the right exit.
-    ; 2 when the public tip passed s_lasttip: the tip-watch at .next
-    ; announces it now, not after the peer's next message (2026-10-24).
+    ; 2 when the public tip passed s_lasttip, or a reorg replaced the block
+    ; at that height: the tip-watch at .next announces it now, not after the
+    ; peer's next message (2026-10-24, the same-height case 2026-10-25).
     ; txann_wait(fd, peer_feefilter, st, announced_tip)
     mov  rdi, r12
     mov  rsi, [s_peerfee]
@@ -2079,12 +2084,16 @@ node_serve_loop:
     ; `inv`(MSG_BLOCK) by default, or a `headers` message when the peer
     ; negotiated `sendheaders` (BIP130). Updates s_lasttip so each new tip is
     ; announced exactly once.
+    ; A reorg that replaces the block at the announced height is a new tip
+    ; too: serve_tipwatch_changed compares the hash there (2026-10-25).
     mov  rdi, r14             ; 3.1: watch the CONNECTED tip, not st[24]
+    mov  rsi, [s_lasttip]
+    call serve_tipwatch_changed
+    test eax, eax
+    jz   .tw_done             ; no advance, same block -> nothing to announce
+    mov  rdi, r14
     call serve_public_tip
     mov  [s_cnt], rax
-    mov  rax, [s_lasttip]
-    cmp  rax, [s_cnt]
-    jge  .tw_done             ; no advance -> nothing to announce
     ; announce the newly-tipped block (height = s_cnt)
     ; node_announce_tip(fd, st, ht_idx, use_headers)
     mov  rdi, r12             ; fd
@@ -2094,6 +2103,8 @@ node_serve_loop:
     call node_announce_tip
     mov  rax, [s_cnt]
     mov  [s_lasttip], rax
+    mov  rdi, rax
+    call serve_tipwatch_note
 .tw_done:
     ; LONG-RUNNING: do not count down to an exit. Real termination is handled
     ; only by connection close / error (p2p_read <= 0 jumps straight to `.done`).

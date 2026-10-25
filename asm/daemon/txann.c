@@ -179,11 +179,11 @@ long txann_tick(int fd, long long now, unsigned long long peer_feefilter){
  * now ends with 2 when the public tip has passed what this connection last
  * announced, and the loop runs its tip-watch. Weak: a harness that links
  * no serve_invbounds.c has no tip to watch. */
-extern long serve_public_tip(const void* st) __attribute__((weak));
+extern int serve_tipwatch_changed(const void* st, long announced) __attribute__((weak));
 long txann_wait(int fd, unsigned long long peer_feefilter, const void* st, long announced_tip){
     if (!g_enabled || !g_st || fd < 0) return 1;                /* pre-CC-1 behaviour: straight to the blocking read */
     for (;;){
-        if (st && serve_public_tip && serve_public_tip(st) > announced_tip) return 2;
+        if (st && serve_tipwatch_changed && serve_tipwatch_changed(st, announced_tip)) return 2;
         long long now = now_ms();
         long long idle_deadline = c_last_msg + (long long)g_idle_secs * 1000;
         if (now >= idle_deadline) return 0;
