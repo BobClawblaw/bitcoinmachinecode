@@ -522,7 +522,47 @@ the kernel keeps them cached and are the kernel's to drop (Core's
 equivalent, its chainstate's page cache, is outside its PSS; its cgroup
 peak with page cache was 76 GB). The honest row for the release: heap,
 bmc's on the mean and parity on the peak; PSS ceiling, Core's by 1.6×,
-all of the excess reclaimable file pages.
+all of the excess reclaimable file pages. Why that row does not move
+with a knob: the peak (56.3 GB at 00:41Z) is the minute before a full
+compaction, when the worker maps 46 generation runs plus the compacted
+run (~49 GB of files, nearly all of it touched by the random lookups
+and so counted) and the compaction child, which reads with `read()`
+and writes with `write()`, has none of it in its own PSS; compacting
+sooner (`bmc.utxocompactthreshold`, ×4 in bulk mode; the run budget of
+35% of RAM) lowers the peak toward the floor set by the compacted run
+itself, 12.9 GB fully resident because every page of it is a lookup
+target, plus the heap — about 30 GB at best, and at the price of
+rewriting the base run every few minutes. The lever that would take
+the row is a `pread` path for the base run's lookups, as LevelDB reads,
+which moves those pages out of PSS and into the same page cache Core's
+chainstate lives in; it is slower than the mapped fast path and is not
+in this release.
+
+Run 49 (2026-10-11, `bmc.lsmreads=pread`, plan B15, the sampler beside
+it; `docs/reports/2026-10-11-run49-vs-core7-stage-report.md`) measured
+that path and was cut at block 847,331 with the finding complete. The
+row flips: PSS peak 19.2 GB, mean 9.6 (Core #7 34.3 / 17.6; run 46
+56.3 / 34.1), the heap peak 10.8. And the apply row goes with it: the
+get column was four times run 46's to the same height (3,824 against
+931 s to block 650,000, 8,867 s at the cut) and the applier's block
+total had passed Core's whole-sync 13,340 s by block 847,000 — at
+lower CPU than run 46's, because the applier was waiting on the disk.
+The worker had read 212 GB of run files from disk at +2 h. The blk and
+rev append streams (294 + 104 GB by block 650,000) go through the same
+page cache, each page referenced once, and a pread'd run page,
+referenced once as well, is evicted with them (`Active(file)` 1.3 GB
+against `Inactive(file)` 50 GB; mincore over the run files at block
+650,000: 30.9 of 40.5 GB resident, the older generation runs 43–65%).
+A mapped page is referenced through the page table and the reclaim
+keeps it, which is why the mmap path never showed this and why its
+pages are the PSS row. So the two rows are one memory: the run files
+either count against the process or get evicted behind the streams.
+Plan B16 (`bmc.dropappends=1`, PR #423) drops the streams behind the
+applier instead — the undo stream written back and dropped every 16
+MB, each blk file dropped once the applier has left it — so the page
+cache is left to the run files; run 50 measures pread and dropappends
+together. Until it does, the release keeps the mapped path and this
+row stays Core's.
 
 ## 6. Verdict, category by category
 
@@ -616,8 +656,10 @@ sized Bloom filters and the resident frozen copy), and the heap row is
 bmc's on the mean (8.2 against 10.0 GB) and parity on the peak (13.3
 against 12.0) since `dbcache` became the whole UTXO heap (M2). What
 Core keeps is the PSS ceiling with mapped files counted, 1.6×, all of
-it the UTXO run files the kernel caches and may drop, and the two disk
-rows it kept before. The release is run 46's build; production has run
+it the UTXO run files the kernel caches and may drop (run 49 took the
+row with the pread path and gave the apply row back, §5; run 50
+measures the pair with the append streams dropped behind the applier),
+and the two disk rows it kept before. The release is run 46's build; production has run
 `deploy-20261010a` since 10-10 04:28Z (the binary's size and strings
 are the tree's build of `a79bcdca`; NRestarts=0 at the time of writing).
 
