@@ -1685,6 +1685,9 @@ static void serve_on_peer_version(void){
     node_relay_flag = (unsigned char)rp_our_frelay(perms, RP_CONN_INBOUND, exhausted);
     g_serve_send_feefilter = (unsigned char)rp_send_feefilter(perms);
 }
+/* this connection's permissions (whitelist | whitebind), for the serve
+ * side's C gates outside this file (serve_invbounds.c's getheaders rule) */
+unsigned serve_conn_perms(void){ return g_conn_perms_all; }
 /* the serve loop's gates (bitcoin_serve.asm calls these): 0 go on, 1 drop
  * the message quietly, -1 protocol violation (the loop disconnects) */
 int serve_tx_gate(void){

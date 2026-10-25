@@ -22,6 +22,10 @@
  */
 #include <stddef.h>
 #include <sys/stat.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include "netperm.h"
 
 #define INV_ENTRY   36                 /* type u32 LE + 32-byte hash */
 #define INV_MAX_SZ  50000              /* Core's MAX_INV_SZ */
@@ -103,6 +107,59 @@ int serve_inv_bounds(const unsigned char* pl, long plen,
  */
 extern int idx_get(void* idx, const unsigned char hash[32], long* height);
 
+/* A hash-index hit names a height; the block at that height is the one the
+ * peer means only if index.dat still holds that hash there. A serve child's
+ * index is its own copy: after a reorg it keeps the losing branch's hashes
+ * until serve_reorg_check rebuilds it, which the getheaders path reached only
+ * AFTER the locator walk (through serve_public_tip), and the worker can
+ * truncate and rewrite index.dat at any moment of the walk. A stale hit
+ * mis-placed the fork point: the peer was served the new branch from the
+ * height of a block it has and we no longer do. Core walks the locator
+ * against its active chain (FindForkInGlobalIndex: chain.Contains), so a
+ * hash off it is skipped, and a stop hash off it never matches. Checking the
+ * record closes the window whatever its timing. node_serve_loop registers
+ * its store (index.dat is st+8); with none registered nothing is checked. */
+static const void* g_loc_store = 0;
+void serve_set_locator_store(const void* st){ g_loc_store = st; }
+static int loc_on_chain(long h, const unsigned char hash[32]){
+    if (!g_loc_store) return 1;
+    int fd = (int)*(const long*)((const char*)g_loc_store + 8);
+    if (fd < 0) return 1;
+    unsigned char rec[48];
+    if (h < 0 || pread(fd, rec, sizeof rec, (off_t)h * 48) != (ssize_t)sizeof rec) return 0;
+    return memcmp(rec, hash, 32) == 0;    /* the record holds the hash in wire order */
+}
+
+/* ---- getheaders below the minimum chain work ----
+ * Core (GETHEADERS, net_processing.cpp 4410-4422) serves no headers from an
+ * active chain whose work is below -minimumchainwork, unless the peer has the
+ * download permission: it answers with an EMPTY headers message, "to tell
+ * the peer to go away but not treat us as unresponsive", so a peer never
+ * starts a low-work headers sync from it. bmc served whatever it had. The
+ * floor is minchainwork.c's (set in main before the serve processes fork);
+ * the work is chainwork.dat's cumulative record at `tip` (16 bytes LE, one
+ * per height), read here because only the download worker opens the
+ * chainwork store. A record not written yet falls back to the last one:
+ * work only grows with height, so the last record clearing the floor means
+ * the tip does. No floor, no minchainwork.o linked (the harnesses), or a
+ * download-permission peer: served as before. 1 = answer empty. */
+extern int reorg_min_chain_work_set(void) __attribute__((weak));
+extern int reorg_work_meets_minimum(const unsigned char work[16]) __attribute__((weak));
+extern unsigned serve_conn_perms(void) __attribute__((weak));   /* daemon/main.c */
+static int g_cw_fd = -2;                    /* -2 = not opened yet */
+int serve_getheaders_low_work(long tip){
+    if (!reorg_min_chain_work_set || !reorg_work_meets_minimum || !reorg_min_chain_work_set()) return 0;
+    if (serve_conn_perms && (serve_conn_perms() & NP_DOWNLOAD)) return 0;
+    unsigned char w[16]; memset(w, 0, sizeof w);   /* no record: no work */
+    if (g_cw_fd == -2) g_cw_fd = open("chainwork.dat", O_RDONLY | O_CLOEXEC);
+    if (g_cw_fd >= 0 && tip >= 0 && pread(g_cw_fd, w, 16, (off_t)tip * 16) != 16){
+        struct stat sb; long n = fstat(g_cw_fd, &sb) == 0 ? (long)(sb.st_size / 16) : 0;
+        memset(w, 0, sizeof w);
+        if (n > 0 && pread(g_cw_fd, w, 16, (off_t)(n - 1) * 16) != 16) memset(w, 0, sizeof w);
+    }
+    return !reorg_work_meets_minimum(w);
+}
+
 int serve_locator_from(const unsigned char* pl, unsigned long plen, void* htidx,
                        long* out_from, long* out_stop, unsigned char* out_stop_hash){
     *out_from = 0;
@@ -157,7 +214,7 @@ int serve_locator_from(const unsigned char* pl, unsigned long plen, void* htidx,
     *out_from = 1;
     for (unsigned long long i = 0; i < n; i++){
         long h = 0;
-        if (idx_get(htidx, pl + p + i * 32u, &h) == 1){ *out_from = h + 1; break; }
+        if (idx_get(htidx, pl + p + i * 32u, &h) == 1 && loc_on_chain(h, pl + p + i * 32u)){ *out_from = h + 1; break; }
     }
 
     /* hashStop: all-zero means "as many as you have" */
@@ -165,7 +222,7 @@ int serve_locator_from(const unsigned char* pl, unsigned long plen, void* htidx,
       if (out_stop_hash) for (int i = 0; i < 32; i++) out_stop_hash[i] = stop[i];
       int zero = 1;
       for (int i = 0; i < 32; i++) if (stop[i]){ zero = 0; break; }
-      if (!zero){ long sh = 0; if (idx_get(htidx, stop, &sh) == 1) *out_stop = sh; } }
+      if (!zero){ long sh = 0; if (idx_get(htidx, stop, &sh) == 1 && loc_on_chain(sh, stop)) *out_stop = sh; } }
     return n == 0 ? 2 : 1;
 }
 

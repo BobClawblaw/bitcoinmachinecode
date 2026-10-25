@@ -2116,3 +2116,48 @@ were still on disk. Nothing in them is new measurement.
   including the dead UTX-2/UTX-6 boot checks. Going by the diff, no on-disk
   format changed: the store changes add syncs, order them and tighten the
   readers. A boot of 11a on a datadir this build has written was not tested.
+
+## 2026-10-25 02:08Z — `deploy-20261025a`: the review's pre-existing issues, and two the end-to-end test found (PR #444)
+
+- **What:** `main` at `1aa903a8`.
+  - #444 fixes the issues the 2026-10-23 review listed as pre-existing and
+    left open, plus two that `validation/serve_rules_regtest_e2e.sh` found.
+    That script passes 8/8 against Core v31.1 on regtest with the change and
+    4/8 without it. #444's merge tree is identical to the branch tip that
+    passed the full gate (477 tests, gate-log audit clean). No mainnet sync
+    from genesis was run on it.
+  - Docs PR #445.
+
+  Built in a clean worktree at the merge commit, with no compiler warnings.
+- **Helpers not replaced.** The five index builders the daemon execs came out
+  byte-identical to the live ones from `deploy-20261024a`, so only the daemon
+  binary changed.
+- **Wallet** files were copied before the deploy. The wallet code did not
+  change.
+- **Started:** 02:08:32Z, at tip 973,002. RPC came up at 02:09:30Z already at
+  the oracle's tip, with the same hash.
+- **Verified live:**
+  - New block 973,003 applied at 02:12:03Z, hash-identical to the Core v31.1
+    oracle's (`000000000000000000003aa8353d32dc86610c55fdf05b57b535d63ffa5343ec`).
+    The heartbeat then read `tip=973003`.
+  - `NRestarts=0` and `active` at 10 minutes; no `[crash]` line; 10/10 peers.
+  - fd count at 62.
+  - RPC and Esplora facade clients back: 104 recent connections on 8331 and
+    54 on 3005.
+- **Behaviour changes:**
+  - a `getheaders` whose chain is below `-minimumchainwork` gets an empty
+    `headers` reply, unless the peer has the download permission;
+  - a block older than 5 blocks deep, or any block while the tip is more than
+    20 block intervals old, is sent as a full block, not a compact one, and
+    the compact path checks the block's hash first (STO-10);
+  - the serve child checks locator hits and the stop hash against the
+    header index on disk, so a stale index can no longer pick the fork point;
+  - a torn `mempool.dat` keeps the transactions read before the error, as
+    Core's does;
+  - an idle inbound peer is told about a new block when it arrives, not at
+    its next ping;
+  - disconnecting a block with an OP_RETURN output no longer logs a false
+    "ALREADY ABSENT" warning (every segwit reorg logged one);
+  - a failed log open is reported as a failure.
+- **Rollback:** relink to `deploy-20261024a`; the helpers are unchanged.
+  Going by the diff, no on-disk format changed.

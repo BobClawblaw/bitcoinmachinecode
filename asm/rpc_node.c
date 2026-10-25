@@ -2844,14 +2844,27 @@ static long mpd_retry_passes(mpd_import_ctx* c){
 /* The load half, likewise shared with the boot path. Returns transactions
  * ACCEPTED, or -1 if the file could not be read at all. A dump that is
  * missing is not an error -- a node that has never saved one, or a fresh
- * datadir, is the ordinary case. */
+ * datadir, is the ordinary case.
+ *
+ * A file that turns malformed partway through keeps what was read before
+ * the fault (2026-10-24). Core's LoadMempool admits each transaction as it
+ * reads it; when a later read throws it logs "Failed to deserialize mempool
+ * data on file ... Continuing anyway." and the ones already admitted stay in
+ * the pool. This collected the whole file first and, on any error, admitted
+ * nothing -- one torn entry at the end of a 30,000-transaction dump emptied
+ * the pool across the restart. -1 only when nothing could be read. */
 long rpc_node_mempool_load(const char* path){
     if (!g_status_rw) return -1;
     mpd_import_ctx c; memset(&c, 0, sizeof c); c.collecting = 1;
     char err[160]; err[0] = 0;
     mpd_collect_ctx col; memset(&col, 0, sizeof col);
     long r = mempool_dump_read(path ? path : "mempool.dat", mpd_collect_sink, &col, err, sizeof err);
-    if (r < 0 || col.oom){ for (long i = 0; i < col.n; i++) free(col.v[i].tx); free(col.v); return -1; }
+    if (col.oom || (r < 0 && col.n == 0)){ for (long i = 0; i < col.n; i++) free(col.v[i].tx); free(col.v); return -1; }
+    if (r < 0){
+        fprintf(stderr, "[mempool] %s is malformed after %ld transaction(s) (%s); loading those, as Core does\n",
+                path ? path : "mempool.dat", col.n, err[0] ? err : "parse error");
+        r = col.n;
+    }
     long* order = malloc((size_t)(col.n + 1) * sizeof *order);
     if (order) mpd_order_parents_first(col.v, col.n, order);
     for (long k = 0; k < col.n; k++){ long i = order ? order[k] : k; mpd_import_one(&c, col.v[i].tx, col.v[i].len, col.v[i].t, col.v[i].d); }

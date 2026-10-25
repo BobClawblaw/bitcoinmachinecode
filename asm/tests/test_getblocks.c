@@ -31,6 +31,12 @@ extern long p2p_write(int, const char*, unsigned, const void*, unsigned);
 extern int  p2p_read(int, char[12], void*, unsigned, unsigned*);
 extern void idx_init(void* idx, unsigned long slots);
 extern int  idx_put(void* idx, const unsigned char hash[32], long height);
+extern void reorg_set_min_chain_work(const unsigned char be32[32]);
+extern void serve_hdrctx_test_set_now(long t);
+
+/* this connection's permissions, as main.c reports them to the serve gates */
+static unsigned g_perms = 0;
+unsigned serve_conn_perms(void){ return g_perms; }
 
 static int failures = 0;
 static void cki(const char* l, long g, long e){
@@ -266,12 +272,14 @@ int main(void){
      * tip) right after it and forgets it (ProcessGetBlockData). That inv is
      * what makes an old-style getblocks sync ask for the next batch. The
      * handler never sent it. Locator [genesis]: the reply is 1..500. Each
-     * block form the getdata path serves is covered: MSG_BLOCK (stripped),
-     * MSG_WITNESS_BLOCK (full) and MSG_CMPCT_BLOCK. */
+     * request form the getdata path serves is covered: MSG_BLOCK (stripped),
+     * MSG_WITNESS_BLOCK (full) and MSG_CMPCT_BLOCK -- which, for blocks 19
+     * and 20 below the tip, Core answers with the full block (more than
+     * MAX_CMPCTBLOCK_DEPTH deep; see "compact only near the tip" below). */
     { static const struct { unsigned type; const char* form; const char* name; } F[] = {
           { 2,          "block",      "MSG_BLOCK" },
           { 0x40000002, "block",      "MSG_WITNESS_BLOCK" },
-          { 4,          "cmpctblock", "MSG_CMPCT_BLOCK" } };
+          { 4,          "block",      "MSG_CMPCT_BLOCK" } };
       for (unsigned k = 0; k < sizeof F / sizeof F[0]; k++){
           int fd = peer_open();
           char lbl[200];
@@ -407,6 +415,137 @@ int main(void){
       printf("      getheaders + ping answered in %ld ms\n", ms);
       cki("no stall: a getheaders and the ping after it are answered within 2 s (log fd -1)",
           pong && count_cmd("headers") == 1 && ms < 2000, 1);
+      peer_close(fd); }
+
+    /* ---- getdata(MSG_CMPCT_BLOCK): compact only near a fresh tip ----
+     * Core (ProcessGetBlockData, net_processing.cpp 2463-2477): a compact
+     * block only when CanDirectFetch() (the tip's nTime within 20 block
+     * intervals, 12,000 s, of now) and the block is at most
+     * MAX_CMPCTBLOCK_DEPTH (5) below the tip; otherwise the full block. bmc
+     * built a compact block at any depth. The tip's nTime here is
+     * 1300000000 + 519; the server's clock is set relative to it. */
+    { const long tipt = 1300000000L + TIP;
+      static const struct { long now_off; int h; const char* form; const char* what; } K[] = {
+          { 60,        TIP - 5, "cmpctblock", "fresh tip, block 5 below it: cmpctblock" },
+          { 60,        TIP - 6, "block",      "fresh tip, block 6 below it: the full block" },
+          { 60,        TIP,     "cmpctblock", "fresh tip, the tip itself: cmpctblock" },
+          { 12000 - 1, TIP,     "cmpctblock", "tip 11,999 s old (inside 20 intervals): cmpctblock" },
+          { 12000,     TIP,     "block",      "tip 12,000 s old (CanDirectFetch false): the full block" } };
+      for (unsigned k = 0; k < sizeof K / sizeof K[0]; k++){
+          serve_hdrctx_test_set_now(tipt + K[k].now_off);
+          int fd = peer_open();
+          unsigned char sc[9]; sc[0] = 0; put_u64(sc + 1, 2);
+          p2p_write(fd, "sendcmpct", 9, sc, 9);
+          send_getdata(fd, 4, bhash[K[k].h]);
+          int pong = reply(fd);
+          char lbl[200]; snprintf(lbl, sizeof lbl, "compact near the tip: %s", K[k].what);
+          cki(lbl, pong && got_block_then(K[k].form, K[k].h, 0), 1);
+          peer_close(fd);
+      }
+      /* the compact path serves the block asked for, as the block path does
+       * (STO-10): a hash the child's index maps to a height whose block is
+       * another one (a reorg behind) is notfound, not that block */
+      serve_hdrctx_test_set_now(tipt + 60);
+      unsigned char ghost[32]; memcpy(ghost, bhash[TIP - 1], 32); ghost[0] ^= 0x77;
+      idx_put(idx, ghost, TIP - 1);
+      int fd = peer_open();
+      unsigned char sc[9]; sc[0] = 0; put_u64(sc + 1, 2);
+      p2p_write(fd, "sendcmpct", 9, sc, 9);
+      send_getdata(fd, 4, ghost);
+      int pong = reply(fd);
+      cki("compact near the tip: a stale index entry is notfound, not the block now at that height",
+          pong && count_cmd("cmpctblock") == 0 && count_cmd("block") == 0 && count_cmd("notfound") == 1, 1);
+      peer_close(fd);
+      serve_hdrctx_test_set_now(0); }
+
+    /* ---- getheaders below -minimumchainwork: an empty headers message ----
+     * Core (GETHEADERS, net_processing.cpp 4410-4422): while the active
+     * chain's work is below the floor, and the peer lacks the download
+     * permission, getheaders is answered with an empty headers message --
+     * after the locator checks, before either walk, so an empty locator
+     * gets it too. bmc served its headers regardless. chainwork.dat gets one
+     * cumulative record per height, work h+1 at height h (16 bytes LE); the
+     * tip's is 520. */
+    { FILE* f = fopen("chainwork.dat", "wb");
+      for (int h = 0; f && h < NB; h++){ unsigned char w[16]; memset(w, 0, 16); put_u32(w, (unsigned)h + 1); fwrite(w, 1, 16, f); }
+      if (f) fclose(f);
+      static const struct { unsigned floor; unsigned perms; int empty; const char* what; } W[] = {
+          { 521, 0,                       1, "floor 521 above the tip's work 520: an empty headers message" },
+          { 521, 1u << 4 /* download */,  0, "floor 521, peer with the download permission: served" },
+          { 521, 1u << 0 /* noban */,     0, "floor 521, peer with noban (implies download): served" },
+          { 520, 0,                       0, "floor 520 = the tip's work: served" } };
+      for (unsigned k = 0; k < sizeof W / sizeof W[0]; k++){
+          unsigned char be[32]; memset(be, 0, 32);
+          be[28] = (unsigned char)(W[k].floor >> 24); be[29] = (unsigned char)(W[k].floor >> 16);
+          be[30] = (unsigned char)(W[k].floor >> 8);  be[31] = (unsigned char)W[k].floor;
+          reorg_set_min_chain_work(be);
+          g_perms = W[k].perms & (1u << 0) ? (W[k].perms | (1u << 4)) : W[k].perms;   /* netperm: noban implies download */
+          int fd = peer_open();
+          unsigned char loc[1][32]; memcpy(loc[0], bhash[3], 32);
+          send_getheaders(fd, (const unsigned char (*)[32])loc, 1, 0);
+          int pong = reply(fd);
+          const msg_t* m = first_cmd("headers"); unsigned off = 0; long n = vec_count(m, &off);
+          char lbl[200]; snprintf(lbl, sizeof lbl, "min chain work: %s", W[k].what);
+          cki(lbl, pong && count_cmd("headers") == 1 && (W[k].empty ? (n == 0 && m->len == 1) : n == TIP - 3), 1);
+          if (k == 0){
+              send_getheaders(fd, 0, 0, bhash[5]);
+              pong = reply(fd);
+              m = first_cmd("headers"); off = 0; n = vec_count(m, &off);
+              cki("min chain work: an empty locator (stop = block 5) also gets the empty headers message",
+                  pong && count_cmd("headers") == 1 && n == 0 && m->len == 1, 1);
+          }
+          peer_close(fd);
+      }
+      /* the record for the tip not written yet: the last one decides (work
+       * only grows with height). Records 0..399, floor 400 = record 399's. */
+      if (truncate("chainwork.dat", 400 * 16) != 0) printf("FAIL truncate chainwork.dat\n");
+      unsigned char be[32]; memset(be, 0, 32); be[30] = 400 >> 8; be[31] = 400 & 0xff;
+      reorg_set_min_chain_work(be); g_perms = 0;
+      int fd = peer_open();
+      unsigned char loc[1][32]; memcpy(loc[0], bhash[3], 32);
+      send_getheaders(fd, (const unsigned char (*)[32])loc, 1, 0);
+      int pong = reply(fd);
+      const msg_t* m = first_cmd("headers"); unsigned off = 0; long n = vec_count(m, &off);
+      cki("min chain work: chainwork.dat behind the tip, its last record clears the floor: served", pong && n == TIP - 3, 1);
+      peer_close(fd);
+      memset(be, 0, 32); reorg_set_min_chain_work(be);              /* no floor for what follows */
+    }
+
+    /* ---- a hash index a reorg behind: the archive decides ----
+     * A serve child keeps its own hash index; after a reorg it maps the
+     * losing branch's hashes to their heights until serve_reorg_check
+     * rebuilds it, and getheaders reached that check only after the locator
+     * walk. Here index.dat's records 510..519 are rewritten to another
+     * branch's hashes and the child's index is left as it was. Core walks
+     * the locator against its active chain (FindForkInGlobalIndex,
+     * chain.Contains): an entry off it is skipped, a stop hash off it is
+     * never met. getdata is untouched: it serves by height from the index.
+     * Kept last: nothing after this needs the old records. */
+    { FILE* f = fopen("index.dat", "r+b");
+      int ok = f != 0;
+      for (int h = 510; ok && h <= TIP; h++){
+          unsigned char rec[48];
+          ok = fseek(f, (long)h * 48, SEEK_SET) == 0 && fread(rec, 1, 48, f) == 48;
+          rec[31] ^= 0x5a;                                /* branch B's block at h */
+          ok = ok && fseek(f, (long)h * 48, SEEK_SET) == 0 && fwrite(rec, 1, 48, f) == 48;
+      }
+      if (f) fclose(f);
+      cki("stale index: index.dat 510..519 rewritten to another branch", ok, 1);
+
+      int fd = peer_open();
+      unsigned char loc[2][32]; memcpy(loc[0], bhash[515], 32); memcpy(loc[1], bhash[505], 32);
+      send_getheaders(fd, (const unsigned char (*)[32])loc, 2, 0);
+      int pong = reply(fd);
+      const msg_t* m = first_cmd("headers"); unsigned off = 0; long n = vec_count(m, &off);
+      cki("stale index: locator [old 515, 505] serves from 506 (the stale entry skipped), 14 headers",
+          pong && n == TIP - 505 && m->len >= off + 81 && !memcmp(m->p + off, blk[506], 80), 1);
+
+      memcpy(loc[0], bhash[3], 32);
+      send_getheaders(fd, (const unsigned char (*)[32])loc, 1, bhash[512]);
+      pong = reply(fd);
+      m = first_cmd("headers"); off = 0; n = vec_count(m, &off);
+      cki("stale index: a stop hash off the active chain caps nothing (4..519, 516 headers)",
+          pong && n == TIP - 3, 1);
       peer_close(fd); }
 
     close(ls);

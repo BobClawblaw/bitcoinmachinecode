@@ -24,6 +24,7 @@
 extern long node_handshake(int fd);
 extern int  node_accept_handshake(int fd);
 extern long node_serve_loop(int fd, int lfd, void* st, void* ht_idx, void* out, long cap);
+extern void serve_hdrctx_test_set_now(long t);
 extern int  tcp_connect_ip(unsigned, unsigned short);
 extern long store_init(void* st);
 extern long store_append(void* st, const unsigned char h[32], const void* blk, long blen);
@@ -58,6 +59,10 @@ int main(void){
     static unsigned char idx[24 + 256*48];
     idx_init(idx, 256);
     idx_put(idx, blkhash, 0);
+    /* Core serves a compact block only while the tip is fresh (CanDirectFetch:
+     * nTime within 20 block intervals of now); this block is years old, so
+     * the server's clock is set to its own time */
+    serve_hdrctx_test_set_now((long)(BLOCK_RAW[68] | BLOCK_RAW[69] << 8 | BLOCK_RAW[70] << 16 | (unsigned)BLOCK_RAW[71] << 24));
 
     /* loopback server */
     int ls=socket(AF_INET,SOCK_STREAM,0);

@@ -2,7 +2,10 @@
 ;   Each event writes one structured line to an explicit fd passed by the
 ;   caller -- NO global mutable state, so it links safely anywhere.
 ;
-;   long node_log_open(const char* path)  -> log fd, or 0 on error
+;   long node_log_open(const char* path)  -> log fd, or -1 on error
+;       (-1, not 0: every writer below then fails at once in fd_write_all,
+;       where 0 sent the lines to whatever fd 0 is -- stdin, or a socket
+;       that reused it)
 ;   void node_log_event(long fd, int kind, u32 a, u32 b, u32 c)
 ;       line: "<KIND> <a> <b> <c>\n"
 ;   void node_log_str(long fd, int kind, const char* s, long len)
@@ -48,7 +51,7 @@ node_log_open:
     pop  rbp
     ret
 .fail:
-    xor  eax, eax
+    mov  rax, -1
     pop  r12
     pop  rbp
     ret
