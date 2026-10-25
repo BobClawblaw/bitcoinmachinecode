@@ -31,6 +31,9 @@
  * of `name`, so the image is a power loss at exactly that point even though
  * the process goes on.
  *
+ * di_kill_after(name, k) (STO-1, 2026-10-24) SIGKILLs the process right after
+ * the k-th sync of `name` returns: a crash at a named step of a trace.
+ *
  * Weak mode (di_set_weak; STO-D/STO-W, 2026-10-23): POSIX only, the formal
  * model's FS = "weak". A regular file's sync makes its own content (its
  * truncations included) durable and nothing else; the namespace becomes
@@ -84,7 +87,7 @@ struct di_state {
     char freeze_name[64];
     char snap[400];
     int weak, nloss, have_loss;
-    struct di_trig dir_fail, dir_lose, open_fail;
+    struct di_trig dir_fail, dir_lose, open_fail, kill;
     struct di_ent ns[DI_MAXN];          /* the committed namespace */
     struct di_ent loss[DI_MAXN];        /* weak: the live namespace when the power was lost */
     char log[DI_LOGN][48];              /* sync order, for the report */
@@ -198,15 +201,18 @@ static void di_on_sigsys(int sig, siginfo_t* si, void* ctx){
                 if (!di->weak) di_commit_ns();
                 di_trig_count(&di->dir_fail, base); di_trig_count(&di->dir_lose, base); di_trig_count(&di->open_fail, base);
                 if (di->freeze_left > 0 && di_eq(base, di->freeze_name) && --di->freeze_left == 0) di_lose();
+                di_trig_count(&di->kill, base);
             }
         }
     }
+    int die = di->kill.fire; if (die){ di->kill.fire = 0; di_note("<SIGKILL here>"); }
     __atomic_store_n(&di->lock, 0, __ATOMIC_RELEASE);
+    if (die) syscall(SYS_kill, (long)syscall(SYS_getpid), SIGKILL);   /* the sync returned; the process dies */
     uc->uc_mcontext.gregs[REG_RAX] = ret;
     errno = saved_errno;
 }
 /* install in the scenario's runner (before it forks the trace's processes) */
-static int di_install(const char* snapdir){
+static __attribute__((unused)) int di_install(const char* snapdir){
     di = mmap(0, sizeof *di, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     if (di == MAP_FAILED) return -1;
     memset(di, 0, sizeof *di);
@@ -232,20 +238,22 @@ static int di_install(const char* snapdir){
     return 0;
 }
 /* start recording in the live directory (the caller's cwd): what exists now counts as durable */
-static void di_arm(void){ di_commit_ns(); di->armed = 1; }
-static void di_freeze_now(void){ di_lose(); }
-static void di_freeze_after(const char* name, int k){
+static __attribute__((unused)) void di_arm(void){ di_commit_ns(); di->armed = 1; }
+static __attribute__((unused)) void di_freeze_now(void){ di_lose(); }
+static __attribute__((unused)) void di_freeze_after(const char* name, int k){
     size_t n = strlen(name); if (n > 63) n = 63;
     memcpy(di->freeze_name, name, n); di->freeze_name[n] = 0; di->freeze_left = k;
 }
-static void di_set_weak(void){ di->weak = 1; }
+static __attribute__((unused)) void di_set_weak(void){ di->weak = 1; }
 static void di_trig_set(struct di_trig* t, const char* name, int k){
     size_t n = strlen(name); if (n > 63) n = 63;
     memcpy(t->name, name, n); t->name[n] = 0; t->fire = 0; t->left = k;
 }
-static void di_fail_dir_after(const char* name, int k){ di_trig_set(&di->dir_fail, name, k); }
-static void di_lose_dir_after(const char* name, int k){ di_trig_set(&di->dir_lose, name, k); }
-static void di_fail_open_dot_after(const char* name, int k){ di_trig_set(&di->open_fail, name, k); }
+static __attribute__((unused)) void di_fail_dir_after(const char* name, int k){ di_trig_set(&di->dir_fail, name, k); }
+static __attribute__((unused)) void di_lose_dir_after(const char* name, int k){ di_trig_set(&di->dir_lose, name, k); }
+static __attribute__((unused)) void di_fail_open_dot_after(const char* name, int k){ di_trig_set(&di->open_fail, name, k); }
+/* SIGKILL the process right after the k-th sync of `name` returns (armed only) */
+static __attribute__((unused)) void di_kill_after(const char* name, int k){ di_trig_set(&di->kill, name, k); }
 static int di_cached(const char* name, const char* const* cached){
     for (int i = 0; cached && cached[i]; i++) if (!strncmp(name, cached[i], strlen(cached[i]))) return 1;
     return 0;
@@ -264,7 +272,7 @@ static void di_image_ent(const char* dst, const struct di_ent* x){
  * directory. kept (weak mode; 0 = none): names whose state at the loss the
  * disk kept, though no directory fsync committed it. A trace that ends
  * without a loss point loses the power at its end. */
-static int di_build_image_weak(const char* dst, const char* const* cached, const char* const* kept){
+static __attribute__((unused)) int di_build_image_weak(const char* dst, const char* const* cached, const char* const* kept){
     if (mkdir(dst, 0755) != 0 && errno != EEXIST) return -1;
     char p[1200];
     if (kept && !di->have_loss){ di_read_ns(di->loss, &di->nloss, 0); di->have_loss = 1; }
@@ -284,8 +292,8 @@ static int di_build_image_weak(const char* dst, const char* const* cached, const
     if (d) closedir(d);
     return 0;
 }
-static int di_build_image(const char* dst, const char* const* cached){ return di_build_image_weak(dst, cached, 0); }
-static void di_print_log(void){
+static __attribute__((unused)) int di_build_image(const char* dst, const char* const* cached){ return di_build_image_weak(dst, cached, 0); }
+static __attribute__((unused)) void di_print_log(void){
     printf("  syncs in order:");
     for (int i = 0; i < di->nlog; ){
         int j = i; while (j < di->nlog && !strcmp(di->log[j], di->log[i])) j++;

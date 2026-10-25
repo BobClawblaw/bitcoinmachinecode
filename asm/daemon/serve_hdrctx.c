@@ -82,6 +82,27 @@ static int sv_hdr_at(void* ctx, long h, u8 hdr[80]){
     return pread(fd, hdr, 80, (off_t)meta[0] + 8) == 80 ? 1 : 0;
 }
 
+/* ---- getdata(MSG_CMPCT_BLOCK): compact only near a fresh tip ----
+ * Core (ProcessGetBlockData, net_processing.cpp 2463-2477) answers with a
+ * compact block only when CanDirectFetch() -- the tip's nTime within 20
+ * block intervals of now (1347-1350; PowTargetSpacing is 600 s on every
+ * chain) -- and the block is at most MAX_CMPCTBLOCK_DEPTH (5) below the tip;
+ * otherwise with the full block, witness included: a peer asking for an old
+ * block will not have a mempool to rebuild it from. bmc built a compact
+ * block at any depth. `tip` is the connected tip. An unreadable tip header
+ * serves the full block, which is a valid answer either way.
+ * 1 = send the full block. */
+static long g_sv_now_test;      /* TEST-ONLY: the clock below (0 = time()) */
+void serve_hdrctx_test_set_now(long t){ g_sv_now_test = t; }
+int serve_cmpct_as_full(void* st, long h, long tip){
+    if (h < tip - 5) return 1;
+    u8 hdr[80];
+    if (!sv_hdr_at(st, tip, hdr)) return 1;
+    long t = (long)((u32)hdr[68] | (u32)hdr[69] << 8 | (u32)hdr[70] << 16 | (u32)hdr[71] << 24);
+    long now = g_sv_now_test ? g_sv_now_test : (long)time(NULL);
+    return t > now - 20 * 600 ? 0 : 1;
+}
+
 /* Core's GetMedianTimePast: median nTime of the up-to-11 blocks ending at
  * `h`. Returns 0 if any header in the window is unreadable -- the caller
  * refuses rather than passing a 0 floor, matching hdrrules.h's contract and

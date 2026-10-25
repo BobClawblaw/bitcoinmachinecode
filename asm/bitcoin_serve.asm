@@ -31,6 +31,9 @@ extern g_peer_wants_addrv2
     extern idx_get
     extern serve_inv_bounds
     extern serve_locator_from
+    extern serve_set_locator_store ; daemon/serve_invbounds.c
+    extern serve_getheaders_low_work ; daemon/serve_invbounds.c
+    extern serve_cmpct_as_full  ; daemon/serve_hdrctx.c
     extern serve_public_tip     ; 3.1: the CONNECTED tip (daemon/serve_invbounds.c)
 extern node_relay_flag
 extern serve_tx_gate
@@ -209,6 +212,7 @@ align 16
 s_plen:   dq 0
 s_fh:     dq 0
 s_ghstop: dq -1        ; NET-8: hashStop height for getheaders, -1 = absent/unknown
+s_ghret:  dq 0         ; serve_locator_from's result, kept across the low-work gate
 s_gbstop: times 32 db 0 ; getblocks: the hashStop hash itself (wire order)
 s_gbcont: times 32 db 0 ; getblocks: Core's m_continuation_block (wire order)
 s_gbcont_set: dq 0      ; 1 while s_gbcont holds one (per connection)
@@ -310,6 +314,10 @@ node_serve_loop:
     mov  [s_lfd], rsi        ; stable lfd copy
     mov  [s_htidx], rcx      ; keep a stable copy (a downstream callee clobbers r15)
     mov  [s_st], rdx         ; stable copy of st
+    ; the locator walk checks each hash-index hit against index.dat
+    ; (serve_locator_from): a child's index can be a reorg behind
+    mov  rdi, rdx
+    call serve_set_locator_store
     mov  qword [s_served], 0 ; served count
     ; NET-1: one-past-the-end of the blocktxn assembly buffer, checked by the
     ; writer below before every append.
@@ -414,12 +422,18 @@ node_serve_loop:
     ; through to the read exactly as before) or 0 when the NET-3 idle bound
     ; expired with nothing to read -- the same outcome the SO_RCVTIMEO on the
     ; socket used to produce from inside p2p_read, so .done is the right exit.
-    ; txann_wait(fd, peer_feefilter)
+    ; 2 when the public tip passed s_lasttip: the tip-watch at .next
+    ; announces it now, not after the peer's next message (2026-10-24).
+    ; txann_wait(fd, peer_feefilter, st, announced_tip)
     mov  rdi, r12
     mov  rsi, [s_peerfee]
+    mov  rdx, [s_st]
+    mov  rcx, [s_lasttip]
     call txann_wait
     test rax, rax
     jz   .done
+    cmp  rax, 2
+    je   .next
     ; ---- read a message ----
     mov  qword [s_plen], 0
     mov  rdi, r12
@@ -1056,6 +1070,41 @@ node_serve_loop:
     test rax, rax
     jle  .gd_miss
     mov  [s_blen_spill], rax
+    ; ---- STO-10, as .gd_block does it: the block read must hash to the one
+    ; requested. A child's index can be a reorg behind (see .gd_block's
+    ; note); this path served whatever block sat at the stale height.
+    mov  [s_ptr], rbx
+    lea  rdi, [s_gdbh]
+    lea  rsi, [sb_buf]
+    call block_hash
+    mov  rbx, [s_ptr]
+    mov  rcx, [s_gdbh]
+    cmp  rcx, [rbx+4]
+    jne  .gd_miss
+    mov  rcx, [s_gdbh+8]
+    cmp  rcx, [rbx+12]
+    jne  .gd_miss
+    mov  rcx, [s_gdbh+16]
+    cmp  rcx, [rbx+20]
+    jne  .gd_miss
+    mov  rcx, [s_gdbh+24]
+    cmp  rcx, [rbx+28]
+    jne  .gd_miss
+    ; Core: compact only for a block at most 5 below a fresh tip, else the
+    ; full block with witness (serve_cmpct_as_full, daemon/serve_hdrctx.c)
+    mov  [s_ptr], rbx
+    mov  rdi, [s_st]
+    call serve_public_tip
+    mov  rdx, rax
+    mov  rdi, [s_st]
+    mov  rsi, [s_fh]
+    call serve_cmpct_as_full
+    mov  rbx, [s_ptr]
+    test eax, eax
+    jz   .gc_compact
+    mov  rax, [s_blen_spill]
+    jmp  .gdb_send_full
+.gc_compact:
     ; ---- NET-14 (audit 2026-09-03): a FRESH nonce per block ----
     ; This was the constant 0x0123456789abcdef, drawn once and then cached in
     ; s_cmpct_nonce for the life of the connection -- so every compact block
@@ -1421,7 +1470,18 @@ node_serve_loop:
     je   .gh_locsz           ; > MAX_LOCATOR_SZ: Core disconnects
     test eax, eax
     jz   .next               ; malformed: drop, as the inv path does
-    cmp  eax, 2
+    mov  [s_ghret], rax
+    ; Core (net_processing.cpp 4410-4422): no headers from a chain below
+    ; -minimumchainwork, unless the peer has the download permission -- an
+    ; empty headers message instead, after the locator checks and before
+    ; either walk. serve_getheaders_low_work: 1 = answer empty.
+    mov  rdi, r14
+    call serve_public_tip
+    mov  rdi, rax
+    call serve_getheaders_low_work
+    test eax, eax
+    jnz  .gh_empty
+    cmp  qword [s_ghret], 2
     je   .gh_nolocator       ; empty locator: the hashStop header alone
 .gh_build:
     ; tip = the CONNECTED tip (3.1), not st[24]: a peer is never told

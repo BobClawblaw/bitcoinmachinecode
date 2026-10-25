@@ -31,6 +31,9 @@ const unsigned char* mpool_get(void* mp, const unsigned char* txid, unsigned lon
  * that says yes for one fd, so txann_wait must not sit in poll for it */
 static int g_v2_buffered_fd = -1;
 int bmc_v2_has_message(int fd){ return fd == g_v2_buffered_fd; }
+/* the serve side's public tip (serve_invbounds.c): here the "store" is the tip itself */
+static long g_test_tip;
+long serve_public_tip(const void* st){ return *(const long*)st; }
 static long long ms(void){ struct timeval t; gettimeofday(&t,0); return t.tv_sec*1000LL + t.tv_usec/1000; }
 int main(void){
     node_status_t* st = calloc(1, sizeof *st); if (!st){ puts("calloc"); return 2; }
@@ -66,20 +69,30 @@ int main(void){
     int sv[2]; if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv)){ perror("sp"); return 2; }
     txann_set_idle_secs(1); txann_child_init(5, 1);
     if (write(sv[1], "x", 1) != 1) return 2;
-    long long t0 = ms(); long r = txann_wait(sv[0], 0); long long dt = ms()-t0;
+    long long t0 = ms(); long r = txann_wait(sv[0], 0, 0, 0); long long dt = ms()-t0;
     ok(r == 1 && dt < 200, "data pending: wait returns 1 immediately");
     char b; if (read(sv[0], &b, 1) != 1) return 2;
     txann_child_init(5, 1);
-    t0 = ms(); r = txann_wait(sv[0], 0); dt = ms()-t0;
+    t0 = ms(); r = txann_wait(sv[0], 0, 0, 0); dt = ms()-t0;
     ok(r == 0 && dt >= 900 && dt <= 2500, "silent peer: wait returns 0 at the 1 s idle bound (was: 20 min in the read)");
     printf("      idle wait took %lld ms\n", dt);
     txann_child_init(5, 1); id(t,400); txann_push(t, 1000, 200); cap_n = 0; cap_writes = 0;
-    txann_set_idle_secs(1); r = txann_wait(sv[0], 0);
+    txann_set_idle_secs(1); r = txann_wait(sv[0], 0, 0, 0);
     ok(cap_writes >= 1 && inv_has(400), "an accept during the wait is announced from inside the wait");
+    printf("== a new tip ends the wait at once (the serve loop's tip-watch runs) ==\n");
+    { int sq[2]; if (socketpair(AF_UNIX, SOCK_STREAM, 0, sq)){ perror("sp"); return 2; }
+      txann_set_idle_secs(2); txann_child_init(5, 1);
+      g_test_tip = 121;
+      long long tq = ms(); long rq = txann_wait(sq[0], 0, &g_test_tip, 120); long long dq = ms() - tq;
+      ok(rq == 2 && dq < 200, "silent peer, public tip 121 past the announced 120: wait returns 2 immediately (was: until the peer's next message)");
+      txann_child_init(5, 1);
+      tq = ms(); rq = txann_wait(sq[0], 0, &g_test_tip, 121); dq = ms() - tq;
+      ok(rq == 0 && dq >= 1800, "silent peer, tip already announced: the wait runs to the idle bound as before");
+      close(sq[0]); close(sq[1]); }
     printf("== a v2 message already buffered ends the wait at once (poll cannot see it) ==\n");
     { int sq[2]; if (socketpair(AF_UNIX, SOCK_STREAM, 0, sq)){ perror("sp"); return 2; }
       txann_set_idle_secs(2); txann_child_init(5, 1); g_v2_buffered_fd = sq[0];
-      long long tq = ms(); long rq = txann_wait(sq[0], 0); long long dq = ms() - tq;
+      long long tq = ms(); long rq = txann_wait(sq[0], 0, 0, 0); long long dq = ms() - tq;
       ok(rq == 1 && dq < 200, "silent socket, message in the v2 session: wait returns 1 immediately (was: until the peer's next packet)");
       if (!(rq == 1 && dq < 200)) printf("      returned %ld after %lld ms\n", rq, dq);
       g_v2_buffered_fd = -1; close(sq[0]); close(sq[1]); }
@@ -93,7 +106,7 @@ int main(void){
     st->peers[5].last_tx_time = 0; id(t,650); txann_push(t, 1000, 200);
     ok(st->peers[5].last_tx_time > 0, "an accept from slot 5 stamps peers[5].last_tx_time");
     st->peers[5].last_block_time = 0; txann_note_block(); ok(st->peers[5].last_block_time > 0, "a block from slot 5 stamps last_block_time");
-    st->peers[5].evict_requested = 1; t0 = ms(); r = txann_wait(sv[0], 0);
+    st->peers[5].evict_requested = 1; t0 = ms(); r = txann_wait(sv[0], 0, 0, 0);
     ok(r == 0 && ms()-t0 < 1500, "evict_requested: the wait returns 0 (the child exits) within a slice, not at the 30 s idle bound");
     st->peers[5].evict_requested = 0; txann_set_my_slot(-1);
     printf("== relay not negotiated ==\n");
@@ -121,7 +134,7 @@ int main(void){
     txann_set_enabled(0); txann_child_init(5, 1); id(t,700); txann_push(t, 1000, 200);
     cap_n = 0; n = txann_tick(9, ms()+1, 0);
     ok(n == 0 && cap_n == 0, "control: disabled, an accept produces NO inv to the inbound peer (the finding)");
-    t0 = ms(); r = txann_wait(sv[0], 0);
+    t0 = ms(); r = txann_wait(sv[0], 0, 0, 0);
     ok(r == 1 && ms()-t0 < 50, "control: disabled, wait falls straight through to the blocking read");
     drained_n = 0; txann_worker_drain(wcb); ok(drained_n == 0, "control: disabled, nothing reaches the outbound legs");
     printf("\n%s (%d checks, %d failures)\n", fails?"TESTS FAILED":"ALL TESTS PASSED", checks, fails);
