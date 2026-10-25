@@ -90,11 +90,13 @@ ca invalidateblock "$(ca getblockhash $((OLDH - 1)))" >/dev/null
 caw generatetoaddress 3 "$(caw getnewaddress)" >/dev/null
 echo "  A: invalidated $((OLDH - 1)), new branch to $(ca getblockcount)"
 bmc_best(){ bmc getbestblockhash | res; }
-# 240 s, not $WAIT: with one quiet peer the worker defers its reorg probe
-# while no leg has received anything for 20 s ("the host's network, not a
-# peer"), and on regtest that has held for two minutes
+# 240 s, not $WAIT: with one quiet peer the reorg waits for the worker's
+# probe, one every 30 s. Until 2026-10-25 the probe was deferred while no
+# leg had received anything for 20 s, and on regtest that held for two
+# minutes (122 s on the 2026-10-25 production build; 32 s since).
+t0=$(date +%s)
 for i in $(seq 240); do [ "$(bmc_best)" = "$(ca getbestblockhash)" ] && break; sleep 1; done
-[ "$(bmc_best)" = "$(ca getbestblockhash)" ] && ok "bmc reorged onto A's new branch" || fail "bmc did not reorg (tip $(bmc_best))"
+[ "$(bmc_best)" = "$(ca getbestblockhash)" ] && ok "bmc reorged onto A's new branch (after $(( $(date +%s) - t0 )) s)" || fail "bmc did not reorg (tip $(bmc_best))"
 wait_tip cb && ok "B followed bmc onto the new branch ($(cb getblockcount), best hash = A's)" \
     || fail "B is not on A's branch: $(cb getbestblockhash) at $(cb getblockcount)"
 [ "$(cb getblockheader "$OLD" 2>/dev/null | python3 -c 'import sys,json;print(json.load(sys.stdin)["confirmations"])' 2>/dev/null)" = "-1" ] \
@@ -123,6 +125,14 @@ else
     grep -a 'mempool.dat is malformed\|mempool\] loaded' "$WORK/bmc.log" | tail -2 | sed 's/^/  log: /'
     [ "$M" = $((N - 1)) ] && ok "restarted on the torn file: $M of $N loaded (all before the cut)" \
         || fail "restarted on the torn file: $M loaded, expected $((N - 1))"
+    # importmempool on the same torn file: bmc answers what Core A answers
+    cp "$MPD" "$WORK/torn-mempool.dat"
+    imp(){ curl -s -m 30 --user e2e:e2epw -H 'content-type:text/plain' \
+             --data-binary "{\"jsonrpc\":\"1.0\",\"id\":\"e\",\"method\":\"importmempool\",\"params\":[\"$WORK/torn-mempool.dat\"]}" \
+             "http://127.0.0.1:$1/" | python3 -c 'import sys,json;e=json.load(sys.stdin).get("error");print(e and "%d %s" % (e["code"], e["message"]))' 2>/dev/null; }
+    IB=$(imp $BMC_RPC); IA=$(imp $A_RPC)
+    [ -n "$IA" ] && [ "$IB" = "$IA" ] && ok "importmempool of the torn file: bmc's error is Core's ($IA)" \
+        || fail "importmempool of the torn file: bmc '$IB', Core '$IA'"
     bmc_stop
 fi
 
