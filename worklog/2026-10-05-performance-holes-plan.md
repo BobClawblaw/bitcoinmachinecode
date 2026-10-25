@@ -1225,3 +1225,25 @@ Run 50: `bmc.lsmreads=pread` + `bmc.dropappends=1`, the sampler
 beside it; the pass mark is the applier under run 46's 9,691 s plus
 the pread syscall cost (the bench's +0.1 µs a lookup, ~400 s) with
 the PSS peak under Core's 34.3 GB.
+
+**Runs 50 and 51 (2026-10-22, 2026-10-25): the memory mark passes, the
+applier mark does not; the defaults stay `mmap` / `0`.** Both ran
+`bmc.lsmreads=pread` + `bmc.dropappends=1` from genesis with the
+sampler beside them, and both PASS (MuHash identical to Core v31.1's,
+at 972,686 and 973,026). Run 50 is these commits on the 10-11 base
+(`7f822deb`); run 51 is them on main after the 2026-10-23 review's
+fixes (`55c04a60`, PR #446). Stage reports against Core #7:
+
+| | run 46 (`mmap`, `0`) | run 50 | run 51 |
+|---|---|---|---|
+| IBD end | 3:17:32 | 5:16:41 | 5:52:03 |
+| applier block total | 9,691 s | 16,693 s | 18,594 s |
+| `get` | 2,870 s | 10,306 s | 12,594 s |
+| PSS peak | 57.6 GB | 23.3 GB | 22.6 GB |
+
+The PSS peak falls by more than half and is under Core's 34.3 GB. But
+the lookups are 4.4x run 46's and the applier is 1.9x, against a mark
+of ~10,100 s: dropping the append streams did not keep enough of the
+run pages resident for the pread path. Both knobs stay as an opt-in
+low-memory mode: about half the peak memory for a sync that takes
+about 1.8x as long.
