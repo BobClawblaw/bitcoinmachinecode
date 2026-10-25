@@ -3872,9 +3872,19 @@ static int legs_heard_within(int i, long long window_ms){
  * 75 s and 135 s into the silence and could only time out. The first began
  * seconds before it and is not saved: once the outage ended, TCP's
  * retransmit backoff held our getheaders until ~06:28:52, and holding the
- * worker inside a probe that long is worse than one re-dial. */
+ * worker inside a probe that long is worse than one re-dial.
+ *
+ * 2026-10-25: the window outlasts REORG_PROBE_INTERVAL_MS. At 20 s, under
+ * the 30 s between probes, the announcement that made a probe due (a fork
+ * peer's headers, then a pass that stored nothing) was often over 20 s old
+ * when the probe came round, and with one quiet peer the probe then waited
+ * for the next ping: on regtest the reorg took two minutes
+ * (validation/serve_rules_regtest_e2e.sh). 35 s still defers every probe of
+ * the 06:24 outage after the first (75 s and 135 s into it). */
 #ifndef PROBE_SILENCE_MS
-#define PROBE_SILENCE_MS 20000
+#define PROBE_SILENCE_MS 35000
+_Static_assert(PROBE_SILENCE_MS > REORG_PROBE_INTERVAL_MS,
+               "the probe's silence window outlasts the interval between probes");
 #endif
 static int reorg_probe_host_silent(void){ return legs_heard_within(-1, PROBE_SILENCE_MS) == 0; }
 /* Test seam: the extra window over the pass's own duration that still counts

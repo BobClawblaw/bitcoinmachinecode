@@ -298,3 +298,32 @@ long serve_public_tip(const void* st){
     if (cap == -2LL /* NODE_TIP_UNTRACKED */) return stored;
     return cap < (long long)stored ? (long)cap : stored;
 }
+
+/* ---- the tip-watch's memory (2026-10-25) ----
+ * The serve loop announced a new tip when the public tip's HEIGHT passed the
+ * one it last announced, so a reorg that ends at the same height (one block
+ * replaced by another) reached an idle peer only with the next block. It
+ * remembers the announced block's hash as well now: index.dat's record at
+ * that height (wire order), which a reorg rewrites in place. A tip that ends
+ * LOWER after a reorg waits for the chain to grow past the announced height,
+ * as before. 1 = announce the public tip. */
+static unsigned char g_tw_hash[32];
+static long g_tw_h = -1;
+static int tw_hash_at(long h, unsigned char out[32]){
+    if (!g_loc_store || h < 0) return 0;
+    int fd = (int)*(const long*)((const char*)g_loc_store + 8);
+    unsigned char rec[48];
+    if (fd < 0 || pread(fd, rec, sizeof rec, (off_t)h * 48) != (ssize_t)sizeof rec) return 0;
+    memcpy(out, rec, 32);
+    return 1;
+}
+void serve_tipwatch_note(long h){
+    g_tw_h = tw_hash_at(h, g_tw_hash) ? h : -1;
+}
+int serve_tipwatch_changed(const void* st, long announced){
+    long tip = serve_public_tip(st);
+    if (tip > announced) return 1;
+    if (tip != announced || g_tw_h != announced) return 0;
+    unsigned char now[32];
+    return tw_hash_at(tip, now) && memcmp(now, g_tw_hash, 32) != 0;
+}
