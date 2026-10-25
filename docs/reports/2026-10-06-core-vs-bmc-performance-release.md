@@ -560,9 +560,20 @@ either count against the process or get evicted behind the streams.
 Plan B16 (`bmc.dropappends=1`, PR #423) drops the streams behind the
 applier instead — the undo stream written back and dropped every 16
 MB, each blk file dropped once the applier has left it — so the page
-cache is left to the run files; run 50 measures pread and dropappends
-together. Until it does, the release keeps the mapped path and this
-row stays Core's.
+cache is left to the run files. Runs 50 and 51 measured the pair (both
+from genesis, `bmc.lsmreads=pread` + `bmc.dropappends=1`, both PASS,
+MuHash identical to Core v31.1's at 972,686 and 973,026; run 51 is
+the PR #446 code on main after the 2026-10-23 review). The row flips:
+PSS peak 22.8 and 22.1 GB, mean 9.4 and 8.5 (Core #7 34.3 / 17.6; run
+46 56.3 / 34.1). The apply row does not come back: the get column was
+10,306 and 12,594 s against run 46's 2,870, the applier's block total
+16,693 and 18,594 s against 9,691 (Core's 13,340), and IBD ended at
+5:16:41 and 5:52:03 against 3:17:32. Dropping the streams did not keep
+enough of the run pages resident. So the release keeps the mapped
+path and this row stays Core's at the defaults; the two knobs ship in
+PR #446 as an opt-in low-memory mode, under half the peak PSS for a
+sync about 1.8× as long, still ahead of Core #7 to every height (0.62×
+its time to block 900,000).
 
 ## 6. Verdict, category by category
 
@@ -657,8 +668,9 @@ bmc's on the mean (8.2 against 10.0 GB) and parity on the peak (13.3
 against 12.0) since `dbcache` became the whole UTXO heap (M2). What
 Core keeps is the PSS ceiling with mapped files counted, 1.6×, all of
 it the UTXO run files the kernel caches and may drop (run 49 took the
-row with the pread path and gave the apply row back, §5; run 50
-measures the pair with the append streams dropped behind the applier),
+row with the pread path and gave the apply row back, §5; runs 50 and
+51, with the append streams dropped behind the applier as well, kept
+the row and still gave the apply row back, so it is an opt-in mode),
 and the two disk rows it kept before. The release is run 46's build; production has run
 `deploy-20261010a` since 10-10 04:28Z (the binary's size and strings
 are the tree's build of `a79bcdca`; NRestarts=0 at the time of writing).

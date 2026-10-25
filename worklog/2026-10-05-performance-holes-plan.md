@@ -1232,14 +1232,16 @@ applier mark does not; the defaults stay `mmap` / `0`.** Both ran
 sampler beside them, and both PASS (MuHash identical to Core v31.1's,
 at 972,686 and 973,026). Run 50 is these commits on the 10-11 base
 (`7f822deb`); run 51 is them on main after the 2026-10-23 review's
-fixes (`55c04a60`, PR #446). Stage reports against Core #7:
+fixes (`55c04a60`, PR #446). Stage reports against Core #7; PSS from
+the sampler over the sync, in the release report's units (MB/1024):
 
 | | run 46 (`mmap`, `0`) | run 50 | run 51 |
 |---|---|---|---|
 | IBD end | 3:17:32 | 5:16:41 | 5:52:03 |
 | applier block total | 9,691 s | 16,693 s | 18,594 s |
 | `get` | 2,870 s | 10,306 s | 12,594 s |
-| PSS peak | 57.6 GB | 23.3 GB | 22.6 GB |
+| PSS peak | 56.3 GB | 22.8 GB | 22.1 GB |
+| PSS mean | 34.1 GB | 9.4 GB | 8.5 GB |
 
 The PSS peak falls by more than half and is under Core's 34.3 GB. But
 the lookups are 4.4x run 46's and the applier is 1.9x, against a mark
