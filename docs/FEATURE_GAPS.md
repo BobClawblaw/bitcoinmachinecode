@@ -2809,7 +2809,7 @@ test, and the bug was in the measurement.
   and five legs lost their third strike within 33 s of it. A design call:
   no strike for N s after a silence ends.
 
-## Update 2026-11-04 — Lightning on bmc: `echo`, the version number, and the reorg gap
+## Update 2026-11-04 — Lightning on bmc: `echo`, the version number, and blocks reorged off
 
 - **`echo`, `echojson` and `echoipc` are served** (`asm/rpc_commands.c`).
   Core Lightning's bcli plugin runs `bitcoin-cli echo` before anything else,
@@ -2843,8 +2843,8 @@ test, and the bug was in the measurement.
   (/BitcoinMachineCode:0.0.1/) and `bmc_build_commit` still say which
   software answered (`asm/rpc_node.c` NODE_RPC_COMPAT_VERSION, pinned by
   `test_rpc_node`).
-- **Lightning: LND and Core Lightning run on this node, except across a
-  reorg.** `validation/lightning_regtest_e2e.py` points LND v0.21.6-beta
+- **Lightning: LND and Core Lightning run on this node** (across a reorg
+  since the fork-tree fix below). `validation/lightning_regtest_e2e.py` points LND v0.21.6-beta
   (bitcoind backend: RPC + rawblock/rawtx ZMQ) and CLN v26.06.9 (bcli,
   through Core's bitcoin-cli) at bmc alone, with Core v31.1 only mining and
   bmc following it over P2P, so every Lightning transaction reaches the miner
@@ -2853,20 +2853,55 @@ test, and the bug was in the measurement.
   goes active, payments both ways settle, a cooperative close confirms, and a
   force close confirms and LND sweeps its CSV-delayed output (199,766 of
   200,000 sat back on chain); `estimatesmartfee` answers as Core's does.
-- **OPEN, and it blocks LND on mainnet: a block this node reorged off cannot
-  be looked up.** `getblockheader` (and every other hash lookup) resolves
-  through the active chain only (`rpc_chain.c` lookup_block_param), so a
-  replaced block answers -5 "Block not found", where Core answers with
-  `confirmations: -1`. LND's wallet layer (btcwallet) processes a reorg by
-  fetching the header of the block it last saw and walking back to the
-  fork; on bmc it logs "Unable to process chain reorg: unable to get block
-  header ... -5: Block not found" on every block and never follows the chain
-  again (stuck at the fork height, `synced_to_chain` false). CLN, which asks
-  by height, took the same one-block reorg ("Funding txid ... REORG from
-  depth 1") and carried on. The fork tree (`daemon/hdr_tree.c`) keeps hash,
-  prev, height, bits and work for side branches, not the 80-byte header, so
-  it cannot answer either. The reorg phase of the e2e checks exactly this and
-  fails until it is fixed.
+- ~~**OPEN, and it blocks LND on mainnet: a block this node reorged off
+  cannot be looked up.**~~ **CLOSED 2026-11-04.** `getblockheader` resolved
+  hashes through the active chain only, so a replaced block answered -5
+  "Block not found" where Core answers with `confirmations: -1`. LND's wallet
+  (btcwallet) processes a reorg by fetching the header of the block it last
+  saw and walking its prev links to the fork; on bmc it logged "Unable to
+  process chain reorg: unable to get block header ... -5" on every block and
+  never followed the chain again. CLN, which asks by height, was unaffected.
+  Two causes, both fixed: the fork tree kept no 80-byte header (hash, prev,
+  height, bits and work only), and the ordinary staged reorg and
+  invalidateblock never put the branch they disconnect into it (only the
+  large-reorg handoff and the best-header gate did). Now:
+  - `daemon/hdr_tree.c`: version-2 records carry the header and the block's
+    transaction count (`headers_forks2.dat`; a version-1 file is read once,
+    rewritten and kept aside as `headers_forks.dat.v1`, its entries without
+    a header to serve). An eviction now leaves the file as well as the table:
+    it was appended to and never rewritten, so a reload brought evicted tips
+    back.
+  - `daemon/reorg.c` `reorg_execute`: every disconnect retains the branch it
+    leaves, except the mutated-block drop (that hash is the real chain's).
+  - `rpc_chain.c`: a `getblockheader` miss on the active chain reads the fork
+    tree file (`daemon/hdr_tree_read.c`; the tree is owned by the download
+    worker, the RPC answers in the parent) and answers in Core's shape:
+    `confirmations: -1`, no `nextblockhash`, `mediantime` along the block's
+    own branch. A block back on the active chain answers as active.
+  - `getblock` for such a block answers -1 "Block not available (pruned
+    data)": the body left with the archive truncation. **Divergence:** Core
+    keeps stale bodies and returns the block.
+  - Evidence: `validation/stale_header_core_diff.py` against v31.1, 18 of 18
+    identical (a two-block reorg: both replaced blocks verbose and raw, the
+    fork point, the walk from the replaced tip to the fork; then a reorg back
+    onto the original branch: its blocks answer as active, the replacement's
+    as replaced); against the commit before this one 10 of them differ (every
+    replaced-block lookup, the walk and the getblock answer). The Lightning
+    e2e passes every phase, its reorg phase included: LND follows the reorg,
+    the channel funded across it opens at the new height and a payment crosses
+    it. `test_reorg` checks the fork tree after each staged reorg (depths 1,
+    3, 12, 101 and a shorter-but-heavier branch; all five fail against the old
+    `reorg.c`), `test_hdr_tree` the file format.
+- **Found while testing the above, OPEN:** `invalidateblock` finds its block
+  by scanning `headers.dat` (`daemon/main.c` txoq_mark_block), and a node
+  that follows its peers block by block through the keep-up path never
+  writes `headers.dat` (0 bytes on the regtest node), so there it answers -5
+  "Block not found" for every block, its own tip included. A node that synced
+  headers-first is unaffected.
+- **Observed, not yet measured further:** right after a reorg,
+  `getbestblockhash` names the new tip about 0.3 s before the hash index can
+  resolve it (`[idx] fold` lands after `[reorg] complete`); a
+  `getblockheader` of the new tip in that window answers -5.
 - **OPEN: LND runs against this node in its pre-0.19 compatibility mode.**
   LND's RPC client (btcd `rpcclient/backend_version.go`) does not read
   `version`; it strips `/Satoshi:` from `subversion` and compares the rest

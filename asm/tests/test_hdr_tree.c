@@ -31,6 +31,36 @@ int main(void){
     ck("filled to the cap", added == HDRTREE_MAX && hdrtree_count() == HDRTREE_MAX);
     { unsigned char x[80]; memset(p, 0x22, 32); mk(x, p, 77); work_n(w, 1); ck("a lighter header than every tip is refused when full", hdrtree_add(x, 9, w) == -1); }
     { unsigned char x[80]; memset(p, 0x33, 32); mk(x, p, 78); work_n(w, 999999); ck("a heavier one evicts the lightest tip and lands", hdrtree_add(x, 9, w) == 1 && hdrtree_count() == HDRTREE_MAX && hdrtree_best(best, &h, w) && *(unsigned*)w == 999999); }
+    { long before = hdrtree_count();
+      hdrtree_open();
+      ck("an eviction leaves the file too: a reload holds exactly the table, the evicted tip gone",
+         hdrtree_count() == before && before == HDRTREE_MAX && hdrtree_best(best, &h, w) && *(unsigned*)w == 999999); }
+
+    /* ---- 2026-11-04: the header itself, for getblockheader on a block reorged off ---- */
+    hdrtree_reset();
+    unsigned char d[80], hd[32], got[80], gw[16]; long gh; unsigned gn;
+    mk(d, ha, 9); block_hash(hd, d); work_n(w, 41);
+    ck("add with nTx 7", hdrtree_add_ntx(d, 120, w, 7) == 1);
+    ck("the RPC process's file lookup returns the 80-byte header, height, work and nTx",
+       hdrtree_file_lookup(hd, got, &gh, gw, &gn) == 1 && !memcmp(got, d, 80) && gh == 120 && *(unsigned*)gw == 41 && gn == 7);
+    ck("an unknown hash is not found", hdrtree_file_lookup(ha, NULL, NULL, NULL, NULL) == 0);
+    { FILE* f = fopen(HDRTREE_FILE, "ab"); unsigned char half[HDRTREE_REC / 2]; memcpy(half, hd, 32); memset(half + 32, 0, sizeof half - 32); fwrite(half, 1, sizeof half, f); fclose(f);
+      ck("a half-written record at the end (an append in flight) is ignored, the whole one still found",
+         hdrtree_file_lookup(hd, got, &gh, NULL, NULL) == 1 && !memcmp(got, d, 80) && gh == 120); }
+
+    /* a version-1 file (96-byte records, no header) is read, rewritten as version 2 and kept aside */
+    hdrtree_reset();
+    { FILE* f = fopen(HDRTREE_FILE_V1, "wb"); unsigned char r[HDRTREE_REC_V1]; memset(r, 0, sizeof r);
+      memcpy(r, hd, 32); memcpy(r + 32, ha, 32); long hh = 120; memcpy(r + 64, &hh, 8); memcpy(r + 72, d + 72, 4); work_n(w, 41); memcpy(r + 76, w, 16);
+      fwrite(r, 1, sizeof r, f); fclose(f); }
+    ck("open reads the version-1 entry", hdrtree_open() == 1 && hdrtree_count() == 1 && hdrtree_get(hd, prev, &h, w) && h == 120 && !memcmp(prev, ha, 32));
+    ck("...moves the version-1 file aside", access(HDRTREE_FILE_V1, F_OK) != 0 && access(HDRTREE_FILE_V1 ".v1", F_OK) == 0);
+    ck("...and a version-1 entry has no header to serve", hdrtree_file_lookup(hd, NULL, NULL, NULL, NULL) == 0);
+    work_n(w, 41);
+    ck("adding the same block again fills its header in (0: already known)", hdrtree_add_ntx(d, 120, w, 3) == 0 &&
+       hdrtree_file_lookup(hd, got, &gh, NULL, &gn) == 1 && !memcmp(got, d, 80) && gn == 3 && hdrtree_count() == 1);
+    unlink(HDRTREE_FILE_V1 ".v1");
+
     printf("%s (%d failure(s))\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);
     return fails ? 1 : 0;
 }

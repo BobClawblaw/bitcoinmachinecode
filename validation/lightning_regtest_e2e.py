@@ -26,10 +26,11 @@ LN -> bmc -> P2P -> Core.
                    invalidated on Core and replaced by a longer branch (the
                    funding transaction re-mined one block later); bmc follows
                    the reorg and still answers for the replaced block; both LN
-                   nodes follow and bring the channel up at the new height.
-                   2026-11-04: FAILS -- bmc answers -5 for the replaced block,
-                   and LND's wallet ("Unable to process chain reorg: unable to
-                   get block header") stops following the chain.
+                   nodes follow and bring the channel up at the new height,
+                   and a payment crosses it. (Before 2026-11-04 bmc answered
+                   -5 for the replaced block and LND's wallet -- "Unable to
+                   process chain reorg: unable to get block header" -- stopped
+                   following the chain.)
 
 Usage: python3 validation/lightning_regtest_e2e.py
        env: CORE_BIN, BMC_BIN, LND_DIR (lnd, lncli), CLN_DIR (the release's
@@ -368,10 +369,11 @@ def main():
        '...and CHANNELD_NORMAL on CLN')
     sc = (cln_chan(ftx3) or {}).get('short_channel_id', '')
     ok(sc.startswith('%dx' % h2), 'CLN\'s short_channel_id names the NEW funding height (%s)' % sc)
-    inv3 = cln('invoice', '50000000', 'ln2cln-3', 'after reorg')['bolt11']
-    pr = lnd_pay(inv3)
-    ok(pr.get('status') == 'SUCCEEDED' and cln('listinvoices', 'ln2cln-3')['invoices'][0]['status'] == 'paid',
-       'a payment across the reorged channel completes (%s)' % pr.get('status'))
+    # CLN funded this channel, so the balance to send is CLN's
+    linv3 = lncli('addinvoice', '--amt=50000', '--memo=after-reorg')
+    pay3 = cln_pay(linv3['payment_request'])
+    ok(pay3.get('status') == 'complete' and lncli('lookupinvoice', linv3['r_hash'])['state'] == 'SETTLED',
+       'CLN pays LND 50,000 sat across the reorged channel (%s)' % pay3.get('status'))
     log('bmc: %d blocks, mempool %d' % (bmc('getblockcount'), len(bmc('getrawmempool'))))
     return 1 if FAILS else 0
 

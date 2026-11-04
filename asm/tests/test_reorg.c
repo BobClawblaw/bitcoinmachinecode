@@ -694,6 +694,9 @@ static int lock_is_free(void){
  * start with base[nbase-pre..nbase-1] -- the overlap a real peer sends when
  * it answers from a locator entry below the fork (pre = nbase-1 is the
  * answer from genesis, the one locator entry every chain has). */
+extern void hdrtree_reset(void);
+extern int  hdrtree_file_lookup(const unsigned char hash[32], unsigned char hdr80[80], long* height,
+                                unsigned char work[16], unsigned* ntx);
 static void do_reorg_case_pre(long nbase, long nlose, long nwin, u32 winbits, const char* label, long pre){
     build_base(nbase, 0x207fffffu);
     build_branch(lose, nlose, nbase, 0x20000000u, 0x207fffffu);
@@ -728,8 +731,23 @@ static void do_reorg_case_pre(long nbase, long nlose, long nwin, u32 winbits, co
     ck(lbuf, c.first_new, pre);
 
     memsrc_t src = { win, nwin };
+    hdrtree_reset();
     snprintf(lbuf,sizeof lbuf,"%s reorg_execute", label);
     ck(lbuf, reorg_execute(store_buf, c.fork_height, nwin, memsrc, &src), 1);
+    /* 2026-11-04: the branch the staged reorg left is in the fork tree with
+     * its header, height and transaction count, readable from the file the
+     * RPC process reads (getblockheader answers for it, confirmations -1);
+     * the winner is not in it */
+    { int all = 1;
+      for (long i = 0; i < nlose; i++){
+          unsigned char hdr[80], w[16]; long hh = -1; unsigned nt = 0;
+          if (!hdrtree_file_lookup(lose[i].hash, hdr, &hh, w, &nt) || memcmp(hdr, lose[i].raw, 80) ||
+              hh != nbase + i || (long)nt != lose[i].ntx){ all = 0; break; }
+      }
+      snprintf(lbuf,sizeof lbuf,"%s every disconnected block is in the fork tree file with its header, height and nTx", label);
+      ck(lbuf, all, 1);
+      snprintf(lbuf,sizeof lbuf,"%s the winning branch is not in the fork tree", label);
+      ck(lbuf, hdrtree_file_lookup(win[0].hash, NULL, NULL, NULL, NULL), 0); }
     /* reorg_execute holds the append lock across pre-flight + disconnect +
      * truncate + the whole reconnect loop, and must release it exactly once
      * on the way out -- a leak here would wedge every future inbound append. */
