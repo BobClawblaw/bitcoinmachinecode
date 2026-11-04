@@ -2207,12 +2207,14 @@ needs to prove.
   declared stopping point, unchanged since 2026-08-30.
 - UPnP/NAT-PMP, `blockreconstructionextratxn`, `rpc.discover` (REST: implemented 2026-09-08)
   — all absent by explicit design, consistently described as such.
-- **Inbound-accepted transactions are not re-announced to this node's other
-  peer connections** (`asm/daemon/tx_relay.c`'s `txrelay_poll_leg` is only
-  ever called with outbound mux legs, `asm/daemon/main.c`). Distinct from
-  the 2026-09-03 own-transaction announcement work earlier today, which
-  fixed how WE originate an announcement, not how we relay one someone
-  else handed us onward past our outbound legs.
+- ~~**Inbound-accepted transactions are not re-announced to this node's other
+  peer connections**~~ **CLOSED 2026-09-06 (CC-1, `5537fab7`); this line was
+  left standing until 2026-11-04.** `daemon/txann.c`: a shared announce ring
+  that every serve child drains to its inbound peer (Poisson 5 s, feefilter
+  honoured, never back to the sender), and that the worker drains into the
+  outbound announcer for inbound-origin transactions. `docs/CORE_BEHAVIORAL_COMPAT.md`
+  rows "Transaction announcement to inbound peers" and "Re-announcement of
+  transactions received from inbound peers" carry it.
 
 ### Confirmed CLOSED, contradicting older passages elsewhere in this file
 
@@ -2806,4 +2808,74 @@ test, and the bug was in the measurement.
   passes whose 24.1 s window straddled the end of the silence still counted,
   and five legs lost their third strike within 33 s of it. A design call:
   no strike for N s after a silence ends.
+
+## Update 2026-11-04 — Lightning on bmc: `echo`, the version number, and the reorg gap
+
+- **`echo`, `echojson` and `echoipc` are served** (`asm/rpc_commands.c`).
+  Core Lightning's bcli plugin runs `bitcoin-cli echo` before anything else,
+  so until now CLN could not start against this node. Measured against
+  v31.1 on regtest by `validation/echo_core_diff.py`: 33 raw request bodies
+  (params absent, null, `{}`, arrays of every JSON type, eleven arguments,
+  named arguments with holes, `args`, unknown and repeated names, a
+  non-container, JSON-RPC 2.0, a notification, a batch, and `echoipc`'s
+  arity and type errors) give the same HTTP status and the same reply bytes,
+  and Core's own bitcoin-cli (`echo`, `echojson`, `-named`, too many
+  arguments) prints the same output with the same exit code against both. The
+  same script against the previous build fails on every `echo` case. The
+  methods are FAST (no execution lock), so the probe does not queue behind a
+  slow call. One deliberate difference: Core's `arg9="trigger_internal_bug"`
+  test hook (an "Internal bug detected" report naming Core's source file) is
+  echoed here like any other string. Unlike Core, `help` lists the three:
+  this node's `help` is generated from the dispatch tables and says so.
+- **Named arguments (JSON-RPC `params` as an object, `bitcoin-cli -named`)
+  are not supported by any other method.** Every handler reads a positional
+  array; an object reaches it unconverted, and the handler sees no arguments
+  or the wrong ones. Core converts names to positions for every method
+  (`transformNamedArguments`) and answers -8 for an unknown name. The echo
+  methods carry that transform themselves (`echo_positional`); a general
+  layer needs each method's argument names, which this node has nowhere in
+  one table. Not yet built.
+- **`getnetworkinfo` `version` is 310100, not 1.** It reported this node's
+  own 0.0.1 encoded Core's way, and clients read the field as a capability
+  level: Core Lightning's bcli refused to start ("Unsupported bitcoind
+  version 1, at least 220000 required"). It now names the Core release whose
+  RPC surface this node is measured against (v31.1); `subversion`
+  (/BitcoinMachineCode:0.0.1/) and `bmc_build_commit` still say which
+  software answered (`asm/rpc_node.c` NODE_RPC_COMPAT_VERSION, pinned by
+  `test_rpc_node`).
+- **Lightning: LND and Core Lightning run on this node, except across a
+  reorg.** `validation/lightning_regtest_e2e.py` points LND v0.21.6-beta
+  (bitcoind backend: RPC + rawblock/rawtx ZMQ) and CLN v26.06.9 (bcli,
+  through Core's bitcoin-cli) at bmc alone, with Core v31.1 only mining and
+  bmc following it over P2P, so every Lightning transaction reaches the miner
+  through bmc's relay. Measured 2026-11-04, every check passing: both start
+  and sync, both wallets see their funds, a channel opened from each side
+  goes active, payments both ways settle, a cooperative close confirms, and a
+  force close confirms and LND sweeps its CSV-delayed output (199,766 of
+  200,000 sat back on chain); `estimatesmartfee` answers as Core's does.
+- **OPEN, and it blocks LND on mainnet: a block this node reorged off cannot
+  be looked up.** `getblockheader` (and every other hash lookup) resolves
+  through the active chain only (`rpc_chain.c` lookup_block_param), so a
+  replaced block answers -5 "Block not found", where Core answers with
+  `confirmations: -1`. LND's wallet layer (btcwallet) processes a reorg by
+  fetching the header of the block it last saw and walking back to the
+  fork; on bmc it logs "Unable to process chain reorg: unable to get block
+  header ... -5: Block not found" on every block and never follows the chain
+  again (stuck at the fork height, `synced_to_chain` false). CLN, which asks
+  by height, took the same one-block reorg ("Funding txid ... REORG from
+  depth 1") and carried on. The fork tree (`daemon/hdr_tree.c`) keeps hash,
+  prev, height, bits and work for side branches, not the 80-byte header, so
+  it cannot answer either. The reorg phase of the e2e checks exactly this and
+  fails until it is fixed.
+- **OPEN: LND runs against this node in its pre-0.19 compatibility mode.**
+  LND's RPC client (btcd `rpcclient/backend_version.go`) does not read
+  `version`; it strips `/Satoshi:` from `subversion` and compares the rest
+  as a string against "0.19.0", "22.0.0", "24.0.0" and "25.0.0".
+  `/BitcoinMachineCode:0.0.1/` sorts below all of them, so LND classifies the
+  node as bitcoind < 0.19 and treats `testmempoolaccept`,
+  `gettxspendingprevout` and `submitpackage` as unsupported, though this node
+  serves all three (the e2e's LND logged "TestMempoolAccept not supported by
+  backend, consider upgrading bitcoind" at each of its publishes). Every e2e phase above passed in that mode. Closing
+  it means changing what `subversion` says, a decision about this node's
+  identity, not yet taken.
 

@@ -128,10 +128,15 @@ static int srt_hex1(char c){
  * blocks (see bitcoind.asm's version msg, kept in sync with this) */
 #define NODE_LOCAL_SERVICES 0x0000000000000009ULL
 
-/* Core encodes CLIENT_VERSION as 10000*major + 100*minor + patch. */
-static long node_client_version(void){
-    return 10000L*NODE_VERSION_MAJOR + 100L*NODE_VERSION_MINOR + NODE_VERSION_PATCH;
-}
+/* getnetworkinfo "version" (2026-11-04): the Core release whose RPC surface
+ * this node is measured against (v31.1, 10000*major + 100*minor + patch), not
+ * this node's own 0.0.1. Clients read the number as a capability level, not
+ * as a name: Core Lightning's bcli refuses anything below 220000 and would not
+ * start against this node ("Unsupported bitcoind version 1, at least 220000
+ * required"). Which software answered is still told by "subversion"
+ * (/BitcoinMachineCode:x.y.z/) and bmc_build_commit. Raise this only when the
+ * parity oracle moves to a newer Core. */
+#define NODE_RPC_COMPAT_VERSION 310100L
 
 /* ---- one definition of "a live connection" (2026-09-16) -------------------
  * getpeerinfo walks the shared peer table and reports every used slot;
@@ -255,7 +260,7 @@ static int cmd_getnetworkinfo(rj_val** res){
     rpc_conn_counts(&n_in, &n_out);
 
     rj_val* o = rj_obj();
-    rj_obj_set(o, "version", rj_numf("%ld", node_client_version()));
+    rj_obj_set(o, "version", rj_numf("%ld", NODE_RPC_COMPAT_VERSION));
     rj_obj_set(o, "subversion", rj_str(g_user_agent[0] ? g_user_agent : NODE_UA_STRING));
     rj_obj_set(o, "protocolversion", rj_numf("%d", NODE_PROTOCOL_VER));
     { char h[17]; snprintf(h, sizeof h, "%016llx", (unsigned long long)NODE_LOCAL_SERVICES);

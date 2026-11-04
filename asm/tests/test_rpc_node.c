@@ -260,6 +260,9 @@ int main(void){
     r = NULL; rc = rpc_node_dispatch("getnetworkinfo", NULL, &r, &ec, &em);
     ck("getnetworkinfo dispatched", rc == 1 && r != NULL);
     ck("protocolversion 70016",  r && S(r,"protocolversion") && !strcmp(S(r,"protocolversion"), "70016"));
+    /* 2026-11-04: the Core release the RPC surface matches, which clients gate
+     * on (CLN's bcli refuses < 220000); our own version is in subversion */
+    ck("version 310100 (v31.1's RPC surface, not our own 0.0.1)", r && S(r,"version") && !strcmp(S(r,"version"), "310100"));
     ck("subversion is ours",     r && S(r,"subversion") && !strcmp(S(r,"subversion"), "/BitcoinMachineCode:0.0.1/"));
     /* 2026-09-10: which BUILD is answering. bmcmonitor could not tell a fixed
      * node from a broken one over RPC -- both reported this same subversion. */

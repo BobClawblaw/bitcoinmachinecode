@@ -949,6 +949,10 @@ static int rpc_method_class_p(const char* m, const rj_val* params){
     if (lane == 2) return RPC_CLASS_NOLOCK;
     if (!strcmp(m, "getpeerinfo") || !strcmp(m, "getconnectioncount") || !strcmp(m, "getnetworkinfo"))
         return RPC_CLASS_FAST;
+    /* echo touches no shared state: Core Lightning's startup probe must not
+     * queue behind a slow call holding the execution lock */
+    if (!strcmp(m, "echo") || !strcmp(m, "echojson") || !strcmp(m, "echoipc"))
+        return RPC_CLASS_FAST;
     return RPC_CLASS_EXCL;   /* getmempoolinfo took the read side until 2026-09-30; it is in the mempool lane now */
 }
 /* Can this whole request run on the intake thread? Only when EVERY entry is

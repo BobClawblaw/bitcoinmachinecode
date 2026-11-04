@@ -790,6 +790,9 @@ int main(void) {
           { "getpeerinfo",        1, "getpeerinfo is FAST (shared peer tables)" },
           { "getconnectioncount", 1, "getconnectioncount is FAST" },
           { "getnetworkinfo",     1, "getnetworkinfo is FAST" },
+          { "echo",               1, "echo is FAST (2026-11-04: no shared state; CLN's startup probe must not queue behind the lock)" },
+          { "echojson",           1, "echojson is FAST" },
+          { "echoipc",            1, "echoipc is FAST" },
           { "getchaintxstats",    2, "getchaintxstats is lock-free but may be slow (its own lane)" },
           { "waitfornewblock",    2, "waitfornewblock is lock-free but slow (a handle per call)" },
           { "waitforblockheight", 2, "waitforblockheight likewise" },
@@ -815,6 +818,7 @@ int main(void) {
         struct { const char* body; int want; const char* why; } bc[] = {
           { "{\"method\":\"uptime\",\"params\":[]}",            1, "a FAST request runs on the intake thread" },
           { "{\"method\":\"getpeerinfo\",\"params\":[]}",       1, "getpeerinfo runs on the intake thread" },
+          { "{\"method\":\"echo\"}",                         1, "echo runs on the intake thread" },
           { "[{\"method\":\"uptime\"},{\"method\":\"getblockcount\"}]", 1, "a batch of FAST entries runs on the intake thread" },
           { "[{\"method\":\"uptime\"},{\"method\":\"getblock\"}]", 0, "a batch with ANY non-FAST entry goes to the pool" },
           { "{\"method\":\"getchaintxstats\",\"params\":[]}",   0, "getchaintxstats goes to the pool (a first build is slow)" },
