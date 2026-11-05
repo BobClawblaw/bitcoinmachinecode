@@ -23,6 +23,7 @@ extern int  store_reload(void* st);
 extern int  store_rd_init(void* st);
 extern long store_read_at(void* st, unsigned long h, void* out, long cap);
 #include "txosp_format.h"
+#include "fd_limit.h"
 #define NBUCKETS 256
 #define BLOCKBUF (4u << 20)
 static int rec_cmp(const void* a, const void* b){
@@ -40,6 +41,7 @@ static void emit(void* ctxv, const u8* prev, u32 vout, u32 off, u32 len){
 }
 int main(int argc, char** argv){
     if (argc < 2){ fprintf(stderr, "usage: build_txospender_index <datadir> [from] [to] [out]\n"); return 2; }
+    bmc_raise_nofile(NBUCKETS + 32);   /* one bucket file each; fd_limit.h */
     const char* dir = argv[1];
     long from_h = argc > 2 ? atol(argv[2]) : 0;
     long to_h   = argc > 3 ? atol(argv[3]) : -1;

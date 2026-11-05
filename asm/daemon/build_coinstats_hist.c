@@ -95,6 +95,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include "coinstats_hist_fmt.h"
+#include "fd_limit.h"
 typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t u64;
 extern long store_init(void* st);
 extern void store_reload(void* st);
@@ -358,6 +359,7 @@ static int p2(int w, void* c){ ctx_t* x = c; u64 m = 0, u = 0; for (int i = w; i
 static int p3(int w, void* c){ ctx_t* x = c; for (int r = w; r < NR; r += x->W) pass3_range(r, x->W, x->remprod_fd); return 0; }
 int main(int argc, char** argv){
     if (argc < 2){ fprintf(stderr, "usage: bmc_build_coinstats_hist <chaindir> [to_height] [workers]\n"); return 2; }
+    bmc_raise_nofile(2 * NB + 32);   /* each forked worker: outpoint and spend files per bucket; fd_limit.h */
     if (chdir(argv[1])){ perror("chdir"); return 1; }
     static u8 store_buf[4096]; if (store_init(store_buf) != 1) die("store_init");
     store_reload(store_buf); store_rd_init(store_buf);

@@ -287,13 +287,10 @@ Requirements: Apple clang (`cc -arch arm64`), `python3`; the daemon and the
 tools link against the system libc, so no NASM, no GNU toolchain. The daemon
 compiles with `-Wall -Werror`, the same bar as the x86 build, and a file that
 fails to compile stops the build before the link. The Mac's gate runs 480
-commands. In the Mac's working tree it recorded 452 PASS, 12 SKIP, 16 N/A,
-0 FAIL (2026-11-04). A fresh clone of `main` (2026-11-05) gives 443 PASS,
-16 SKIP, 16 N/A, 5 FAIL: three index-builder tests fail there every run
-(`test_coinstats_hist_build`, `test_txospender_index`, `test_addr_hist`),
-two other tests fail in a full run and pass alone (different ones each
-run), and the extra SKIPs are the large fixtures a fresh clone lacks. Both
-are open. The N/A rows are the x86-only differential tests of shadow twins
+commands. On a fresh clone of `main` (2026-11-05) it gives 448 PASS,
+16 SKIP, 16 N/A, 0 FAIL. Two earlier fresh-clone runs each had two tests
+fail in the full run that pass alone, different ones each time; that is
+open. The N/A rows are the x86-only differential tests of shadow twins
 that no daemon links. Both a mainnet and a signet node run
 from `bmc_osx` on an M-series Mac, at Bitcoin Core's tip, with the mainnet
 UTXO set identical to Core's on every `gettxoutsetinfo` field

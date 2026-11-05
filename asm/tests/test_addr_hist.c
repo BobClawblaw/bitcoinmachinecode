@@ -2,6 +2,7 @@
  * archive (standard-script outputs, a spend chain), read back through the
  * real reader; and the reader's sparse search over a synthetic file with
  * more keys than one sparse stride. */
+#include <sys/resource.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -141,6 +142,10 @@ static long mk_tx(u8* p, int tag, const u8* prev_txid, unsigned prev_vout, int n
     *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0; return p - s;
 }
 int main(void){
+    /* 2026-11-05: the builder failed on macOS, whose soft open-file limit
+     * starts at 256, while Linux's 1024 hid it (daemon/fd_limit.h). Run
+     * this test, and the builder it spawns, under the Mac's limit. */
+    { struct rlimit r; if (getrlimit(RLIMIT_NOFILE, &r) == 0 && (r.rlim_cur == RLIM_INFINITY || r.rlim_cur > 256)){ r.rlim_cur = 256; if (setrlimit(RLIMIT_NOFILE, &r) != 0) return 1; } }
     char tool[4096]; if (!getcwd(tool, sizeof tool - 40)) return 1; strcat(tool, "/daemon/bmc_build_addr_hist");
     char merger_path[4096]; if (!getcwd(merger_path, sizeof merger_path - 40)) return 1; strcat(merger_path, "/daemon/bmc_merge_index_runs");
     tt_isolate();
