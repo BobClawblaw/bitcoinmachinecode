@@ -4,6 +4,10 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-11-05 — merged main through #452 (#451, #452)
+
+Merge of `origin/main` at b3892db3 into `bmc_osx` (backup tag `pre-merge-452` = a47a5dd1). #451 makes Core Lightning and LND work against the RPC (`echo`/`echojson`/`echoipc`, `getnetworkinfo` version 310100 and Core's subversion shape, `getblockheader` for a block reorged off); #452 is docs. Shared C only, no conflicts. One Mac build change: `build_daemon.sh` compiles #451's new `daemon/hdr_tree_read.c`. Full suite: 452 PASS, 12 SKIP, 16 N/A, 0 FAIL (480 commands).
+
 ## 2026-11-04 — merged main through #450 (243 commits, 7eb763ab..e4e54e3f) and ported its x86 changes
 
 Merge (not rebase) of `origin/main` at e4e54e3f into `bmc_osx`. Backup tag `pre-merge-450` = d48a7c2e.
