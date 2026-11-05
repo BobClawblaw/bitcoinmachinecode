@@ -2291,3 +2291,31 @@ were still on disk. Nothing in them is new measurement.
     11 of 12 peers.
   - RPC and Esplora clients back (211 TIME-WAIT sockets on 8331/3005).
 - **Rollback:** relink to `deploy-20261105a`. No on-disk format changed.
+
+## 2026-11-05 05:48Z — `deploy-20261105c`: the index builders raise their open-file limit (PRs #458, #459)
+
+- **What:** `main` at `4c7bbaed`. #458 makes the Mac daemon build `-Wall
+  -Werror` and fixes its warnings; on x86 every file it touched compiles to
+  the same instructions (`main.c` differs only in `__LINE__` constants).
+  #459 has the five index builders raise their soft `RLIMIT_NOFILE` to the
+  number of bucket files they hold (`daemon/fd_limit.h`); on this box the
+  soft limit already covers it, so they behave as before.
+- **Checked before the merge:** `make test` passes on x86; the Mac's full
+  suite on a fresh clone gives 448 PASS, 16 SKIP, 16 N/A, 0 FAIL.
+- Built from clean (`make -B daemon/bmcbitcoind` and the helpers by name) in
+  a clean worktree at the merge commit; `bmc_build_commit` 4c7bbaed. Four
+  exec'd helpers differed and were replaced (`bmc_build_addr_hist`,
+  `bmc_build_coinstats_hist`, `bmc_build_tx_index`,
+  `bmc_build_txospender_index`); the old ones are kept as
+  `<name>.pre-20261105c`. `bmc_merge_index_runs` was byte-identical. Wallet
+  files were copied first.
+- **Started:** 05:48:58Z at tip 974,629 (= the oracle). RPC came up at
+  05:49:50Z.
+- **Verified live:**
+  - New block 974,630 applied with the Core v31.1 oracle's hash
+    (`000000000000000000010b513015734a19832b2564c76fdbd7704ca0a15ed439`);
+    the heartbeat reads `tip=974630` at 06:10:07Z.
+  - `NRestarts=0` and `active` at 21 minutes; no `[crash]` line; 60 fds;
+    15 of 15 peers. `MALLOC_ARENA_MAX=4` is in the process environment.
+- **Rollback:** relink to `deploy-20261105b` and restore the four
+  `.pre-20261105c` helpers. No on-disk format changed.
