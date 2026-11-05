@@ -25,6 +25,18 @@
 
 /* abi_caller_rsp() -> the RSP its caller held at the `call` instruction.
  * Written in assembly because any C prologue would move RSP first. */
+#if defined(__aarch64__)
+/* AArch64: `bl` does not move sp, so sp on entry IS the caller's sp at the
+ * call -- and AAPCS64 requires it 16-aligned there, the same property (a
+ * misaligned sp faults on the first sp-relative access). Mach-O names carry
+ * a leading underscore and take no .type/.size. */
+__asm__(".text\n"
+        ".p2align 2\n"
+        ".globl _abi_caller_rsp\n"
+        "_abi_caller_rsp:\n"
+        "    mov x0, sp\n"
+        "    ret\n");
+#else
 __asm__(".text\n"
         ".globl abi_caller_rsp\n"
         ".type abi_caller_rsp,@function\n"
@@ -32,6 +44,7 @@ __asm__(".text\n"
         "    lea 8(%rsp),%rax\n"
         "    ret\n"
         ".size abi_caller_rsp,.-abi_caller_rsp\n");
+#endif
 extern unsigned long abi_caller_rsp(void);
 
 #define ELEM_SIZE     528

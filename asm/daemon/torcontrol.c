@@ -8,6 +8,10 @@
 #include <errno.h>
 #include <arpa/inet.h>
 #include <sys/random.h>
+#ifdef __APPLE__
+/* bmc_osx: Darwin's getentropy (<= 256 bytes a call) stands in for getrandom */
+static ssize_t getrandom(void* b, size_t n, unsigned f){ (void)f; return getentropy(b, n) == 0 ? (ssize_t)n : -1; }
+#endif
 #include "torcontrol.h"
 #include "netaddr.h"
 #include "../crypto_hkdf.h"

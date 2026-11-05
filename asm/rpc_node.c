@@ -43,6 +43,7 @@ int rpc_msg_index(const char* cmd, unsigned cmdlen){
 #include <stdlib.h>   /* atof/atol/atoll -- implicitly declared before 2026-08-25,
                         * which silently corrupted their return values */
 #include <pthread.h>
+#include "bmc_thread.h"   /* BMC_TLS_GROW */
 #include <unistd.h>  /* getcwd -- implicitly declared until 2026-08-27, which on
                       * this ABI means int, truncating the returned pointer */
 #include <time.h>
@@ -1079,7 +1080,8 @@ long rpc_node_mempool_many(const unsigned char (*txid_wire)[32], long n, rpc_mp_
  * daemon/reorg.c uses): +0 n, +8 mask, +16 blob, then MPOOL_SLOT_BYTES slots
  * at +40 -- [+0 len][+8 txid[32]][+40 blob_off][+48 wtxid[32]], len==~0
  * marking empty. */
-typedef struct { const unsigned char* txid; const unsigned char* tx; unsigned long len; } mp_ent;
+typedef struct { const unsigned char* txid; const unsigned char* tx; unsigned long len;
+                 const unsigned char* wtxid;   /* the slot's cached sha256d of tx (mpool_put) */ } mp_ent;
 static long mp_slot(void* mp, unsigned long i, mp_ent* e){
     unsigned char* m = (unsigned char*)mp;
     unsigned long long mask; memcpy(&mask, m+8, 8);
@@ -1090,6 +1092,7 @@ static long mp_slot(void* mp, unsigned long i, mp_ent* e){
     unsigned char* blob; memcpy(&blob, m+16, 8);
     unsigned long long off; memcpy(&off, s+MPOOL_SLOT_OFF, 8);
     e->txid = s+8; e->tx = blob+off; e->len = (unsigned long)len;
+    e->wtxid = s+MPOOL_SLOT_WTXID;
     return 1;
 }
 static unsigned long mp_slot_count(void* mp){
@@ -1141,19 +1144,34 @@ static int mp_tx_signals_rbf(const unsigned char* tx, unsigned long len);   /* b
  * re-parsed only when its slot's txid or length changed since the last walk,
  * and a walk of unchanged slots is a memcmp per slot. Keyed on txid AND
  * length so a same-txid different-witness replacement is not served the old
- * weight. Guarded by the mempool lane's mutex (rpc_node_dispatch). */
-typedef struct { unsigned char id[32]; unsigned long len, w; unsigned char rbf, used; } mpc_t;
+ * weight. Guarded by the mempool lane's mutex (rpc_node_dispatch).
+ *
+ * 2026-10-07: 16 bytes a slot, not 56. The table is indexed by slot, so it
+ * is the slot table's CAPACITY long -- 1,048,576 at maxmempool=300MB -- and a
+ * 68k pool's entries are spread over all of it, so every page is touched:
+ * ~56 MB of RSS from the first verbose getrawmempool on, the largest single
+ * piece of that call's peak. The key is now 64 bits, the txid's first eight
+ * bytes XORed with the slot's cached wtxid's (which commits to every byte,
+ * witness included), plus the length; weight and the BIP125 bit share a
+ * word. A wrong hit needs a transaction ground to match another's 64-bit key
+ * in the same slot -- ~2^64 work -- and would show a wrong vsize. */
+typedef struct { unsigned long long key; unsigned int len, wr; } mpc_t;   /* wr: weight | rbf << 31; len 0 = unused */
 static mpc_t* g_mpc; static unsigned long g_mpc_n;
 static long g_mpc_hits, g_mpc_parses;                 /* test hooks */
 void rpc_node_mpc_stats(long* hits, long* parses){ if (hits) *hits = g_mpc_hits; if (parses) *parses = g_mpc_parses; }
+unsigned long rpc_node_mpc_bytes(void){ return g_mpc ? g_mpc_n * sizeof *g_mpc : 0; }   /* test hook */
 static unsigned long mpc_weight(unsigned long n, unsigned long i, const mp_ent* e, unsigned char* rbf){
     if (g_mpc_n != n){ free(g_mpc); g_mpc = (mpc_t*)calloc(n ? n : 1, sizeof *g_mpc); g_mpc_n = g_mpc ? n : 0; }
     mpc_t* c = (g_mpc && i < g_mpc_n) ? &g_mpc[i] : 0;
-    if (c && c->used && c->len == e->len && !memcmp(c->id, e->txid, 32)){ g_mpc_hits++; if (rbf) *rbf = c->rbf; return c->w; }
+    unsigned long long a, b; memcpy(&a, e->txid, 8); memcpy(&b, e->wtxid, 8);
+    unsigned long long key = a ^ b;
+    if (c && c->len && c->len == e->len && c->key == key){
+        g_mpc_hits++; if (rbf) *rbf = (unsigned char)(c->wr >> 31); return c->wr & 0x7fffffffu; }
     unsigned long w = mp_tx_weight(e->tx, e->len);
     unsigned char r = (unsigned char)mp_tx_signals_rbf(e->tx, e->len);
     g_mpc_parses++;
-    if (c){ memcpy(c->id, e->txid, 32); c->len = e->len; c->w = w; c->rbf = r; c->used = 1; }
+    if (c && e->len && e->len <= 0xffffffffUL && w <= 0x7fffffffUL){
+        c->key = key; c->len = (unsigned int)e->len; c->wr = (unsigned int)w | ((unsigned int)(r ? 1 : 0) << 31); }
     if (rbf) *rbf = r;
     return w;
 }
@@ -1293,7 +1311,7 @@ static int ctl_send(int op, const char* arg, long long num,
     int waited = 0, done = 0, result = 0;
     reason[0] = 0;
     while (waited < CTL_WAIT_MS * 1000){
-        if (s->ctl_ack == myseq){
+        if (s->ctl_ack == myseq){ __atomic_thread_fence(__ATOMIC_ACQUIRE);   /* ARM64: the result/reason loads after the ack (the worker fenced before publishing it) */
             result = s->ctl_result;
             memcpy(reason, (const void*)s->ctl_reason, sizeof reason);
             reason[sizeof reason - 1] = 0;
@@ -1652,11 +1670,25 @@ static int cmd_gettxspendingprevout(const rj_val* params, rj_val** res,
  * graph has supplied the member's sigop cost (inf >= 0), and plain BIP141
  * until then; w is the BIP141 weight either way. rbf: the tx itself signals
  * BIP125, so bip125-replaceable over an ancestor set is lookups too. */
-typedef struct { unsigned char id[32]; unsigned long vs, w; long inf; unsigned char rbf; } mpe_vs_t;
+typedef struct { unsigned char id[32]; unsigned long vs, w; long inf; unsigned char rbf;
+                 /* 2026-10-06, the snapshot path (see cmd_getrawmempool): what
+                  * mpe_entry_obj used to read from the pool and its hooks,
+                  * copied under the pool lock so the build can run after it */
+                 unsigned char wtxid[32]; long tm; long long pri; unsigned long ord; } mpe_vs_t;
 static mpe_vs_t* g_mpe_vs; static unsigned long g_mpe_vs_n;
-/* the whole graph for this call, filled once by pol_entry_info_all; indexed
-   by the same sorted txid order as the vsize cache above */
-static mp_entry_info* g_mpe_inf; static unsigned char (*g_mpe_inf_id)[32]; static long g_mpe_inf_n;
+/* 1 while verbose getrawmempool builds its entries AFTER releasing the pool
+ * lock: every per-entry input then comes from g_mpe_vs / g_mpe_g, and
+ * nothing may touch the pool, the registry or the arrival/priority tables.
+ * Per call, under the mempool lane's mutex like the tables themselves. */
+static int g_mpe_snap;
+/* test knob: 0 forces the old all-under-the-lock build, for a byte-for-byte
+ * comparison of the two (tests/test_rpc_chunk_scale) */
+static int g_grm_snapshot = 1;
+void rpc_node_set_grm_snapshot(int on){ g_grm_snapshot = on ? 1 : 0; }
+/* the whole graph for this call, filled once by pol_graph_all (compact:
+   mempool_entry.h); g_mpe_vs[k].inf is the node's index in it. node is null
+   when the call has no graph. */
+static mp_graph g_mpe_g;
 /* the per-call chunk cache (2026-09-19), parallel to g_mpe_vs: st 0 = not
  * yet computed, 1 = fee/weight hold this entry's chunk, -1 = no honest answer
  * (component beyond the 64 bound, or a graph that did not build). One cluster
@@ -1684,7 +1716,7 @@ static long mpe_vs_find(const unsigned char id[32]){
 }
 static long mpe_inf_lookup(const unsigned char id[32]){
     long k = mpe_vs_find(id);
-    return (k >= 0 && g_mpe_inf) ? g_mpe_vs[k].inf : -1;
+    return (k >= 0 && g_mpe_g.node) ? g_mpe_vs[k].inf : -1;
 }
 static unsigned long mpe_vs_lookup(const unsigned char id[32]){
     long k = mpe_vs_find(id);
@@ -1739,7 +1771,10 @@ static unsigned long mpe_member_vsize(const unsigned char id[32], const unsigned
     }
     unsigned sc = 0;
     if (!memcmp(id, self, 32)) sc = selfinf->sigop_cost;
-    else if (g_mph.polstate && g_mph.pol_entry_info){
+    else if (!g_mpe_snap && g_mph.polstate && g_mph.pol_entry_info){
+        /* (snapshot mode skips it: a member the one-pass graph lacks is not
+         * in the registry -- pol_graph_all covers the whole registry
+         * -- so this lookup could only have answered "not found") */
         static mp_entry_info mi;             /* ~8 KB: kept off the stack */
         if (g_mph.pol_entry_info(g_mph.polstate, id, &mi) == 1) sc = mi.sigop_cost;
     }
@@ -1755,6 +1790,8 @@ static int mpe_member_rbf(const unsigned char id[32]){
 /* the per-entry object, shared by getmempoolentry and verbose getrawmempool */
 static int mpc_lookup_here(void* ctx, const unsigned char txid[32], mpc_entry* out);
 static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx, unsigned long len);
+static long long pri_delta_of(const unsigned char txid[32]);
+static void mpe_hex(char* dst, const unsigned char* internal);
 static int cmd_getrawmempool(const rj_val* params, rj_val** res, long* ec, const char** em){
     /* verbose (params[0]==true) -> object keyed by txid; else -> array of
      * txids (display byte order).
@@ -1835,6 +1872,23 @@ static int cmd_getrawmempool(const rj_val* params, rj_val** res, long* ec, const
     if (!g_mph.mp && g_mph.mempool_sequence) mseq = g_mph.mempool_sequence();
     if (g_mph.mp){
         static const char* HEXD = "0123456789abcdef";
+        /* 2026-10-06: the verbose call's pool-lock hold is the COPY, not the
+         * build. Until today everything below ran under mpl() -- the graph,
+         * one cluster linearization per cluster, and ~75k entry objects of
+         * rj_* allocations -- so every p2p accept in the download worker
+         * waited for a monitor's poll to finish serializing: 1.1-1.9 s holds
+         * at a ~75k pool on the Mac's mainnet node (02:57-04:09Z 10-02, the
+         * caller BlockYard's getrawmempool(true) poll; note item 24 for x86).
+         * Now the pass under the lock records, per entry, everything the
+         * builder reads from the pool or its hooks -- weight and BIP125 from
+         * the slot cache, the wtxid (one sha256d over the bytes, which exist
+         * only in the pool), the arrival time, the prioritisetransaction
+         * delta -- takes the one-pass graph and the sequence number, and lets
+         * go. The sort, the cluster builds and the JSON then run on the
+         * call's own tables (g_mpe_snap). Same answer byte for byte
+         * (tests/test_rpc_chunk_scale compares it with the old path). A call
+         * whose tables did not build (no one-pass graph, an allocation that
+         * failed) keeps the old shape: it still needs the per-txid lookups. */
         mpl();
         unsigned long n = mp_slot_count(g_mph.mp);
         /* ONE parse per transaction for the whole call: fill the vsize cache
@@ -1842,56 +1896,119 @@ static int cmd_getrawmempool(const rj_val* params, rj_val** res, long* ec, const
          * searches instead of a pool lookup plus a full parse per set member.
          * If the allocation fails the cache stays null and every entry takes
          * the slower direct path -- correct either way, just slower. */
+        /* 2026-10-06: the tables are sized by the LIVE count, not by n. n is
+         * the slot table's capacity (mask + 1: 1,048,576 at maxmempool=300MB,
+         * ~15x a 68k pool), and the graph table's element was then a ~8.3 KB
+         * mp_entry_info, so sizing by n asked malloc for ~8.7 GB per verbose
+         * call -- under the pool lock, every 20 s under BlockYard's poll.
+         * The live count plus an eighth is the first try; the vsize table
+         * grows to n if the walk ever outruns it. (The graph sizes itself
+         * since it became compact, later the same day.) */
+        unsigned long live = g_mph.count ? (unsigned long)g_mph.count(g_mph.mp) : n;
+        unsigned long cap = live + live / 8 + 64;
+        if (cap > n) cap = n;
         if (verbose && n){
-            g_mpe_vs = (mpe_vs_t*)malloc((size_t)n * sizeof *g_mpe_vs);
+            g_mpe_vs = (mpe_vs_t*)malloc((size_t)cap * sizeof *g_mpe_vs);
             g_mpe_vs_n = 0;
             if (g_mpe_vs){
                 for (unsigned long i=0;i<n;i++){ mp_ent e2;
                     if (mp_slot(g_mph.mp,i,&e2) != 1) continue;
-                    memcpy(g_mpe_vs[g_mpe_vs_n].id, e2.txid, 32);
+                    if (g_mpe_vs_n == cap){
+                        mpe_vs_t* g2 = cap < n ? (mpe_vs_t*)realloc(g_mpe_vs, (size_t)n * sizeof *g_mpe_vs) : 0;
+                        if (!g2){ free(g_mpe_vs); g_mpe_vs = 0; g_mpe_vs_n = 0; break; }
+                        g_mpe_vs = g2; cap = n;
+                    }
+                    mpe_vs_t* v = &g_mpe_vs[g_mpe_vs_n];
+                    memcpy(v->id, e2.txid, 32);
                     { unsigned char rbf = 0;
-                      g_mpe_vs[g_mpe_vs_n].w = mpc_weight(n, i, &e2, &rbf);   /* 2026-09-30: the slot cache */
-                      g_mpe_vs[g_mpe_vs_n].rbf = rbf; }
-                    g_mpe_vs[g_mpe_vs_n].vs = (g_mpe_vs[g_mpe_vs_n].w+3)/4;
-                    g_mpe_vs[g_mpe_vs_n].inf = -1;
+                      v->w = mpc_weight(n, i, &e2, &rbf);   /* 2026-09-30: the slot cache */
+                      v->rbf = rbf; }
+                    v->vs = (v->w+3)/4;
+                    v->inf = -1;
+                    /* the snapshot's per-entry inputs, in the builder's order
+                     * of preference (wtxid degrades to the txid without a
+                     * hash hook, as mpe_entry_obj does). 2026-10-06: the
+                     * wtxid is the SLOT'S CACHED one, not a fresh sha256d:
+                     * mpool_put computes it once over the bytes as stored,
+                     * mpool_del's shift moves it with the record, compaction
+                     * moves only blob_off, and every writer holds the lock
+                     * we hold -- so it is sha256d(e2.tx) without re-hashing
+                     * ~25 MB of transactions under the lock on every poll.
+                     * (The hook stays the switch for the degraded case.) */
+                    if (g_mph.sha256d) memcpy(v->wtxid, e2.wtxid, 32);
+                    else memcpy(v->wtxid, e2.txid, 32);
+                    v->tm = g_mph.time_of ? g_mph.time_of(e2.txid) : 0;
+                    v->pri = pri_delta_of(e2.txid);
+                    v->ord = g_mpe_vs_n;           /* the pool's order, the reply's */
                     g_mpe_vs_n++;
                 }
-                /* the whole graph in one pass; -1 means fall back per entry */
-                g_mpe_inf_n = -1;
-                if (g_mph.polstate && g_mph.pol_entry_info_all){
-                    g_mpe_inf = (mp_entry_info*)malloc((size_t)n * sizeof *g_mpe_inf);
-                    g_mpe_inf_id = (unsigned char (*)[32])malloc((size_t)n * 32);
-                    if (g_mpe_inf && g_mpe_inf_id)
-                        g_mpe_inf_n = g_mph.pol_entry_info_all(g_mph.polstate, g_mpe_inf, g_mpe_inf_id, (unsigned)n);
-                    if (g_mpe_inf_n < 0){ free(g_mpe_inf); free(g_mpe_inf_id); g_mpe_inf=0; g_mpe_inf_id=0; }
-                }
-                qsort(g_mpe_vs, g_mpe_vs_n, sizeof *g_mpe_vs, mpe_vs_cmp);
-                for (long q=0;q<g_mpe_inf_n;q++){
-                    long k = mpe_vs_find(g_mpe_inf_id[q]);
-                    if (k >= 0){ g_mpe_vs[k].inf = q;
-                                 g_mpe_vs[k].vs = mpe_adj_vsize(g_mpe_vs[k].w, g_mpe_inf[q].sigop_cost); }
-                }
-                /* chunk cache: only with the one-pass graph (the lookup it
-                 * drives reads g_mpe_inf); without it, per-entry builds */
-                if (g_mpe_inf && g_mpe_vs_n)
-                    g_mpe_chunk = (mpe_chunk_t*)calloc(g_mpe_vs_n, sizeof *g_mpe_chunk);
+                /* the whole graph in one pass, compact (2026-10-06: it was an
+                 * ~8.3 KB mp_entry_info per registry node, ~+790 MB peak RSS
+                 * per call at a 68k pool); -1 means fall back per entry */
+                if (g_mpe_vs && g_mph.polstate && g_mph.pol_graph_all)
+                    if (g_mph.pol_graph_all(g_mph.polstate, &g_mpe_g) < 0) mp_graph_free(&g_mpe_g);
             }
         }
-        for (unsigned long i=0;i<n;i++){ mp_ent e;
-            if (mp_slot(g_mph.mp,i,&e) != 1) continue;
-            char hx[65];
-            for (int k=0;k<32;k++){ unsigned char b=e.txid[31-k]; hx[k*2]=HEXD[b>>4]; hx[k*2+1]=HEXD[b&15]; }
-            hx[64]=0;
-            if (!verbose){ rj_arr_push(out, rj_str(hx)); continue; }
-            /* the same builder getmempoolentry uses, under the same pool lock */
-            rj_obj_set(out, hx, mpe_entry_obj(e.txid, e.tx, e.len));
+        /* chunk cache: only with the one-pass graph (the lookup it drives
+         * reads g_mpe_g); without it, per-entry builds. Allocated here, under
+         * the lock, because the snapshot path needs it: without it
+         * mpe_chunk_of would fall back to the registry lookup. */
+        if (g_mpe_vs && g_mpe_g.node && g_mpe_vs_n)
+            g_mpe_chunk = (mpe_chunk_t*)calloc(g_mpe_vs_n, sizeof *g_mpe_chunk);
+        /* the snapshot is complete: let the pool go before any of the work */
+        unsigned long* ordk = 0;
+        int snap = g_grm_snapshot && g_mpe_vs && g_mpe_g.node && g_mpe_chunk;
+        if (snap) ordk = (unsigned long*)malloc((g_mpe_vs_n ? g_mpe_vs_n : 1) * sizeof *ordk);
+        if (!ordk) snap = 0;
+        if (snap){
+            if (g_mph.mempool_sequence) mseq = g_mph.mempool_sequence();
+            mpu();
+            g_mpe_snap = 1;
         }
+        if (g_mpe_vs){
+            qsort(g_mpe_vs, g_mpe_vs_n, sizeof *g_mpe_vs, mpe_vs_cmp);
+            for (long q=0;q<g_mpe_g.n;q++){
+                long k = mpe_vs_find(g_mpe_g.node[q].txid);
+                if (k >= 0){ g_mpe_vs[k].inf = q;
+                             g_mpe_vs[k].vs = mpe_adj_vsize(g_mpe_vs[k].w, g_mpe_g.node[q].sigop_cost); }
+            }
+        }
+        if (snap){
+            for (unsigned long k=0;k<g_mpe_vs_n;k++) ordk[g_mpe_vs[k].ord] = k;
+            for (unsigned long j=0;j<g_mpe_vs_n;j++){
+                const mpe_vs_t* v = &g_mpe_vs[ordk[j]];
+                char hx[65]; mpe_hex(hx, v->id);
+                /* 2026-10-06: written as soon as it is built, and only its
+                 * text kept (rj_freeze): the 68k entry trees were ~200 MB of
+                 * the request arena for ~39 MB of reply */
+                rj_mark mk = rj_arena_mark();
+                rj_val* ent = rj_freeze(mpe_entry_obj(v->id, NULL, 0), mk);
+                rj_obj_set(out, hx, ent);
+            }
+        } else {
+            for (unsigned long i=0;i<n;i++){ mp_ent e;
+                if (mp_slot(g_mph.mp,i,&e) != 1) continue;
+                char hx[65];
+                for (int k=0;k<32;k++){ unsigned char b=e.txid[31-k]; hx[k*2]=HEXD[b>>4]; hx[k*2+1]=HEXD[b&15]; }
+                hx[64]=0;
+                if (!verbose){ rj_arr_push(out, rj_str(hx)); continue; }
+                /* the same builder getmempoolentry uses, under the same pool
+                 * lock; frozen as the snapshot path's entries are */
+                rj_mark mk = rj_arena_mark();
+                rj_val* ent = rj_freeze(mpe_entry_obj(e.txid, e.tx, e.len), mk);
+                rj_obj_set(out, hx, ent);
+            }
+        }
+        g_mpe_snap = 0;
+        free(ordk);
         free(g_mpe_chunk); g_mpe_chunk = 0;
         free(g_mpe_vs); g_mpe_vs = 0; g_mpe_vs_n = 0;
-        free(g_mpe_inf); free(g_mpe_inf_id); g_mpe_inf = 0; g_mpe_inf_id = 0; g_mpe_inf_n = 0;
-        /* still inside the lock that covered the walk above */
-        if (g_mph.mempool_sequence) mseq = g_mph.mempool_sequence();
-        mpu();
+        mp_graph_free(&g_mpe_g);
+        if (!snap){
+            /* still inside the lock that covered the walk above */
+            if (g_mph.mempool_sequence) mseq = g_mph.mempool_sequence();
+            mpu();
+        }
     }
     if (want_seq){
         rj_val* o = rj_obj();
@@ -1927,6 +2044,9 @@ static long long pri_delta_of(const unsigned char txid[32]);
 static rj_val* mpe_amount(unsigned long long sat){
     return rj_numf("%llu.%08llu", sat/100000000ULL, sat%100000000ULL);
 }
+static int mpe_snapshot_component(const unsigned char seed[32]);
+static void mpe_snapshot_index(void);
+static void mpe_tables_free(void);
 static int cmd_getmempoolentry(const rj_val* params, rj_val** res, long* ec, const char** em){
     static __thread char embuf[256];
     if (!params || params->typ != RJ_ARR || params->nitems < 1){
@@ -1951,6 +2071,25 @@ static int cmd_getmempoolentry(const rj_val* params, rj_val** res, long* ec, con
     unsigned long len=0;
     const unsigned char* tx = g_mph.get(g_mph.mp, txid, &len);
     if (!tx){ mpu(); *ec=-5; *em="Transaction not in mempool"; return 0; }
+    /* 2026-10-09: rendered from a snapshot of the component, after the lock,
+     * as verbose ancestors/descendants are (mpe_snapshot_component). Built
+     * under the lock, the entry asked the registry once for itself, once per
+     * ancestor and descendant and once per cluster member for its chunk --
+     * each an O(pool) children-index rebuild -- and linearized the cluster
+     * there too. On mainnet a client polling getmempoolentry held the lock
+     * 3-18 ms a call, and three calls held it ~2.4 s each. At production
+     * shape (test_rpc_chunk_scale 68000 1048576) the longest hold on a
+     * 25-chain goes 10.4 -> 3.5 ms; the linearization now runs unlocked. */
+    if (g_grm_snapshot && mpe_snapshot_component(txid)){
+        mpu();
+        g_mpe_snap = 1;
+        mpe_snapshot_index();
+        rj_val* so = mpe_vs_find(txid) >= 0 ? mpe_entry_obj(txid, NULL, 0) : NULL;
+        mpe_tables_free();
+        if (!so){ *ec=-5; *em="Transaction not in mempool"; return 0; }
+        *res = so;
+        return 1;
+    }
     rj_val* o = mpe_entry_obj(txid, tx, len);
     mpu();
     *res = o;
@@ -1968,20 +2107,23 @@ static int mpc_lookup_bulk(void* ctx, const unsigned char txid[32], mpc_entry* o
     (void)ctx;
     long k = mpe_vs_find(txid);
     if (k < 0 || g_mpe_vs[k].inf < 0) return 0;
-    const mp_entry_info* inf = &g_mpe_inf[g_mpe_vs[k].inf];
+    long q = g_mpe_vs[k].inf;
+    const mp_graph_node* inf = &g_mpe_g.node[q];
+    const unsigned int* dep = mp_graph_depends(&g_mpe_g, q);
+    const unsigned int* sb = mp_graph_spentby(&g_mpe_g, q);
     memset(out, 0, sizeof *out);
-    long long modified = (long long)inf->fee + pri_delta_of(txid);
+    long long modified = (long long)inf->fee + (g_mpe_snap ? g_mpe_vs[k].pri : pri_delta_of(txid));
     out->fee = modified < 0 ? 0 : (uint64_t)modified;
     { unsigned long long bps = g_mph.bytespersigop ? g_mph.bytespersigop() : 20;
       unsigned long long w = g_mpe_vs[k].w;
       unsigned long long sw = (unsigned long long)inf->sigop_cost * bps;
       out->weight = sw > w ? sw : w; }
-    for (int i = 0; i < inf->n_depends && out->n_parents < MPC_MAX_CLUSTER; i++)
-        if (mpe_vs_find(inf->depends[i]) >= 0)
-            memcpy(out->parents[out->n_parents++], inf->depends[i], 32);
-    for (int i = 0; i < inf->n_spentby && out->n_children < MPC_MAX_CLUSTER; i++)
-        if (mpe_vs_find(inf->spentby[i]) >= 0)
-            memcpy(out->children[out->n_children++], inf->spentby[i], 32);
+    for (int i = 0; i < inf->n_depends && out->n_parents < MPC_MAX_CLUSTER; i++){
+        const unsigned char* id = g_mpe_g.node[dep[i]].txid;
+        if (mpe_vs_find(id) >= 0) memcpy(out->parents[out->n_parents++], id, 32); }
+    for (int i = 0; i < inf->n_spentby && out->n_children < MPC_MAX_CLUSTER; i++){
+        const unsigned char* id = g_mpe_g.node[sb[i]].txid;
+        if (mpe_vs_find(id) >= 0) memcpy(out->children[out->n_children++], id, 32); }
     return 1;
 }
 
@@ -2003,7 +2145,7 @@ static int mpc_lookup_bulk(void* ctx, const unsigned char txid[32], mpc_entry* o
 static int mpe_chunk_of(const unsigned char txid[32], unsigned long long* fee,
                         unsigned long long* weight)
 {
-    int bulk = (g_mpe_chunk && g_mpe_inf && g_mpe_vs);
+    int bulk = (g_mpe_chunk && g_mpe_g.node && g_mpe_vs);
     long self_k = bulk ? mpe_vs_find(txid) : -1;
     if (bulk && self_k >= 0 && g_mpe_chunk[self_k].st){
         if (g_mpe_chunk[self_k].st < 0) return 0;
@@ -2049,19 +2191,23 @@ static int mpe_chunk_of(const unsigned char txid[32], unsigned long long* fee,
  * per-member body of the verbose getmempoolancestors/-descendants forms). */
 static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx, unsigned long len){
     rj_val* o = rj_obj();
-    unsigned long w = mp_tx_weight(tx, len);
+    /* snapshot mode: tx is NULL and every input below comes from the call's
+     * tables (copied under the pool lock); the lock is not held here */
+    long sk = g_mpe_snap ? mpe_vs_find(txid) : -1;
+    if (g_mpe_snap && sk < 0) return o;              /* not reachable: the walk is over the table */
+    unsigned long w = g_mpe_snap ? g_mpe_vs[sk].w : mp_tx_weight(tx, len);
 
     mp_entry_info inf; int have_inf = 0;
     /* Prefer the one-pass graph when this call built one; otherwise ask per
      * txid. The FALLBACK MATTERS: the bulk build is skipped when the node
-     * exposes no pol_entry_info_all and refused when its allocation fails, and
+     * exposes no pol_graph_all and refused when its allocation fails, and
      * the first cut of this returned no graph at all in those cases -- it made
      * the per-txid branch conditional on there being no bulk cache, so a
      * verbose call with a cache but no graph silently dropped depends,
      * spentby and both counts. The suite caught it immediately. */
-    long myinf = (g_mpe_vs && g_mpe_inf) ? mpe_inf_lookup(txid) : -1;
-    if (myinf >= 0){ inf = g_mpe_inf[myinf]; have_inf = 1; }
-    else if (g_mph.polstate && g_mph.pol_entry_info)
+    long myinf = (g_mpe_vs && g_mpe_g.node) ? mpe_inf_lookup(txid) : -1;
+    if (myinf >= 0){ mp_graph_expand(&g_mpe_g, myinf, &inf); have_inf = 1; }
+    else if (!g_mpe_snap && g_mph.polstate && g_mph.pol_entry_info)
         have_inf = (int)g_mph.pol_entry_info(g_mph.polstate, txid, &inf);
     if (!have_inf) inf.sigop_cost = 0;
     /* vsize is Core's entry size, the sigops-adjusted one (see
@@ -2070,7 +2216,8 @@ static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx,
     unsigned long vs = mpe_adj_vsize(w, inf.sigop_cost);
     rj_obj_set(o, "vsize", rj_numf("%lu", vs));
     rj_obj_set(o, "weight", rj_numf("%lu", w));
-    rj_obj_set(o, "time", rj_numf("%ld", g_mph.time_of ? g_mph.time_of(txid) : 0));
+    rj_obj_set(o, "time", rj_numf("%ld", g_mpe_snap ? g_mpe_vs[sk].tm
+                                          : (g_mph.time_of ? g_mph.time_of(txid) : 0)));
     rj_obj_set(o, "height", rj_numf("%d", 0));   /* documented gap: entry height untracked */
 
     /* ancestor/descendant sums of the same entry size, over set members
@@ -2090,20 +2237,21 @@ static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx,
     /* Core's IsRBFOptIn: the tx signals itself, or an unconfirmed ancestor
      * does (the set above holds self as well). Full-RBF does not enter into
      * it -- v31.1 reports signalling, not replaceability under its policy. */
-    if (!rbf) rbf = mp_tx_signals_rbf(tx, len);
+    if (!rbf) rbf = g_mpe_snap ? g_mpe_vs[sk].rbf : mp_tx_signals_rbf(tx, len);
     rj_obj_set(o, "descendantcount", rj_numf("%d", desc_n));
     rj_obj_set(o, "descendantsize", rj_numf("%llu", desc_vs));
     rj_obj_set(o, "ancestorcount", rj_numf("%d", anc_n));
     rj_obj_set(o, "ancestorsize", rj_numf("%llu", anc_vs));
 
     { unsigned char wt[32]; char whx[65];
-      if (g_mph.sha256d){ g_mph.sha256d(wt, tx, len); mpe_hex(whx, wt); }
+      if (g_mpe_snap) mpe_hex(whx, g_mpe_vs[sk].wtxid);
+      else if (g_mph.sha256d){ g_mph.sha256d(wt, tx, len); mpe_hex(whx, wt); }
       else mpe_hex(whx, txid);                       /* degrade: txid */
       rj_obj_set(o, "wtxid", rj_str(whx)); }
 
     { rj_val* fees = rj_obj();
       unsigned long long base = have_inf ? inf.fee : 0;
-      long long modified = (long long)base + pri_delta_of(txid);   /* prioritisetransaction */
+      long long modified = (long long)base + (g_mpe_snap ? g_mpe_vs[sk].pri : pri_delta_of(txid));   /* prioritisetransaction */
       long long am = modified < 0 ? -modified : modified;
       rj_obj_set(fees, "base", mpe_amount(base));
       rj_obj_set(fees, "modified", rj_numf("%s%lld.%08lld", modified<0?"-":"", am/100000000LL, am%100000000LL));
@@ -2161,6 +2309,144 @@ static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx,
     return o;
 }
 
+/* ---- 2026-10-06: the relatives' snapshot ------------------------------------
+ * Verbose getmempoolancestors / getmempooldescendants render up to 63 entries
+ * with mpe_entry_obj. Without the bulk tables every one of them asked the
+ * registry per txid -- its own node, then each ancestor's and descendant's for
+ * the size sums, then each cluster member's for the chunk -- and each such
+ * mpool_policy_entry_info call rebuilds the registry's children index, O(pool).
+ * All of it, and the JSON, ran under the pool lock: set x cluster x pool.
+ *
+ * Instead, under the lock: walk the transaction's connected component (the
+ * only nodes any of those lookups can reach) once, one entry_info per node,
+ * and copy each pool-present node's inputs into the same per-call tables the
+ * bulk getrawmempool path fills (g_mpe_vs / g_mpe_g / g_mpe_chunk). Then
+ * the caller releases the lock and renders in snapshot mode. A component
+ * larger than MPE_REL_CAP, or an allocation that fails, returns 0 and the
+ * caller keeps the old all-under-the-lock path (the answer is the same; the
+ * cap only bounds the walk -- the cluster limit is 64, so it is not reached
+ * on a policy-respecting pool). Caller holds the pool lock. */
+#define MPE_REL_CAP 256
+static int mpe_snapshot_component(const unsigned char seed[32]){
+    if (!g_mph.polstate || !g_mph.pol_entry_info || !g_mph.get) return 0;
+    unsigned char (*ids)[32] = (unsigned char (*)[32])malloc((size_t)MPE_REL_CAP * 32);
+    mp_entry_info* e = (mp_entry_info*)malloc(sizeof *e);   /* one scratch record */
+    mpe_vs_t* vs = (mpe_vs_t*)malloc((size_t)MPE_REL_CAP * sizeof *vs);
+    mp_graph g; memset(&g, 0, sizeof g);
+    /* each popped node's header and its members' txids, until every node is
+     * known: the graph stores a member as its node's index (2026-10-07) */
+    typedef struct { unsigned long long fee, size, anc_fee, anc_size, desc_fee; unsigned int sigop_cost;
+                     int n_depends, n_spentby, n_anc, n_desc; unsigned long off; } pend_t;
+    pend_t* pd = (pend_t*)malloc((size_t)MPE_REL_CAP * sizeof *pd);
+    unsigned char (*pm)[32] = NULL; unsigned long npm = 0, cpm = 0;
+    if (!ids || !e || !vs || !pd){ free(ids); free(e); free(vs); free(pd); return 0; }
+    /* breadth-first over depends + spentby; ids[] is the queue and the seen
+     * set, and each registry node joins the graph, in the order popped */
+    int nq = 0, npd = 0;
+    unsigned char (*nid)[32] = (unsigned char (*)[32])malloc((size_t)MPE_REL_CAP * 32);   /* node txids */
+    if (!nid){ free(ids); free(e); free(vs); free(pd); return 0; }
+#define MPE_COMP_FAIL() do { free(ids); free(e); free(vs); free(pd); free(pm); free(nid); mp_graph_free(&g); return 0; } while (0)
+    memcpy(ids[nq++], seed, 32);
+    for (int h = 0; h < nq; h++){
+        if (g_mph.pol_entry_info(g_mph.polstate, ids[h], e) != 1) continue;
+        { unsigned long k = (unsigned long)e->n_depends + e->n_spentby + e->n_anc + e->n_desc;
+          if (npm + k > cpm){
+              unsigned long c2 = cpm ? cpm * 2 : 1024; while (c2 < npm + k) c2 *= 2;
+              unsigned char (*m2)[32] = (unsigned char (*)[32])realloc(pm, (size_t)c2 * 32);
+              if (!m2) MPE_COMP_FAIL();
+              pm = m2; cpm = c2;
+          }
+          pend_t* d = &pd[npd];
+          d->fee = e->fee; d->size = e->size; d->sigop_cost = e->sigop_cost;
+          d->anc_fee = e->anc_fee; d->anc_size = e->anc_size; d->desc_fee = e->desc_fee;
+          d->n_depends = e->n_depends; d->n_spentby = e->n_spentby;
+          d->n_anc = e->n_anc; d->n_desc = e->n_desc;
+          d->off = npm;
+          memcpy(pm + npm, e->depends, (size_t)e->n_depends * 32); npm += (unsigned long)e->n_depends;
+          memcpy(pm + npm, e->spentby, (size_t)e->n_spentby * 32); npm += (unsigned long)e->n_spentby;
+          memcpy(pm + npm, e->anc, (size_t)e->n_anc * 32);         npm += (unsigned long)e->n_anc;
+          memcpy(pm + npm, e->desc, (size_t)e->n_desc * 32);       npm += (unsigned long)e->n_desc;
+          memcpy(nid[npd], ids[h], 32);
+          npd++; }
+        for (int side = 0; side < 2; side++){
+            int ne = side ? e->n_spentby : e->n_depends;
+            unsigned char (*ed)[32] = side ? e->spentby : e->depends;
+            for (int j = 0; j < ne; j++){
+                int seen = 0;
+                for (int q = 0; q < nq && !seen; q++) seen = !memcmp(ids[q], ed[j], 32);
+                if (seen) continue;
+                if (nq >= MPE_REL_CAP) MPE_COMP_FAIL();
+                memcpy(ids[nq++], ed[j], 32);
+            }
+        }
+    }
+    /* every node is known: resolve each member to its node and build the
+     * graph. A member that is not a node (outside what the walk reached)
+     * cannot be stored; the caller then keeps the old path, whose answer
+     * is the same -- every reader skips a member the tables lack. */
+    { unsigned int idx[4 * MPE_MAX_SET];
+      for (int q = 0; q < npd; q++){
+          const pend_t* d = &pd[q];
+          unsigned long k = (unsigned long)d->n_depends + d->n_spentby + d->n_anc + d->n_desc;
+          for (unsigned long j = 0; j < k; j++){
+              int f = -1;
+              for (int r = 0; r < npd && f < 0; r++) if (!memcmp(nid[r], pm[d->off + j], 32)) f = r;
+              if (f < 0) MPE_COMP_FAIL();
+              idx[j] = (unsigned int)f;
+          }
+          /* e, the scratch record, carries the header (its arrays are not read) */
+          e->fee = d->fee; e->size = d->size; e->sigop_cost = d->sigop_cost;
+          e->anc_fee = d->anc_fee; e->anc_size = d->anc_size; e->desc_fee = d->desc_fee;
+          e->n_depends = d->n_depends; e->n_spentby = d->n_spentby; e->n_anc = d->n_anc; e->n_desc = d->n_desc;
+          if (mp_graph_append(&g, nid[q], e, idx) != 0) MPE_COMP_FAIL();
+      } }
+#undef MPE_COMP_FAIL
+    free(pd); free(pm); free(nid);
+    /* the registry nodes are g.node[0..g.n), in the order they were
+     * popped. Now the pool's side of each. */
+    free(e);
+    unsigned long nv = 0;
+    for (long i = 0; i < g.n; i++){
+        const unsigned char* id = g.node[i].txid;
+        unsigned long len = 0;
+        const unsigned char* tx = g_mph.get(g_mph.mp, id, &len);
+        if (!tx) continue;                               /* stale registry node: not rendered, not summed */
+        mpe_vs_t* v = &vs[nv];
+        memcpy(v->id, id, 32);
+        v->w = mp_tx_weight(tx, len);
+        v->rbf = (unsigned char)mp_tx_signals_rbf(tx, len);
+        v->vs = (v->w + 3) / 4;
+        v->inf = -1;
+        if (g_mph.sha256d) g_mph.sha256d(v->wtxid, tx, len); else memcpy(v->wtxid, id, 32);
+        v->tm = g_mph.time_of ? g_mph.time_of(id) : 0;
+        v->pri = pri_delta_of(id);
+        v->ord = nv;
+        nv++;
+    }
+    mpe_chunk_t* ch = (mpe_chunk_t*)calloc(nv ? nv : 1, sizeof *ch);
+    free(ids);
+    if (!ch){ free(vs); mp_graph_free(&g); return 0; }
+    g_mpe_vs = vs; g_mpe_vs_n = nv;
+    g_mpe_g = g;
+    g_mpe_chunk = ch;
+    return 1;
+}
+/* after the lock: sort the snapshot and pair each pool entry with its node */
+static void mpe_snapshot_index(void){
+    qsort(g_mpe_vs, g_mpe_vs_n, sizeof *g_mpe_vs, mpe_vs_cmp);
+    for (long q = 0; q < g_mpe_g.n; q++){
+        long k = mpe_vs_find(g_mpe_g.node[q].txid);
+        if (k >= 0){ g_mpe_vs[k].inf = q;
+                     g_mpe_vs[k].vs = mpe_adj_vsize(g_mpe_vs[k].w, g_mpe_g.node[q].sigop_cost); }
+    }
+}
+static void mpe_tables_free(void){
+    g_mpe_snap = 0;
+    free(g_mpe_chunk); g_mpe_chunk = 0;
+    free(g_mpe_vs); g_mpe_vs = 0; g_mpe_vs_n = 0;
+    mp_graph_free(&g_mpe_g);
+}
+
 /* getmempoolancestors / getmempooldescendants (Core rpc/mempool.cpp): the
  * tx's transitive in-mempool ancestors (txs it depends on) or descendants
  * (txs depending on it), EXCLUDING the tx itself -- verified live on the
@@ -2201,6 +2487,25 @@ static int cmd_mpe_relatives(const rj_val* params, rj_val** res, long* ec, const
     if (g_mph.polstate && g_mph.pol_entry_info)
         have_inf = (int)g_mph.pol_entry_info(g_mph.polstate, txid, &inf);
     rj_val* out = verbose ? rj_obj() : rj_arr();
+    /* 2026-10-06: verbose renders from a snapshot of the component, after
+     * the lock (mpe_snapshot_component); non-verbose is a list of txids and
+     * stays as it was */
+    if (have_inf && verbose && g_grm_snapshot && mpe_snapshot_component(txid)){
+        mpu();
+        g_mpe_snap = 1;
+        mpe_snapshot_index();
+        int n = want_desc ? inf.n_desc : inf.n_anc;
+        unsigned char (*set)[32] = want_desc ? inf.desc : inf.anc;
+        for (int i=0;i<n;i++){
+            if (!memcmp(set[i], txid, 32)) continue;         /* EXCLUDING self */
+            if (mpe_vs_find(set[i]) < 0) continue;           /* stale registry entry */
+            char h2[65]; mpe_hex(h2, set[i]);
+            rj_obj_set(out, h2, mpe_entry_obj(set[i], NULL, 0));
+        }
+        mpe_tables_free();
+        *res = out;
+        return 1;
+    }
     if (have_inf){
         int n = want_desc ? inf.n_desc : inf.n_anc;
         unsigned char (*set)[32] = want_desc ? inf.desc : inf.anc;
@@ -2421,7 +2726,7 @@ static long sbk_stage(const char* hex, int proposal, int* result,
 
     int waited = 0, done = 0;
     while (waited < SBK_WAIT_MS*1000){
-        if (st->blk_submit_ack == myseq){
+        if (st->blk_submit_ack == myseq){ __atomic_thread_fence(__ATOMIC_ACQUIRE);   /* ARM64: the result/reason loads after the ack (the worker fenced before publishing it) */
             *result = st->blk_submit_result;
             if (reason && rcap){
                 unsigned long rl = rcap < sizeof st->blk_submit_reason ? rcap : sizeof st->blk_submit_reason;
@@ -2773,7 +3078,7 @@ static int mpd_import_one(void* vctx, const unsigned char* tx, unsigned long len
     st->tx_submit_seq = myseq;
     int waited = 0, ok = 0, acked = 0;
     while (waited < g_srt_wait_us){
-        if (st->tx_submit_ack == myseq){ ok = (st->tx_submit_result == 1); acked = 1; break; }
+        if (st->tx_submit_ack == myseq){ __atomic_thread_fence(__ATOMIC_ACQUIRE);   /* ARM64: the result/reason loads after the ack (the worker fenced before publishing it) */ ok = (st->tx_submit_result == 1); acked = 1; break; }
         if (g_mpd_shutdown_flag && *g_mpd_shutdown_flag){ c->aborted = 1; c->abort_why = "shutdown requested"; break; }
         struct timespec ts = {0, MPD_POLL_US*1000L}; nanosleep(&ts, NULL);   /* the worker acks within ~0.5 ms once it is servicing the stream */
         waited += MPD_POLL_US;
@@ -2956,11 +3261,11 @@ static int cmd_importmempool(const rj_val* params, rj_val** res, long* ec, const
  * the hex. */
 #define CORE_DECODE_MSG "TX decode failed. Make sure the tx has at least one input."
 static const char* core_decode_msg_hex(const char* hex){
-    static __thread char* b; static __thread size_t cap;
+    static __thread bmc_tls_grow* g; BMC_TLS_GROW(g);   /* freed at thread exit */
     size_t need = strlen(hex) + 80;
-    if (need > cap){ char* nb = (char*)realloc(b, need); if (!nb) return "TX decode failed"; b = nb; cap = need; }
-    snprintf(b, cap, "TX decode failed: %s Make sure the tx has at least one input.", hex);
-    return b;
+    if (need > g->cap){ char* nb = (char*)realloc(g->buf, need); if (!nb) return "TX decode failed"; g->buf = nb; g->cap = need; }
+    snprintf(g->buf, g->cap, "TX decode failed: %s Make sure the tx has at least one input.", hex);
+    return g->buf;
 }
 
 static int cmd_sendrawtransaction(const rj_val* params, rj_val** res, long* ec, const char** em){
@@ -3021,7 +3326,7 @@ static int cmd_sendrawtransaction(const rj_val* params, rj_val** res, long* ec, 
     char detail[512]; detail[0] = 0;
     reason[0] = 0;
     while (waited < g_srt_wait_us){
-        if (s->tx_submit_ack == myseq){
+        if (s->tx_submit_ack == myseq){ __atomic_thread_fence(__ATOMIC_ACQUIRE);   /* ARM64: the result/reason loads after the ack (the worker fenced before publishing it) */
             result = s->tx_submit_result;
             memcpy(reason, (const void*)s->tx_submit_reason, sizeof reason);
             reason[sizeof reason-1]=0;
@@ -3083,7 +3388,7 @@ static int tma_stage(node_status_t* s, const unsigned char* tx, unsigned long n,
     s->tx_submit_seq = myseq;
     int waited = 0;
     while (waited < g_srt_wait_us){
-        if (s->tx_submit_ack == myseq){
+        if (s->tx_submit_ack == myseq){ __atomic_thread_fence(__ATOMIC_ACQUIRE);   /* ARM64: the result/reason loads after the ack (the worker fenced before publishing it) */
             *result_out = s->tx_submit_result;
             *fee_out = s->tx_submit_fee;
             memcpy(reason, (const void*)s->tx_submit_reason, 128);
@@ -3185,7 +3490,7 @@ static int cmd_submitpackage(const rj_val* params, rj_val** res, long* ec, const
     st->tx_submit_seq = myseq;
     int waited = 0, got = 0;
     while (waited < g_srt_wait_us){
-        if (st->tx_submit_ack == myseq){ got = 1; break; }
+        if (st->tx_submit_ack == myseq){ __atomic_thread_fence(__ATOMIC_ACQUIRE);   /* ARM64: the result/reason loads after the ack (the worker fenced before publishing it) */ got = 1; break; }
         struct timespec ts = {0, SRT_POLL_US*1000L}; nanosleep(&ts, NULL);
         waited += SRT_POLL_US;
     }
@@ -3361,7 +3666,7 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
         s->tx_submit_seq = myseq;
         int waited = 0, got = 0;
         while (waited < g_srt_wait_us){
-            if (s->tx_submit_ack == myseq){ got = 1; break; }
+            if (s->tx_submit_ack == myseq){ __atomic_thread_fence(__ATOMIC_ACQUIRE);   /* ARM64: the result/reason loads after the ack (the worker fenced before publishing it) */ got = 1; break; }
             struct timespec ts = {0, SRT_POLL_US*1000L}; nanosleep(&ts, NULL);
             waited += SRT_POLL_US;
         }
@@ -4044,7 +4349,7 @@ static int cmd_getmempoolcluster(const rj_val* params, rj_val** res, long* ec, c
  * classes them NOLOCK through rpc_node_method_lane) and under this mutex
  * instead: they read the pool under its own lock (mpl/mpu, shared with the
  * worker) and share only what this file owns -- the per-call tables
- * (g_mpe_vs, g_mpe_inf, g_mpe_chunk), the slot cache (g_mpc) and one
+ * (g_mpe_vs, g_mpe_g, g_mpe_chunk), the slot cache (g_mpc) and one
  * handler's static block buffer -- none of which a write-locked handler
  * touches. Recursive because the facade dispatches one of them from inside
  * another's frame. A slow getrawmempool now waits only its own kind. */

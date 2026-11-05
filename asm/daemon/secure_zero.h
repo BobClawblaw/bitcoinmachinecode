@@ -14,8 +14,10 @@
  * mechanism as Core's memory_cleanse.
  *
  * secure_lock below is the other half: mlock keeps a secret out of swap and
- * off a hibernation image, and MADV_DONTDUMP keeps it out of a core file.
- * Together they cover the three ways a "cleared" secret was still readable.
+ * off a hibernation image, and MADV_DONTDUMP keeps it out of a core file --
+ * or, where there is no per-mapping exclusion (Darwin), a core-file limit of
+ * zero keeps the whole process out of one. Together they cover the three ways
+ * a "cleared" secret was still readable.
  *
  * header-only: it must inline into every caller, and a link-time function
  * would be one more thing for a caller to forget to link.
@@ -26,6 +28,7 @@
 #include <string.h>
 #include <stddef.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 
 static inline void secure_zero(void* p, size_t n){
     if (!p || !n) return;
@@ -59,6 +62,13 @@ static inline int secure_lock(void* p, size_t n){
     int locked = (mlock(p, n) == 0);
 #ifdef MADV_DONTDUMP
     (void)madvise(p, n, MADV_DONTDUMP);   /* independent of the lock succeeding */
+#else
+    /* No per-mapping core exclusion on this platform (Darwin): the process
+     * holds a secret from here on, so no core file of it may be written at
+     * all. Soft AND hard limit to zero: the hard limit is the one a later
+     * setrlimit cannot raise back (2026-09-27; until then a Mac relied on the
+     * default soft limit of 0, which any shell `ulimit -c` undoes). */
+    { struct rlimit rc = { 0, 0 }; (void)setrlimit(RLIMIT_CORE, &rc); }
 #endif
     return locked;
 }

@@ -28,17 +28,30 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#ifdef __APPLE__
+#define _XOPEN_SOURCE 700       /* Darwin hides ucontext_t without it */
+#define _DARWIN_C_SOURCE        /* ...and SA_ONSTACK/sigaltstack/syscall with it alone */
+#endif
 #include <signal.h>
 #include <string.h>
 #include <unistd.h>
 #include <execinfo.h>
 #include <ucontext.h>
 #include <stdlib.h>
+#ifndef __APPLE__
 #include <sys/syscall.h>
+#endif
 #include "crash_trace.h"
+#ifdef __APPLE__
+#include <pthread.h>
+#include <mach-o/getsect.h>
+#include <mach-o/ldsyms.h>
+#endif
 
+#ifndef __APPLE__
 extern char __executable_start[];
 extern char etext[];
+#endif
 
 static int g_ct_fd = 2;
 
@@ -65,21 +78,46 @@ static void ct_handler(int sig, siginfo_t* si, void* ctxv){
 #if defined(__x86_64__)
     if (uc){ rip = (unsigned long)uc->uc_mcontext.gregs[REG_RIP]; rsp = (unsigned long)uc->uc_mcontext.gregs[REG_RSP];
              rbp = (unsigned long)uc->uc_mcontext.gregs[REG_RBP]; }
+#elif defined(__APPLE__) && defined(__aarch64__)
+    /* the port: pc / sp / fp (x29) in the rip / rsp / rbp slots of the line */
+    if (uc && uc->uc_mcontext){ rip = (unsigned long)uc->uc_mcontext->__ss.__pc; rsp = (unsigned long)uc->uc_mcontext->__ss.__sp;
+             rbp = (unsigned long)uc->uc_mcontext->__ss.__fp; }
 #endif
     ct_puts("\n[crash] "); ct_puts(ct_name(sig)); ct_puts(" ("); ct_dec(sig); ct_puts(") at address ");
     ct_hex(si ? (unsigned long)si->si_addr : 0);
-    ct_puts(" pid "); ct_dec((long)getpid()); ct_puts(" tid "); ct_dec((long)syscall(SYS_gettid)); ct_puts("\n");
+    ct_puts(" pid "); ct_dec((long)getpid());
+#ifdef __APPLE__
+    { uint64_t tid = 0; pthread_threadid_np(NULL, &tid); ct_puts(" tid "); ct_dec((long)tid); }
+#else
+    ct_puts(" tid "); ct_dec((long)syscall(SYS_gettid));
+#endif
+    ct_puts("\n");
     ct_puts("[crash] rip "); ct_hex(rip); ct_puts(" rsp "); ct_hex(rsp); ct_puts(" rbp "); ct_hex(rbp); ct_puts("\n");
     ct_puts("[crash] backtrace:\n");
     void* frames[64]; int n = backtrace(frames, 64);
     backtrace_symbols_fd(frames, n, g_ct_fd);
     /* return addresses on the crashing stack, text-segment words only */
+#ifdef __APPLE__
+    /* Mach-O: the text section's own bounds (ASLR slide included); atos -o <binary> -l <load> resolves them */
+    unsigned long tsz = 0; const unsigned char* tsec = getsectiondata(&_mh_execute_header, "__TEXT", "__text", &tsz);
+    unsigned long lo = (unsigned long)tsec, hi = lo + tsz;
+#else
     unsigned long lo = (unsigned long)__executable_start, hi = (unsigned long)etext;
+#endif
     ct_puts("[crash] text addresses on the stack (innermost first; resolve with addr2line -fe <binary>):\n");
     if (rip >= lo && rip < hi){ ct_puts("[crash]   rip "); ct_hex(rip); ct_puts("\n"); }
     if (rsp && !(rsp & 7)){
         const unsigned long* p = (const unsigned long*)rsp; int shown = 0;
-        for (int i = 0; i < 2048 && shown < 48; i++){
+        int words = 2048;
+#ifdef __APPLE__
+        /* Darwin maps nothing above a thread's stack (Linux has env/auxv over
+         * the main one): a read past the top faults HERE, with the signal
+         * blocked, and the thread re-faults forever instead of dying. Stop at
+         * the faulting thread's stack top. */
+        { unsigned long top = (unsigned long)pthread_get_stackaddr_np(pthread_self());
+          if (top > rsp && (top - rsp) / 8 < (unsigned long)words) words = (int)((top - rsp) / 8); }
+#endif
+        for (int i = 0; i < words && shown < 48; i++){
             unsigned long v = p[i];
             if (v >= lo && v < hi){ ct_puts("[crash]   [rsp+"); ct_dec((long)i * 8); ct_puts("] "); ct_hex(v); ct_puts("\n"); shown++; }
         }

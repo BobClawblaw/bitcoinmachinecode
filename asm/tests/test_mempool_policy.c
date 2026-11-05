@@ -48,6 +48,9 @@ extern void mpool_policy_set_acceptnonstd(void*, unsigned);
 extern void mpool_policy_set_cluster_limits(void*, unsigned count, unsigned vbytes);   /* -limitclustercount / -limitclustersize (2026-10-01) */
 extern void mpool_policy_set_baremultisig(void*, unsigned);
 static int test_bare_multisig(void);   /* defined below main */
+static void test_cluster_walk_differential(void);   /* defined below main */
+static void test_descendant_walk_differential(void);   /* defined below main */
+static void test_conflict_mark_differential(void);   /* defined below main */
 extern long   mpool_policy_add(void* pol, void* st, void* mp,
                                const unsigned char* tx, unsigned long txlen,
                                const unsigned char txid[32], void* utxo);
@@ -1116,6 +1119,10 @@ int main(void){
         }
     }
 
+    test_cluster_walk_differential();
+    test_descendant_walk_differential();
+    test_conflict_mark_differential();
+
     printf("\n%s (%d failures)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED", failures);
     return failures ? 1 : 0;
 }
@@ -1291,4 +1298,303 @@ static int hex_in(unsigned char* out, const char* h){
     int n = (int)strlen(h)/2;
     for (int i=0;i<n;i++){ unsigned v; sscanf(h+2*i,"%2x",&v); out[i]=(unsigned char)v; }
     return n;
+}
+
+
+/* ================================================================
+ * 2026-10-08: mpol_add_core's cluster-limit walk finds a node's neighbours
+ * through the children index instead of scanning the whole registry for each
+ * node it pops (at a 77k pool that scan was ~63% of the mainnet worker's
+ * CPU). The walk's outcome depends only on the set it reaches, so the index
+ * must give the scan's answer on every transaction. This replays one random
+ * workload twice -- scan, then index -- on fresh state and compares every
+ * verdict and reason: chains, fan-ins (2-3 in-pool parents), diamonds, a
+ * limitclustercount of 12 so the bound is hit often, and BIP125-signalling
+ * replacements whose evicted sets the walk must leave out.
+ * ================================================================ */
+extern void mpool_policy_set_cluster_walk_scan(int on);
+#define CWD_STEPS 1500
+static int cwd_run(int scan, unsigned cluster_count, char verdict[CWD_STEPS], char reasons[CWD_STEPS][48],
+                   int* n_cluster_refused, int* n_multi_parent_in, int* n_replaced,
+                   void (*after)(void* st, void* mp)){
+    static unsigned char pol[128];
+    static unsigned char stbuf[1<<22];
+    static unsigned char mp[40 + 8192*80 + 8];
+    static unsigned char mblob[1<<21];
+    static unsigned char ux[40 + 4096*48 + 8];
+    static unsigned char ublob[1<<16];
+    memset(stbuf, 0, sizeof stbuf);
+    mpool_policy_init(pol, 1000, 200, 10100000, 200, 10100000, 1);
+    mpool_policy_set_cluster_limits(pol, cluster_count, 101000);
+    POLICY_STATE_INIT(stbuf, 8192);
+    mpool_init(mp, 8192, mblob, sizeof mblob);
+    utxo_init(ux, 4096, ublob, sizeof ublob);
+    mpool_policy_set_cluster_walk_scan(scan);
+    /* every output ever made: confirmed coins first, then each accepted tx's */
+    static struct { unsigned char txid[32]; unsigned vout; unsigned long long value; int spent, pool; } out[CWD_STEPS * 3 + 256];
+    int nout = 0;
+    unsigned char spk[2] = { 0x51, 0x00 };
+    for (int c = 0; c < 160; c++){
+        memset(out[nout].txid, 0xC7, 32); out[nout].txid[0] = (unsigned char)c; out[nout].txid[1] = (unsigned char)(c >> 8);
+        out[nout].vout = 0; out[nout].value = 5000000ULL; out[nout].spent = 0; out[nout].pool = 0;
+        utxo_put(ux, out[nout].txid, 0, out[nout].value, 0, 0, spk, 1);
+        nout++;
+    }
+    unsigned x = 0x9e3779b9u;
+    #define CWD_RND() (x = x * 1103515245u + 12345u, (x >> 8))
+    *n_cluster_refused = *n_multi_parent_in = *n_replaced = 0;
+    for (int step = 0; step < CWD_STEPS; step++){
+        int pick[3], np = 1 + (int)(CWD_RND() % 3);
+        int replace = (CWD_RND() % 10) == 0;          /* spend an already-spent in-pool output: a conflict */
+        int got = 0;
+        for (int tries = 0; tries < 60 && got < np; tries++){
+            int k;
+            /* mostly in-pool outputs (clusters), recent ones (chains) */
+            if ((CWD_RND() % 4) && nout > 160) k = nout - 1 - (int)(CWD_RND() % (unsigned)((nout - 160) < 40 ? (nout - 160) : 40));
+            else k = (int)(CWD_RND() % (unsigned)nout);
+            if (replace && got == 0){ if (!out[k].spent || !out[k].pool) continue; }
+            else if (out[k].spent) continue;
+            int dup = 0; for (int q = 0; q < got; q++) if (pick[q] == k) dup = 1;
+            if (dup) continue;
+            pick[got++] = k;
+        }
+        if (got == 0){ verdict[step] = 2; reasons[step][0] = 0; continue; }
+        unsigned long long in = 0; int pool_parents = 0;
+        for (int q = 0; q < got; q++){ in += out[pick[q]].value; pool_parents += out[pick[q]].pool; }
+        unsigned long long fee = replace ? 400000ULL + (CWD_RND() % 1000) : 2000ULL + (CWD_RND() % 3000);
+        if (in <= fee + 3 * 1000){ verdict[step] = 2; reasons[step][0] = 0; continue; }
+        int nouts = 1 + (int)(CWD_RND() % 3);
+        unsigned long long each = (in - fee) / (unsigned long long)nouts;
+        unsigned char tx[3*41 + 3*31 + 32]; unsigned long n = 0;
+        tx[n++]=2;tx[n++]=0;tx[n++]=0;tx[n++]=0;
+        tx[n++]=(unsigned char)got;
+        for (int q = 0; q < got; q++){
+            memcpy(tx+n, out[pick[q]].txid, 32); n+=32;
+            for (int b=0;b<4;b++) tx[n++]=(unsigned char)(out[pick[q]].vout>>(8*b));
+            tx[n++]=0; tx[n++]=0xfd; tx[n++]=0xff; tx[n++]=0xff; tx[n++]=0xff;   /* BIP125 */
+        }
+        tx[n++]=(unsigned char)nouts;
+        for (int o = 0; o < nouts; o++){
+            for (int b=0;b<8;b++) tx[n++]=(unsigned char)(each>>(8*b));
+            tx[n++]=22; tx[n++]=0x00; tx[n++]=0x14; memset(tx+n, (unsigned char)(step + o), 20); tx[n+1] = (unsigned char)(step >> 8); n+=20;
+        }
+        memset(tx+n, 0, 4); n+=4;
+        unsigned char tid[32]; memset(tid, 0xD3, 32); tid[0] = (unsigned char)step; tid[1] = (unsigned char)(step >> 8);
+        long r = mpool_policy_add(pol, stbuf, mp, tx, n, tid, ux);
+        verdict[step] = (char)(r == 1);
+        snprintf(reasons[step], 48, "%s", r == 1 ? "" : mpool_policy_reason(pol));
+        if (r != 1 && strstr(reasons[step], "too-large-cluster")) (*n_cluster_refused)++;
+        if (r == 1){
+            if (pool_parents >= 2) (*n_multi_parent_in)++;
+            if (replace) (*n_replaced)++;
+            for (int q = 0; q < got; q++) out[pick[q]].spent = 1;
+            for (int o = 0; o < nouts && nout < (int)(sizeof out / sizeof out[0]); o++){
+                memcpy(out[nout].txid, tid, 32); out[nout].vout = (unsigned)o; out[nout].value = each;
+                out[nout].spent = 0; out[nout].pool = 1; nout++;
+            }
+        }
+    }
+    #undef CWD_RND
+    mpool_policy_set_cluster_walk_scan(0);
+    if (after) after(stbuf, mp);
+    return (int)mpool_count(mp);
+}
+static void test_cluster_walk_differential(void){
+    printf("== the cluster-limit walk: children index vs the registry scan ==\n");
+    static char va[CWD_STEPS], vb[CWD_STEPS];
+    static char ra[CWD_STEPS][48], rb[CWD_STEPS][48];
+    const unsigned limits[2] = { 12, 64 };
+    for (int L = 0; L < 2; L++){
+        int ca, ma, xa, cb, mb, xb;
+        int pa = cwd_run(1, limits[L], va, ra, &ca, &ma, &xa, 0);
+        int pb = cwd_run(0, limits[L], vb, rb, &cb, &mb, &xb, 0);
+        int first = -1;
+        for (int i = 0; i < CWD_STEPS && first < 0; i++)
+            if (va[i] != vb[i] || strcmp(ra[i], rb[i])) first = i;
+        if (first >= 0) printf("      limitclustercount=%u: step %d: scan %d \"%s\", index %d \"%s\"\n",
+                               limits[L], first, va[first], ra[first], vb[first], rb[first]);
+        printf("      limitclustercount=%u: pool %d, %d too-large-cluster, %d accepted with 2+ in-pool parents, %d replacements\n",
+               limits[L], pb, cb, mb, xb);
+        char m[200];
+        snprintf(m, sizeof m, "limitclustercount=%u: every verdict and reason is the scan's (%d transactions)", limits[L], CWD_STEPS);
+        okv(first < 0 && pa == pb, m);
+        if (L == 0){
+            okv(cb >= 20, "...the workload hits the cluster bound (at least 20 too-large-cluster refusals)");
+            okv(mb >= 20 && xb >= 5, "...and covers fan-ins (2+ in-pool parents) and accepted replacements");
+        }
+    }
+}
+
+/* ================================================================
+ * 2026-10-08 (2): collect_descendant_txids -- the descendant set behind RBF
+ * eviction, package removal and sibling eviction -- walks the children index
+ * after its first pop instead of scanning the registry for every node it
+ * pops. Its output is a LIST whose order the removal paths consume, so this
+ * compares the list itself, not just its size:
+ *
+ *   1. On the cluster-walk workload's final pool (limitclustercount 64, so
+ *      clusters run deep), every transaction's descendant list under the scan
+ *      and under the index, element for element, at the full bound and at a
+ *      bound of 3 so the -1 overflow is taken often.
+ *   2. Then a removal sequence run on two fresh copies of that workload, one
+ *      per mode: remove_package on every 5th surviving transaction, comparing
+ *      each removed count and the pool size after.
+ * ================================================================ */
+extern void mpool_policy_set_desc_walk_scan(int on);
+extern long mpool_policy_remove_package(void* st, void* mp, const unsigned char txid[32]);
+extern long mpool_policy_descendant_txids(void* st, const unsigned char txid[32],
+                                          unsigned char (*out)[32], int cap);
+static int dwd_lists, dwd_mismatch, dwd_with_desc, dwd_overflow, dwd_max;
+static long dwd_removed[CWD_STEPS + 1];
+static int dwd_nremoved;
+static void dwd_tid(unsigned char tid[32], int step){
+    memset(tid, 0xD3, 32); tid[0] = (unsigned char)step; tid[1] = (unsigned char)(step >> 8);
+}
+static void dwd_compare(void* st, void* mp){
+    (void)mp;
+    static unsigned char a[128][32], b[128][32];
+    const int caps[2] = { 128, 3 };
+    for (int step = 0; step < CWD_STEPS; step++){
+        unsigned char tid[32]; dwd_tid(tid, step);
+        for (int c = 0; c < 2; c++){
+            mpool_policy_set_desc_walk_scan(1);
+            long na = mpool_policy_descendant_txids(st, tid, a, caps[c]);
+            mpool_policy_set_desc_walk_scan(0);
+            long nb = mpool_policy_descendant_txids(st, tid, b, caps[c]);
+            if (na == -2) break;                          /* not in the pool */
+            dwd_lists++;
+            if (na != nb || (na > 0 && memcmp(a, b, (size_t)na * 32))) dwd_mismatch++;
+            if (c == 0 && na > 0) dwd_with_desc++;
+            if (c == 0 && na > dwd_max) dwd_max = (int)na;
+            if (c == 1 && na == -1) dwd_overflow++;
+        }
+    }
+}
+static void dwd_remove(void* st, void* mp){
+    dwd_nremoved = 0;
+    for (int step = 0; step < CWD_STEPS; step += 5){
+        unsigned char tid[32]; dwd_tid(tid, step);
+        dwd_removed[dwd_nremoved++] = mpool_policy_remove_package(st, mp, tid);
+    }
+    dwd_removed[dwd_nremoved++] = (long)mpool_count(mp);
+}
+static void test_descendant_walk_differential(void){
+    printf("== the descendant walk: children index vs the registry scan ==\n");
+    static char v[CWD_STEPS]; static char r[CWD_STEPS][48];
+    int c, m, x;
+    dwd_lists = dwd_mismatch = dwd_with_desc = dwd_overflow = dwd_max = 0;
+    cwd_run(0, 64, v, r, &c, &m, &x, dwd_compare);
+    printf("      %d lists compared, %d with descendants (largest %d), %d overflowed at a bound of 3, %d differ\n",
+           dwd_lists, dwd_with_desc, dwd_max, dwd_overflow, dwd_mismatch);
+    okv(dwd_mismatch == 0, "every descendant list is the scan's, element for element, at bounds 128 and 3");
+    okv(dwd_with_desc >= 100 && dwd_max >= 10 && dwd_overflow >= 20,
+        "...over sets that are many, deep (10+), and overflow the small bound");
+
+    static long rs[CWD_STEPS + 1]; int ns;
+    mpool_policy_set_desc_walk_scan(1);
+    cwd_run(0, 64, v, r, &c, &m, &x, dwd_remove);
+    mpool_policy_set_desc_walk_scan(0);
+    memcpy(rs, dwd_removed, sizeof rs); ns = dwd_nremoved;
+    cwd_run(0, 64, v, r, &c, &m, &x, dwd_remove);
+    long total = 0, multi = 0;
+    for (int i = 0; i + 1 < ns; i++){ total += rs[i]; if (rs[i] > 1) multi++; }
+    printf("      remove_package x%d: %ld removed, %ld removals took descendants, pool %ld -> %ld\n",
+           ns - 1, total, multi, rs[ns - 1] + total, rs[ns - 1]);
+    okv(ns == dwd_nremoved && !memcmp(rs, dwd_removed, (size_t)ns * sizeof rs[0]),
+        "remove_package: every removed count and the final pool size are the scan's");
+    okv(multi >= 10, "...and at least 10 of those removals took a descendant set");
+}
+
+/* ================================================================
+ * 2026-10-08 (3): a block connect marks each pool transaction the block
+ * CONFLICTS with, and its descendants, by walking the children index (built
+ * once per block) instead of sweeping the registry to a fixpoint per conflict.
+ * The marks decide what leaves, and the block index recorded with each mark
+ * decides the ORDER the sequence hook publishes removals in, so this compares
+ * what a subscriber sees, not just what is left:
+ *
+ * On the cluster-walk workload's final pool (limitclustercount 64), one
+ * block spends output 0 of every 3rd pool transaction. Whatever in the pool
+ * spends that output is a conflict and leaves with its descendants. Many
+ * conflicts sit below an earlier one, which is the case the walk must skip.
+ * The block is connected on two fresh copies, sweep then walk, and the
+ * test compares the removed count, the pool after, and every departure and
+ * sequence callback in order.
+ * ================================================================ */
+extern void mpool_policy_set_rm_fixpoint_scan(int on);
+extern long mpool_policy_block_connect(void* st, void* mp, const unsigned char* block, unsigned long blen);
+extern void mpool_policy_set_depart_cb(void (*fn)(const unsigned char*, unsigned long long, unsigned long long, int));
+extern void mpool_policy_set_seq_cb(void (*fn)(const unsigned char*, int));
+#define RFX_EV 4096
+static struct { unsigned char txid[32]; int kind, why; } rfx_ev[RFX_EV];
+static int rfx_nev, rfx_nconf, rfx_conf_with_desc;
+static long rfx_removed, rfx_left;
+static void rfx_depart(const unsigned char* txid, unsigned long long sz, unsigned long long fee, int why){
+    (void)sz; (void)fee;
+    if (rfx_nev < RFX_EV){ memcpy(rfx_ev[rfx_nev].txid, txid, 32); rfx_ev[rfx_nev].kind = 0; rfx_ev[rfx_nev].why = why; rfx_nev++; }
+}
+static void rfx_seq(const unsigned char* txid, int mined){
+    if (rfx_nev < RFX_EV){ memcpy(rfx_ev[rfx_nev].txid, txid, 32); rfx_ev[rfx_nev].kind = 1; rfx_ev[rfx_nev].why = mined; rfx_nev++; }
+}
+static unsigned long rfx_tx(unsigned char* o, const unsigned char prev[32], unsigned vout, unsigned char tag){
+    unsigned long n = 0;
+    o[n++]=2;o[n++]=0;o[n++]=0;o[n++]=0;
+    o[n++]=1; memcpy(o+n, prev, 32); n+=32;
+    for (int b=0;b<4;b++) o[n++]=(unsigned char)(vout>>(8*b));
+    o[n++]=0; memset(o+n,0xff,4); n+=4;
+    o[n++]=1; for (int b=0;b<8;b++) o[n++]=(unsigned char)(1000ULL>>(8*b));
+    o[n++]=22; o[n++]=0x00; o[n++]=0x14; memset(o+n, tag, 20); n+=20;
+    memset(o+n,0,4); n+=4;
+    return n;
+}
+static void rfx_block(void* st, void* mp){
+    static unsigned char blk[80 + 3 + 600 * 90];
+    static unsigned char pick[600][32];
+    unsigned char a[128][32];
+    int np = 0, seen = 0;
+    rfx_nconf = rfx_conf_with_desc = 0;
+    for (int step = 0; step < CWD_STEPS && np < 600; step++){
+        unsigned char tid[32]; dwd_tid(tid, step);
+        if (mpool_policy_descendant_txids(st, tid, a, 128) == -2) continue;
+        if (seen++ % 3) continue;
+        memcpy(pick[np++], tid, 32);
+    }
+    unsigned long n = 80; memset(blk, 0, 80);
+    unsigned ntx = (unsigned)np + 1;
+    if (ntx < 0xfd) blk[n++] = (unsigned char)ntx;               /* canonical varint */
+    else { blk[n++] = 0xfd; blk[n++] = (unsigned char)ntx; blk[n++] = (unsigned char)(ntx >> 8); }
+    unsigned char zero[32]; memset(zero, 0, 32);
+    n += rfx_tx(blk + n, zero, 0xffffffffu, 0xEE);          /* the coinbase: skipped */
+    for (int k = 0; k < np; k++) n += rfx_tx(blk + n, pick[k], 0, (unsigned char)k);
+    rfx_nev = 0;
+    mpool_policy_set_depart_cb(rfx_depart);
+    mpool_policy_set_seq_cb(rfx_seq);
+    long before = (long)mpool_count(mp);
+    rfx_removed = mpool_policy_block_connect(st, mp, blk, n);
+    rfx_left = (long)mpool_count(mp);
+    mpool_policy_set_depart_cb(0);
+    mpool_policy_set_seq_cb(0);
+    for (int i = 0; i < rfx_nev; i++) if (rfx_ev[i].kind == 0 && rfx_ev[i].why == 5) rfx_nconf++;
+    rfx_conf_with_desc = (int)(before - rfx_left);
+}
+static void test_conflict_mark_differential(void){
+    printf("== block-connect conflict marking: children index vs the fixpoint sweep ==\n");
+    static char v[CWD_STEPS]; static char r[CWD_STEPS][48];
+    int c, m, x;
+    static struct { unsigned char txid[32]; int kind, why; } ev_a[RFX_EV];
+    mpool_policy_set_rm_fixpoint_scan(1);
+    cwd_run(0, 64, v, r, &c, &m, &x, rfx_block);
+    mpool_policy_set_rm_fixpoint_scan(0);
+    long rem_a = rfx_removed, left_a = rfx_left; int nev_a = rfx_nev;
+    memcpy(ev_a, rfx_ev, sizeof ev_a);
+    cwd_run(0, 64, v, r, &c, &m, &x, rfx_block);
+    int same_ev = (nev_a == rfx_nev);
+    for (int i = 0; same_ev && i < nev_a; i++)
+        if (ev_a[i].kind != rfx_ev[i].kind || ev_a[i].why != rfx_ev[i].why || memcmp(ev_a[i].txid, rfx_ev[i].txid, 32)) same_ev = 0;
+    printf("      block connect: %ld removed (%d as conflicts), pool %ld -> %ld, %d callbacks\n",
+           rfx_removed, rfx_nconf, rfx_left + rfx_conf_with_desc, rfx_left, rfx_nev);
+    okv(rem_a == rfx_removed && left_a == rfx_left,
+        "the removed count and the pool left are the sweep's");
+    okv(same_ev, "every departure and sequence callback, in order, is the sweep's");
+    okv(rfx_nconf >= 50, "...over a block conflicting with at least 50 pool transactions");
 }

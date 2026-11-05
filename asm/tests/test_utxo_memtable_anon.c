@@ -63,6 +63,27 @@ static u64 file_first_qword(const char* p){
     int fd = open(p, O_RDONLY); if (fd < 0) return (u64)-1;
     u64 v = 0; if (read(fd, &v, 8) != 8) v = (u64)-2; close(fd); return v;
 }
+#ifdef __APPLE__
+/* bmc_osx: no /proc/self/maps. The VM region that starts at a, as a line of
+ * the same shape: "lo-hi path" for a file mapping, "lo-hi" for anonymous
+ * memory. Darwin names no anonymous regions, so the [anon:...] checks below
+ * become "not a file mapping" here. */
+#include <libproc.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+static int maps_line_at(void* a, char* out, size_t cap){
+    mach_vm_address_t addr = (mach_vm_address_t)(uintptr_t)a; mach_vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t obj;
+    if (mach_vm_region(mach_task_self(), &addr, &size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &cnt, &obj) != KERN_SUCCESS) return 0;
+    if (addr != (mach_vm_address_t)(uintptr_t)a) return 0;
+    char path[PROC_PIDPATHINFO_MAXSIZE] = "";
+    if (proc_regionfilename(getpid(), addr, path, sizeof path) <= 0) path[0] = 0;
+    snprintf(out, cap, "%lx-%lx %s\n", (unsigned long)addr, (unsigned long)(addr + size), path);
+    return 1;
+}
+#define ANON_NAMED(line, name) (strstr(line, ".map") == NULL)   /* Darwin: anonymous = no file */
+#else
+#define ANON_NAMED(line, name) (strstr(line, "[anon:" name "]") != NULL)
 /* the /proc/self/maps line that starts at address a: its path/name column (or "") */
 static int maps_line_at(void* a, char* out, size_t cap){
     FILE* f = fopen("/proc/self/maps", "r"); if (!f) return 0;
@@ -73,6 +94,7 @@ static int maps_line_at(void* a, char* out, size_t cap){
     }
     fclose(f); return found;
 }
+#endif
 static u8 store_buf[4096];
 
 static void one_round(int anon){
@@ -95,23 +117,23 @@ static void one_round(int anon){
     ck("a raw put lands", utxo_put(u, txid, 0, 5000ULL, 100, 0, spk, sizeof spk), 1);
     ck("count 1 after the put", utxo_count(u), 1);
     ck("the FILE's first qword shows the count (the header page is shared)", (long)file_first_qword("utxo_lsm_table.map"), 1);
-    char line[512];
+    char line[512]; long pg = getpagesize();          /* the header page: 4096 on x86, 16384 on Apple silicon */
     if (maps_line_at(u, line, sizeof line)){
         printf("     maps: %s", line);
         ckm("the table's first page is a mapping of utxo_lsm_table.map", strstr(line, "utxo_lsm_table.map") != NULL);
         unsigned long lo = 0, hi = 0; sscanf(line, "%lx-%lx", &lo, &hi);
-        if (anon) ck("...of exactly one page (the header page)", (long)(hi - lo), 4096);
-        else      ck("...of the whole table (file mappings, as before)", (long)(hi - lo), (utxo_struct_size(slots) + 4095) & ~4095L);
+        if (anon) ck("...of exactly one page (the header page)", (long)(hi - lo), pg);
+        else      ck("...of the whole table (file mappings, as before)", (long)(hi - lo), (utxo_struct_size(slots) + pg - 1) & ~(pg - 1));
     } else ckm("a maps line at the table address", 0);
     if (anon){
-        if (maps_line_at((char*)u + 4096, line, sizeof line)){
+        if (maps_line_at((char*)u + pg, line, sizeof line)){
             printf("     maps: %s", line);
-            ckm("the rest of the table is anonymous memory named utxo-memtable-table", strstr(line, "[anon:utxo-memtable-table]") != NULL);
-        } else ckm("a maps line at table+4096", 0);
+            ckm("the rest of the table is anonymous memory named utxo-memtable-table", ANON_NAMED(line, "utxo-memtable-table"));
+        } else ckm("a maps line at table+one page", 0);
         void* blob = (void*)(uintptr_t)((u64*)u)[2];             /* +16 */
         if (maps_line_at(blob, line, sizeof line)){
             printf("     maps: %s", line);
-            ckm("the blob is anonymous memory named utxo-memtable-blob", strstr(line, "[anon:utxo-memtable-blob]") != NULL);
+            ckm("the blob is anonymous memory named utxo-memtable-blob", ANON_NAMED(line, "utxo-memtable-blob"));
         } else ckm("a maps line at the blob address", 0);
     }
     utxo_live_close();

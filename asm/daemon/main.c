@@ -1412,8 +1412,15 @@ static int leg_peer_hung_up(int fd, short* revents_out){
  * the parent replays the same bookkeeping from the report, once. */
 static int g_pass_in_child = 0;
 static long g_pass_child_rewound = -1;
+/* 2026-10-09: a closed leg's slot keeps no strikes. Neither close reset the
+ * streak -- only a good pass or the next peer in the slot did -- so a leg
+ * closed for any other reason after a failing pass or two left its count
+ * in an empty slot, and slots no dial candidate could fill (three of ten on
+ * mainnet for hours) carried it into every heartbeat: sync_failing=2-3 for
+ * a whole two-hour run in which no leg reached the third strike. */
 static void leg_close_ours(int i, const char* reason, const char* detail){
     if(g_pass_in_child) return;                        /* the parent decides from the report */
+    g_sync_fail_streak[i] = 0;
     fprintf(stderr,"[dl:%d] %s connection closed ours/%s after %llds%s%s\n", i, mux_out_host[i][0] ? mux_out_host[i] : "?", reason, leg_age_s(i),
             detail && detail[0] ? " -- " : "", detail ? detail : "");
     if(mux_out_fd[i] >= 0){ bmc_v2_close(mux_out_fd[i]), close(mux_out_fd[i]); mux_out_fd[i] = -1; }
@@ -1421,6 +1428,7 @@ static void leg_close_ours(int i, const char* reason, const char* detail){
 }
 static void leg_close_theirs(int i, const char* how, const char* unread){
     if(g_pass_in_child) return;                        /* the parent decides from the report */
+    g_sync_fail_streak[i] = 0;
     long long age = leg_age_s(i);
     fprintf(stderr,"[dl:%d] %s connection closed theirs (%s) after %llds; unread: %s\n", i, mux_out_host[i][0] ? mux_out_host[i] : "?", how, age, unread ? unread : "(nothing)");
     if(g_dialmem && age >= 0 && age <= DM_EARLY_S) dialmem_note_failure(g_dialmem, mux_out_host[i], age <= DM_REFUSED_S ? DM_REFUSED : DM_EARLY_DROP, dialmem_now());
@@ -2397,17 +2405,47 @@ static long txoq_mark_block(void* store_buf, const unsigned char hash[32], int o
 }
 static void* g_txoq_store = NULL;                 /* CC-10: set by the worker before its rotation */
 static void txoq_service(void);
+static void txoq_service_mode(int allow_marks);
 /* The catch-up loop's between-block hook: publish the connected tip (3.1) so
  * the parent's RPCs and the serve children follow a long catch-up call block
  * by block, then answer pending gettxout queries (a no-op without the IPC). */
 static void dl_apply_hook(void){ dl_publish_connected_tip(); txoq_service(); }
-static void txoq_service(void){
+static void txoq_service(void){ txoq_service_mode(1); }
+/* 2026-09-26: the worker's idle rest (all legs quiet: 200 ms before the next
+ * rotation) was a blind usleep, and on a quiet node it was where gettxout
+ * waited -- signet measured 88-97 ms median, ~208 ms max, AFTER the leg-level
+ * service points went in, because the worker is mostly resting there. Rest on
+ * the query channel instead: a query ends the wait and is answered at once
+ * (queries only, as between legs) and the rest ends -- a MARK too, left
+ * unconsumed for the full service point, so a readable channel can never
+ * make this spin. Without a channel it is the plain sleep it was. */
+static void txoq_idle_rest(int ms){
+    if(g_txoq_worker < 0){ usleep((useconds_t)ms * 1000); return; }
+    struct pollfd pf = { g_txoq_worker, POLLIN, 0 };
+    if(poll(&pf, 1, ms) > 0 && (pf.revents & POLLIN))
+        txoq_service_mode(0);          /* answer the queries; a MARK is left for the full point */
+}                                      /* either way the rest ends: the next rotation starts now */
+/* 2026-09-26: the rotation's legs call this with allow_marks = 0. gettxout
+ * waited for the worker's next pass over its one service point -- a whole
+ * leg rotation, each relay leg polling up to 250 ms for its getdata replies:
+ * 23-1166 ms (median 268) on the Mac mainnet node with 9 peers, for a lookup
+ * that takes microseconds. The worker applies nothing inside the rotation
+ * (the apply runs after it), so a point query is as safe between two legs as
+ * after the catch-up. A block MARK (invalidateblock / reconsiderblock, CC-10)
+ * changes chain state, so it is left in the socket for the full service
+ * point: the request is peeked first and not consumed. */
+static void txoq_service_mode(int allow_marks){
     if(g_txoq_worker < 0) return;
     for(int guard = 0; guard < 64; guard++){
         struct pollfd pf = { g_txoq_worker, POLLIN | POLLOUT, 0 };
         if(poll(&pf, 1, 0) <= 0) return;
         if(!(pf.revents & POLLIN)) return;             /* nothing pending */
         if(!(pf.revents & POLLOUT)) return;            /* no room for a whole reply: the parent is not reading */
+        if(!allow_marks){
+            unsigned int magic = 0;
+            if(recv(g_txoq_worker, &magic, sizeof magic, MSG_PEEK | MSG_DONTWAIT) != (ssize_t)sizeof magic) return;
+            if(magic == TXOQ_MAGIC_MARK) return;       /* the full service point takes it */
+        }
         txoq_req q;
         if(!txoq_read_all(g_txoq_worker, &q, sizeof q, 50)) return;
         if(q.magic == TXOQ_MAGIC_MARK){                /* CC-10: invalidateblock / reconsiderblock */
@@ -2530,6 +2568,73 @@ static void handle_shutdown_signal(int sig){
 static int datadir_lock_fd;              /* defined (= -1) with datadir_lock_acquire below */
 #define LOCK_HOLDERS_MAX 64
 typedef struct { int pid; int tid; unsigned long long start; char comm[20]; } lock_holder_t;
+#ifdef __APPLE__
+/* ---- Darwin (osx port, 2026-09 merge): no /proc, no kcmp. The fd tables
+ * are read through libproc; where Linux compares open file descriptions
+ * (kcmp KCMP_FILE) the inode alone decides -- the conservative fallback
+ * this code already documents. The /proc-only exit-pending window
+ * (exit_files before the flock release) has no equivalent here -- a
+ * Darwin close releases the lock at the close -- so proc_exit_pending is
+ * 0, and our own download worker is tracked portably (waitpid + kill(0))
+ * in shutdown_wait_lock_released. ---- */
+static void proc_comm(int pid, char* out, size_t cap){
+    char p[PROC_PIDPATHINFO_SIZE];
+    if (proc_pidpath((pid_t)pid, p, sizeof p) <= 0){ snprintf(out, cap, "?"); return; }
+    char* sl = strrchr(p, '/');
+    snprintf(out, cap, "%s", sl ? sl + 1 : p);
+}
+static unsigned long long darwin_pid_start(int pid){
+    struct proc_bsdinfo b;
+    if (proc_pidinfo((pid_t)pid, PROC_PIDTBSDINFO, 0, &b, sizeof b) != (int)sizeof b) return 0;
+    return (unsigned long long)b.pbi_start_tvsec;
+}
+static int proc_exit_pending(int pid, unsigned long long start){
+    (void)pid; (void)start;
+    return 0;                            /* see block comment above */
+}
+/* Every process other than this one with an fd on the file `lockfd` is
+ * open on: libproc PROC_PIDLISTFDS + PROC_PIDFDVNODEPATHINFO, matched by
+ * dev+ino. match_ofd is not implementable without kcmp, so a NEW instance
+ * waiting on .lock is reported too -- conservative, bounded. */
+static int lock_holders_scan(int lockfd, int match_ofd, lock_holder_t* out, int cap){
+    (void)match_ofd;
+    struct stat ls;
+    if (fstat(lockfd, &ls) != 0) return 0;
+    int self = (int)getpid(), n = 0;
+    int mib[3] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL };
+    size_t sz = 0;
+    if (sysctl(mib, 3, NULL, &sz, NULL, 0) != 0 || sz == 0) return 0;
+    sz += 16 * sizeof(struct kinfo_proc);          /* processes born since the sizing call */
+    struct kinfo_proc* kp = malloc(sz);
+    if (!kp) return 0;
+    if (sysctl(mib, 3, kp, &sz, NULL, 0) != 0){ free(kp); return 0; }
+    int np = (int)(sz / sizeof(struct kinfo_proc));
+    for (int i = 0; i < np && n < cap; i++){
+        int pid = (int)kp[i].kp_proc.p_pid;
+        if (pid <= 0 || pid == self) continue;
+        int nf = proc_pidinfo((pid_t)pid, PROC_PIDLISTFDS, 0, 0, 0);
+        if (nf <= 0 || nf % (int)sizeof(struct proc_fdinfo) != 0) continue;
+        struct proc_fdinfo* fds = malloc((size_t)nf);
+        if (!fds) continue;
+        if (proc_pidinfo((pid_t)pid, PROC_PIDLISTFDS, 0, fds, (size_t)nf) != nf){ free(fds); continue; }
+        int hit = 0;
+        for (int k = 0; k < nf / (int)sizeof(struct proc_fdinfo) && !hit; k++){
+            if (fds[k].proc_fdtype != PROX_FDTYPE_VNODE) continue;
+            struct vnode_fdinfowithpath vi;
+            if (proc_pidfdinfo((pid_t)pid, fds[k].proc_fd, PROC_PIDFDVNODEPATHINFO, &vi, sizeof vi) != (int)sizeof vi) continue;
+            if (vi.pvip.vip_vi.vi_stat.vst_dev == ls.st_dev && vi.pvip.vip_vi.vi_stat.vst_ino == ls.st_ino) hit = 1;
+        }
+        free(fds);
+        if (!hit) continue;
+        out[n].pid = out[n].tid = pid;
+        out[n].start = darwin_pid_start(pid);
+        proc_comm(pid, out[n].comm, sizeof out[n].comm);
+        n++;
+    }
+    free(kp);
+    return n;
+}
+#else
 static void proc_comm(int pid, char* out, size_t cap){
     char p[64]; snprintf(p, sizeof p, "/proc/%d/comm", pid);
     int fd = open(p, O_RDONLY); ssize_t n = fd >= 0 ? read(fd, out, cap - 1) : -1;
@@ -2646,6 +2751,7 @@ static int lock_holders_scan(int lockfd, int match_ofd, lock_holder_t* out, int 
     closedir(pd);
     return n;
 }
+#endif   /* __APPLE__ */
 static void lock_holders_fmt(const lock_holder_t* h, int n, char* buf, size_t cap){
     size_t o = 0; buf[0] = 0;
     for (int i = 0; i < n && i < LOCK_HOLDERS_MAX && o + 48 < cap; i++)
@@ -2774,12 +2880,18 @@ static void stopping_marker_write(void){
  * a SIGTERM to a serve child is deferred past any mempool critical section
  * by mp_lock), wait for the lock, then leave. */
 static int is_my_child(int pid){            /* a tracked pid may have been reused since */
+#ifdef __APPLE__
+    struct proc_bsdinfo b;
+    if (proc_pidinfo((pid_t)pid, PROC_PIDTBSDINFO, 0, &b, sizeof b) != (int)sizeof b) return 0;
+    return (int)b.pbi_ppid == (int)getpid();
+#else
     char p[64], b[512]; snprintf(p, sizeof p, "/proc/%d/stat", pid);
     int fd = open(p, O_RDONLY); if (fd < 0) return 0;
     ssize_t n = read(fd, b, sizeof b - 1); close(fd); if (n <= 0) return 0;
     b[n] = 0; char* rp = strrchr(b, ')'); int ppid = -1;   /* comm may contain spaces: parse after the last ')' */
     if (!rp || sscanf(rp + 1, " %*c %d", &ppid) != 1) return 0;
     return ppid == (int)getpid();
+#endif
 }
 static void parent_stop_and_wait(int max_s){
     for (int i = 0; i < upl_n; i++) if (upl_pid[i] > 0 && is_my_child(upl_pid[i])) kill(upl_pid[i], SIGTERM);
@@ -3520,7 +3632,14 @@ static void on_tsp_run(long to, void* ctx){ (void)ctx; if (!(ixw_on() && ixw_pus
  * this executable (bmc_build_tx_index, bmc_build_txospender_index,
  * bmc_build_addr_hist, and bmc_merge_index_runs to merge their runs). */
 static void dl_index_trail_configure(const char* dir){
-    char exe[512]; ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    char exe[512];
+#ifdef __APPLE__
+    /* /proc/self/exe does not exist on Darwin (osx port) */
+    uint32_t xs = (uint32_t)sizeof exe;
+    ssize_t n = _NSGetExecutablePath(exe, &xs) == 0 ? (ssize_t)strlen(exe) : -1;
+#else
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+#endif
     if (n > 0){ exe[n] = 0; char* sl = strrchr(exe, '/'); if (sl) *sl = 0; }
     char bb[600], mm[600];
     snprintf(mm, sizeof mm, "%s/bmc_merge_index_runs", n > 0 ? exe : ".");
@@ -3940,6 +4059,12 @@ static void pass_fail_bookkeeping(int i, long ok, int fail_code, double sync_s){
         g_sync_fail_streak[i] = 0;
         mux_out_nextretry[i] = 0;   /* re-dial on the next rotation, not after the dead-slot backoff */
     }
+}
+/* the heartbeat's sync_failing: CONNECTED legs with a failing streak */
+static int legs_sync_failing(void){
+    int failing = 0;
+    for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && g_sync_fail_streak[k]) failing++;
+    return failing;
 }
 static long do_outbound_sync(int i){
     /* STAGE B: a REAL multi-hash locator built fresh from our stored chain on
@@ -4513,6 +4638,65 @@ static int mux_refuse_log_due(int i){
     g_mux_refuse_logged[i] = now; return 1;
 }
 
+/* Is peers[p] free for slot i to dial? Not on an anonymity net (the helper
+ * dials those), not under dial-memory backoff unless it is a manual peer,
+ * and not a host another live leg already holds. */
+static int mux_candidate_free(int i, const char* host){
+    char me[128]; ctl_ip_only(host, me, sizeof me);
+    if(leg_is_anon_net(leg_net_of(host))) return 0;
+    if(g_dialmem && !node_config_is_manual(me) && !dialmem_allowed(g_dialmem, host, dialmem_now())) return 0;
+    for(int k = 0; k < mux_n_out; k++){
+        if(k == i || mux_out_fd[k] < 0) continue;
+        char other[128]; ctl_ip_only(mux_out_host[k], other, sizeof other);
+        if(me[0] && !strcmp(me, other)) return 0;
+    }
+    return 1;
+}
+/* 2026-10-10: the redial pool is refreshed from the book when it runs dry.
+ * Every pool a slot redials from was sampled ONCE, when the worker started
+ * -- 64 addresses of the book's 3,401 dialable on mainnet. As they went into
+ * dial backoff or were held by other legs, slots found no free candidate
+ * ("no dial candidate is free", 15,517 lines) and the node ran on 6-8 of
+ * its 10-11 outbound legs for hours. Core picks every outbound from its
+ * whole table. So when the caller's pool has nothing free, a second pool,
+ * sampled fresh from the book, is tried with the same gates. It is re-drawn
+ * at most every MUX_RESAMPLE_MS, and never under connect= (those are the
+ * only peers). The callers' pools are left alone: some are connect= lists
+ * and anchors, and mux_out_peer[] indexes them. */
+#ifndef MUX_RESAMPLE_MS
+#define MUX_RESAMPLE_MS (5 * 60 * 1000LL)
+#endif
+#define DL_POOL_SLOT 80   /* a pool entry, "host:port": why 80, with dl_pool_from_book below */
+static char g_mux_fresh[64][DL_POOL_SLOT]; static int g_mux_fresh_n = 0, g_mux_fresh_cur = 0;
+static long long g_mux_fresh_at = 0;   /* when it was drawn (0 = never) */
+long g_mux_resamples = 0;              /* test seam: draws taken */
+static int dl_pool_from_book(void* ab, char out[][DL_POOL_SLOT], int nitems);
+static const char* mux_fresh_pick(int i){
+    if(g_cfg.connect_only) return NULL;
+    long long now = dh_now_ms();
+    for(int pass = 0; pass < 2; pass++){
+        for(int t = 0; t < g_mux_fresh_n; t++){
+            int q = (g_mux_fresh_cur + t) % g_mux_fresh_n;
+            if(mux_candidate_free(i, g_mux_fresh[q])){ g_mux_fresh_cur = (q + 1) % g_mux_fresh_n; return g_mux_fresh[q]; }
+        }
+        if(pass || (g_mux_fresh_at && now - g_mux_fresh_at < MUX_RESAMPLE_MS) || !addr_book()) return NULL;
+        g_mux_fresh_n = dl_pool_from_book(NULL, g_mux_fresh, 64); g_mux_fresh_cur = 0;
+        g_mux_fresh_at = now; g_mux_resamples++;
+        fprintf(stderr, "[mux] the dial pool has no free candidate: %d address(es) sampled fresh from the book\n", g_mux_fresh_n);
+    }
+    return NULL;
+}
+/* The host slot i dials next: the caller's pool, rotating from the slot's
+ * pointer, else the fresh pool. NULL when neither has a free candidate. */
+static const char* mux_pick_host(int i, const char* peers[], int pool_len){
+    int p = (mux_out_peer[i]+1) % (pool_len>0?pool_len:1);
+    for(int tries = 0; tries < pool_len; tries++){
+        if(mux_candidate_free(i, peers[p])){ mux_out_peer[i] = p; return peers[p]; }
+        p = (p + 1) % (pool_len > 0 ? pool_len : 1);
+    }
+    mux_out_peer[i] = p;
+    return mux_fresh_pick(i);
+}
 static void mux_next_peer(int i, const char* peers[], int pool_len, int out_port){
     /* 2026-09-17: this used to drop a LIVE leg silently -- the slot changed
      * hands and the log said nothing, so the departure had no owner. Every
@@ -4527,43 +4711,26 @@ static void mux_next_peer(int i, const char* peers[], int pool_len, int out_port
      * gates every reconnect -- a toggle that only dropped the current legs
      * would be undone by the next rotation. */
     if(g_node_status && !g_node_status->net_active) return;
-    /* rotate to the next seed in the pool (wrap); avoids hammering the same dead host */
-    int p = (mux_out_peer[i]+1) % (pool_len>0?pool_len:1);
-    int free_pick = 0;                                     /* a candidate passed every gate */
-    /* ...and never onto a host another live leg already holds: each leg
-     * rotates its own pointer, so two legs could land on one peer (deploy g,
-     * 2026-09-01: legs 1 and 2 both on 108.245.166.132). Compared by HOST,
-     * so a book carrying one peer under two ports still yields one leg. */
-    { char me[128];
-      for(int tries = 0; tries < pool_len; tries++){
-          ctl_ip_only(peers[p], me, sizeof me);
-          int held = leg_is_anon_net(leg_net_of(peers[p]));   /* anonymity dials belong to the helper, never inline */
-          /* 2026-09-09: under backoff. 2026-09-24: a manual peer is exempt;
-           * the retry floor below bounds it instead. */
-          if(!held && g_dialmem && !node_config_is_manual(me) &&
-             !dialmem_allowed(g_dialmem, peers[p], dialmem_now())) held = 1;
-          for(int k = 0; k < mux_n_out && !held; k++){
-              if(k == i || mux_out_fd[k] < 0) continue;
-              char other[128]; ctl_ip_only(mux_out_host[k], other, sizeof other);
-              if(me[0] && !strcmp(me, other)) held = 1;
-          }
-          if(!held){ free_pick = 1; break; }
-          p = (p + 1) % (pool_len > 0 ? pool_len : 1);
-      } }
-    mux_out_peer[i] = p;
-    if(!free_pick){
+    /* rotate to the next seed in the pool (wrap); avoids hammering the same
+     * dead host -- and never onto a host another live leg already holds:
+     * each leg rotates its own pointer, so two legs could land on one peer
+     * (deploy g, 2026-09-01: legs 1 and 2 both on 108.245.166.132). Compared
+     * by HOST, so a book carrying one peer under two ports still yields one
+     * leg. The gates: mux_candidate_free. */
+    const char* host = mux_pick_host(i, peers, pool_len);
+    if(!host){
         if(mux_refuse_log_due(i)) fprintf(stderr,"[mux:%d] no dial candidate is free (backoff / already held / anonymity net) -- the leg stays down\n", i);
         return;
     }
     /* a banned peer is not dialed. Checked HERE for the same reason: this is
      * the only path to a new outbound leg. */
-    { char ip[128]; ctl_ip_only(peers[p], ip, sizeof ip);
+    { char ip[128]; ctl_ip_only(host, ip, sizeof ip);
       if(ctl_is_banned(ip)){
-          fprintf(stderr,"[mux:%d] %s is banned -- not dialing\n", i, peers[p]);
+          fprintf(stderr,"[mux:%d] %s is banned -- not dialing\n", i, host);
           return;
       } }
     /* the manual-peer retry floor: at most one dial per slot per floor */
-    { char ip[128]; ctl_ip_only(peers[p], ip, sizeof ip);
+    { char ip[128]; ctl_ip_only(host, ip, sizeof ip);
       int kind = node_config_manual_kind(ip);
       if(kind){
           long long now = dh_now_ms(), floor_ms = kind == 2 ? CONNECT_RETRY_FLOOR_MS : ADDNODE_RETRY_FLOOR_MS;
@@ -4580,7 +4747,7 @@ static void mux_next_peer(int i, const char* peers[], int pool_len, int out_port
      * fills THIS slot. One helper per slot; the caller's backoff stamp keeps
      * the slot from asking again before the helper has answered. */
     if(dh_inflight_for(i)) return;
-    if(!dh_start_slot(peers[p], out_port, i)) fprintf(stderr,"[mux:%d] no dial helper free for %s -- the leg stays down until the next retry\n", i, peers[p]);
+    if(!dh_start_slot(host, out_port, i)) fprintf(stderr,"[mux:%d] no dial helper free for %s -- the leg stays down until the next retry\n", i, host);
 }
 
 /* ---- per-leg sync wall-clock budget (accept-starve fix, t_7ea57703) ----
@@ -4776,7 +4943,7 @@ static long dl_bootstrap(void* ab, const char* peers[], int pool_len){
  * since the port had to survive the trip from the book, and an onion name is
  * 62 chars -- "<onion>:65535" is 68, so the old 64 truncated every Tor peer
  * to "<onion>:", undialable and still burning a slot. */
-#define DL_POOL_SLOT 80
+/* DL_POOL_SLOT is 80 (defined with the dial pool, above) */
 /* The pool's entries are "host:port" ("[v6]:port" for IPv6/CJDNS). Every
  * consumer that used to inet_pton() a bare host MUST split first -- three of
  * them did not, and the node came up with zero outbound legs and skipped its
@@ -5383,16 +5550,16 @@ static int dlc_retry_push(volatile long* ctl, long lo){
     for(;;){
         long h = ctl[DLC_CTL_RETRY_HEAD], t = ctl[DLC_CTL_RETRY_TAIL];
         if(h - t >= DLC_RETRY_MAX) return 0;                                   /* full: the next pass will find the hole */
-        if(__sync_bool_compare_and_swap(&ctl[DLC_CTL_RETRY_HEAD], h, h + 1)){ ctl[DLC_CTL_RING + (h % DLC_RETRY_MAX)] = lo; return 1; }
+        if(__sync_bool_compare_and_swap(&ctl[DLC_CTL_RETRY_HEAD], h, h + 1)){ __atomic_store_n(&ctl[DLC_CTL_RING + (h % DLC_RETRY_MAX)], lo, __ATOMIC_RELEASE); return 1; }   /* ARM64: release/acquire on the slot (2026-09-25) */
     }
 }
 static long dlc_retry_pop(volatile long* ctl){
     for(;;){
         long t = ctl[DLC_CTL_RETRY_TAIL], h = ctl[DLC_CTL_RETRY_HEAD];
         if(t >= h) return -1;
-        long lo = ctl[DLC_CTL_RING + (t % DLC_RETRY_MAX)];
+        long lo = __atomic_load_n(&ctl[DLC_CTL_RING + (t % DLC_RETRY_MAX)], __ATOMIC_ACQUIRE);
         if(lo < 0) continue;                                                    /* the push reserved the slot but has not written it yet */
-        if(__sync_bool_compare_and_swap(&ctl[DLC_CTL_RETRY_TAIL], t, t + 1)){ ctl[DLC_CTL_RING + (t % DLC_RETRY_MAX)] = -1; return lo; }
+        if(__sync_bool_compare_and_swap(&ctl[DLC_CTL_RETRY_TAIL], t, t + 1)){ __atomic_store_n(&ctl[DLC_CTL_RING + (t % DLC_RETRY_MAX)], -1L, __ATOMIC_RELEASE); return lo; }
     }
 }
 
@@ -7893,10 +8060,27 @@ static void dl_publish_peer_table(void* store_buf, int with_tip){
                  * five peers that had no socket in any state (2026-09-16).
                  * getsockopt on a closed or non-socket fd fails; that is the
                  * signal to retire the slot rather than publish a ghost. */
+#if defined(__APPLE__) && defined(TCP_CONNECTION_INFO)
+                /* bmc_osx 2026-09-24: Darwin has no Linux TCP_INFO -- the compat
+                 * header maps it to an unassigned option so getsockopt FAILS --
+                 * and since this failure became the liveness test (run 26) every
+                 * live leg was retired on every sweep: getpeerinfo,
+                 * getconnectioncount and getnetworkinfo all answered 0 on the
+                 * m5ultra while the worker held 11 legs and followed the tip.
+                 * TCP_CONNECTION_INFO is Darwin's equivalent (dh_tcp_state uses it
+                 * too): the liveness test and the byte meters. */
+                struct tcp_connection_info ci; socklen_t cil = sizeof ci;
+                (void)ti; (void)tl;
+                if(getsockopt(mux_out_fd[i], IPPROTO_TCP, TCP_CONNECTION_INFO, &ci, &cil) != 0){
+                    g_node_status->peers[i].used = 0;
+                    continue;
+                }
+#else
                 if(getsockopt(mux_out_fd[i], IPPROTO_TCP, TCP_INFO, &ti, &tl) != 0){
                     g_node_status->peers[i].used = 0;
                     continue;
                 }
+#endif
                 /* ...and the descriptor must still be THIS peer's socket. A
                  * closed leg leaves its number behind, and the kernel hands
                  * that number to the next socket opened -- a download worker's
@@ -7929,6 +8113,14 @@ static void dl_publish_peer_table(void* store_buf, int with_tip){
                       leg_note_best_known(i, bh); }
                 {
                     rpc_peer_t* pr = &g_node_status->peers[i];
+#if defined(__APPLE__) && defined(TCP_CONNECTION_INFO)
+                    /* the connection's payload bytes; Darwin keeps no
+                     * last-data timestamps here, so lastsend/lastrecv keep
+                     * what the fill set */
+                    pr->bytes_sent = (long long)ci.tcpi_txbytes;
+                    pr->bytes_recv = (long long)ci.tcpi_rxbytes;
+                    (void)nows;
+#else
                     /* byte fields only if the kernel returned a struct large
                      * enough to include them */
                     if(tl >= (socklen_t)((char*)(&ti.bytes_received + 1) - (char*)&ti)){
@@ -7945,6 +8137,7 @@ static void dl_publish_peer_table(void* store_buf, int with_tip){
                         pr->last_send = nows - (long long)(ti.last_data_sent / 1000);
                         pr->last_recv = nows - (long long)(ti.last_data_recv / 1000);
                     }
+#endif
                 }
             } }
 }
@@ -9842,9 +10035,39 @@ static void dl_new_block_choke(void){
     g_dl_last_seen_tip = now_tip;
 }
 
+#ifdef __APPLE__
+/* bmc_osx: the download worker was dying on SIGSYS/SIGSEGV during regtest
+ * submitblock with no way to see where -- lldb attach AND batch launch are
+ * permission-gated on this macOS (26.6).  Dump a native backtrace + siginfo
+ * to stderr from the handler; the parent's "died on signal" line then has a
+ * stack behind it.  Not async-signal-safe by the book (snprintf/backtrace),
+ * but on a fatal path beyond saving that is the right trade. */
+#include <execinfo.h>
+static void dlc_crash_handler(int sig, siginfo_t* si, void* uctx){
+    (void)uctx;
+    char msg[160];
+    int n = snprintf(msg, sizeof msg,
+        "\n[dlc] FATAL-CRASH: signal %d si_code=%d si_addr=%p errno=%d\n",
+        sig, si ? si->si_code : 0, si ? si->si_addr : NULL,
+        si ? si->si_errno : 0);
+    write(2, msg, (size_t)n);
+    void* bt[64];
+    int nbt = backtrace(bt, 64);
+    backtrace_symbols_fd(bt, nbt, 2);
+    _exit(128 + sig);
+}
+#endif
+
 static void serve_download_worker(const char* dir, const char* peers[], int pool_len, int out_port){
     signal(SIGPIPE, SIG_IGN);
     signal(SIGCHLD, SIG_IGN);
+#ifdef __APPLE__
+    { struct sigaction sa; memset(&sa, 0, sizeof sa);
+      sa.sa_sigaction = dlc_crash_handler; sa.sa_flags = SA_SIGINFO;
+      sigaction(SIGSEGV, &sa, NULL); sigaction(SIGBUS, &sa, NULL);
+      sigaction(SIGILL,  &sa, NULL); sigaction(SIGSYS, &sa, NULL);
+      sigaction(SIGFPE,  &sa, NULL); sigaction(SIGABRT, &sa, NULL); }
+#endif
     signal(SIGTERM, handle_shutdown_signal);
     signal(SIGINT, handle_shutdown_signal);
     /* Let the (multi-hour, during bulk replay) utxo_live_catchup loop see the
@@ -10142,7 +10365,14 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             /* 2026-09-08: the history base repairs itself. The builder lives
              * beside this executable; the supervisor ticks at the heartbeat. */
             { extern void csi_hist_repair_configure(const char*, const char*, const char*, int, int);
-              char exe[512], builder[600]; ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+              char exe[512], builder[600];
+#ifdef __APPLE__
+              /* /proc/self/exe does not exist on Darwin (osx port) */
+              uint32_t xs = (uint32_t)sizeof exe;
+              ssize_t n = _NSGetExecutablePath(exe, &xs) == 0 ? (ssize_t)strlen(exe) : -1;
+#else
+              ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+#endif
               if (n > 0){ exe[n] = 0; char* sl = strrchr(exe, '/'); if (sl) *sl = 0; snprintf(builder, sizeof builder, "%s/bmc_build_coinstats_hist", exe); }
               else snprintf(builder, sizeof builder, "bmc_build_coinstats_hist");
               csi_hist_repair_configure(builder, dir, g_chainp->name, g_cfg.coinstatshist_workers, g_cfg.coinstatshist_repair); }
@@ -10495,6 +10725,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
          * Core's error rather than reporting a success that changed nothing. */
         if(g_node_status && g_node_status->ctl_seq != ctl_last_seq){
             ctl_last_seq = g_node_status->ctl_seq;
+            __atomic_thread_fence(__ATOMIC_ACQUIRE);   /* ARM64 (2026-09-25): the command's fields after its seq -- the RPC side fenced before publishing; a stale tx_submit_private/_test or ctl_op/arg would act on the previous request */
             int op = g_node_status->ctl_op;
             long long num = g_node_status->ctl_num;
             char arg[128];
@@ -10676,6 +10907,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 }
                 if(--budget < 0 || txsub_now_ms() - t_enter > TXSUB_ROTATION_MS) break;   /* back to the main loop; next rotation continues */
                 txsub_last_seq = g_node_status->tx_submit_seq;
+                __atomic_thread_fence(__ATOMIC_ACQUIRE);   /* ARM64 (2026-09-25): the command's fields after its seq -- the RPC side fenced before publishing; a stale tx_submit_private/_test or ctl_op/arg would act on the previous request */
             int result; char reason[128]; reason[0]=0;
             { extern void tx_accept_clear_detail(void); tx_accept_clear_detail(); }   /* no stale detail on a path that never validates */
             if(g_node_status->tx_submit_pkg_n > 0){
@@ -10781,6 +11013,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
          * word for it) until the UTXO dry-run slice lands. */
         if(g_node_status && g_node_status->blk_submit_seq != blksub_last_seq){
             blksub_last_seq = g_node_status->blk_submit_seq;
+            __atomic_thread_fence(__ATOMIC_ACQUIRE);   /* ARM64 (2026-09-25): the command's fields after its seq -- the RPC side fenced before publishing; a stale tx_submit_private/_test or ctl_op/arg would act on the previous request */
             extern long blk_submit_evaluate_ex(const unsigned char*, unsigned long,
                                                const unsigned char*, long, int, char*, unsigned long);
             char reason[64]; reason[0]=0;
@@ -11103,6 +11336,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         memset(g_pick_tried, 0, sizeof g_pick_tried);    /* each announced leg is offered once per rotation */
         for(int n_=0;n_<mux_n_out;n_++){
             int i = (leg_start + n_) % mux_n_out;
+            txoq_service_mode(0);   /* gettxout between legs, not once a rotation (see txoq_service_mode) */
             /* 2026-09-10: a leg whose peer announced a block we do not have
              * goes first (its pass fetches it); this slot is revisited */
             int announced_now = 0;
@@ -11528,7 +11762,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         if(now_ms >= next_heartbeat_ms){
             int live_peers=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) live_peers++;
             char upbuf[UPTIME_BUF];
-            int failing=0; for(int k=0;k<mux_n_out;k++) if(g_sync_fail_streak[k]) failing++;
+            int failing=legs_sync_failing();
             char failbuf[32]; failbuf[0]=0;
             if(failing) snprintf(failbuf, sizeof failbuf, " sync_failing=%d", failing);
             char storedbuf[40]; storedbuf[0]=0;
@@ -11602,7 +11836,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         }
         if(!did){
             if(g_utxo_live_on){ extern void utxo_live_bg_poll(void); utxo_live_bg_poll(); }   /* B3 at the tip (2026-10-07): adopt a finished flush writer / compaction within a rotation */
-            usleep(200000);           /* all idle: rest before next rotation */
+            txoq_idle_rest(200);      /* all idle: rest before next rotation -- awake for gettxout */
         }
         /* background leg-fill: gradually acquire live legs toward MUX_MAX_OUT
          * from the discovered candidate pool. Boot rarely lands all 8 at once
@@ -12034,7 +12268,7 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
       extern long mempool_time_of(const unsigned char*);
       extern long mpool_policy_entry(void*, const unsigned char*,
                                      unsigned long long*, unsigned long long*);
-      extern long mpool_policy_entry_info_all(void*, struct mp_entry_info*, unsigned char (*)[32], unsigned);
+      extern long mpool_policy_graph_all(void*, struct mp_graph*);
       extern long mpool_policy_totals(void*, unsigned long long*, unsigned long long*);
       extern long mpool_policy_entry_pkg_many(void*, const unsigned char (*)[32], unsigned, struct mp_entry_info*, unsigned char*);
 extern long mpool_policy_entry_info(void*, const unsigned char*, struct mp_entry_info*);
@@ -12051,7 +12285,7 @@ extern long mpool_policy_entry_info(void*, const unsigned char*, struct mp_entry
           .time_of = mempool_time_of,
           .pol_entry = mpool_policy_entry,
           .pol_entry_info = mpool_policy_entry_info,
-          .pol_entry_info_all = mpool_policy_entry_info_all,
+          .pol_graph_all = mpool_policy_graph_all,
           .pol_totals = mpool_policy_totals,
           .pol_pkg_many = mpool_policy_entry_pkg_many,
           .estimate = mpool_policy_estimate,
@@ -14056,6 +14290,9 @@ int main(int argc, char** argv){
             { extern void mp_fork_child_reset(void) __attribute__((weak));
               if (mp_fork_child_reset) mp_fork_child_reset(); }
             if(g_txoq_parent >= 0){ close(g_txoq_parent); g_txoq_parent = -1; }
+            /* 2026-09-26: the relay poll's getdata wait wakes on a gettxout
+             * query, so the rotation answers it at the next leg boundary */
+            { extern int txrelay_wake_fd, txrelay_wake_pid; txrelay_wake_fd = g_txoq_worker; txrelay_wake_pid = (int)getpid(); }
             /* TXOQ-1 (2026-09-05 benchmark): register the between-block
              * service hook before the worker's first utxo_live_catchup, so a
              * long catch-up pass answers gettxout queries at its block

@@ -11,6 +11,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include "bmc_thread.h"   /* BMC_TLS_GROW */
 
 /* ---------------- the request arena (2026-10-06, plan A5) ----------------
  *
@@ -81,6 +82,22 @@ void rj_arena_end(void){
     free(a); t_arena = NULL;
 }
 int  rj_arena_active(void){ return t_arena != NULL; }
+/* where the arena is now: rj_freeze rewinds to it */
+rj_mark rj_arena_mark(void){
+    rj_mark m = { 0, 0, 0 };
+    if (t_arena){ m.chunk = t_arena->cur; m.used = t_arena->cur ? t_arena->cur->used : 0; m.total = t_arena->total; }
+    return m;
+}
+/* back to m: chunks opened since are freed, the marked chunk is cut back */
+static void arena_rewind(rj_mark m){
+    rj_arena* a = t_arena;
+    rj_chunk* keep = (rj_chunk*)m.chunk;
+    rj_chunk* c = keep ? keep->next : a->head;
+    while (c){ rj_chunk* n = c->next; free(c); a->chunks--; c = n; }
+    if (keep){ keep->next = NULL; keep->used = m.used; }
+    else a->head = NULL;
+    a->cur = keep; a->total = m.total;
+}
 long rj_arena_bytes(void){ return t_arena ? (long)t_arena->total : -1; }
 int  rj_arena_owns(const void* p){ return arena_owns(p); }
 
@@ -201,6 +218,9 @@ rj_val* rj_clone(const rj_val* v){
         case RJ_BOOL: c = rj_bool(v->str && v->str[0] == '1'); break;
         case RJ_NUM:  c = rj_num(v->str ? v->str : "0"); break;
         case RJ_STR:  c = rj_str(v->str ? v->str : ""); break;
+        case RJ_RAW:
+            c = rj_null(); if (!c) return NULL;
+            c->typ = RJ_RAW; c->str = xstrdup(v->str ? v->str : "null"); break;
         case RJ_ARR:
             c = rj_arr();
             if (!c) return NULL;
@@ -224,6 +244,7 @@ rj_val* rj_clone(const rj_val* v){
 }
 
 rj_val* rj_obj_get(const rj_val* o, const char* key) {
+    if (o->typ == RJ_RAW) rj_expand((rj_val*)o);   /* logically const: same value, unfolded */
     for (size_t i = 0; i < o->nmembers; i++)
         if (!strcmp(o->members[i].key, key)) return o->members[i].val;
     return NULL;
@@ -249,6 +270,33 @@ void rj_obj_splice(rj_val* dst, rj_val* src) {
     rj_free(src);   /* the keys and the member array; the values are NULL now */
 }
 
+/* ---------------- output buffer ---------------- */
+/* Three modes. GROW (sink NULL, count_only 0): append to buf, doubling it.
+ * COUNT (count_only 1): add up the length, write nothing -- rj_measure.
+ * SINK (sink set): hand every piece to the sink as it is made, keep nothing
+ * -- rj_write_to; once the sink fails, the rest is dropped. (2026-10-07: the
+ * server wrote a reply into one buffer and then wrote that buffer out; a
+ * 39 MB verbose getrawmempool doubled its way to 64 MB first.) */
+typedef struct {
+    char* buf; size_t len; size_t cap;
+    int count_only;
+    int (*sink)(void* ctx, const char* p, size_t n); void* ctx; int failed;
+} sbuf;
+static void sb_push(sbuf* s, const char* txt, size_t n) {
+    if (s->count_only) { s->len += n; return; }
+    if (s->sink) {
+        if (!s->failed && n && s->sink(s->ctx, txt, n) != 0) s->failed = 1;
+        s->len += n;
+        return;
+    }
+    if (s->len + n + 1 >= s->cap) {
+        while (s->cap < s->len + n + 1) s->cap = s->cap ? s->cap * 2 : 128;
+        s->buf = realloc(s->buf, s->cap); if (!s->buf) abort();
+    }
+    memcpy(s->buf + s->len, txt, n); s->len += n;
+    s->buf[s->len] = 0;
+}
+
 /* ---------------- escapeStringBN (Core-exact) ---------------- */
 /* the bytes the escaper rewrites: the seven named escapes, every control
  * byte and 0x7f. Everything else is copied through in spans (2026-10-06:
@@ -258,14 +306,12 @@ static const unsigned char rj_esc_needed[256] = {
     [0]=1,[1]=1,[2]=1,[3]=1,[4]=1,[5]=1,[6]=1,[7]=1,[8]=1,[9]=1,[10]=1,[11]=1,[12]=1,[13]=1,[14]=1,[15]=1,
     [16]=1,[17]=1,[18]=1,[19]=1,[20]=1,[21]=1,[22]=1,[23]=1,[24]=1,[25]=1,[26]=1,[27]=1,[28]=1,[29]=1,[30]=1,[31]=1,
     ['"']=1, ['\\']=1, [0x7f]=1 };
-static void rj_append_escaped(char** out, size_t* cap, size_t* len, const char* in) {
+static void rj_append_escaped(sbuf* s, const char* in) {
     for (const unsigned char* p = (const unsigned char*)in; *p; p++) {
         if (!rj_esc_needed[*p]) {
             const unsigned char* q = p + 1;
             while (*q && !rj_esc_needed[*q]) q++;
-            size_t n = (size_t)(q - p);
-            if (*len + n + 1 >= *cap) { while (*len + n + 1 >= *cap) *cap = (*cap ? *cap * 2 : 64); *out = realloc(*out, *cap); if (!*out) abort(); }
-            memcpy(*out + *len, p, n); *len += n;
+            sb_push(s, (const char*)p, (size_t)(q - p));
             p = q - 1;   /* the loop's p++ lands on q */
             continue;
         }
@@ -289,32 +335,16 @@ static void rj_append_escaped(char** out, size_t* cap, size_t* len, const char* 
                     /* \uXXXX with lowercase hex, 4 digits */
                     char buf[8];
                     snprintf(buf, sizeof buf, "\\u%04x", (unsigned)*p);
-                    size_t bl = strlen(buf);
-                    if (*len + bl + 1 >= *cap) { *cap = (*cap ? *cap * 2 : 64); *out = realloc(*out, *cap); if (!*out) abort(); }
-                    memcpy(*out + *len, buf, bl); *len += bl;
+                    sb_push(s, buf, strlen(buf));
                     break;
                 }
-                if (*len + 2 >= *cap) { *cap = (*cap ? *cap * 2 : 64); *out = realloc(*out, *cap); if (!*out) abort(); }
-                (*out)[(*len)++] = c;
+                sb_push(s, &c, 1);
         }
-        if (esc) {
-            size_t el = strlen(esc);
-            if (*len + el + 1 >= *cap) { *cap = (*cap ? *cap * 2 : 64); *out = realloc(*out, *cap); if (!*out) abort(); }
-            memcpy(*out + *len, esc, el); *len += el;
-        }
+        if (esc) sb_push(s, esc, strlen(esc));
     }
 }
 
 /* ---------------- serializer ---------------- */
-typedef struct { char* buf; size_t len; size_t cap; } sbuf;
-static void sb_push(sbuf* s, const char* txt, size_t n) {
-    if (s->len + n + 1 >= s->cap) {
-        while (s->cap < s->len + n + 1) s->cap = s->cap ? s->cap * 2 : 128;
-        s->buf = realloc(s->buf, s->cap); if (!s->buf) abort();
-    }
-    memcpy(s->buf + s->len, txt, n); s->len += n;
-    s->buf[s->len] = 0;
-}
 static void sb_pushs(sbuf* s, const char* txt) { sb_push(s, txt, strlen(txt)); }
 static void sb_repeat(sbuf* s, char c, size_t k) {
     char block[128]; memset(block, c, sizeof block);
@@ -333,7 +363,7 @@ static void rj_w(sbuf* s, const rj_val* v, int pretty, unsigned indent) {
                         if (i) sb_pushs(s, ",\n");
                         sb_repeat(s, ' ', 2 * (indent + 1));
                         sb_pushs(s, "\"");
-                        rj_append_escaped(&s->buf, &s->cap, &s->len, v->members[i].key);
+                        rj_append_escaped(s, v->members[i].key);
                         sb_pushs(s, "\": ");
                         rj_w(s, v->members[i].val, pretty, indent + 1);
                     }
@@ -346,7 +376,7 @@ static void rj_w(sbuf* s, const rj_val* v, int pretty, unsigned indent) {
                 for (size_t i = 0; i < v->nmembers; i++) {
                     if (i) sb_pushs(s, ",");
                     sb_pushs(s, "\"");
-                    rj_append_escaped(&s->buf, &s->cap, &s->len, v->members[i].key);
+                    rj_append_escaped(s, v->members[i].key);
                     sb_pushs(s, "\":");
                     rj_w(s, v->members[i].val, pretty, indent);
                 }
@@ -380,11 +410,20 @@ static void rj_w(sbuf* s, const rj_val* v, int pretty, unsigned indent) {
         }
         case RJ_STR:
             sb_pushs(s, "\"");
-            rj_append_escaped(&s->buf, &s->cap, &s->len, v->str);
+            rj_append_escaped(s, v->str);
             sb_pushs(s, "\"");
             break;
         case RJ_NUM:
             sb_pushs(s, v->str ? v->str : "0");
+            break;
+        case RJ_RAW:
+            if (!pretty) { sb_pushs(s, v->str ? v->str : "null"); break; }
+            {   /* pretty: the text is compact, so render it again (rare --
+                 * the server writes compact) */
+                rj_val* t = v->str ? rj_parse(v->str, strlen(v->str)) : NULL;
+                rj_w(s, t, pretty, indent);
+                rj_free(t);
+            }
             break;
         case RJ_BOOL:
             sb_pushs(s, (v->str && !strcmp(v->str, "1")) ? "true" : "false");
@@ -397,7 +436,7 @@ static void rj_w(sbuf* s, const rj_val* v, int pretty, unsigned indent) {
 }
 
 long rj_write(char* out, long cap, const rj_val* v, int pretty) {
-    sbuf s = {0, 0, 0};
+    sbuf s = {0};
     unsigned indent = 0;
     rj_w(&s, v, pretty, indent);
     if (cap > 0) {
@@ -417,12 +456,27 @@ long rj_write(char* out, long cap, const rj_val* v, int pretty) {
  * a fixed stack buffer + rj_write's returned length is an out-of-bounds read
  * waiting to happen. Returns NULL only on allocation failure. */
 char* rj_write_alloc(const rj_val* v, int pretty, long* len_out) {
-    sbuf s = {0, 0, 0};
+    sbuf s = {0};
     rj_w(&s, v, pretty, 0);
     if (!s.buf) { s.buf = malloc(1); if (s.buf) s.buf[0] = 0; }
     else s.buf[s.len] = 0;                      /* sb_push keeps cap >= len+1 */
     if (len_out) *len_out = (long)s.len;
     return s.buf;
+}
+
+/* the length rj_write_alloc would return, without writing anything */
+long rj_measure(const rj_val* v, int pretty) {
+    sbuf s = { .count_only = 1 };
+    rj_w(&s, v, pretty, 0);
+    return (long)s.len;
+}
+
+/* Serialize to a sink, piece by piece: nothing is kept. 0, or -1 once the
+ * sink has failed (the rest of the value is not handed to it). */
+int rj_write_to(const rj_val* v, int pretty, int (*sink)(void* ctx, const char* p, size_t n), void* ctx) {
+    sbuf s = { .sink = sink, .ctx = ctx };
+    rj_w(&s, v, pretty, 0);
+    return s.failed ? -1 : 0;
 }
 
 void rj_free(rj_val* v) {
@@ -643,6 +697,7 @@ rj_val* rj_parse(const char* s, size_t len) {
 
 const char* rj_type_name(const rj_val* v) {
     if (!v) return "null";
+    if (v->typ == RJ_RAW) return (v->str && v->str[0] == '[') ? "array" : (v->str && v->str[0] == '{') ? "object" : "null";
     switch (v->typ) {
         case RJ_NULL: return "null";  case RJ_BOOL: return "bool";
         case RJ_NUM:  return "number"; case RJ_STR: return "string";
@@ -693,4 +748,32 @@ int rj_typeerr_fail(rj_typeerrs* t, long* ec, const char** em) {
     if (!t->n) return 0;
     snprintf(out, sizeof out, "Wrong type passed:\n{\n%s\n}", t->buf);
     *ec = -3; *em = out; return 1;
+}
+
+/* ---------------- frozen values (2026-10-06) ---------------- */
+/* verbose getrawmempool built ~68,000 entry trees and kept them all until the
+ * reply was written: ~200 MB of arena at a 68k pool for ~39 MB of text. Each
+ * entry is now written as soon as it is built and only its text is kept.
+ * The scratch is freed at thread exit (bmc_thread.h, 2026-10-09). */
+static __thread bmc_tls_grow* t_frz;
+rj_val* rj_freeze(rj_val* v, rj_mark m){
+    if (!v) return NULL;
+    BMC_TLS_GROW(t_frz);
+    sbuf sb = { .buf = t_frz->buf, .cap = t_frz->cap };   /* one scratch buffer per thread, reused */
+    rj_w(&sb, v, 0, 0);
+    t_frz->buf = sb.buf; t_frz->cap = sb.cap;
+    if (t_arena) arena_rewind(m); else rj_free(v);
+    rj_val* r = xmalloc(sizeof *r); memset(r, 0, sizeof *r);
+    r->typ = RJ_RAW;
+    r->str = xstrndup(sb.buf ? sb.buf : "null", sb.buf ? sb.len : 4);
+    return r;
+}
+int rj_expand(rj_val* v){
+    if (!v || v->typ != RJ_RAW) return 0;
+    rj_val* t = v->str ? rj_parse(v->str, strlen(v->str)) : NULL;
+    if (!t) return -1;
+    xfree(v->str);
+    *v = *t;                     /* take the parsed value's fields */
+    xfree(t);                    /* its shell only */
+    return 0;
 }

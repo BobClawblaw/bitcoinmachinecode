@@ -50,7 +50,7 @@ int main(void){
     { char wd[] = "/tmp/bmc_ir_fds_XXXXXX"; char* d = mkdtemp(wd);
       char sp[256], out[256]; snprintf(sp, sizeof sp, "%s/fds_builder.sh", d ? d : "/tmp"); snprintf(out, sizeof out, "%s/fds_repair.out", d ? d : "/tmp");
       FILE* sf = fopen(sp, "w");
-      if (sf){ fputs("#!/bin/sh\nls /proc/$$/fd | tr '\\n' ' ' > \"$1/fds_repair.out\"\nexit 0\n", sf); fclose(sf); }
+      if (sf){ fputs("#!/bin/sh\nif [ -d /proc/$$/fd ]; then ls /proc/$$/fd; else ls /dev/fd; fi | tr '\\n' ' ' > \"$1/fds_repair.out\"\nexit 0\n", sf); fclose(sf); }
       chmod(sp, 0755);
       int mk = open("/dev/null", O_RDONLY); if (mk >= 0 && mk != 77){ dup2(mk, 77); close(mk); }
       ir_spawn_hook = 0;

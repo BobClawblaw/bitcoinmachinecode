@@ -109,6 +109,14 @@ typedef struct {
     uint32_t last_pid;
     long     last_held_ms;
     char     last_site[96];
+    /* 2026-09-30 (x86's first lines): a wait can be a CONVOY of short holds
+     * rather than one long one, and the last release cannot tell them
+     * apart. So: every take counts, and while anyone is waiting each
+     * release keeps the longest hold of the convoy; a waiter's line reports
+     * how many takes went by during its wait and that longest hold. */
+    uint64_t takes;                  /* every take, under the lock */
+    long     conv_max_ms;            /* the longest hold released while someone waited */
+    char     conv_max_site[96];
 } mp_lockpage_t;
 static mp_lockpage_t*   g_mp_page  = 0;
 static pthread_mutex_t* g_mp_mutex = 0;   /* &g_mp_page->lk.mu */
@@ -135,7 +143,8 @@ static int g_mp_robust = 0;               /* MEM-20: PTHREAD_MUTEX_ROBUST armed 
  *
  * Best-effort by design: a platform without robust process-shared mutexes
  * keeps exactly today's behaviour rather than failing mempool_configure and
- * dropping the node to the built-in 2 MiB pool.
+ * dropping the node to the built-in 2 MiB pool. (Darwin is not such a
+ * platform any more: it gets the pid-word lock below.)
  */
 /* ---------------------------------------------------------------- 2026-09-19
  * Nothing on a NORMAL stop may die inside this critical section. EOWNERDEAD
@@ -165,6 +174,88 @@ static int g_mp_robust = 0;               /* MEM-20: PTHREAD_MUTEX_ROBUST armed 
  * is the point: the parent closing its gate must not close the worker's. A
  * child forked while a parent thread was inside inherits a count that no
  * thread of its own will ever decrement; mp_fork_child_reset() clears it. */
+#ifdef __APPLE__
+/* ---------------------------------------------------------------- MEM-20 on Darwin
+ * macOS has no robust process-shared mutexes (no PTHREAD_MUTEX_ROBUST, no
+ * EOWNERDEAD), so the "best-effort" above meant a node that wedged for good
+ * the first time any process died inside this lock (test_mempool_shared's
+ * MEM-20 case hung until its alarm). The shared page holds this instead:
+ *
+ *   word    = the HOLDER'S PID, 0 when free. Taking the lock is one CAS
+ *             0 -> pid, so there is no instant where the lock is held and its
+ *             owner unknown.
+ *   waiters = sleepers in os_sync_wait_on_address (a shared-memory futex),
+ *             so an unlock only issues a wake when someone is waiting.
+ *
+ * A waiter that sleeps 20 ms without a wake asks whether the holder's
+ * process is still alive -- gone, or a zombie not yet reaped -- and if not,
+ * takes the lock by CAS from that pid and reports EOWNERDEAD, exactly what
+ * the Linux kernel hands the next locker. The pool's state is then treated
+ * as mp_lock's comment above says. (A dead holder's pid reused by a new
+ * process inside those 20 ms would keep the lock held; Darwin assigns pids
+ * sequentially, so that needs ~100k process creations in the window.)
+ *
+ * 2026-10-09: a newcomer does not jump the queue. An unlock frees the word
+ * and wakes one sleeper, but the releasing thread's next take is a single
+ * CAS and won the race before the woken waiter was scheduled. On mainnet a
+ * client polling getmempoolentry (a 3-18 ms hold per call) kept the
+ * worker's accepts waiting 1-6 s while 97-216 takes went by
+ * (test_mempool_lock_fair: 2.8-3.7 s behind a 3 ms poller). So a thread
+ * that arrives while others sleep first waits for one take by somebody
+ * else -- the `takes` count moving -- or 1 ms, whichever is first, and only
+ * then tries. It sleeps on `takes`, not on the word, so an unlock's
+ * wake-one still goes to a real waiter. Bounded at 1 ms, it is not a queue
+ * and cannot wedge: a waiter that died counted only costs later newcomers
+ * that millisecond. */
+#include <stdint.h>
+#include <os/os_sync_wait_on_address.h>
+#include <sys/sysctl.h>
+typedef struct { uint32_t word; uint32_t waiters; uint32_t takes; uint32_t deferring; } mp_rlock_t;
+static void mp_rlock_took(mp_rlock_t* l){
+    __atomic_add_fetch(&l->takes, 1, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&l->deferring, __ATOMIC_SEQ_CST))
+        os_sync_wake_by_address_all(&l->takes, sizeof l->takes, OS_SYNC_WAKE_BY_ADDRESS_SHARED);
+}
+#define MP_RL ((mp_rlock_t*)(void*)g_mp_mutex)
+static int mp_pid_gone(pid_t p){
+    if (kill(p, 0) != 0 && errno == ESRCH) return 1;
+    struct kinfo_proc kp; size_t len = sizeof kp; int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, p };
+    return sysctl(mib, 4, &kp, &len, NULL, 0) == 0 && len == sizeof kp && kp.kp_proc.p_stat == SZOMB;
+}
+static int mp_rlock_lock(mp_rlock_t* l){
+    const uint32_t me = (uint32_t)getpid();
+    if (__atomic_load_n(&l->waiters, __ATOMIC_SEQ_CST)){         /* others were here first: let one go */
+        uint32_t t = __atomic_load_n(&l->takes, __ATOMIC_SEQ_CST);
+        __atomic_add_fetch(&l->deferring, 1, __ATOMIC_SEQ_CST);
+        if (__atomic_load_n(&l->waiters, __ATOMIC_SEQ_CST))
+            os_sync_wait_on_address_with_timeout(&l->takes, t, sizeof l->takes, OS_SYNC_WAIT_ON_ADDRESS_SHARED,
+                                                 OS_CLOCK_MACH_ABSOLUTE_TIME, 1000ull * 1000);
+        __atomic_sub_fetch(&l->deferring, 1, __ATOMIC_SEQ_CST);
+    }
+    for (;;){
+        uint32_t cur = 0;
+        if (__atomic_compare_exchange_n(&l->word, &cur, me, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)){ mp_rlock_took(l); return 0; }
+        __atomic_add_fetch(&l->waiters, 1, __ATOMIC_SEQ_CST);
+        cur = __atomic_load_n(&l->word, __ATOMIC_SEQ_CST);        /* after the count: an unlock now wakes us */
+        int rc = 0, timed_out = 0;
+        if (cur != 0){
+            rc = os_sync_wait_on_address_with_timeout(&l->word, cur, sizeof l->word, OS_SYNC_WAIT_ON_ADDRESS_SHARED,
+                                                      OS_CLOCK_MACH_ABSOLUTE_TIME, 20ull * 1000 * 1000);
+            timed_out = rc < 0 && errno == ETIMEDOUT;
+        }
+        __atomic_sub_fetch(&l->waiters, 1, __ATOMIC_SEQ_CST);
+        if (timed_out && cur != me && mp_pid_gone((pid_t)cur)){
+            uint32_t exp = cur;                                       /* one waiter wins the takeover */
+            if (__atomic_compare_exchange_n(&l->word, &exp, me, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)){ mp_rlock_took(l); return EOWNERDEAD; }
+        }
+    }
+}
+static void mp_rlock_unlock(mp_rlock_t* l){
+    __atomic_store_n(&l->word, 0, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&l->waiters, __ATOMIC_SEQ_CST))
+        os_sync_wake_by_address_any(&l->word, sizeof l->word, OS_SYNC_WAKE_BY_ADDRESS_SHARED);
+}
+#endif
 static volatile int g_mp_inflight = 0;      /* this process's threads entering or inside */
 static volatile int g_mp_closed   = 0;      /* mp_quiesce ran: park, do not enter */
 static unsigned long g_mp_owner_died = 0;   /* EOWNERDEAD recoveries seen by this process */
@@ -254,8 +345,13 @@ void mp_lock_at(const char* site){
         site = sitebuf[0] ? sitebuf : "(unnamed)";
     }
     struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+    uint64_t takes0 = __atomic_load_n(&g_mp_page->takes, __ATOMIC_SEQ_CST);
     __atomic_add_fetch(&g_mp_page->waiting, 1, __ATOMIC_SEQ_CST);
+#ifdef __APPLE__
+    int r = mp_rlock_lock(MP_RL);
+#else
     int r = pthread_mutex_lock(g_mp_mutex);
+#endif
     __atomic_sub_fetch(&g_mp_page->waiting, 1, __ATOMIC_SEQ_CST);
     clock_gettime(CLOCK_MONOTONIC, &g_ml_took);
     g_ml_waited_ms = ml_ms_between(&t0, &g_ml_took);
@@ -263,12 +359,21 @@ void mp_lock_at(const char* site){
     /* the release that let us in, read before we overwrite the holder fields */
     uint32_t last_pid = g_mp_page->last_pid; long last_ms = g_mp_page->last_held_ms;
     char last[96]; snprintf(last, sizeof last, "%s", g_mp_page->last_site[0] ? g_mp_page->last_site : "(none yet)");
+    /* the convoy this wait sat through: takes that went by, and the longest
+     * hold released while someone was waiting; the last waiter out resets it */
+    __atomic_add_fetch(&g_mp_page->takes, 1, __ATOMIC_SEQ_CST);
+    uint64_t went_by = g_mp_page->takes - takes0 - 1;
+    long conv_ms = g_mp_page->conv_max_ms;
+    char conv[96]; snprintf(conv, sizeof conv, "%s", g_mp_page->conv_max_site[0] ? g_mp_page->conv_max_site : "?");
+    if (__atomic_load_n(&g_mp_page->waiting, __ATOMIC_SEQ_CST) == 0){ g_mp_page->conv_max_ms = 0; g_mp_page->conv_max_site[0] = 0; }
     g_mp_page->holder_pid = (uint32_t)getpid();
     g_mp_page->holder_since_ns = (uint64_t)g_ml_took.tv_sec * 1000000000ull + (uint64_t)g_ml_took.tv_nsec;
     ml_holder_site_set(NULL);
     if (r == EOWNERDEAD){
         /* the previous holder died inside the critical section */
+#ifndef __APPLE__
         pthread_mutex_consistent(g_mp_mutex);
+#endif
         g_mp_owner_died++;
         fprintf(stderr,
             "[mempool] WARNING: a process died holding the mempool lock; the lock has\n"
@@ -280,8 +385,9 @@ void mp_lock_at(const char* site){
     long thr = ml_log_ms();
     if (thr > 0 && g_ml_waited_ms >= thr){
         char line[640];
-        snprintf(line, sizeof line, "[mempool] pool lock: %s (pid %d) waited %ld ms; the holder was %s (pid %u, held %ld ms); %u still waiting",
-                 site, (int)getpid(), g_ml_waited_ms, last, (unsigned)last_pid, last_ms, (unsigned)g_mp_page->waiting);
+        snprintf(line, sizeof line, "[mempool] pool lock: %s (pid %d) waited %ld ms; the holder was %s (pid %u, held %ld ms); %llu other take(s) went by during the wait, the longest of them held %ld ms (%s); %u still waiting",
+                 site, (int)getpid(), g_ml_waited_ms, last, (unsigned)last_pid, last_ms,
+                 (unsigned long long)went_by, conv_ms, conv, (unsigned)g_mp_page->waiting);
         ml_log_line(line);
     }
 }
@@ -296,11 +402,19 @@ void mp_unlock(void){
     /* the last release, for the next taker's line; then free */
     g_mp_page->last_pid = (uint32_t)getpid();
     g_mp_page->last_held_ms = held;
+    if (__atomic_load_n(&g_mp_page->waiting, __ATOMIC_SEQ_CST) && held >= g_mp_page->conv_max_ms){
+        g_mp_page->conv_max_ms = held;
+        memcpy(g_mp_page->conv_max_site, g_mp_page->holder_site, sizeof g_mp_page->conv_max_site);
+    }
     memcpy(g_mp_page->last_site, g_mp_page->holder_site, sizeof g_mp_page->last_site);
     g_mp_page->holder_pid = 0; g_mp_page->holder_site[0] = 0;
     unsigned waiting = g_mp_page->waiting;
     g_ml_held = 0;
+#ifdef __APPLE__
+    mp_rlock_unlock(MP_RL);
+#else
     pthread_mutex_unlock(g_mp_mutex);
+#endif
     sigset_t m = g_mp_saved_mask;                /* copy first: a pending SIGTERM may end us in the call */
     __atomic_sub_fetch(&g_mp_inflight, 1, __ATOMIC_SEQ_CST);
     pthread_sigmask(SIG_SETMASK, &m, NULL);
@@ -434,6 +548,19 @@ int mempool_configure(void){
     /* Cross-process lock, in its own shared page. If it cannot be set up,
      * fall back to the per-process pools (unshare) rather than run a shared
      * pool without a lock. */
+#ifdef __APPLE__
+    /* Darwin: the pid-word lock above, zeroed (free) by the anonymous map */
+    { void* pg = mmap(0, sizeof(mp_lockpage_t), PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
+      if (pg == MAP_FAILED){
+          munmap(area, struct_sz); munmap(blob, (size_t)blob_cap);
+          mp_ext_area=0; mp_ext_blob=0; mp_ext_slots=0; mp_ext_blobcap=0;
+          mp_ext_inited=0; g_mp_area=0;
+          fprintf(stderr,"[mempool] process-shared lock unavailable -- falling back to the built-in 2MiB mempool\n");
+          return 0;
+      }
+      g_mp_robust = 1;
+      g_mp_page = (mp_lockpage_t*)pg; g_mp_mutex = &g_mp_page->lk.mu; }
+#else
     { void* pg = mmap(0, sizeof(mp_lockpage_t), PROT_READ|PROT_WRITE,
                       MAP_SHARED|MAP_ANONYMOUS, -1, 0);
       pthread_mutexattr_t at;
@@ -458,6 +585,7 @@ int mempool_configure(void){
           return 0;
       }
       g_mp_page = (mp_lockpage_t*)pg; g_mp_mutex = &g_mp_page->lk.mu; }
+#endif
 
     /* Shared tx-accept policy state (fee/ancestor registry), init'd once
      * pre-fork; tx_accept.c uses this instead of a per-process malloc.
@@ -824,6 +952,7 @@ static void mpseq_push(const unsigned char hash[32], int label, unsigned long lo
     mpseq_ev* e = &g_seq->ev[slot % MPSEQ_RING];
     /* a reader lapped onto this slot must not take it while it is refilled */
     __atomic_store_n(&e->ready, 0ULL, __ATOMIC_RELEASE);
+    __atomic_thread_fence(__ATOMIC_RELEASE);   /* ARM64: keep the payload stores below behind ready=0 */
     memcpy(e->hash, hash, 32);
     e->label = (unsigned char)label;
     e->mseq  = mseq;

@@ -344,7 +344,9 @@ int main(void){
    * corrupted adjacent buffers and returned the WRONG VERDICT instead. The
    * verdict comparison below is what actually fails deterministically; the
    * signal check just names the failure correctly when it does happen. */
+#ifdef M_MMAP_THRESHOLD
   mallopt(M_MMAP_THRESHOLD, 128*1024);
+#endif   /* glibc only; the verdict comparison below is the deterministic check either way */
   tt_isolate();
   /* The blob lives in the source tree; tt_src() rebases it past the chdir. */
   static char blobpath[1024];

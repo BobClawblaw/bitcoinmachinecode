@@ -22,10 +22,15 @@
  * ON DARWIN there is no /proc and no MADV_DONTDUMP. The lock is read back
  * from the kernel instead through mach_vm_region_recurse on our own task
  * (user_wired_count per region; no privileges needed), with the same control.
- * DONTDUMP is not asserted there: Darwin has no per-mapping core exclusion,
- * so secure_lock's madvise is compiled out (its #ifdef MADV_DONTDUMP). What
- * stands in on a Mac is platform policy, printed as a NOTE: the core-file
- * limit (0 by default) and encrypted swap (always on since 10.7).
+ * DONTDUMP cannot be asserted there: Darwin has no per-mapping core
+ * exclusion, so secure_lock's madvise is compiled out (its #ifdef
+ * MADV_DONTDUMP). What secure_lock does instead on a Mac (2026-09-27) is set
+ * the process's core-file limit to zero, soft and hard, so no core of a
+ * process holding a secret can be written at all. That IS asserted, against
+ * the kernel: the soft limit is raised first (so the test does not pass on
+ * the default of 0), then read back after the call, and a later attempt to
+ * raise it must be refused. Encrypted swap (always on since 10.7) is printed
+ * as a NOTE.
  */
 #include <stdio.h>
 #include <string.h>
@@ -97,6 +102,14 @@ int main(void){
     memset(secret, 0xA5, page);
     memset(plain,  0x5A, page);
 
+#ifdef __APPLE__
+    /* WAL-3 (Darwin): give the process a NONZERO core-file limit first, so
+     * the zero read back below is secure_lock's doing, not the default */
+    { struct rlimit rc; getrlimit(RLIMIT_CORE, &rc);
+      rc.rlim_cur = (rc.rlim_max == RLIM_INFINITY || rc.rlim_max > 1 << 20) ? 1 << 20 : rc.rlim_max;
+      if (rc.rlim_cur == 0) printf("      (the hard core-file limit is already 0 here: the raise-back check is what remains)\n");
+      setrlimit(RLIMIT_CORE, &rc); }
+#endif
     int locked = secure_lock(secret, page);
     if (!locked){
         /* An operator with a low RLIMIT_MEMLOCK gets a warning at startup and
@@ -119,10 +132,15 @@ int main(void){
     { struct rlimit rc; int enc = -1; struct xsw_usage sw; size_t swl = sizeof sw;
       if (sysctlbyname("vm.swapusage", &sw, &swl, NULL, 0) == 0) enc = sw.xsu_encrypted ? 1 : 0;
       getrlimit(RLIMIT_CORE, &rc);
-      printf("NOTE: no MADV_DONTDUMP on Darwin (secure_lock compiles it out); stand-ins here:\n"
-             "      core-file limit %s, swap %s\n",
-             rc.rlim_cur == 0 ? "0 (no core files)" : "NONZERO (a core would include the wallet page)",
-             enc == 1 ? "encrypted" : enc == 0 ? "NOT encrypted" : "unknown"); }
+      printf("      (core-file limit after secure_lock: soft %lld hard %lld; swap %s)\n",
+             (long long)rc.rlim_cur, (long long)rc.rlim_max,
+             enc == 1 ? "encrypted" : enc == 0 ? "NOT encrypted" : "unknown");
+      ck("WAL-3 no MADV_DONTDUMP on Darwin: the core-file limit is 0 after secure_lock (soft and hard)",
+         rc.rlim_cur == 0 && rc.rlim_max == 0);
+      struct rlimit up = { 1 << 20, 1 << 20 };
+      ck("WAL-3 ...and the process cannot raise it back", setrlimit(RLIMIT_CORE, &up) != 0);
+      getrlimit(RLIMIT_CORE, &rc);
+      ck("WAL-3 ...so it is still 0 afterwards", rc.rlim_cur == 0 && rc.rlim_max == 0); }
 #else
     ck("WAL-3 the locked region really is LOCKED per /proc/self/smaps", lk > 0);
     ck("WAL-3 ...and is marked DONTDUMP, so it stays out of a core file", dd == 1);

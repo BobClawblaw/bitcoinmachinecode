@@ -236,10 +236,11 @@ static uint64_t sv_checksig(void* cptr, const uint8_t* sig, size_t siglen,
      * the interpreter-supplied slice, BEFORE legacy_sighash's own internal
      * OP_CODESEPARATOR strip (interp.asm:CODESEPARATOR handling already
      * bounds `sc` to [pbegincodehash, pend), matching Core's scriptCode). */
-    static __thread uint8_t needle[600], scF[20000];
-    long long nlen = script_push_encode(needle, sizeof needle, sig, siglen);
+    static __thread uint8_t* needle;  BMC_TLS_BUF(needle, 600);
+    static __thread uint8_t* scF;     BMC_TLS_BUF(scF, 20000);
+    long long nlen = script_push_encode(needle, 600, sig, siglen);
     if (nlen < 0) return 0;
-    long long scflen = script_find_and_delete(scF, sizeof scF, sc->p, sc->n,
+    long long scflen = script_find_and_delete(scF, 20000, sc->p, sc->n,
                                               needle, (unsigned long)nlen);
     if (scflen < 0) return 0;
 

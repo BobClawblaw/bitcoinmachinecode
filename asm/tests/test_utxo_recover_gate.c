@@ -180,6 +180,30 @@ static u8 raw[512];
 
 /* ST2-9: the run files this process still maps after their unlink -- the
  * per-thread mapping cache (utxo_lsm_mm.c) holding a compaction's inputs */
+#ifdef __APPLE__
+/* bmc_osx: no /proc/self/maps. Every VM region's backing file
+ * (proc_regionfilename); an unlinked one is a path that no longer exists,
+ * which maps names "(deleted)" on Linux. */
+#include <libproc.h>
+#include <sys/stat.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+static int runs_mapped(int deleted_only){
+    mach_vm_address_t a = 0; int n = 0;
+    for (;;){
+        mach_vm_size_t sz = 0; vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t obj;
+        if (mach_vm_region(mach_task_self(), &a, &sz, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &cnt, &obj) != KERN_SUCCESS) break;
+        char path[PROC_PIDPATHINFO_MAXSIZE];
+        if (proc_regionfilename(getpid(), a, path, sizeof path) > 0 && strstr(path, "utxo_run_")){
+            struct stat st;
+            if (!deleted_only || stat(path, &st) != 0) n++;
+        }
+        a += sz;
+    }
+    return n;
+}
+#else
 static int runs_mapped(int deleted_only){
     FILE* f = fopen("/proc/self/maps", "r"); if (!f) return -1;
     char line[1024]; int n = 0;
@@ -187,6 +211,7 @@ static int runs_mapped(int deleted_only){
         if (strstr(line, "utxo_run_") && (!deleted_only || strstr(line, "(deleted)"))) n++;
     fclose(f); return n;
 }
+#endif
 extern void* utxo_live_test_tbl(void);
 extern long utxo_lsm_get(void* lst, void* u, const u8 txid[32], unsigned index, u64* value,
                          unsigned long* height, unsigned long* is_coinbase, const u8** script, unsigned long* slen);
@@ -197,6 +222,9 @@ static long lookup(const u8 txid[32]){
 
 int main(void){
     tt_isolate();
+#ifdef __APPLE__
+    setenv("BMC_LSM_MMAP", "1", 1);      /* bmc_osx: the mapping cache is off by default there; this pins it */
+#endif
     memset(store_buf,0,sizeof store_buf);
     if (store_init(store_buf)!=1){ printf("FAIL store_init\n"); return 1; }
     if (utxo_live_init(".")!=1){ printf("FAIL utxo_live_init\n"); return 1; }

@@ -47,6 +47,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "test_tmpdir.h"
+#include "loopback_alias.h"
 
 #define main daemon_main_disabled
 #include "../daemon/main.c"
@@ -183,7 +184,7 @@ static long run_phase(const char* tag, const fp_opts_t* ops, char peer[4][DL_POO
     memset(store_buf, 0, sizeof store_buf);
     unsigned short ports[4]; pid_t pids[4];
     for(int i=0;i<4;i++) g_served[i] = 0;
-    for(int i=0;i<4;i++){ pids[i] = start_peer(0x7f000001u + (unsigned)i, &ports[i], &ops[i], i); if(pids[i] < 0) return -2; }
+    for(int i=0;i<4;i++){ pids[i] = start_peer(0x7f000001u + (unsigned)i, &ports[i], &ops[i], i); if(pids[i] < 0){ stop_peers(pids, i); return -2; } }
     static char live[4][DL_POOL_SLOT]; memset(live, 0, sizeof live);
     for(int i=0;i<4;i++){ snprintf(live[i], DL_POOL_SLOT, "127.0.0.%d:%u", i+1, (unsigned)ports[i]); memcpy(peer[i], live[i], DL_POOL_SLOT); }
     for(int i=0;i<DLC_MAXPOOL;i++) g_live_announced[i] = i < 4 ? g_announce : 0;
@@ -216,6 +217,7 @@ int main(void){
     signal(SIGPIPE, SIG_IGN);
     g_served = mmap(NULL, 4 * sizeof(int), PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
     setvbuf(stdout, NULL, _IONBF, 0);
+    require_loopback_aliases(4);     /* the four fake peers are 127.0.0.1..4 */
     build_chain();
     printf("chain built: %d headers\n", NB);
     tt_isolate();

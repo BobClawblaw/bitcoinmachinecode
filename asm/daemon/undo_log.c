@@ -162,14 +162,22 @@ void undo_mark_dirty_heights(long lo, long hi){
 #define SFR_WAIT_BEFORE 1
 #define SFR_WRITE       2
 #define SFR_WAIT_AFTER  4
+#ifdef __APPLE__
+/* bmc_osx: Darwin has neither sync_file_range nor posix_fadvise, and no call
+ * that frees one file's clean pages, so bmc.dropappends (off by default) does
+ * nothing on the Mac: no drops are made or counted. */
+#define UNDO_NO_DROP 1
+#else
 #include <sys/syscall.h>
 static int sfr(int fd, u64 off, u64 len, unsigned flags){ return (int)syscall(SYS_sync_file_range, fd, (off_t)off, (off_t)len, flags); }
+#endif
 static int      g_undo_drop = 0;
 static unsigned g_drop_file = ~0u;    /* the file g_drop_mark describes */
 static u64      g_drop_mark;          /* the next step boundary in g_drop_file */
 static u64      g_stat_drops;         /* steps (and whole files) dropped */
 void undo_set_drop_appends(int on){ g_undo_drop = on ? 1 : 0; }
 unsigned long long undo_drop_count(void){ return g_stat_drops; }
+#ifndef UNDO_NO_DROP
 static void undo_drop_whole(unsigned file){
     char name[32]; us_rev_name(name, file);
     int fd = open(name, O_RDONLY);
@@ -198,6 +206,9 @@ static void undo_drop_behind(int fd, unsigned file){
         g_drop_mark += UNDO_DROP_STEP;
     }
 }
+#else
+static void undo_drop_behind(int fd, unsigned file){ (void)fd; (void)file; (void)g_undo_drop; (void)g_drop_file; (void)g_drop_mark; }
+#endif
 static int g_undo_split_timing = 0;
 static u64 g_undo_split_ns[4];   /* 0 the prevout get, 1 the record write, 2 the del, 3 undo_commit */
 static u64 undo_clock_ns(void);

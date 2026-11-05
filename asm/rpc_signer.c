@@ -54,6 +54,81 @@ extern char** environ;
  * the clone, and they make raw system calls only: the daemon is threaded,
  * and a lock another thread held at the clone (malloc's, glibc's fork
  * handlers) stays held in the copy. */
+#ifdef __APPLE__
+/* bmc_osx: Darwin has no clone(), no exit-signal-free child and no
+ * __WCLONE, so the keeper is an ordinary fork() child and the daemon's
+ * waitpid(-1) reaper may take it. Its result therefore does not travel
+ * through its own wait status: the keeper writes the shell's wait status
+ * down a second pipe, and signer_wait reads that, then reaps the keeper if
+ * the handler has not (ECHILD is expected, not an error). The fds are closed
+ * with the loop (no close_range). The keeper, a fork of a threaded process,
+ * calls only async-signal-safe functions. */
+static __thread int t_signer_stfd = -1;
+static void signer_close_from3(long maxfd, int keep){
+    for (long fd = 3; fd < maxfd; fd++) if ((int)fd != keep) close((int)fd);
+}
+static int signer_pipe(int p[2]){
+    if (pipe(p) != 0) return -1;
+    if (fcntl(p[0], F_SETFD, FD_CLOEXEC) != 0 || fcntl(p[1], F_SETFD, FD_CLOEXEC) != 0){
+        close(p[0]); close(p[1]); return -1; }
+    return 0;
+}
+static pid_t signer_spawn(const char* cmd, int* rfd){
+    int pfd[2], sfd[2];
+    if (signer_pipe(pfd) != 0) return -1;
+    if (signer_pipe(sfd) != 0){ close(pfd[0]); close(pfd[1]); return -1; }
+    char* argv[] = { (char*)"sh", (char*)"-c", (char*)cmd, NULL };
+    sigset_t none; sigemptyset(&none);
+    struct sigaction dfl; memset(&dfl, 0, sizeof dfl); dfl.sa_handler = SIG_DFL; sigemptyset(&dfl.sa_mask);
+    long maxfd = sysconf(_SC_OPEN_MAX); if (maxfd < 0 || maxfd > 65536) maxfd = 65536;
+    pid_t r = fork();
+    if (r < 0){ close(pfd[0]); close(pfd[1]); close(sfd[0]); close(sfd[1]); return -1; }
+    if (r == 0){
+        sigaction(SIGCHLD, &dfl, NULL);
+        sigaction(SIGPIPE, &dfl, NULL);
+        sigprocmask(SIG_SETMASK, &none, NULL);
+        pid_t g = fork();
+        if (g == 0){
+            if (dup2(pfd[1], 1) < 0) _exit(127);
+            signer_close_from3(maxfd, -1);
+            execve("/bin/sh", argv, environ);
+            _exit(127);
+        }
+        signer_close_from3(maxfd, sfd[1]);   /* the output pipe too: EOF is the shell's to give */
+        int st = 127 << 8;                   /* a failed fork reads as exit 127 */
+        if (g > 0)
+            for (;;){
+                pid_t w = waitpid(g, &st, 0);
+                if (w == g) break;
+                if (w < 0 && errno == EINTR) continue;
+                st = 127 << 8; break;
+            }
+        while (write(sfd[1], &st, sizeof st) < 0 && errno == EINTR) {}
+        _exit(0);
+    }
+    close(pfd[1]); close(sfd[1]);
+    *rfd = pfd[0];
+    t_signer_stfd = sfd[0];
+    return r;
+}
+static int signer_wait(pid_t pid){
+    int st = 0, fd = t_signer_stfd; t_signer_stfd = -1;
+    size_t got = 0;
+    while (fd >= 0 && got < sizeof st){
+        ssize_t k = read(fd, (char*)&st + got, sizeof st - got);
+        if (k > 0){ got += (size_t)k; continue; }
+        if (k < 0 && errno == EINTR) continue;
+        break;
+    }
+    if (fd >= 0) close(fd);
+    for (;;){                                /* the keeper: ours or the handler's to reap */
+        int kst; pid_t w = waitpid(pid, &kst, 0);
+        if (w == pid || (w < 0 && errno != EINTR)) break;
+    }
+    if (got != sizeof st){ errno = EPIPE; return -1; }
+    return st;
+}
+#else
 static void signer_close_from3(long maxfd){
     if (syscall(SYS_close_range, 3U, ~0U, 0U) != 0)
         for (long fd = 3; fd < maxfd; fd++) close((int)fd);
@@ -111,6 +186,8 @@ static int signer_wait(pid_t pid){
         return -1;
     }
 }
+
+#endif
 
 static char g_signer_cmd[512];
 

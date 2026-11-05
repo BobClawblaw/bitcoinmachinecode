@@ -84,7 +84,11 @@ static __attribute__((unused, access(none, 1))) void benchlog_mem_name_region(co
     a = ((unsigned long)p + pg - 1) & ~(pg - 1);
     e = ((unsigned long)p + len) & ~(pg - 1);
     if (e <= a) return;
+#ifdef SYS_prctl
     (void)syscall(SYS_prctl, 0x53564d41L /* PR_SET_VMA */, 0L /* PR_SET_VMA_ANON_NAME */, a, e - a, name);
+#else
+    (void)name;                     /* Darwin: no anonymous-region names (osx port) */
+#endif
 }
 
 #endif

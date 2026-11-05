@@ -75,7 +75,9 @@
 #include <stdatomic.h>
 #include <time.h>
 #include <stdint.h>
+#ifndef __APPLE__
 #include <sys/eventfd.h>
+#endif
 
 typedef unsigned char u8;
 typedef unsigned int  u32;
@@ -208,10 +210,23 @@ void zmq_pub_set_byte_cap(unsigned long b){ g_sub_max_bytes = b ? (size_t)b : ZP
 
 /* wakes the servicing thread when a queue goes from empty to not */
 static int g_wake_fd = -1;
+#ifdef __APPLE__
+/* Darwin has no eventfd (osx port): a non-blocking pipe in its place. The
+ * read end is the polled fd; the write end lives beside it. One byte per
+ * wake: EAGAIN on write still means "already pending", and a reader that
+ * drains less than was written keeps POLLIN set, which only costs one
+ * cheap zmqpub_poll() round on an empty queue. */
+static int g_wake_wfd = -1;
+#endif
 static void zp_wake(void){
     if (g_wake_fd < 0) return;
+#ifdef __APPLE__
+    char one = 1;
+    ssize_t w = write(g_wake_wfd, &one, 1); (void)w;   /* EAGAIN: already pending */
+#else
     uint64_t one = 1;
     ssize_t w = write(g_wake_fd, &one, sizeof one); (void)w;   /* EAGAIN: already pending */
+#endif
 }
 
 static void zp_nonblock(int fd){
@@ -594,7 +609,11 @@ static void* zp_thread_main(void* arg){
         int r = poll(pf, (nfds_t)n, 200);
         if (r < 0 && errno != EINTR) break;
         if (r > 0 && (pf[0].revents & POLLIN)){
+#ifdef __APPLE__
+            char v[64]; ssize_t rd = read(g_wake_fd, v, sizeof v); (void)rd;
+#else
             uint64_t v; ssize_t rd = read(g_wake_fd, &v, sizeof v); (void)rd;
+#endif
         }
         if (r > 0) zmqpub_poll();
         else if (r == 0){                     /* quiet: only the handshake deadline can be due */
@@ -610,7 +629,23 @@ int zmqpub_start(void){
     if (g_thread_up) return 1;
     if (g_nep == 0) return 0;
     atomic_store(&g_stop, 0);
+#ifdef __APPLE__
+    if (g_wake_fd < 0){
+        int p[2];
+        if (pipe(p) != 0){
+            fprintf(stderr, "[zmq] could not create the wake-up pipe: %s -- "
+                            "subscribers will not connect\n", strerror(errno));
+            return 0;
+        }
+        for (int e = 0; e < 2; e++){
+            int fl = fcntl(p[e], F_GETFL, 0); fcntl(p[e], F_SETFL, fl | O_NONBLOCK);
+            fl = fcntl(p[e], F_GETFD); fcntl(p[e], F_SETFD, fl | FD_CLOEXEC);
+        }
+        g_wake_fd = p[0]; g_wake_wfd = p[1];
+    }
+#else
     if (g_wake_fd < 0) g_wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+#endif
     if (g_wake_fd < 0){
         fprintf(stderr, "[zmq] could not create the wake-up eventfd: %s -- "
                         "subscribers will not connect\n", strerror(errno));
@@ -741,5 +776,8 @@ void zmqpub_close(void){
     g_nep = 0;
     for (int i = 0; i < ZP_NTOPIC; i++){ g_topic_ep[i] = -1; g_topic_seq[i] = 0; }
     if (g_wake_fd >= 0){ close(g_wake_fd); g_wake_fd = -1; }
+#ifdef __APPLE__
+    if (g_wake_wfd >= 0){ close(g_wake_wfd); g_wake_wfd = -1; }
+#endif
     pthread_mutex_unlock(&g_lock);
 }

@@ -40,6 +40,10 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#include <sys/mount.h>
+#endif
 #include <signal.h>
 #include <pthread.h>
 #include <sys/mman.h>
@@ -433,7 +437,18 @@ static void fz_shutdown(void);
 static void* g_fz_table;                 /* the frozen copy (defined with the async flush below) */
 static u64   g_mt_table_bytes = 0;       /* the live table's mapping, header page included */
 static u64   g_fz_table_bytes = 0;       /* the frozen copy's table mapping */
+#ifdef __APPLE__
+/* bmc_osx: no MADV_DONTFORK. Darwin's minherit(VM_INHERIT_NONE) could take a
+ * buffer out of the child, but nothing restores a range's own inheritance
+ * afterwards (the live table's header page is MAP_SHARED, so VM_INHERIT_COPY
+ * would quietly unshare it in every later fork), and its pages are 16 KB.
+ * The two forks take everything, as before M2. */
+static int   g_fork_trim = 0;
+#define MADV_DONTFORK 0
+#define MADV_DOFORK   0
+#else
 static int   g_fork_trim = 1;            /* TEST-ONLY 0: fork with everything, as before M2 */
+#endif
 static void (*g_test_child_probe)(int who) = 0;   /* TEST-ONLY: runs first in the child */
 struct fork_rgn { unsigned long a, len; };
 #define FORK_RGN_MAX 12
@@ -583,8 +598,21 @@ static void compact_flush_hook(void){
 static u64 g_run_budget = ~0ULL;
 u64 utxo_live_run_budget(void){
     if (g_run_budget != ~0ULL) return g_run_budget;
-    u64 kb = 0; FILE* f = fopen("/proc/meminfo", "r");
+    u64 kb = 0;
+#ifdef __APPLE__
+    /* bmc_osx: /proc/meminfo is Linux-only. With kb=0 the budget came out 0
+     * and lsm_compact_pick_budget treated EVERY run as over budget -- a
+     * near-full background compaction forked on practically every flush,
+     * which is how the first testnet4 IBD walked into the 2026-09-01
+     * incident class (store answered two different things right after a
+     * flush). hw.memsize is the same number in bytes. */
+    size_t sz = sizeof kb;
+    if (sysctlbyname("hw.memsize", &kb, &sz, NULL, 0) != 0) kb = 0;
+    kb /= 1024;
+#else
+    FILE* f = fopen("/proc/meminfo", "r");
     if (f){ char line[128]; while (fgets(line, sizeof line, f)) if (!strncmp(line, "MemTotal:", 9)){ kb = strtoull(line + 9, NULL, 10); break; } fclose(f); }
+#endif
     /* 35%, not 45%: on the 63 GB box the worker itself holds ~16 GB of anonymous
      * flush scratch plus the file-backed memtable, and at 25.7 GB of runs (4 runs)
      * lookups were already faulting from disk (2026-09-01 18:09, 3-12 blk/s). */
@@ -675,7 +703,11 @@ static int compact_start_async(long height, const char* why){
          * busy apply and the merge never lands, see the 09-08 note). */
         if (g_test_child_probe) g_test_child_probe(FORK_FOR_MERGE);
         setpriority(PRIO_PROCESS, 0, 10);
+#ifndef __APPLE__
+        /* macOS has no ioprio(2) and deprecated syscall(); the nice above
+         * is the whole concession there (osx port, merge 2026-09-12). */
         syscall(SYS_ioprio_set, 1 /* IOPRIO_WHO_PROCESS */, 0, (2 << 13) | 7 /* best-effort, prio 7 */);
+#endif
         utxo_lsm_set_flush_hook(0);
         utxo_store_set_predrain_hook(0); undo_set_discard_hook(0);
         utxo_lsm_set_defer_unlink(1);
@@ -790,6 +822,24 @@ static int    g_fz_dir_unsynced = 0;   /* STO-D: a manifest was renamed, its dir
 static unsigned long g_fz_count = 0, g_fz_waits = 0, g_fz_inline = 0, g_fz_bytes_retired = 0;
 #define FZ_FALLOC_KEEP_SIZE  0x01      /* linux/falloc.h: FALLOC_FL_KEEP_SIZE */
 #define FZ_FALLOC_PUNCH_HOLE 0x02      /* FALLOC_FL_PUNCH_HOLE (needs KEEP_SIZE) -- by raw syscall, as the ioprio call above, so no feature macro is needed */
+#ifdef __APPLE__
+/* bmc_osx: F_PUNCHHOLE wants whole filesystem blocks, so the range shrinks
+ * inward to them: only retired bytes are ever zeroed, and a partial block at
+ * either end keeps its space until a later retire covers it. */
+static int fz_punch(int fd, u64 off, u64 len){
+    struct statfs sf; u64 bs = 4096;
+    if (fstatfs(fd, &sf) == 0 && sf.f_bsize >= 512) bs = (u64)sf.f_bsize;
+    u64 a = (off + bs - 1) / bs * bs, e = (off + len) / bs * bs;
+    if (e <= a) return 0;
+    struct fpunchhole ph; memset(&ph, 0, sizeof ph);
+    ph.fp_offset = (off_t)a; ph.fp_length = (off_t)(e - a);
+    return fcntl(fd, F_PUNCHHOLE, &ph);
+}
+#else
+static int fz_punch(int fd, u64 off, u64 len){
+    return (int)syscall(SYS_fallocate, fd, FZ_FALLOC_PUNCH_HOLE | FZ_FALLOC_KEEP_SIZE, (off_t)off, (off_t)len);
+}
+#endif
 static u64 clock_ns(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (u64)t.tv_sec * 1000000000ULL + (u64)t.tv_nsec; }
 
 /* retire the frozen generation's WAL bytes: utxo.idx {log_off = fz_wal_end,
@@ -851,7 +901,7 @@ static void fz_retire_wal(void){
     g_utxo_lst.ckpt_log_off = off; g_utxo_lst.ckpt_n = 0;
     if (!dir_ok) return;
     if (off > g_wal_live_start && g_fz_punch_ok != 0){
-        if (syscall(SYS_fallocate, (int)g_utxo_lst.log_fd, FZ_FALLOC_PUNCH_HOLE | FZ_FALLOC_KEEP_SIZE, (off_t)g_wal_live_start, (off_t)(off - g_wal_live_start)) == 0){
+        if (fz_punch((int)g_utxo_lst.log_fd, g_wal_live_start, off - g_wal_live_start) == 0){
             g_fz_punch_ok = 1; g_fz_bytes_retired += (unsigned long)(off - g_wal_live_start);
         } else {
             fprintf(stderr, "[utxo_live] WARNING: fallocate(PUNCH_HOLE) on utxo.dat failed (%s): retired WAL generations keep their disk space until an inline flush truncates the log\n", strerror(errno));
@@ -1002,7 +1052,11 @@ unsigned long utxo_live_test_fz_adopted(void){ return g_fz_count; }
  * the flush writer run first; the pre-M2 fork (everything inherited); a
  * background merge started without waiting and its pid; the copy itself. */
 void utxo_live_test_set_child_probe(void (*fn)(int who)){ g_test_child_probe = fn; }
+#ifdef __APPLE__
+void utxo_live_test_set_fork_trim(int on){ (void)on; }   /* stays 0: see g_fork_trim */
+#else
 void utxo_live_test_set_fork_trim(int on){ g_fork_trim = on ? 1 : 0; }
+#endif
 int  utxo_live_test_compact_nowait(void){ return compact_start_async(g_apply_height, "test"); }
 int  utxo_live_test_compact_pid(void){ return (int)g_cmp_pid; }
 void utxo_live_test_set_apply_lag(long lag){ g_apply_lag = lag; }
@@ -1277,7 +1331,9 @@ static void* mmap_anon_kept_file(const char* path, u64 size, int header_page){
     if (ftruncate(fd, (off_t)size) != 0) { fprintf(stderr, "[utxo_live] ftruncate(%s,%lu) failed: %s\n", path, size, strerror(errno)); close(fd); return 0; }
     void* p = mmap(0, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0);
     if (p == MAP_FAILED) { fprintf(stderr, "[utxo_live] mmap(anon %s,%lu) failed: %s\n", path, size, strerror(errno)); close(fd); return 0; }
+#ifdef MADV_HUGEPAGE
     madvise(p, size, MADV_HUGEPAGE);
+#endif
     if (header_page && size >= 4096){
         void* h = mmap(p, 4096, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED, fd, 0);
         if (h == MAP_FAILED) { fprintf(stderr, "[utxo_live] mmap(header page of %s) failed: %s\n", path, strerror(errno)); munmap(p, size); close(fd); return 0; }
@@ -1601,8 +1657,8 @@ static void live_on_input(void* ctxv, const u8 txid[32], u32 index){
          * block's undo records), the failure is classified as a store error, and
          * the node retries from the checkpoint -- loudly, never silently. */
         if (r == 0) {
-            fprintf(stderr, "[utxo_live] FATAL h=%ld: prevout resolved by verification is ABSENT at apply (store lookup inconsistency) -- failing the block\n",
-                    g_apply_height);
+            fprintf(stderr, "[utxo_live] FATAL h=%ld: prevout resolved by verification is ABSENT at apply (store lookup inconsistency) outpoint=%02x%02x%02x%02x%02x%02x%02x%02x:%u -- failing the block\n",
+                    g_apply_height, txid[0],txid[1],txid[2],txid[3],txid[4],txid[5],txid[6],txid[7], index);
             g_store_inconsistent = 1;
             g_halted = 1;          /* nothing below (rollback, retry, recovery) can trust a lookup now */
             ctx->fatal = 1;
@@ -4027,7 +4083,9 @@ int utxo_live_init(const char* dir){
             if (fzb != MAP_FAILED) munmap(fzb, (size_t)blob_cap);
             free(tomb2);
         } else {
+#ifdef MADV_HUGEPAGE
             madvise(fzt, (size_t)ustruct, MADV_HUGEPAGE); madvise(fzb, (size_t)blob_cap, MADV_HUGEPAGE);
+#endif
             ((u64*)fzt)[2] = (u64)(uintptr_t)fzb; ((u64*)fzt)[3] = blob_cap;   /* +16 blob, +24 blob_cap: what the freeze keeps */
             g_fz_table = fzt;
             g_fz_table_bytes = (u64)ustruct;
@@ -4052,6 +4110,20 @@ int utxo_live_init(const char* dir){
     struct stat sb;
     int has_wal = (stat("utxo.dat", &sb) == 0 && sb.st_size > 0);
     int has_manifest = (stat("utxo_manifest.dat", &sb) == 0);
+#ifdef __APPLE__
+    /* bmc_osx: the twin's lookup fallback re-reads the FULL bloom of every
+     * candidate run per point lookup (4MB on a 4.5M-record run) -- the
+     * catch-up apply crawled at 1-30 blk/s once runs existed. The mm fast
+     * path (utxo_lsm_mm.c) caches mapped runs and is documented
+     * "single-threaded byte-correct" on macOS; its unpinned failure mode is
+     * CONCURRENT gets (8 threads), and this worker's LSM access is
+     * single-threaded (apply loop, txoq hook at block boundaries, recount
+     * -- one thread; serve children only read via their own reload).
+     * Enable it here; BMC_LSM_MMAP=0 still forces the fallback off for
+     * diffing (mm_enabled honours the env on first use). */
+    { const char *mmenv = getenv("BMC_LSM_MMAP");
+      if (!mmenv || mmenv[0] != '0') { extern void lsm_mm_set_enabled(int); lsm_mm_set_enabled(1); } }
+#endif
     int have_prior_state = has_wal || has_manifest;
     /* utxo_lsm_init(lst) -> 1 ok / -1 err, but utxo_lsm_reload(lst,u) ->
      * REPLAYED RECORD COUNT / -1 err (not literally 1) -- different
@@ -4314,9 +4386,11 @@ static void blk_drop_behind(void* st, long h){
     if (last_file != ~0u && f > last_file){
         int fd = store_rd_fd(st, last_file);
         if (fd >= 0){
+#ifndef __APPLE__   /* bmc_osx: no sync_file_range/posix_fadvise; the drop is a no-op (see undo_log.c) */
             syscall(SYS_sync_file_range, fd, (off_t)0, (off_t)0, 1 | 2 | 4);   /* WAIT_BEFORE | WRITE | WAIT_AFTER */
             posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
             g_stat_blk_drops++;
+#endif
         }
     }
     last_file = f;

@@ -76,6 +76,8 @@ void zmqn_tx_accepted(const unsigned char txid[32], const unsigned char* tx,
     unsigned k = (unsigned)(seq % RPC_ZMQ_RING);
     /* a consumer lapped onto this entry must not take it while it is refilled */
     __atomic_store_n(&st->zmq_ring[k].ready, 0ULL, __ATOMIC_RELEASE);
+    __atomic_thread_fence(__ATOMIC_RELEASE);   /* ARM64 (2026-09-25): a release STORE orders what came before it, not the
+                                                  payload stores after -- without this fence they can land before ready=0 */
     memcpy((void*)st->zmq_ring[k].txid, txid, 32);
     st->zmq_ring[k].off = off;
     st->zmq_ring[k].len = txlen;
@@ -131,6 +133,7 @@ int zmqn_drain_sequence(void){
         }
         /* the slot may have been lapped while it was read: publish only what
          * was still this slot's event after the copy */
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);   /* ARM64: the copy's loads complete before the re-check (an acquire LOAD does not hold back earlier loads) */
         if (__atomic_load_n(&e->ready, __ATOMIC_ACQUIRE) != g_zs_cursor + 1) continue;
         zmqpub_notify("sequence", body, blen);
         g_zs_cursor++; n++;

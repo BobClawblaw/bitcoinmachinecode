@@ -146,6 +146,13 @@ int main(void){
         char big[2048];
         int n = benchlog_mem_line(big, sizeof big, "test");
         printf("     %s\n", big);
+#ifdef __APPLE__
+        /* bmc_osx: the line is built from /proc/self/smaps, which Darwin has
+         * not; it says so, bounded and tagged, and the totals are not checked */
+        ckm("mem: the line is non-empty and bounded", n > 0 && n < (int)sizeof big);
+        ckm("mem: Darwin: the line reports smaps unreadable", strncmp(big, "[mem] test: ", 12) == 0 && strstr(big, "unreadable") != NULL);
+        (void)named;
+#else
         ckm("mem: the line is non-empty and bounded", n > 0 && n < (int)sizeof big);
         ckm("mem: starts with the tag and the totals", strncmp(big, "[mem] test: pss ", 16) == 0 && strstr(big, " MB (anon ") != NULL);
         ckm("mem: the totals are non-zero (smaps_rollup read)", strstr(big, "pss 0 MB") == NULL);
@@ -159,6 +166,7 @@ int main(void){
         /* a cap too small for the list still yields a bounded, NUL-terminated prefix */
         char small[40]; int m = benchlog_mem_line(small, sizeof small, "t");
         ckm("mem: a small cap is honoured", m < (int)sizeof small && strlen(small) < sizeof small && strncmp(small, "[mem] t: pss ", 13) == 0);
+#endif
         munmap(p, len);
     }
 

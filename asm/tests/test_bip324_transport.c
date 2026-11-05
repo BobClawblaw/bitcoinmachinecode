@@ -89,7 +89,12 @@ static __attribute__((noinline)) void run_then_snap(int which, const unsigned ch
               chacha20poly1305_encrypt(out, out + 64, pt, sizeof pt, NULL, 0, key, nonce); break; }
     case 2: leave_in_dead_frame(key); break;
     }
-    const volatile unsigned char* hi; __asm__ volatile("mov %%rsp, %0" : "=r"(hi));
+    const volatile unsigned char* hi;
+#if defined(__aarch64__)
+    __asm__ volatile("mov %0, sp" : "=r"(hi));       /* bmc_osx: the same read on AArch64 */
+#else
+    __asm__ volatile("mov %%rsp, %0" : "=r"(hi));
+#endif
     const volatile unsigned char* lo = hi - STACK_SCAN;
     for (size_t i = 0; i < STACK_SCAN; i++) g_snap[i] = lo[i];
 }

@@ -96,8 +96,10 @@ void notify_run(const char* cmd_template, const char* value, const char* what){
              * rule. Peer sockets and the RPC listener go too (DMN-6's leak,
              * by another door). */
             { long maxfd = sysconf(_SC_OPEN_MAX); if (maxfd < 0 || maxfd > 65536) maxfd = 65536;
+#ifdef SYS_close_range
               if (syscall(SYS_close_range, 3U, ~0U, 0U) != 0)
-                  for (long fd = 3; fd < maxfd; fd++) close((int)fd); }
+#endif
+                  for (long fd = 3; fd < maxfd; fd++) close((int)fd); }   /* Darwin: no close_range, the loop is the whole path (osx port) */
             execl("/bin/sh", "sh", "-c", cmd, (char*)NULL);
             _exit(127);
         }

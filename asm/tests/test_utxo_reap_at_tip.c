@@ -63,6 +63,16 @@ static void ckm(const char* l, int cond){
 }
 /* the state letter of /proc/<pid>/stat, or 0 when the pid is gone. Read, never
  * waitpid'd: a test that reaps the daemon's child steals the status it is testing. */
+#ifdef __APPLE__
+/* bmc_osx: no /proc. The kernel's own record says the same: p_stat SZOMB for
+ * an exited, unreaped child ('Z'), no record once it is reaped (0). */
+#include <sys/sysctl.h>
+static char proc_state(int pid){
+    struct kinfo_proc kp; size_t len = sizeof kp; int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, pid };
+    if (pid <= 0 || sysctl(mib, 4, &kp, &len, 0, 0) != 0 || len == 0) return 0;
+    return kp.kp_proc.p_stat == SZOMB ? 'Z' : 'R';
+}
+#else
 static char proc_state(int pid){
     char p[64]; snprintf(p, sizeof p, "/proc/%d/stat", pid);
     FILE* f = fopen(p, "r"); if (!f) return 0;
@@ -70,6 +80,7 @@ static char proc_state(int pid){
     char* rp = strrchr(buf, ')');                    /* comm may hold spaces: the state follows the last ')' */
     return (rp && rp[1] == ' ') ? rp[2] : '?';
 }
+#endif
 static void key(u8* t, unsigned i){ memset(t, 0x3c, 32); t[0] = (u8)i; t[1] = (u8)(i >> 8); }
 static void seed(unsigned lo, unsigned n){
     u8 spk[25]; memset(spk, 0x76, sizeof spk);

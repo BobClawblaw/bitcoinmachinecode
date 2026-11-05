@@ -194,6 +194,16 @@ int main(void){
     serve_rejects_attach(rej);
     int A[2], B[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, A) || socketpair(AF_UNIX, SOCK_STREAM, 0, B)){ perror("socketpair"); return 1; }
+#ifdef __APPLE__
+    /* bmc_osx: a Darwin socketpair buffers 8 KiB, Linux's ~200 KiB; the
+     * 5,000-entry inv below is one ~180 KB message, written before the leg
+     * reads it, and blocked forever at the Mac's default */
+    for (int i = 0; i < 2; i++){
+        int big = 1 << 20;
+        setsockopt(A[i], SOL_SOCKET, SO_SNDBUF, &big, sizeof big); setsockopt(A[i], SOL_SOCKET, SO_RCVBUF, &big, sizeof big);
+        setsockopt(B[i], SOL_SOCKET, SO_SNDBUF, &big, sizeof big); setsockopt(B[i], SOL_SOCKET, SO_RCVBUF, &big, sizeof big);
+    }
+#endif
     static u8 t1[4096], t2[4096], t3[4096];
     u8 id1[32], id2[32], w1[32];
     long n1, n2, s0, f0;

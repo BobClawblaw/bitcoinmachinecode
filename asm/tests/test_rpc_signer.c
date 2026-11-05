@@ -183,7 +183,7 @@ int main(void){
       int marker = open("/dev/null", O_RDONLY);            /* no O_CLOEXEC, like the datadir .lock */
       if (marker >= 0 && marker != 77){ dup2(marker, 77); close(marker); }
       write_script("fdlist",
-          "printf '[{\"fingerprint\":\" %s\",\"model\":\"fds\"}]' \"$(ls /proc/$$/fd | tr '\\n' ' ')\"\n");
+          "printf '[{\"fingerprint\":\" %s\",\"model\":\"fds\"}]' \"$(ls /dev/fd | tr '\\n' ' ')\"\n");
       char cmd[1100]; snprintf(cmd, sizeof cmd, "%s/fdlist", tt_workdir());
       rpc_signer_set_cmd(cmd);
       r = NULL;

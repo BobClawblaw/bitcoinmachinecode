@@ -1112,7 +1112,7 @@ static int find_node(void* st, const unsigned char txid[32]){
  * yields children in ascending node order -- the order the scans it replaces
  * produced, so the reported sets keep their shape.
  *
- * One allocation pass per call, freed by the caller. mpool_policy_entry_info_all
+ * One allocation pass per call, freed by the caller. mpool_policy_graph_all
  * builds the same thing inline for its whole-registry sweep. */
 static int mpol_children_build(void* st, uint32_t n,
                                uint32_t** head_o, uint32_t** nxt_o, uint32_t** chld_o){
@@ -1137,6 +1137,13 @@ static int mpol_children_build(void* st, uint32_t n,
     *head_o = head; *nxt_o = nxt; *chld_o = chld;
     return 1;
 }
+
+/* test knob: 1 makes mpol_add_core's cluster-limit walk scan the registry for
+ * each node's neighbours, as it did before 2026-10-08, instead of using the
+ * children index (main's persistent g_cx since the 2026-10-23 audit) --
+ * test_mempool_policy's cluster-walk differential compares the two */
+static int g_mpol_cluster_walk_scan;
+void mpool_policy_set_cluster_walk_scan(int on){ g_mpol_cluster_walk_scan = on ? 1 : 0; }
 
 /* ---- MPL-3/4/6 (audit 2026-10-23): a children index that persists ------
  *
@@ -1343,33 +1350,78 @@ static int find_claim(void* st, const unsigned char prev[32], uint32_t index){
 /* removal machinery (single node; package = node + descendants)              */
 /* ========================================================================== */
 
+/* test knob: 1 makes collect_descendant_txids scan the registry for every
+ * popped node's children, as it did before 2026-10-08, instead of using the
+ * children index -- test_descendant_walk_differential compares the two */
+static int g_mpol_desc_walk_scan;
+void mpool_policy_set_desc_walk_scan(int on){ g_mpol_desc_walk_scan = on ? 1 : 0; }
+
 /* Collect node ci's in-pool descendant TXIDS (self excluded), bounded.
- * Children found by scanning parent links; pops bounded by desc_cnt<=25. */
+ *
+ * Until 2026-10-08 every popped node's children were found by scanning the
+ * whole registry, so a set of d descendants cost d+1 passes over the pool --
+ * the same O(set x pool) shape the cluster-limit walk had (ac078e42). Now the
+ * FIRST pop (ci itself) is still a scan, because most removals are of
+ * childless transactions and one pass is all those need. Only if ci has a
+ * child is the children index built (one more pass) and the rest of the walk
+ * done through it: at most two passes whatever the set's size.
+ *
+ * The index lists children in ascending node order, the order the scan found
+ * them, and both push them the same way, so the output -- order, the -1
+ * bound and all -- is unchanged. If the index cannot be allocated the walk
+ * falls back to scanning. */
 static int collect_descendant_txids(void* st, int ci,
                                     unsigned char out[][32], int cap){
     mpol_node* t = mpol_nodes_base(st);
     uint32_t n = *(uint32_t*)((char*)st+16);
     uint32_t stack[MPOL_PKG_MAX]; int sp = 0, cnt = 0;
     uint32_t seenidx[MPOL_PKG_MAX]; int nseen = 0;
+    uint32_t *head = 0, *nxt = 0, *chld = 0;
+    int have_ch = 0, first = 1, rc = 0;
     stack[sp++] = (uint32_t)ci;
     seenidx[nseen++] = (uint32_t)ci;
+#define MPOL_DW_VISIT(ix) do { \
+        uint32_t i_ = (ix); int seen_ = 0; \
+        for (int k_ = 0; k_ < nseen; k_++) if (seenidx[k_] == i_){ seen_ = 1; break; } \
+        if (seen_) break; \
+        if (cnt >= cap || nseen >= MPOL_PKG_MAX || sp >= MPOL_PKG_MAX){ rc = -1; goto done; } \
+        memcpy(out[cnt++], t[i_].txid, 32); \
+        seenidx[nseen++] = i_; \
+        stack[sp++] = i_; \
+    } while (0)
     while (sp > 0){
         uint32_t cur = stack[--sp];
-        for (uint32_t i = 0; i < n; i++){
-            int is_child = 0;
-            for (uint32_t k = 0; k < t[i].n_parents; k++)
-                if (mpol_par_at(st, &t[i], k) == cur){ is_child = 1; break; }
-            if (!is_child) continue;
-            int seen = 0;
-            for (int k = 0; k < nseen; k++) if (seenidx[k] == i){ seen = 1; break; }
-            if (seen) continue;
-            if (cnt >= cap || nseen >= MPOL_PKG_MAX || sp >= MPOL_PKG_MAX) return -1;
-            memcpy(out[cnt++], t[i].txid, 32);
-            seenidx[nseen++] = i;
-            stack[sp++] = i;
+        if (have_ch){
+            if (cur < n)
+                for (uint32_t e = head[cur]; e != MPOL_IDX_NONE; e = nxt[e]){
+                    MPOL_DW_VISIT(chld[e]);
+                }
+        } else {
+            for (uint32_t i = 0; i < n; i++){
+                int is_child = 0;
+                for (uint32_t k = 0; k < t[i].n_parents; k++)
+                    if (mpol_par_at(st, &t[i], k) == cur){ is_child = 1; break; }
+                if (!is_child) continue;
+                MPOL_DW_VISIT(i);
+            }
         }
+        if (first && sp > 0 && !g_mpol_desc_walk_scan)   /* ci has a child */
+            have_ch = mpol_children_build(st, n, &head, &nxt, &chld);
+        first = 0;
     }
-    return cnt;
+    rc = cnt;
+done:
+#undef MPOL_DW_VISIT
+    if (have_ch){ free(head); free(nxt); free(chld); }
+    return rc;
+}
+
+/* test hook: collect_descendant_txids for txid, -2 if it is not in the pool */
+long mpool_policy_descendant_txids(void* st, const unsigned char txid[32],
+                                   unsigned char (*out)[32], int cap){
+    int ci = find_node(st, txid);
+    if (ci < 0) return -2;
+    return collect_descendant_txids(st, ci, out, cap);
 }
 
 /* Walk ci's ancestors decrementing their with-descendants aggregates by
@@ -1801,13 +1853,36 @@ static long mpol_remove_marked(void* st, void* mp, uint32_t n){
 }
 
 /* Mark a node and every in-pool DESCENDANT of it, for batch removal.
- * Sweeps to a fixpoint rather than walking children, because there is no
- * child index: a node is a descendant if any of its parents is marked, so
- * repeating the sweep until nothing new is marked closes the set. The round
- * bound is 128 -- twice the 64-transaction cluster limit, so it can never cut
- * a legitimate closure short, and it still terminates if the graph is ever
- * malformed. Only reached when a block actually conflicts with something in
- * the pool, which is the rare case. */
+ *
+ * Until 2026-10-08 this swept the whole registry to a fixpoint -- a node is a
+ * descendant if any of its parents is marked 2, repeated until nothing new is
+ * marked, at least two full sweeps per conflict and up to 129 -- because
+ * there was no child index. Now the block connect builds the children index
+ * once, the first time a block conflicts with anything (the graph does not
+ * change while marking; removal comes after), and each call walks down from
+ * its root through it.
+ *
+ * Why walking from the root alone gives the sweep's answer: the sweep closes
+ * the WHOLE level-2 set, not just the root's descendants. But level 2 is only
+ * ever set here, and every call leaves the set closed, so the only open edges
+ * are the root's. The one way the set can be opened from outside is the
+ * confirm mark (level 1) landing on a node already at 2; that raises
+ * g_rm_reseed, and the next call seeds its walk from every level-2 node
+ * instead, exactly as the sweep would see it. The sweep stopped after 128
+ * rounds, twice the 64-transaction cluster limit, so it never cut a
+ * legitimate closure short; the walk has no bound and terminates because
+ * every node is pushed at most once. If the index cannot
+ * be built the sweep runs, as before, and a test knob forces it. */
+static int g_mpol_rm_fixpoint_scan;
+void mpool_policy_set_rm_fixpoint_scan(int on){ g_mpol_rm_fixpoint_scan = on ? 1 : 0; }
+static uint32_t *g_rm_ch_head, *g_rm_ch_nxt, *g_rm_ch_chld;
+static int g_rm_ch_state;              /* 0 not built yet, 1 built, -1 could not build */
+static int g_rm_reseed;                /* a level-2 node was set back to 1 */
+static void mpol_rm_children_free(void){
+    if (g_rm_ch_state == 1){ free(g_rm_ch_head); free(g_rm_ch_nxt); free(g_rm_ch_chld); }
+    g_rm_ch_head = g_rm_ch_nxt = g_rm_ch_chld = 0;
+    g_rm_ch_state = 0; g_rm_reseed = 0;
+}
 /* TWO MARK LEVELS, and the distinction is the whole correctness of the batch:
  *
  *   1 = this node leaves ALONE. A transaction the block CONFIRMED: its
@@ -1829,6 +1904,28 @@ static void mpol_mark_with_descendants(void* st, uint32_t n, uint32_t root, uint
     if (root >= n || g_rm_mark[root] == 2) return;
     if (!g_rm_mark[root]) g_rm_order[root] = order;
     g_rm_mark[root] = 2;
+    if (g_rm_ch_state == 0 && !g_mpol_rm_fixpoint_scan)
+        g_rm_ch_state = mpol_children_build(st, n, &g_rm_ch_head, &g_rm_ch_nxt, &g_rm_ch_chld) ? 1 : -1;
+    if (g_rm_ch_state == 1 && !g_mpol_rm_fixpoint_scan){
+        /* g_rm_remap is free until mpol_remove_marked; each node is pushed at
+         * most once (when it reaches 2, or as a seed), so n slots suffice */
+        uint32_t* stack = g_rm_remap; uint32_t sp = 0;
+        if (g_rm_reseed){
+            for (uint32_t i = 0; i < n; i++) if (g_rm_mark[i] == 2) stack[sp++] = i;
+            g_rm_reseed = 0;
+        } else stack[sp++] = root;
+        while (sp){
+            uint32_t cur = stack[--sp];
+            for (uint32_t e = g_rm_ch_head[cur]; e != MPOL_IDX_NONE; e = g_rm_ch_nxt[e]){
+                uint32_t c = g_rm_ch_chld[e];
+                if (g_rm_mark[c] == 2) continue;
+                if (!g_rm_mark[c]) g_rm_order[c] = order;
+                g_rm_mark[c] = 2;
+                stack[sp++] = c;
+            }
+        }
+        return;
+    }
     mpol_node* t = mpol_nodes_base(st);
     int changed = 1, rounds = 0;
     while (changed && rounds++ <= 128){
@@ -1843,6 +1940,7 @@ static void mpol_mark_with_descendants(void* st, uint32_t n, uint32_t root, uint
             }
         }
     }
+    g_rm_reseed = 0;                   /* the sweep closed the whole set */
 }
 
 /* Remove a tx AND its whole in-pool descendant set (by txid). Returns the
@@ -2660,6 +2758,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
      * the UTXO view. */
     if (vsize_out) *vsize_out = (unsigned long long)vsize;
 
+    mpol_phase("add/standard");
     /* --- standardness (Core IsStandardTx order: before fees) --------------- */
     int n_dust = 0;
     { const char* r = standard_checks(pol, tx, txlen, &meta, prev[0], idx[0], &n_dust);
@@ -2670,6 +2769,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
     if (mpool_get(mp, txid, &(unsigned long){0}) != NULL){
         _mpol_last_reason = "txn-already-in-mempool"; return 0; }
 
+    mpol_phase("add/inputs");
     /* --- fee: resolve inputs (mempool outreg first, then confirmed set) ---- */
     unsigned long long sum_in = 0;
     for (int i=0;i<n_in;i++){
@@ -2687,6 +2787,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
     uint64_t fee = sum_in - meta.sum_out;
     if (fee_out) *fee_out = (unsigned long long)fee;
 
+    mpol_phase("add/dust+feefloors");
     /* ---- ephemeral dust (Core PreCheckEphemeralTx / CheckEphemeralSpends) --
      * Dust is normally refused because it costs more to spend than it is
      * worth, and left in the UTXO set forever. Core carves out one case: dust
@@ -2768,6 +2869,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
             mpol_detail("%llu < %llu", (unsigned long long)eff_fee, (unsigned long long)need);
             _mpol_last_reason = "min relay fee not met"; return 0; } } }
 
+    mpol_phase("add/conflicts");
     /* --- conflicts + RBF (Core ReplacementChecks / classic BIP125) --------- */
     int n_conf = 0;
     uint32_t conf_claimers[MPOL_MAX_IN];
@@ -2851,6 +2953,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
               _mpol_last_reason = "insufficient fee"; return 0; } }
     }
 
+    mpol_phase("add/limits+cluster");
     /* --- ancestor / descendant limits (vsize budgets) ---------------------- */
     uint32_t cap = *(uint32_t*)((char*)st+4);
     mpol_node* t = mpol_nodes_base(st);
@@ -3033,7 +3136,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
          * the order differs, and the verdict depends only on the set), so
          * the limits answer exactly as before. Without an index (out of
          * memory) it falls back to the scan. */
-        int have_cx = mpol_cx_get(st);
+        int have_cx = !g_mpol_cluster_walk_scan && mpol_cx_get(st);
         #define MPOL_CL_VISIT(ix) do { uint32_t _i = (ix); \
             if (_i >= nn || MPOL_CL_EVICTED(_i)) break;   /* gone, or leaves the pool if this tx is accepted */ \
             int _dup = 0; \
@@ -3078,6 +3181,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
      * lacking. The cluster check above is the whole bound. anc_cnt/anc_bytes
      * are still computed: the entry stores them (ancestorcount/-size). */
 
+    mpol_phase("add/truc");
     /* --- BIP431 TRUC topology (Core SingleTRUCChecks) ----------------------
      * Runs for EVERY transaction, not only v3 ones: half of these rules are
      * about what a non-TRUC transaction may not spend. Skipped wholesale
@@ -3263,6 +3367,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
         #undef TRUC_PARENT_IDS_PKG
     }
 
+    mpol_phase("add/diagram");
     /* ---- Core v31.1 ImprovesFeerateDiagram (2026-10-01) -------------------
      * After every eviction is decided (conflicts, their descendants, a TRUC
      * sibling) and every other rule has passed: the replacement must strictly
@@ -3279,6 +3384,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
                      _mpol_last_reason = "replacement-failed"; return 0; }
     }
 
+    mpol_phase("add/commit");
     /* ================= commit ============================================ */
     if (!commit) return 1;
 
@@ -3396,6 +3502,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
         }
     }
 
+    mpol_phase("add/rbf_evict");
     /* 1a. RBF eviction (packages: conflicts + descendants, snapshotted) */
     { int prev_r = g_depart_reason; g_depart_reason = 2 /* MPJ_REPLACED */;
     for (int e=0;e<n_evict;e++){
@@ -3452,6 +3559,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
         }
     }
 
+    mpol_phase("add/store+trim");
     /* 1b. store; on a full pool, TrimToSize by descendant package (Core):
      * evict argmin of max(own, package) feerate WITH its descendants; floor
      * = removed package feerate + incrementalrelayfee. If the incoming tx
@@ -3742,7 +3850,7 @@ long mpool_policy_block_connect(void* st, void* mp,
      * failure -- a block connect must not be skippable on an allocation. */
     uint32_t n_nodes = *(uint32_t*)((char*)st+16);
     int batch = (n_nodes > 0) && g_batch_connect && mpol_rm_reserve(n_nodes);
-    if (batch) memset(g_rm_mark, 0, n_nodes);
+    if (batch){ memset(g_rm_mark, 0, n_nodes); mpol_rm_children_free(); }
 
     for (uint64_t j = 0; j < ntx; j++){
         unsigned char info[64];
@@ -3760,6 +3868,7 @@ long mpool_policy_block_connect(void* st, void* mp,
                 self_ci = find_node(st, txid);
                 if (self_ci >= 0){
                     if (!g_rm_mark[self_ci]) g_rm_order[self_ci] = (uint32_t)j;
+                    if (g_rm_mark[self_ci] == 2) g_rm_reseed = 1;   /* see mpol_mark_with_descendants */
                     g_rm_mark[self_ci] = 1;                 /* confirmed: alone */
                 }
             } else {
@@ -3808,7 +3917,7 @@ long mpool_policy_block_connect(void* st, void* mp,
         }
         p += txlen;
     }
-    if (batch){ mpol_phase("remove_marked"); removed += mpol_remove_marked(st, mp, n_nodes); }   /* the per-tx fallback removed inside "mark" */
+    if (batch){ mpol_rm_children_free(); mpol_phase("remove_marked"); removed += mpol_remove_marked(st, mp, n_nodes); }   /* the per-tx fallback removed inside "mark" */
     mpol_phase("rejects_clear+note");
     /* MEM-10: Core resets m_recent_rejects on every new block, because a
      * block can make a previously-invalid transaction valid -- its missing
@@ -3860,7 +3969,7 @@ long mpool_policy_entry(void* st, const unsigned char txid[32],
  * the single RPC execution lock, on a call every monitoring tool polls.
  *
  * The same "per-txid call x n" shape is already called out above
- * mpool_policy_entry_info_all, for the same reason. Returns the entry count.
+ * mpool_policy_graph_all, for the same reason. Returns the entry count.
  * The policy registry and the structural pool are maintained together
  * (mpool_policy_remove_package takes both), so this covers the same
  * transactions the per-slot loop did. */
@@ -4063,15 +4172,34 @@ long mpool_policy_set_sigops(void* st, const unsigned char txid[32], unsigned in
  * Returns the number of entries written, or -1 on a bad state / allocation
  * failure, in which case the caller falls back to the per-entry path.
  *
- * out[i] corresponds to ids[i]; the caller matches by txid. Caller holds
- * mp_lock, exactly as for the single-entry call. */
-long mpool_policy_entry_info_all(void* st, mp_entry_info* out, unsigned char (*ids)[32], uint32_t max)
+ * g->node[i] carries its own txid; the caller matches by it. Caller holds
+ * mp_lock, exactly as for the single-entry call, and frees g with
+ * mp_graph_free.
+ *
+ * 2026-10-06: the output is the compact mp_graph (mempool_entry.h), sized by
+ * the registry itself. It was an mp_entry_info per node in a caller-sized
+ * buffer -- ~8.3 KB each, ~+790 MB peak RSS per verbose getrawmempool at a
+ * 68k pool -- and a buffer smaller than the registry (stale nodes) was
+ * refused with -1, which the caller had to retry at full capacity. */
+long mpool_policy_graph_all(void* st, mp_graph* g)
 {
-    if (!st || *(uint32_t*)st != MPOL_MAGIC || !out || !ids) return -1;
+    if (!st || *(uint32_t*)st != MPOL_MAGIC || !g) return -1;
+    memset(g, 0, sizeof *g);
     mpol_node* t = mpol_nodes_base(st);
     uint32_t n = *(uint32_t*)((char*)st+16);
-    if (n > max) return -1;
     if (n == 0) return 0;
+    /* sized for the common shape (most nodes are singletons: self in anc
+     * and in desc, plus an edge or two); mp_graph_append grows past it */
+    g->node = (mp_graph_node*)malloc((size_t)n * sizeof *g->node);
+    g->mem  = (unsigned int*)malloc((size_t)n * 4 * sizeof *g->mem);
+    /* ONE scratch record, reused per node: only its counted members are
+     * written, so it is not cleared between nodes either */
+    mp_entry_info* o = (mp_entry_info*)malloc(sizeof *o);
+    /* each set's members as node indices: node q is registry node q, since
+     * every node is appended, in order (2026-10-07: mempool_entry.h) */
+    uint32_t (*ix)[MPE_MAX_SET] = (uint32_t (*)[MPE_MAX_SET])malloc(4 * sizeof *ix);
+    if (!g->node || !g->mem || !o || !ix){ free(o); free(ix); mp_graph_free(g); return -1; }
+    g->cap = n; g->cap_mem = (unsigned long)n * 4;
 
     /* children index: head[i] is the first child slot, nxt[] chains the rest */
     uint32_t* head = (uint32_t*)malloc((size_t)n * sizeof *head);
@@ -4079,7 +4207,7 @@ long mpool_policy_entry_info_all(void* st, mp_entry_info* out, unsigned char (*i
     for (uint32_t i=0;i<n;i++) edges += t[i].n_parents;
     uint32_t* nxt  = (uint32_t*)malloc((size_t)(edges?edges:1) * sizeof *nxt);
     uint32_t* chld = (uint32_t*)malloc((size_t)(edges?edges:1) * sizeof *chld);
-    if (!head || !nxt || !chld){ free(head); free(nxt); free(chld); return -1; }
+    if (!head || !nxt || !chld){ free(head); free(nxt); free(chld); free(o); free(ix); mp_graph_free(g); return -1; }
     for (uint32_t i=0;i<n;i++) head[i] = 0xFFFFFFFFu;
     uint32_t e = 0;
     for (uint32_t i=0;i<n;i++)
@@ -4090,24 +4218,23 @@ long mpool_policy_entry_info_all(void* st, mp_entry_info* out, unsigned char (*i
         }
 
     for (uint32_t s=0;s<n;s++){
-        mp_entry_info* o = &out[s];
-        memcpy(ids[s], t[s].txid, 32);
-        memset(o, 0, sizeof *o);
         o->fee = t[s].fee; o->size = t[s].size; o->sigop_cost = t[s].sigop_cost;
+        o->n_depends = o->n_spentby = o->n_anc = o->n_desc = 0;
+        o->anc_fee = o->anc_size = o->desc_fee = 0;
 
         for (uint32_t k=0; k<t[s].n_parents && o->n_depends<MPE_MAX_SET; k++){
             uint32_t p = mpol_par_at(st, &t[s], k);
             if (p >= n) continue;
-            if (!mpe_seen(o->depends, o->n_depends, t[p].txid))
-                memcpy(o->depends[o->n_depends++], t[p].txid, 32);
+            if (!mpe_seen(o->depends, o->n_depends, t[p].txid)){
+                ix[0][o->n_depends] = p; memcpy(o->depends[o->n_depends++], t[p].txid, 32); }
         }
         for (uint32_t c = head[s]; c != 0xFFFFFFFFu && o->n_spentby<MPE_MAX_SET; c = nxt[c]){
             uint32_t i = chld[c];
-            if (!mpe_seen(o->spentby, o->n_spentby, t[i].txid))
-                memcpy(o->spentby[o->n_spentby++], t[i].txid, 32);
+            if (!mpe_seen(o->spentby, o->n_spentby, t[i].txid)){
+                ix[1][o->n_spentby] = i; memcpy(o->spentby[o->n_spentby++], t[i].txid, 32); }
         }
         { uint32_t stack[MPE_MAX_SET]; int sp=0;
-          memcpy(o->anc[o->n_anc++], t[s].txid, 32);
+          ix[2][o->n_anc] = s; memcpy(o->anc[o->n_anc++], t[s].txid, 32);
           o->anc_fee = t[s].fee; o->anc_size = t[s].size;
           stack[sp++] = s;
           while (sp > 0){
@@ -4116,13 +4243,13 @@ long mpool_policy_entry_info_all(void* st, mp_entry_info* out, unsigned char (*i
                   uint32_t p = mpol_par_at(st, &t[cur], k);
                   if (p >= n || mpe_seen(o->anc, o->n_anc, t[p].txid)) continue;
                   if (o->n_anc >= MPE_MAX_SET) break;
-                  memcpy(o->anc[o->n_anc++], t[p].txid, 32);
+                  ix[2][o->n_anc] = p; memcpy(o->anc[o->n_anc++], t[p].txid, 32);
                   o->anc_fee += t[p].fee; o->anc_size += t[p].size;
                   if (sp < MPE_MAX_SET) stack[sp++] = p;
               }
           } }
         { uint32_t stack[MPE_MAX_SET]; int sp=0;
-          memcpy(o->desc[o->n_desc++], t[s].txid, 32); o->desc_fee = t[s].fee;
+          ix[3][o->n_desc] = s; memcpy(o->desc[o->n_desc++], t[s].txid, 32); o->desc_fee = t[s].fee;
           stack[sp++] = s;
           while (sp > 0){
               uint32_t cur = stack[--sp];
@@ -4130,13 +4257,20 @@ long mpool_policy_entry_info_all(void* st, mp_entry_info* out, unsigned char (*i
                   uint32_t i = chld[c];
                   if (mpe_seen(o->desc, o->n_desc, t[i].txid)) continue;
                   if (o->n_desc >= MPE_MAX_SET) break;
-                  memcpy(o->desc[o->n_desc++], t[i].txid, 32);
+                  ix[3][o->n_desc] = i; memcpy(o->desc[o->n_desc++], t[i].txid, 32);
                   o->desc_fee += t[i].fee;
                   if (sp < MPE_MAX_SET) stack[sp++] = i;
               }
           } }
+        { uint32_t all[4 * MPE_MAX_SET]; uint32_t k = 0;   /* in mp_graph's order */
+          memcpy(all + k, ix[0], (size_t)o->n_depends * 4); k += (uint32_t)o->n_depends;
+          memcpy(all + k, ix[1], (size_t)o->n_spentby * 4); k += (uint32_t)o->n_spentby;
+          memcpy(all + k, ix[2], (size_t)o->n_anc * 4);     k += (uint32_t)o->n_anc;
+          memcpy(all + k, ix[3], (size_t)o->n_desc * 4);
+          if (mp_graph_append(g, t[s].txid, o, all) != 0){
+              free(head); free(nxt); free(chld); free(o); free(ix); mp_graph_free(g); return -1; } }
     }
-    free(head); free(nxt); free(chld);
+    free(head); free(nxt); free(chld); free(o); free(ix);
     return (long)n;
 }
 

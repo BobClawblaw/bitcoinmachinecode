@@ -100,6 +100,16 @@ int main(void){
 
     printf("== 6. a producer dies holding the lock: the next one proceeds ==\n");
     {
+#ifdef __APPLE__
+        /* macOS has no robust mutexes (see txho_create's guard): a holder
+         * that dies keeps the shared mutex locked forever, so the recovery
+         * this section pins on x86 (EOWNERDEAD -> pthread_mutex_consistent)
+         * cannot happen there. The degrade is the documented cost of the
+         * osx port of tx_handoff -- the hold is two memcpys between
+         * cooperating processes -- not a silent divergence: skipped, not
+         * weakened, until the ring grows a Darwin death-safe lock. */
+        printf("SKIP (Darwin: no robust mutexes -- see txho_create)\n");
+#else
         p = fork();
         if (p == 0){ txho_test_lock_and_die(); _exit(0); }
         waitpid(p, &stt, 0);
@@ -109,6 +119,7 @@ int main(void){
         ok(WIFEXITED(stt) && WEXITSTATUS(stt) == 0, "a push after the holder's death succeeds (no hang, no refusal)");
         drained = 0; txho_drain(count_cb, &drained, 10);
         ok(drained == 1, "and exactly its record is visible -- the dead producer published nothing");
+#endif
     }
 
     printf("\n%d checks, %d failed\n", checks, fails);

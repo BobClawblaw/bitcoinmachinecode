@@ -46,8 +46,10 @@ static pid_t spawn_real(const ir_t* r, long to){
          * worker (store files, peer sockets, the datadir .lock), and held
          * the lock for as long as it ran. Closed here as notify.c does. */
         { long maxfd = sysconf(_SC_OPEN_MAX); if (maxfd < 0 || maxfd > 65536) maxfd = 65536;
+#ifdef SYS_close_range
           if (syscall(SYS_close_range, 3U, ~0U, 0U) != 0)
-              for (long fd = 3; fd < maxfd; fd++) close((int)fd); }
+#endif
+              for (long fd = 3; fd < maxfd; fd++) close((int)fd); }   /* Darwin: no close_range, the loop is the whole path (osx port) */
         const char* base = strrchr(r->builder, '/'); base = base ? base + 1 : r->builder;
         execl(r->builder, base, r->chaindir, to_s, (char*)0);
         _exit(127);

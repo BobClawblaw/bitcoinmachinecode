@@ -33,6 +33,7 @@
  * removed, case 2's oversized passphrase is accepted.
  */
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -49,6 +50,26 @@ static void ck(const char* l, int c){ printf("%s %s\n", c ? "ok  :" : "FAIL:", l
 static const char* MN =
     "abandon abandon abandon abandon abandon abandon "
     "abandon abandon abandon abandon abandon about";
+
+#ifdef __APPLE__
+/* Mach-O has no __data_start/_end: the same range is the main image's
+ * __DATA segment (.data, .bss and common all live in it), slide applied. */
+#include <mach-o/getsect.h>
+#include <mach-o/dyld.h>
+static char *bmc_data_lo, *bmc_data_hi;
+static void bmc_data_bounds(void){
+    if (bmc_data_lo) return;
+    unsigned long sz = 0;
+    uint8_t* p = getsegmentdata((const struct mach_header_64*)_dyld_get_image_header(0), "__DATA", &sz);
+    bmc_data_lo = (char*)p; bmc_data_hi = (char*)p + sz;
+}
+#define DATA_LO (bmc_data_bounds(), bmc_data_lo)
+#define DATA_HI (bmc_data_bounds(), bmc_data_hi)
+#else
+extern char __data_start[], _end[];
+#define DATA_LO __data_start
+#define DATA_HI _end
+#endif
 
 int main(void){
     u8 seed[64], seed2[64];
@@ -110,11 +131,10 @@ int main(void){
         /* Scan this process's writable data for the key block. kpad holds the
          * key XOR 0x36 then XOR 0x5c, so look for both forms as well as the
          * raw key -- any of the three surviving is the leak. */
-        extern char __data_start[], _end[];
         u8 ip[64], op[64];
         for (int i = 0; i < 64; i++){ ip[i] = key[i] ^ 0x36; op[i] = key[i] ^ 0x5c; }
         int found_raw = 0, found_ip = 0, found_op = 0;
-        for (char* q = __data_start; q + 64 <= _end; q++){
+        for (char* q = DATA_LO; q + 64 <= DATA_HI; q++){
             if (!memcmp(q, key, 64)){
                 /* our own `key` local is on the stack, not here; a hit in
                  * .data/.bss is the module's scratch */

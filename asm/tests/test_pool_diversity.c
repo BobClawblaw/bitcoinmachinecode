@@ -107,6 +107,43 @@ int main(void){
     int anon = 0; for(int i = 0; i < n3; i++){ int k = net_of(pool2[i]); if(k == BMC_NET_TORV3 || k == BMC_NET_I2P || k == BMC_NET_CJDNS) anon++; }
     ok(n3 == 64 && anon == 0, "with no anonymity transport configured the pool holds none of their addresses");
 
+    printf("== a slot whose pool has no free candidate draws a fresh pool from the book (2026-10-10) ==\n");
+    /* mainnet ran on 6-8 of its 10-11 outbound legs for hours: every slot
+     * redialled from the 64 addresses sampled at start, and once those were
+     * under backoff or held by other legs there was nothing to dial. Watched
+     * to fail first: with mux_fresh_pick returning NULL, the first check
+     * fails and no draw is taken. */
+    { void* dm = malloc(dialmem_bytes(DIALMEM_CAP)); dialmem_init(dm, DIALMEM_CAP); g_dialmem = (dm_table_t*)dm;
+      for(int k = 0; k < MUX_MAX_OUT; k++) mux_out_fd[k] = -1;
+      mux_n_out = 1; mux_out_peer[0] = 0;
+      const char* tiny[2] = { "11.1.1.7:8333", "11.1.2.7:8333" };
+      long long now = dialmem_now();
+      for(int k = 0; k < 2; k++) dialmem_note_failure(g_dialmem, tiny[k], DM_REFUSED, now);
+      long r0 = g_mux_resamples;
+      const char* h = mux_pick_host(0, tiny, 2);
+      ok(h != NULL && strcmp(h, tiny[0]) && strcmp(h, tiny[1]), "both pool hosts under backoff: a fresh address from the book is picked");
+      ok(h && dialmem_allowed(g_dialmem, h, now) && net_of(h) == BMC_NET_IPV4, "...one the dial memory allows, on a dialable network");
+      ok(g_mux_resamples == r0 + 1, "...from one fresh draw");
+      /* every fresh address under backoff too: nothing to dial, and no
+       * second draw inside the interval */
+      for(int q = 0; q < g_mux_fresh_n; q++) dialmem_note_failure(g_dialmem, g_mux_fresh[q], DM_REFUSED, now);
+      ok(mux_pick_host(0, tiny, 2) == NULL && g_mux_resamples == r0 + 1, "the fresh pool exhausted too: no dial, and no re-draw inside the interval");
+      g_mux_fresh_at -= MUX_RESAMPLE_MS + 1;
+      dl_pool_test_seed(4242);
+      h = mux_pick_host(0, tiny, 2);
+      ok(h != NULL && g_mux_resamples == r0 + 2, "after the interval: a second draw, and a free address from it");
+      /* a host another live leg holds is not picked from the fresh pool either */
+      { int sp[2]; if(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0){
+            mux_n_out = 2; mux_out_fd[1] = sp[0]; snprintf(mux_out_host[1], sizeof mux_out_host[1], "%s", h);
+            int dup = 0; for(int t = 0; t < 64; t++){ const char* h2 = mux_pick_host(0, tiny, 2); if(h2 && !strcmp(h2, h)) dup = 1; }
+            ok(!dup, "...and never a host another live leg already holds");
+            close(sp[0]); close(sp[1]); mux_out_fd[1] = -1; mux_n_out = 1; } }
+      g_cfg.connect_only = 1; g_mux_fresh_at -= MUX_RESAMPLE_MS + 1;
+      for(int q = 0; q < g_mux_fresh_n; q++) dialmem_note_failure(g_dialmem, g_mux_fresh[q], DM_REFUSED, now);
+      long r2 = g_mux_resamples;
+      ok(mux_pick_host(0, tiny, 2) == NULL && g_mux_resamples == r2, "under connect= the configured peers are the only ones: no draw");
+      g_cfg.connect_only = 0; }
+
     char cmd[256]; snprintf(cmd, sizeof cmd, "rm -rf %s", dir); (void)!system(cmd);
     printf("\n%s (%d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);
     return fails ? 1 : 0;

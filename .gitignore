@@ -459,6 +459,12 @@ asm/daemon/bmc_build_*.run-*
 asm/daemon/bmc_build_tx_index
 asm/daemon/bmc_utxo_probe_one
 
+# ---- Private project rules (local-only; contains identity info, never push) ----
+docs/PROJECT_LOCAL_RULES.md
+
+# ---- osx port build scratch (binaries + run logs) ----
+port/osx/daemon_out/
+
 # ---- gate log audits (scripts/gate_log_audit.py writes one per gate log) ----
 asm/gate-*.audit
 

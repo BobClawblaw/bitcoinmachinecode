@@ -16,6 +16,7 @@ latest ones (audit 2026-09-02, recommendation 8: publish the height).
 | 2026-09-28 02:09 | 968,920 | (not recorded) | `20a98a1547ea0e51` | production after #331 (the AVX2 keystream under MuHash): indexed row equal to Core's |
 | 2026-09-27 12:10 | 968,837 | (not recorded) | `b0982e65d4d5ed94` | production after #321: the no-height answer, the per-height row and Core all print this |
 | 2026-09-27 09:3x | 968,821 | 165,210,914 | `ee7594826ad13e65` | production and the assumevalid=0 fresh sync, both equal to Core; rows 968,806–968,821 all equal |
+| 2026-09-25 17:41 | 968,570 | 165,271,852 | `6cc459ddaa38e1ad` | bmc_osx (macOS/arm64) mainnet vs a local Core; muhash identical once printed in Core's byte order (c42cc03f) |
 | 2026-09-02 07:04 | 965,135 | 165,632,732 | `4025abd64e518e80` | deploy ak (audit N3/N7) |
 
 > BLD-5 (2026-09-05): THIS TABLE IS BEHIND THE NODE. The last attestation is

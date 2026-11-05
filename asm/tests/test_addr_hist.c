@@ -9,12 +9,16 @@
 #include <dirent.h>
 #include <errno.h>
 #include <stddef.h>
+#include <sys/wait.h>
+#ifndef __APPLE__
 #include <sys/prctl.h>
 #include <sys/syscall.h>
-#include <sys/wait.h>
 #include <linux/audit.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
+#else
+#include <sys/stat.h>
+#endif
 #include "../daemon/addr_hist_fmt.h"
 #include "test_tmpdir.h"
 typedef unsigned char u8; typedef unsigned int u32; typedef unsigned long long u64;
@@ -35,6 +39,25 @@ static int bucket_files_left(void){
     while ((e = readdir(d))) if (!strncmp(e->d_name, "aho_b", 5) || !strncmp(e->d_name, "ahs_b", 5)) n++;
     closedir(d); return n;
 }
+#ifdef __APPLE__
+/* bmc_osx: no seccomp. The addr_hist files present before the merge are
+ * marked user-immutable, so the merger's unlink of each input fails with
+ * EPERM, the filter's answer; its new output is not marked. Cleared after. */
+static void flag_ah_files(unsigned flags){
+    DIR* d = opendir("."); struct dirent* e;
+    while (d && (e = readdir(d))) if (!strncmp(e->d_name, "addr_hist", 9)) chflags(e->d_name, flags);
+    if (d) closedir(d);
+}
+static int run_ah_merger(const char* merger, int fail_unlink){
+    fflush(stdout);
+    if (fail_unlink) flag_ah_files(UF_IMMUTABLE);
+    pid_t p = fork();
+    if (p == 0){ execl(merger, "bmc_merge_index_runs", ".", "addr_hist", (char*)0); _exit(127); }
+    int st = 0; waitpid(p, &st, 0);
+    if (fail_unlink) flag_ah_files(0);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 255;
+}
+#else
 /* ST2-2: run the merger; fail_unlink puts it under a seccomp filter that
  * answers unlink/unlinkat with EPERM (inherited across the exec) */
 static int run_ah_merger(const char* merger, int fail_unlink){
@@ -60,6 +83,7 @@ static int run_ah_merger(const char* merger, int fail_unlink){
     int st = 0; waitpid(p, &st, 0);
     return WIFEXITED(st) ? WEXITSTATUS(st) : 255;
 }
+#endif
 /* ST2-7: a hostile/corrupt addr_hist.dat. hdr fields as given; one group of
  * key (3, 00 00 01 ..) claiming `gn` events with ONE event actually present.
  * Returns ah_lookup's answer for that key from a forked child (so an

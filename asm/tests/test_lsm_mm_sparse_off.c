@@ -92,6 +92,9 @@ static long lookup(unsigned run_no, u8 first, u8 second){
 
 int main(void){
     tt_isolate();
+#ifdef __APPLE__
+    setenv("BMC_LSM_MMAP", "1", 1);   /* bmc_osx: the fast path is off by default there; this is its test */
+#endif
     const u64 len = 44 + NREC * 37;
 
     write_run(1, len);

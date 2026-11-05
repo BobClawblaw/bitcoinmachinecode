@@ -181,6 +181,15 @@ int main(void){
     int badlen = hex2bin(MPV_BAD_TX_HEX, badtx, sizeof badtx);
     printf("bad tx (input %d corrupted): %d bytes\n", MPV_BAD_INDEX, badlen);
 
+    /* 2026-10-08: each call above runs on FRESH threads, and every one of
+     * them allocates the interpreter's per-thread scratch (BMC_TLS_BUF,
+     * ~11 MB of address space a thread). Those buffers were never freed, so
+     * the Mac's mainnet worker grew by one set per mempool transaction with 8+
+     * inputs -- 195 GB of address space in two hours. They are freed at
+     * thread exit now: across the 20 calls below the workers allocate, and
+     * what is held afterwards is what was held before. */
+    extern long bmc_tls_live, bmc_tls_made;
+    long live0 = bmc_tls_live, made0 = bmc_tls_made;
     int all_consistent = 1;
     for (int iter = 0; iter < 20; iter++){
         const char* r2 = "?";
@@ -192,6 +201,10 @@ int main(void){
         }
     }
     ck("corrupted-input tx: REJECTED with the right reason, 20/20 consistent runs", all_consistent);
+    printf("    per-thread scratch over 20 calls: %ld allocated, held %ld -> %ld\n",
+           bmc_tls_made - made0, live0, bmc_tls_live);
+    ck("the worker threads allocated per-thread scratch (the path under test ran)", bmc_tls_made - made0 >= 20);
+    ck("...and every buffer was freed when its thread exited: none held afterwards", bmc_tls_live == live0);
     /* assumevalid (2026-09-01): with script evaluation switched off the same
      * corrupted signature passes block connection (every structural and UTXO
      * check still ran); switched back on it is rejected again. */

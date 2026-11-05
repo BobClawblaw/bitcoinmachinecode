@@ -23,6 +23,10 @@
 #include <string.h>
 #include <unistd.h>
 #include "test_tmpdir.h"
+#ifdef __APPLE__
+#include <libproc.h>
+#include <sys/proc_info.h>
+#endif
 typedef unsigned char u8; typedef unsigned long long u64;
 
 extern int  store_init(void* st);
@@ -36,7 +40,25 @@ extern const u8* store_map_at(void* st, u64 height, u64 out[2]);
 static long failures;
 #define CK(c, ...) do{ if (c) printf("ok  : " __VA_ARGS__); else { failures++; printf("FAIL: " __VA_ARGS__); } printf("\n"); }while(0)
 
-/* mappings of a file with this basename, from /proc/self/maps */
+/* mappings of a file with this basename: from /proc/self/maps, or on Darwin
+ * (2026-09-28) by walking our own task's regions with
+ * proc_pidinfo(PROC_PIDREGIONPATHINFO), which names the vnode each region
+ * is backed by. (Not proc_regionfilename per mach_vm_region: asked about an
+ * address in a hole it answers for the next mapped entry, so one mapping
+ * counted three times here.) */
+#ifdef __APPLE__
+static int mappings_of(const char* base){
+    unsigned long long a = 0; int n = 0; size_t bl = strlen(base);
+    for (;;){
+        struct proc_regionwithpathinfo r; memset(&r, 0, sizeof r);
+        if (proc_pidinfo(getpid(), PROC_PIDREGIONPATHINFO, a, &r, sizeof r) < (int)sizeof r) break;
+        size_t pl = strlen(r.prp_vip.vip_path);
+        if (pl >= bl && !strcmp(r.prp_vip.vip_path + pl - bl, base) && (pl == bl || r.prp_vip.vip_path[pl-bl-1] == '/')) n++;
+        a = r.prp_prinfo.pri_address + r.prp_prinfo.pri_size;
+    }
+    return n;
+}
+#else
 static int mappings_of(const char* base){
     FILE* f = fopen("/proc/self/maps", "r"); if (!f) return -1;
     char line[512]; int n = 0; size_t bl = strlen(base);
@@ -46,6 +68,7 @@ static int mappings_of(const char* base){
     }
     fclose(f); return n;
 }
+#endif
 
 int main(void){
     tt_isolate();
@@ -72,7 +95,7 @@ int main(void){
     { FILE* f = fopen("blk00007.dat", "w"); if (!f){ printf("FAIL creating blk00007.dat\n"); return 1; } fclose(f); }
     int fd7 = store_rd_fd(st, 7);
     CK(fd7 >= 0, "store_rd_fd(7) caches a descriptor (%d) in slot 7 -- the bytes at st+120..127", fd7);
-    CK(*(unsigned*)(st + 120) == 7, "slot 7 holds file_no 7 at st+120 (the old magic's home)");
+    CK(*(unsigned*)(st + 120) == 7, "slot 7 holds file_no 7 at st+120 (the old magic's home; the Mac's magic sits at +384)");
 
     const u8* p2 = store_map_at(st, 1, o);
     int m2 = mappings_of("blk00000.dat");

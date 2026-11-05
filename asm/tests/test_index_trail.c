@@ -149,7 +149,7 @@ int main(void){
      * fds 0-2 only. It inherited every descriptor of the worker -- store
      * files, peer sockets, the datadir .lock -- here a marker on fd 77. */
     { FILE* sf = fopen("fds_builder.sh", "w");
-      fputs("#!/bin/sh\nls /proc/$$/fd | tr '\\n' ' ' > \"$1/fds_trail.out\"\nexit 1\n", sf); fclose(sf);
+      fputs("#!/bin/sh\nif [ -d /proc/$$/fd ]; then ls /proc/$$/fd; else ls /dev/fd; fi | tr '\\n' ' ' > \"$1/fds_trail.out\"\nexit 1\n", sf); fclose(sf);
       chmod("fds_builder.sh", 0755);
       char sp[4200]; snprintf(sp, sizeof sp, "%s/fds_builder.sh", tt_workdir());
       int mk = open("/dev/null", O_RDONLY); if (mk >= 0 && mk != 77){ dup2(mk, 77); close(mk); }

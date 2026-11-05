@@ -1,0 +1,1084 @@
+# OSX PORT STATE — durable snapshot
+
+Updated whenever status materially changes. Newest section top.
+(Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
+status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
+
+## 2026-11-04 — merged main through #450 (243 commits, 7eb763ab..e4e54e3f) and ported its x86 changes
+
+Merge (not rebase) of `origin/main` at e4e54e3f into `bmc_osx`. Backup tag `pre-merge-450` = d48a7c2e.
+
+**Conflicts (9), resolved:**
+- `asm/Makefile`: main's test list, plus the Mac's `tests/test_mempool_lock_fair` after `test_mempool_lock_log`.
+- `asm/bitcoin_mempool_policy.c`: main's persistent children index (`g_cx`, `mpol_cx_get`), with the Mac's `mpool_policy_set_cluster_walk_scan` knob kept in front of it (`have_cx = !g_mpol_cluster_walk_scan && mpol_cx_get(st)`); `test_mempool_policy` uses the knob for its differential check.
+- `asm/rpc_chain.c`: both sides fixed the read lane's per-thread leak independently (main on 10-07 with a pthread key, the Mac on 10-09 with `bmc_tls_keep`). The Mac's version is kept and main's key removed; `test_rpc_chain` keeps both tests (the six exiting threads and main's 64 `getblock_once` threads, counting fds with the Mac's `open_fds`).
+- `asm/daemon/main.c` (idle branch), `daemon/coinstats_index.c` (the Mac's acquire-fence comments), `tests/test_dlc_header_probe.c` (main's served-count reset and 5-argument `start_peer`, the Mac's `stop_peers` on failure), `docs/FEATURE_GAPS.md` and `docs/devlog/LOG.md` (both sides).
+
+**Shared C that did not build on Darwin, now guarded:**
+- `SYS_close_range` under `#ifdef SYS_close_range` (`coinstats_index.c`, `index_repair.c`, `index_trail.c`, as `notify.c` already did); `benchlog.h`'s `PR_SET_VMA` naming under `#ifdef SYS_prctl`.
+- `rpc_signer.c`: the keeper was a `clone()` child. On Darwin it is a `fork()` child that writes the shell's wait status down a second CLOEXEC pipe (`pipe` + `fcntl`: no `pipe2`); `signer_wait` reads it, then reaps, tolerating ECHILD. `test_rpc_signer` lists fds with `ls /dev/fd`.
+- `undo_log.c`: `undo_drop_behind` is a no-op (`UNDO_NO_DROP`: no `sync_file_range`/`posix_fadvise` page drop).
+- `utxo_live.c`: the cache drops are under `#ifndef __APPLE__`, `MADV_HUGEPAGE` under its ifdef. **Fork trim (plan M2) is off on the Mac** (`g_fork_trim = 0`): Darwin has no `MADV_DONTFORK`, and `minherit` cannot restore the MAP_SHARED header page. The merge child and the flush writer are forked whole, so pages the parent writes while a child lives are copied. The WAL retire punches with `F_PUNCHHOLE`, rounded inward to the filesystem block (`fz_punch`); `g_fz_bytes_retired` still counts the whole range.
+- `torcontrol.c`: `getrandom` via `getentropy`.
+
+**Assembly ports (`port/osx/*.S`):**
+- `bitcoin_utxo_lsm.S`, plan B3 (the async flush): `utxo_lsm_freeze`, `utxo_lsm_build_run` (the run writer split out of the flush; the flush calls it), `utxo_lsm_set_freeze_hook` (called in place of the flush at put/del's threshold), `utxo_lsm_fz_enable`, and the frozen generation in `utxo_lsm_get` (between the live generation and the runs). The flush empties `utxo.idx` before the WAL reset. ST2-1: the run's and the manifest's fsync results are checked; STO-W: a directory fsync between the run's create and the manifest rename; STO-D: the directory fsync's open and result are checked (`Lfsync_dir` returns a status), in the flush and the compaction. F7: a manifest entry with gen or run_no 2^64-1 fails the reload; the reload's tombstone scan starts at `ckpt_log_off`. Runs may carry a bloom up to 256 MiB (`RUN_BLOOM_MAX_BYTES`, its own mapping past the 4 MiB scratch area). The Mac's file-path lookup preads its three bloom bytes, so it tests a large bloom where main's fallback skips it. The tombstone set uses `utxo_hash`'s multiply mix (`Ltomb_probe_raw`).
+- `bitcoin_utxo.S`: the memtable home slot is the new multiply mix (the C `outpoint_hash` in `utxo_live.c` agrees).
+- `bitcoin_utxo_store.S`: the WAL buffer is 32 MiB, with the pre-drain hook (STO-A), `utxo_store_forget_buffer`, and the STO-E heal of a log shorter than its checkpoint.
+- `bitcoind.S` (P2P-1): a `block` reply whose hash is not the one asked for is passed over; 16 of them end the pass (where=11). It also adds `g_block_ctx_hook`, and a compact-block hook result of -2 fails the pass (where=14).
+- `bitcoin_serve.S`: main's getblocks rewrite (hashStop, the internal-order hashes, the continuation inv at 500), the locator limits (`serve_locator_from`'s size check; no-locator getheaders), low-work getheaders, the tip watch, `serve_cmpct_as_full`, and MPL-1 (the reject filter is keyed by wtxid, so a MSG_WTX announcement is checked against it too).
+- Smaller ones: CON-9 canonical CompactSize tx count (`bitcoin_cons.S`), the addr count's canonical and MAX_SIZE checks (`bitcoin_addrmgr.S`), `k == n` refused (`bitcoin_keys.S`, and `bitcoin_bip32.S`'s master key now uses that check), `fd_write_all` failing at once on a negative fd (`bitcoin_net.S`), `node_log_open` returning -1 (`node_log.S`), the store's fd set to -1 after a failed open (`bitcoin_store.S`).
+- `utxo_lsm_mm.c`: main's version (pread record reads, `lsm_mm_set_reads`, the ST2-8 sparse_off check, cached bloom hashes) with the Mac's default-off patch reapplied.
+
+**Mac gaps that main had already closed, found while porting `bitcoin_serve.S`:**
+- 3.1: peers were told the stored tip rather than the connected one; announcements and getheaders now use `serve_public_tip`.
+- CC-1: the serve loop never announced mempool transactions to inbound peers (`txann_wait`).
+- BIP144: a plain MSG_BLOCK request (no witness bit) was sent with witnesses; `block_strip_witness` now strips them.
+- A bug of the port's own: `.gh_build` stored the header count through the tip value as if it were an address (`str x10, [x11]`). It now stores to `s_cnt`.
+- Another, introduced by this port and caught by `test_serve_txrejects`: the tx-announcement path reloaded the item pointer from a stack slot that nothing on its way had written, so a connection's first tx announcement read address 0 and killed the serve child. It keeps the pointer from the inv loop now.
+
+**A Mac bug that predates the merge:** `p2p_read`'s v1 path returned -1 on a clean close or short header read; x86 returns 0 (`.eof_or_err`). It now returns -1 only on a read error. `test_getblocks`'s disconnect checks caught it.
+
+**Tests:**
+- `run_tests.py` emulates `-Wl,--wrap` (ld64 has none). Each object's undefined references to SYM are pointed at `__wrap_SYM` in its Mach-O symbol table, and a `__real_SYM: b SYM` trampoline is linked in. Eight Makefile rules use it; three of them predate this merge.
+- `test_support/bitcoin_utxo_lsm_badsparse_twin` is now the Mac assembly with `LSM_REPRO_BAD_SPARSE`, as on x86. The C twin it used lacked the async-flush entry points, so the runner had quietly linked the good LSM, and both `_bad` negative controls stopped reproducing the incident.
+- Shared tests made to run on Darwin:
+  - `test_secret_wipe` reads `sp` on AArch64.
+  - `test_coinstats_hist_build` and `test_rpc_signer` list `/dev/fd`.
+  - `test_utxo_reap_at_tip` reads the zombie state with `sysctl(KERN_PROC_PID)`.
+  - `test_utxo_memtable_anon` reads VM regions with `mach_vm_region`/`proc_regionfilename` and uses the page size (16 KiB here) for the header page; Darwin does not name anonymous regions.
+  - `test_lsm_fsync_fail` interposes `fsync` in place of the seccomp trap. It confirms that the Mac LSM's flush and compaction each make exactly four fsyncs and that each one's failure fails the operation.
+  - `tests/durable_image.h` (the power-loss recorder of `test_sto_crash` and `test_sto1_crash`) and `test_undo_ckpt_sync` define `fsync`, `fdatasync` and `open` in place of the seccomp trap (the Mac code calls them through libc); a file is named with `F_GETPATH`, identified by `st_ino` + `st_birthtimespec`. Every STO scenario and its control heals, the EIO and EMFILE injections included.
+  - `test_index_runs` and `test_addr_hist` make the merger's unlinks fail with `chflags(UF_IMMUTABLE)` on the inputs (EPERM, the seccomp filter's answer).
+  - `test_index_repair` and `test_index_trail` list `/dev/fd`; `test_benchlog`'s mem section checks only that the line stays bounded (no `/proc/self/status`); `test_bip324_transport` reads `sp`.
+  - `test_rpc_server` and `test_rpc_esplora_listener` measure the heap with `malloc_zone_statistics`. RPC-21's bound allows 12 KiB per thread on the Mac (4 elsewhere): libmalloc's per-thread magazines took +20,736 KiB for 16 threads.
+  - `test_utxo_recover_gate` reads VM regions as `memtable_anon` does (an unlinked run is a mapped path that no longer exists); it and `test_lsm_mm_sparse_off` turn the mapping cache on (`BMC_LSM_MMAP=1`), which the Mac leaves off by default.
+  - `test_tx_relay_rejects` gives its socketpairs 1 MiB buffers (Darwin's 8 KiB default blocked its 5,000-entry inv).
+  - `test_rpc_intake` dials from 127.0.0.2 and .3 and is alias-gated (`loopback_alias.h`).
+  - `build_tools.sh` lets `bmc_rpcd` leave `serve_conn_perms` and `serve_reorg_check` undefined (the daemon supplies them).
+- N/A: `test_utxo_fork_trim` (`MADV_DONTFORK`) and `test_drop_appends` (the page-cache drop is a no-op on the Mac).
+  - `test_block_481827_pool_stack` drops its macOS `#define` stand-in for `--wrap`: with the runner's emulation as well, its `__real_store_get_at` was redirected back to the wrapper and recursed forever.
+- **Full suite (2026-11-04, 480 commands):** 452 PASS, 12 SKIP, 16 N/A, 0 FAIL. Of those, 451 passed in the full run; `test_block_481827_pool_stack` timed out there and passed alone after the fix above. The N/A list is the 14 x86 asm differentials plus `fork_trim` and `drop_appends`; SKIP is the alias-gated and fixture-gated tests.
+
+**Not deployed.** The mainnet node (`~/bmc_osx_deploy`, `com.bmc.mainnet`) is stopped and disabled since 2026-10-12. A deploy restarts it on the async flush and the new store code.
+
+## 2026-10-10 (2) — an outbound slot with no free candidate draws a fresh pool from the book (shared C)
+
+The empty slots found in (1). Every pool a slot redials from was sampled once, when the worker started: 64 addresses of the book's 3,401 dialable. As they entered dial backoff or were held by other legs, slots found no free candidate, and the node ran on 6–8 of its 10–11 outbound legs, logging "no dial candidate is free" (15,517 lines; one per slot per minute) from an hour or two after each restart.
+- **Fix** (`daemon/main.c`): the candidate gates are one function (`mux_candidate_free`: not an anonymity net, not under backoff unless manual, not held by another live leg), and `mux_pick_host` tries the caller's pool first, as before. When the caller's pool has nothing free, it falls back to a second pool sampled fresh from the book (`dl_pool_from_book`, the same uniform sample), which is redrawn at most every 5 minutes (`MUX_RESAMPLE_MS`) and never under `connect=`. The callers' pools are left alone: some are `connect=` lists and anchors, and `mux_out_peer[]` indexes them. A draw logs `[mux] the dial pool has no free candidate: N address(es) sampled fresh from the book`.
+- **Test:** `test_pool_diversity` gains seven checks against the real book: with both pool hosts under backoff a fresh, allowed address is picked from one draw; an exhausted fresh pool dials nothing and is not redrawn inside the interval; after the interval a second draw gives a free address; a host another live leg holds is never picked; under `connect=` nothing is drawn. With the fallback disabled, five fail.
+- **Full suite:** 425 PASS, 11 SKIP, 14 N/A, 0 FAIL.
+
+## 2026-10-10 (1) — `sync_failing` counted closed legs; signet retired
+
+- **Signet:** stopped and its launch agent (`com.bmc.signet`) disabled at the user's request; `~/bmc_signet` and the plist are left in place. Deploys now go to mainnet only.
+- **`sync_failing` in the heartbeat:** it never cleared. It read 1–4, mostly 2–3, for all 127 heartbeats of a two-hour run in which no leg was closed for `sync-failed-3x`, and it never exceeded the number of empty slots. The count is legs with a nonzero failing streak, and neither `leg_close_ours` nor `leg_close_theirs` reset the streak; only a good pass or the next peer in the slot did. A leg closed for another reason after a failing pass or two left its count in an empty slot, and three slots that no dial candidate could fill carried it for hours. **Fix:** both closes reset the slot's streak, and the heartbeat counts connected legs only (`legs_sync_failing`). **Test:** `test_pass_silence_strike` gains four checks (a close by either side clears the slot; a stale count in an empty slot is not reported); without the fix all four fail.
+- **Found here, fixed in (2):** why those slots stay empty. The worker samples 64 addresses from the book once at start (3,401 dialable) and redials only from them. As they enter dial backoff or are held by other legs, slots find no free candidate ("no dial candidate is free", 15,517 lines in the log) and the node runs with 6–8 of its 10–11 outbound peers. Core picks each outbound from its whole table.
+- **Full suite:** 425 PASS, 11 SKIP, 14 N/A, 0 FAIL.
+
+## 2026-10-09 (3) — the worker's own long accept holds now name their steps (shared C, logging only)
+
+In the ten minutes after the f7ce2d72 deploy, the lock log's only long hold was the worker's: `tx_accept_validate_p2p held 1170 ms (waited 0 ms)`. There were eight such lines on 10-09 (1.0–5.8 s), with up to two waiters behind some. Most coincide with my own load on the Mac (the full suite at 23:34–23:35, the `getmempoolentry` timing at 23:41), so some may be a busy CPU stretching an ordinary hold. The log could not say where the time went: script checking runs before the lock, but `mpool_policy_add` and the fee-estimator note named no steps.
+- **Change:** `mpol_add_core` names its stages with `mpol_phase`: `add/standard`, `add/inputs`, `add/dust+feefloors`, `add/conflicts`, `add/limits+cluster`, `add/truc`, `add/diagram`, `add/commit`, `add/rbf_evict`, `add/store+trim`. The three accept entries name `fee_note`. A hold line now reads `tx_accept_validate_p2p ... held N ms: add/standard 0 ms, add/inputs ... ms, ...`. `mp_lock_phase` is a weak no-op when the caller does not hold the lock, so tests that call the policy without it are unaffected.
+- **Not tested directly:** nothing in the suite makes an accept hold the lock past the threshold. The first production line will show the steps.
+- **Full suite:** 425 PASS, 11 SKIP, 14 N/A, 0 FAIL.
+
+## 2026-10-09 (2) — the pool lock: `getmempoolentry` builds after the lock, and a newcomer no longer jumps the queue (shared C + Mac lock)
+
+Item 24 (verbose `getrawmempool` holding the lock for its JSON build) was already fixed on 2026-10-06. The log after the e9a44c97 restart showed a different shape: 29 wait lines in about an hour, every one behind `getmempoolentry`.
+- **Starved waiters:** the worker's accepts (`tx_accept_validate_p2p`, `tx_accept_validate_reason`, `txacc_note_sigops`) waited 1.0–6.0 s while 97–216 takes went by, none longer than 18 ms. A client polls `getmempoolentry` in a loop.
+- **Long holds:** three single `getmempoolentry` calls held the lock about 2.4 s each, ~69 s apart, in the first five minutes.
+- **Cause 1, the hold:** `getmempoolentry` built its entry under the lock through the per-entry path. That is one registry call for the transaction, one per ancestor and descendant, one per cluster member for the chunk (each rebuilding the O(pool) children index), plus the cluster's optimal linearization. **Fix:** it snapshots the component under the lock and renders after it, as verbose ancestors/descendants have done since 2026-10-06 (`mpe_snapshot_component`). `test_rpc_chunk_scale 68000 1048576`: longest hold over six members of 25-chains 10.4 → 3.5 ms, answers byte-identical. The 2.4 s holds were not reproduced offline; the linearization, the likely cost for a large cluster, now runs after the release.
+- **Cause 2, the starvation:** `mp_unlock` frees the word and wakes one sleeper, but the releaser's next take is one CAS and won before the woken waiter ran. **Fix** (`mp_rlock_lock`, the Mac's lock): a thread that arrives while others sleep first waits for one take by somebody else (a new `takes` count in the lock word, which it sleeps on, so an unlock's wake-one still reaches a real waiter) or 1 ms, then tries. It is bounded, so it is not a queue and cannot wedge, and the uncontended path costs one atomic load.
+- **Test:** new `test_mempool_lock_fair`. A child process takes, holds 3 ms, releases and takes again at once; the parent times 20 takes. Before: median 0–206 ms, longest 2.8–3.7 s, 8 s for the 20. After: median ~1 ms, longest 3.0–3.2 ms, 80 ms for the 20. `test_rpc_chunk_scale` gains the `getmempoolentry` old-vs-snapshot section. `test_mempool_lock_log`'s convoy section (E) relied on the starvation: its waiter behind six 3 ms holders now gets in within a few holds, short of the 100 ms threshold. It runs at a smaller scale, twelve holders and a 20 ms threshold, and still pins a wait made of short holds (39–160 ms through 11–44 takes in five runs).
+- **x86:** the `getmempoolentry` change is shared C. Its lock is a process-shared `pthread_mutex`, which probably barges the same way; the fairness test is N/A there until it gets an equivalent.
+- **Full suite:** 425 PASS, 11 SKIP, 14 N/A, 0 FAIL.
+
+## 2026-10-09 (1) — the RPC side's per-thread buffers: freed, and the read lane's archive handle closed, at thread exit (shared C)
+
+(5) and (7) left the RPC code's hand-rolled heap TLS alone. Most of it lives on the RPC pools' long-lived threads, so the question was which short-lived threads reach it.
+- **Who can:** the Esplora facade runs one thread per connection (`esp_conn_thread`, capped at 16 live), and its routes call `getblock` in that thread through `rpc_dispatch`. `getblock` enters the per-thread read lane (2026-10-05). On a thread's first call, the lane opens a private archive handle (its own `index.dat` descriptor and block-file descriptors) and allocates an 8 MB block buffer. At verbosity 2/3 it also allocates 4.8 MB and 19 MB of undo arrays, and the txid scratch, 256 KB or more. None of this was released at thread exit, so each Esplora connection that served a block left about 32 MB **and three open descriptors** behind. The descriptors run out first. Longpoll waiters only run `getblocktemplate` and reach none of it.
+- **Deployed nodes:** neither the mainnet nor the signet config enables Esplora, so neither was leaking. The RPC parent's 1.1 GB of malloc is 332 blocks, mostly a few fixed buffers (384, 256, 192 and 64 MB), and does not grow with requests.
+- **Fix:**
+  - `bmc_thread.h` gains `bmc_tls_keep(p, fin)`, which puts a block the caller already has on the thread-exit list, optionally with a finaliser, and `BMC_TLS_GROW`, a holder for buffers that `realloc`.
+  - `rpc_chain.c`: the read lane's handle becomes a heap block whose finaliser closes its descriptors. The block buffer, the undo arrays and the txid scratch go on the list.
+  - Also on the list: `rpc_json.c`'s freeze scratch, `rpc_node.c`'s decode-error message, and `rpc_server.c`'s auth-user name (now `BMC_TLS_BUF`).
+  - `tls_bitcoin_scriptcodec.c` (Mac): the interpreter's 5 MiB IF/ELSE stack (`vfexec`). The mainnet worker holds 16 of these and the count stayed flat for eight minutes, so they belong to long-lived threads, but any thread that ran a script and exited would have kept one.
+- **Test:** `test_rpc_chain` runs `getblock <h> 3` on 6 threads, one after another, each of which exits. It requires the 6 handles to be closed by the finaliser, the descriptor count unchanged (14 → 14), the lane's buffers to have gone on the list (30), and none held afterwards. With the lane back on plain `malloc`, it goes 14 → 32 descriptors with 0 handles closed, and the test fails.
+- **x86:** the same code, and the same exposure wherever Esplora is on.
+- **Full suite:** 424 PASS, 11 SKIP, 14 N/A, 0 FAIL.
+
+## 2026-10-08 (7) — the second per-thread leak: taproot's 4 MiB preimage buffer (Mac port only)
+
+After the ae2085f0 deploy, the mainnet worker's large-malloc count still grew: 3,282 → 3,423 in 5.3 minutes. That is about 27 a minute, down from ~45. `heap` showed the sizes (5) fixed holding steady at 1–6 live blocks each, but 4 MiB blocks accumulating: 3,377 of them, all exactly 4,194,304 bytes. Each began with SHA256("TapSighash") written twice, the BIP340 tag prefix of a taproot sighash preimage.
+- **Cause:** `secp256k1_taproot.S` keeps a per-thread pointer (a Mach-O TLV) to a 4 MiB `tap_preimg` buffer and `malloc`'d it on the thread's first use, never freeing it. This is the same leak as `BMC_TLS_BUF`, in assembly, so (5) did not reach it. Every short-lived verification thread that checked a taproot input left one behind. (5)'s attribution of the ~20k "4096K" blocks to the segwit midstate buffer was wrong: most were these.
+- **Fix:** the buffer comes from `bmc_tls_alloc_export` (new `port/osx/bmc_tls_export.c`, a wrapper the assembly can call), so it is on the thread's list and freed at exit. `bitcoin_utxo_lsm.S`, the only other assembly that allocates, uses a fixed TLV, which dyld frees with the thread.
+- **Test:** `test_taproot_thread_stress` now checks that its 8 threads allocate their buffers through the tracker and hold none afterwards (8 allocated, held 1 → 1). With plain `malloc` restored, the check fails. On x86 the counters are absent (weak), and it prints N/A.
+- **x86:** not affected; its `tap_preimg` is `.tbss`.
+- **Full suite:** 424 PASS, 11 SKIP, 14 N/A, 0 FAIL.
+
+## 2026-10-08 (6) — `TLS_ADDR` in `bitcoin_interp.S` never delivered a callee-saved destination: the CHECKMULTISIG strip wrote wherever the C caller's x27 pointed (Mac port only)
+
+Found through (5). With the leak fix in, 14 script-verification tests crashed, most with SEGV or SIGBUS. In the first one, `legacy_sighash` received a garbage `tx` from an `sv_ctx` that was intact on entry. A watchpoint on that `sv_ctx` caught `script_find_and_delete`'s memmove writing over it, called from the interpreter's CHECKMULTISIG strip (`.strip_call`).
+- **The bug:** the Darwin `TLS_ADDR` macro calls a C getter. It saves x0–x17 and x30 around the call and delivers the result by writing it into the destination's save slot. A destination in x19–x28 has no slot, and `bitcoin_interp.S`'s copy had no other path for one, so `TLS_ADDR x27, _cms_scstrip0/1` left x27 holding whatever the C caller had put there. The strip then wrote the signature-stripped scriptCode, up to 10,008 bytes, to that address and read it back from there. (`bitcoin_scriptcodec.S`'s copy of the macro already handled x19–x28; its one such use, `TLS_ADDR x24, _hnd_tab`, was fine.)
+- **Why it never showed:** in the deployed binaries `sv_run_v` keeps its `script` argument in x27 when it calls `script_eval`. So the strip overwrote the script being run with its own scriptCode. With no OP_CODESEPARATOR and no signature inside the script, those are the same bytes. When they differ, it wrote different bytes into the caller's script buffer; for a P2SH redeem script that buffer is the interpreter's own per-thread copy. The leak fix shifted register allocation in `sv_checksig`/`sv_verify_script`, x27 came to point at a stack frame, and the write landed on `sv_ctx`.
+- **Fix:** the macro moves the result straight into x19–x28 (the pops don't touch them). Both copies now `.error` at assembly time on a destination neither handles (x18, x29/fp, x30/lr, sp). Checked with a probe: `TLS_ADDR x29, ...` fails to assemble.
+- **Test:** the 14 tests that crashed pass. There is no separate runtime test: the wrong write either lands where a test cannot observe it or depends on the compiler's register choice. The assembly guard is what stops a recurrence.
+- **x86:** not affected. Its `TLS_ADDR` is native `gottpoff` arithmetic and writes any destination.
+- **Full suite:** 424 PASS, 11 SKIP, 14 N/A, 0 FAIL.
+
+## 2026-10-08 (5) — the worker's memory growth: per-thread interpreter scratch leaked on every 8+-input transaction (shared C)
+
+The mainnet worker's RSS had risen at each deploy (about 4.2 → 4.9 → 6.0 → 6.5 GB), and two hours after the bee50e2b deploy it was at 9.1 GB.
+- **What the RSS was made of** (`vmmap --summary`):
+  - 4.1 GB was clean, read-only pages of the mapped UTXO run file (`utxo_run_020206.dat`, 3.4 GB resident of 12.5 GB) and the other UTXO and index runs. That is file cache; it rises as lookups touch the file and macOS can drop it. It is not a leak.
+  - The dirty 4.6 GB was mostly malloc. "Malloc Large" grew steadily, by roughly 45 regions a minute.
+- **The leak** (`heap`): 185k live blocks, 195 GB of address space, almost all untouched. They came in fixed sizes: 4096K ×20k, 2352K ×25k, 1024K ×22k, 528K ×38k, 64K ×38k and 20K ×20k. Every one is a `BMC_TLS_BUF` per-thread scratch buffer: segwit midstate, offset table, sighash preimage, script stacks of 1000 × 528, and so on. `lldb` reads of sample blocks found scriptPubKeys, a 2-of-3 multisig script and DER signatures.
+- **The cause:** `BMC_TLS_BUF` never freed a thread's buffers. That was safe for long-lived threads, but `txv_verify_all` creates fresh threads for every transaction with 8+ inputs, so each such accept leaked about 11 MB of address space. About 18 KB of it is touched per block, which comes to ~120 MB resident an hour. RPC was not involved: it runs in the parent process.
+- **Fix** (`bmc_thread.h`): each buffer is recorded on a per-thread list, and a `pthread_key` destructor frees the list at thread exit. The key, once-guard and counters (`bmc_tls_live`, `bmc_tls_made`) are weak definitions, shared by every file that includes the header.
+- **Tests:**
+  - `leaks --atExit` on `test_tx_verify_parallel`: 1,989 leaks (2.0 GB) before, 0 after.
+  - `test_tx_verify_parallel` now checks that its 20 parallel calls allocate scratch (1,800 buffers) and hold nothing afterwards. Without the destructor the count goes 90 → 1,890 and the check fails.
+- **Not changed:** the RPC side's hand-rolled heap TLS in `rpc_chain.c`/`rpc_server.c`. It lives on pool threads, but Esplora connection threads and longpoll waiters are per-request; not measured.
+- **Full suite:** 424 PASS, 11 SKIP, 14 N/A, 0 FAIL. Note item 28 for x86.
+
+## 2026-10-08 (4) — a block connect marks conflicts through the children index, not a fixpoint sweep per conflict (shared C)
+
+The last registry-per-step scan on the removal paths: `mpol_mark_with_descendants` marks each pool transaction a block conflicts with, and its descendants, for the batch removal. It swept every node until nothing new was marked, at least two sweeps per conflict.
+- **Now** the block connect builds the children index once, the first time the block conflicts with anything, and each conflict walks down from its root. The only way the level-2 set can be open on entry is a confirm mark downgrading a level-2 node. That case sets `g_rm_reseed`, and the next walk then seeds from every level-2 node, which is the set the sweep would close. So the marks and the block order recorded with them are unchanged, and with them what leaves and the order of the sequence hook's removals. If the index cannot be built, the sweep runs as before; a test knob (`mpool_policy_set_rm_fixpoint_scan`) also forces it.
+- **Test:** `test_mempool_policy` connects one block conflicting with every third transaction of the cluster-walk pool, on two fresh copies, sweep then walk. It compares the removed count, the pool left, and every departure and sequence callback in order: 233 removed and 466 callbacks, all identical.
+  - Giving descendants the wrong block order fails the callback check.
+  - Stopping the walk one level down fails both checks.
+  - The reseed path is not exercised: a valid block cannot confirm a descendant of a transaction it conflicts with.
+  - The test now links `bitcoin_tx.o` (`asm/Makefile`), as `test_mempool_core_parity` does. The block connect needs `tx_parse`.
+- **Full suite:** 424 PASS, 11 SKIP, 14 N/A, 0 FAIL. Note item 27 for x86.
+
+## 2026-10-08 (3) — `collect_descendant_txids` walks the children index after its first pop (shared C)
+
+The deploy of ac078e42 confirmed the cluster-walk fix: mainnet's refill peaked at 28–47% for about a minute (85.6k transactions), then settled at 1–5%. The same scan pattern was left in `collect_descendant_txids`, which builds the descendant set for RBF eviction (single and package), `mpool_policy_remove_package` and TRUC sibling eviction. It scanned every registry node for each node it popped: d+1 passes over the pool for d descendants.
+- **Now** the first pop (the root) is still a scan, since most roots have no child and one pass is all they need. If the root has a child, the walk builds the children index (one more pass) and finishes through it, so it costs at most two passes. The index yields children in ascending node order, as the scan did, and both push them the same way, so the returned list, its order and the -1 overflow are unchanged. If the index cannot be allocated, the walk keeps scanning. The scan stays as the reference behind `mpool_policy_set_desc_walk_scan`.
+- **Test:** `test_mempool_policy` reuses the cluster-walk workload at limit 64 and runs two checks:
+  - It compares every pool transaction's descendant list under both walks, element for element, at bounds 128 and 3, through the `mpool_policy_descendant_txids` hook. That covers 656 lists, 270 with descendants (largest 54), and 205 that overflow the small bound.
+  - It replays 300 `remove_package` calls on two fresh copies, one per walk; 11 of them take descendant sets.
+
+  Both checks match. A walk that drops children after the first fails both (196 lists differ).
+- **Full suite:** 424 PASS, 11 SKIP, 14 N/A, 0 FAIL. Note item 26 for x86.
+
+## 2026-10-08 (2) — the cluster-limit walk uses the children index, not a registry scan per node (shared C)
+
+After the deploy of 8e8f2fb0 the mainnet worker sat at 40–65% of a core while the pool refilled (~77k transactions). `sample` put ~63% of its samples in `mpol_add_core`, in the cluster-limit walk (`bitcoin_mempool_policy.c`, the `too-large-cluster` check).
+- **The walk** found each popped node's neighbours by scanning every registry node, checking both directions of the parent links. That is up to 64 passes over the pool per transaction with an in-pool parent, and every pass read every node's parent list. It also ran twice per transaction: `mpool_policy_test`, then `mpool_policy_add`. About 92% of production entries are cluster members, so nearly every accept paid it. Once the refill finished the worker dropped to 1–3%, but every restart repeats the burst, and so does any steady flow of child transactions.
+- **Now** the walk builds the children index once (`mpol_children_build`, O(pool + edges), the same index `mpool_policy_entry_info` uses) and takes a node's neighbours from its own parent list plus its index entry. The outcome depends only on the set the walk reaches (the component through parent links, with members of the eviction set left out), not on the order it reaches it, so the answer is the scan's. The scan stays as the fallback when the index cannot be allocated, and as the reference behind a test knob (`mpool_policy_set_cluster_walk_scan`).
+- **Not changed here:** `collect_descendant_txids` uses the same scan pattern. It runs for RBF and removals, which are much rarer than accepts, and did not show in the sample. Fixed in (3) below.
+- **Test:** `test_mempool_policy` replays one random 1,500-transaction workload twice, scan then index, and compares every verdict and reason. It runs at `limitclustercount` 12 (775 too-large-cluster refusals) and 64 (471). The workload includes chains, fan-ins with 2–3 in-pool parents (66 and 176 accepted) and BIP125 replacements whose evicted sets the walk must skip (35 and 48 accepted). Identical on all 3,000.
+- **Full suite:** 424 PASS, 11 SKIP, 14 N/A, 0 FAIL. Note item 25 for x86.
+
+## 2026-10-08 — verbose `getrawmempool`'s handler peak: +177 → +88 MB (graph members are indices; the weight cache is 16 bytes a slot) (shared C)
+
+With the body streamed, the call's whole peak was the handler. Instrumented by step at production shape (`test_rpc_chunk_scale 68000 1048576`): +64 MB building the table under the lock, +63 MB for the one-pass graph, +50 MB for the entries (the arena).
+- **The table step was almost all the per-slot weight cache** (`g_mpc`, 2026-09-30). It is indexed by slot, so it is the slot table's capacity long: 1,048,576 entries of 56 bytes. A 68k pool's entries are spread over all of it, so every page is touched. An entry is now 16 bytes: a 64-bit key (the txid's first eight bytes XORed with the slot's cached wtxid's), the length, and weight with the BIP125 bit in one word. The wtxid commits to the witness, so a same-txid, same-length, different-witness replacement is now re-parsed; under the old key it was a hit. A wrong hit would need a transaction ground to match another's 64-bit key in the same slot, about 2^64 work, and would show a wrong vsize.
+- **The graph's members were 32-byte txids**, and most of a node's members are its ancestor and descendant sets. That is about 27 per entry on the test pool's chains, and production is ~90% cluster members. A member is now a 4-byte node index (`mempool_entry.h`): every member is itself a node, so its txid is `node[i].txid`, and `mp_graph_expand` rebuilds the same record. `mpool_policy_graph_all` records each member's registry index as it adds it (node q is registry node q). `mpe_snapshot_component` (verbose ancestors/descendants) collects its members as txids during the walk and resolves them once every node is known. A member that is not a node sends the call down the old path, whose answer is the same, because every reader already skips a member the tables lack.
+- **Measured:** first-call peak RSS +177 → +88 MB at production shape; 1.18 KB per entry at the default 32k shape. Graph: 204 bytes per entry (27.1 members each), where txid members would be ~960. The reply is byte-identical to the previous commit: the same FNV hash over 41,189,425 bytes at production shape, checked with a `HEAD` worktree. What is left is mostly the arena (49 MB: the reply's text plus each entry's key and shell) and the ~9 MB table.
+- **Tests:**
+  - `test_rpc_chunk_scale`:
+    - The peak bound is now 1.6 KB per entry (was 8).
+    - New direct checks: the graph is under 300 bytes per entry, and the cache is 16 bytes a slot.
+    - Peak RSS alone did not catch a graph regression at the default shape: heap freed by the pool build absorbed it. The direct graph check does; widening the members to 8 bytes fails it at 313.
+    - Padding the cache entry back to 56 bytes fails the cache check.
+    - The ancestors/descendants comparison still runs against the old path, which does not use the graph, with the snapshot taken (1.95 ms hold against 99 ms).
+  - `test_rpc_node`: a same-txid, same-length, different-witness swap is parsed again (1 hit, 1 parse) with the same `bytes`.
+- **Full suite:** 424 PASS, 11 SKIP, 14 N/A, 0 FAIL. FEATURE_GAPS.md RPC-12 and note item 24 updated.
+
+## 2026-10-07 — the RPC reply is streamed to the socket, not buffered: writing a 39 MB body adds 0.1 MB to the peak (shared C)
+
+After the entries became text, what was left of the server's spike beyond the handler was the body. `render_request` serialized the reply into a buffer that grew by doubling, appended the newline, then copied headers and body into a second buffer for the caller to write.
+- **`rpc_json`:** the writer's buffer (`sbuf`) has two new modes. COUNT adds up the length and writes nothing (`rj_measure`). SINK hands each piece to a callback and keeps nothing (`rj_write_to`); once the callback fails, the rest is dropped and the call returns -1. The escaper now writes through `sb_push`, so it works in all three modes.
+- **`rpc_server.c`:** `render_request` builds the reply (`request_reply`, the old body of `render_request_inner` without the serialization), measures it for an exact Content-Length, and writes headers, body and the RPC-10 newline through `rpc_out`: one 64 KB buffer, flushed to the client fd (or, for the `rpc_render_probe` seam, into memory). A small reply still goes out in one `write()`, headers and body together. `respond()` replaces the `render_request` + `send_response` pair at all three call sites (intake fast path, execution pool, longpoll waiter). No lock is held while writing: since 2026-09-19 `exec_one` takes and releases each method's lock itself.
+- **Trade-off:** the arena now lives until the client has read the reply; it used to be freed before the write. At production shape that is 49 MB against the 39 MB + up to 64 MB of body copies it replaces.
+- **Measured** (`test_rpc_chunk_scale 68000 1048576`, server path): first-call peak RSS +211 → +177 MB (+211 is the old path with the server's header copy; +207, as reported last night, was the doubling buffer alone). The +177 is the handler's own peak, reached before the first byte is written: the call's tables and the 49 MB arena. Writing the 39.3 MB body adds 0.1 MB.
+- **Tests:**
+  - `test_rpc_json` has a stream section. `rj_measure` and `rj_write_to` match `rj_write_alloc` byte for byte, in both layouts and with and without an arena, over every escape kind, empty containers, a frozen entry and a 300 KB string. A failing sink is reported and not called again, and the bare top-level kinds are covered.
+  - `test_rpc_server` sends a 200-call `help` batch to the live test server (613 KB, about ten 64 KB writes). Content-Length equals the bytes received, the body ends in `]\n`, and it is byte-identical to the same request rendered in memory.
+  - `test_rpc_chunk_scale` streams the first call the way the server does and asserts the write raises the peak by under 4 MB. A mutation that makes the sink path also buffer fails it (13.9 MB at the default 32k size).
+- **Full suite:** 424 PASS, 11 SKIP, 14 N/A, 0 FAIL. FEATURE_GAPS.md RPC-12 and note item 24 updated.
+
+## 2026-10-06 (night, 5) — verbose `getrawmempool` keeps each entry as text, not a tree: reply arena 198 → 49 MB (shared C)
+
+The remaining spike after the compact graph was the reply. The server builds every value in the request arena (`rpc_server.c` `render_request`, plan A5), where `rj_free` is a no-op, so all 68k entry trees stayed live until the body was written: 198 MB of arena for a 39 MB body (measured on the server's path: arena, dispatch, `rj_write_alloc`).
+- **`rpc_json`:** a new value type `RJ_RAW` holds an object or array already serialized compactly. `rj_arena_mark()` / `rj_freeze(v, mark)` serialize `v` into a per-thread scratch buffer, rewind the arena to the mark (freeing any chunks opened since), and return the text as an `RJ_RAW`; without an arena they `rj_free` the tree. The writer copies `RJ_RAW` through in compact mode and re-renders it in pretty mode. `rj_clone` keeps it frozen, `rj_type_name` answers from its first byte, and `rj_obj_get` expands it in place (`rj_expand`), so readers that go through `rj_obj_get` see no difference.
+- **`rpc_node.c`:** both verbose loops in `cmd_getrawmempool` (the snapshot one and the under-the-lock fallback) freeze each entry right after `mpe_entry_obj` builds it.
+- **Measured** (`test_rpc_chunk_scale 68000 1048576`, server path): arena 198 → 49 MB; first-call peak RSS +356 → +207 MB. The full server path (arena, dispatch, write, release) is unchanged at ~350 ms: the serialization moved from the writer into the handler, so the handler alone went from ~328 to ~388 ms while the write became a copy.
+- **What is left** of the +207 MB is mostly the 39 MB body in `rj_write_alloc`'s doubling buffer (up to 64 MB) next to the arena's copy of the same text, plus the call's tables. Writing straight to the socket would remove both; that is a change to the server's response path, not done.
+- **Tests:**
+  - `test_rpc_json` gains 17 freeze checks, run both with and without an arena: byte-identical compact and pretty output, clone, `rj_type_name`, expansion through `rj_obj_get`, and an arena rewind across chunk boundaries that keeps what was built before the mark.
+  - `test_rpc_chunk_scale`'s first call now runs on the server's path and asserts the arena stays under twice the body (49.0 MB for 39.3 MB).
+  - `test_rpc_esplora`'s mock `getrawmempool` freezes its entry, so `/mempool/recent` reads through an expansion. Disabling the expansion in `rj_obj_get` fails it and `test_rpc_json`.
+- **Full suite:** 424 PASS, 11 SKIP, 14 N/A, 0 FAIL. FEATURE_GAPS.md RPC-12 and note item 24 updated.
+
+## 2026-10-06 (night, 4) — verbose `getrawmempool`'s one-pass graph is compact: peak RSS per call +794 → +318 MB (shared C)
+
+The ~+790 MB peak RSS was `pol_entry_info_all` writing one ~8.3 KB `mp_entry_info` (four fixed 64-txid arrays) per registry node, ~560 MB at a 68k pool, under the lock. Now `mpool_policy_graph_all` fills an `mp_graph` (`mempool_entry.h`): per node a header (txid, fees, sizes, sigop cost, four counts) and an offset into one shared txid list, in the order depends, spentby, anc, desc. A singleton costs its header plus two txids. The walk is unchanged: it fills one reusable scratch record and appends it, so the sets are the same members in the same order. `rpc_node.c` reads edges in place (`mp_graph_depends`/`_spentby`, for `mpc_lookup_bulk`) and expands one node into the existing local `mp_entry_info` in `mpe_entry_obj` (`mp_graph_expand`). The hook is `pol_graph_all(polstate, mp_graph*)`, which sizes its own output, so `cmd_getrawmempool`'s capacity retry is gone. The ancestors/descendants component snapshot builds the same format (it had a 256 × 8.3 KB = 2 MB array).
+- **Measured** (`test_rpc_chunk_scale 68000 1048576`): first call peak RSS +794 → +318 MB; first-call hold 51.9 → 26.0 ms (no longer touching ~560 MB of fresh pages under the lock); steady hold 25.3 → 21.4 ms; with a quarter of the pool stale in the registry 48.3 → 20.0 ms.
+- **What is left:** heap accounting (`malloc_zone_statistics`, scratch probe) puts the remaining ~318 MB in the reply's JSON tree: 244 MB of `rj_val` for 68k entries (~3.6 KB each) and a 64 MB buffer for the 39 MB of serialized text. Only a writer that serializes entry by entry would shrink that. It touches `rpc_json` and every consumer that walks the reply tree, so it is not part of this change.
+- **Test:** `test_rpc_chunk_scale` asserts the first call's peak RSS stays under 8 KB per entry (4.8 KB at production shape, 4.1 at the default 32k). A mutation that touches ~8.3 KB per node again fails it at 11.3 KB. `test_rpc_node`'s bulk/per-txid parity sections use the new hook.
+- **Full suite:** 424 PASS, 11 SKIP, 14 N/A, 0 FAIL. FEATURE_GAPS.md RPC-12 and note item 24 updated.
+
+## 2026-10-06 (night, 3) — the verbose `getrawmempool` copy reads the slot's cached wtxid instead of re-hashing (shared C)
+
+The snapshot fill ran `g_mph.sha256d` over every pool transaction under the lock (~25 MB at a 68k pool). The pool already keeps that hash: `mpool_put` writes `sha256d(bytes as stored)` into the slot (`MPOOL_SLOT_WTXID`, +48) before the txid, `mpool_del`'s backward shift moves it with the record, compaction rewrites only `blob_off`, and every writer holds the lock the fill holds. `mp_ent` now carries the slot's wtxid pointer and the fill copies it (with no hash hook the reply still degrades to the txid, as before). Single `getmempoolentry`, the old path and the relatives' component snapshot (≤256 txs, no slot index) still hash.
+- **Measured:** hold at production shape (`68000 1048576`) 32.1 → 25.7 ms; on the 32k pool 13.0 → 9.5 ms.
+- **Test:** `test_rpc_chunk_scale`'s hook is now the real `sha256d` (a fake one would make the paths disagree by construction), and its 1,000 singletons carry a witness (`mk_tx1w`), so wtxid ≠ txid for them and the byte comparison checks the slot cache against a fresh hash. Copying the txid instead fails four checks. `test_mempool_wtxid` and `test_cmpct_recv` (the cache's other readers) pass.
+- **Full suite:** 424 PASS, 11 SKIP, 14 N/A, 0 FAIL. FEATURE_GAPS.md RPC-12 and note item 24 updated.
+
+## 2026-10-06 (night, 2) — verbose `getrawmempool`'s tables sized by the live count, not the slot capacity (shared C)
+
+The finding of the "later" section, fixed. `cmd_getrawmempool` sized `g_mpe_vs` and `g_mpe_inf` by `mp_slot_count` (mask + 1, 1,048,576 at `maxmempool=300MB`), and `g_mpe_inf`'s element is an ~8.3 KB `mp_entry_info`: ~8.7 GB asked of malloc per verbose call, under the lock, every 20 s. Now both start at the live count (`g_mph.count`) plus an eighth plus 64; the vsize table grows to capacity if the walk outruns it, and `pol_entry_info_all` is retried at capacity if it refuses the smaller buffer (it answers -1 when the registry has more nodes than `max` — stale nodes after a pool removal).
+- **Measured** (`test_rpc_chunk_scale` now takes an optional slot count; `68000 1048576` is production's shape): snapshot hold 55.8 → 32.1 ms (best of 3), close to the 29.3 ms the same pool gets in a 262k-slot table; the rest is the walk of 1M slots. Peak RSS per call unchanged at ~+794 MB: it is the 8.3 KB record per registry node, which only a compact graph format would cut (not done).
+- **Tests:** two new sections — a quarter of the entries dropped from the pool but kept in the registry (live 24,000: the retry must fire; snapshot hold 11.7 ms against 121.2, byte-identical), and a count hook under-reporting 4× (the buffer must grow; 12.4 against 131.4 ms, byte-identical). Without the retry or the grow, each falls to the per-entry path: **a ~45 s hold** on the test pool, which the checks catch.
+- **Full suite:** 424 PASS, 11 SKIP, 14 N/A, 0 FAIL. Note item 24 and FEATURE_GAPS.md RPC-12 updated.
+
+## 2026-10-06 (later) — verbose `getmempoolancestors` / `getmempooldescendants` render outside the pool lock too (shared C)
+
+The bulk `getmempoolentry` paths. Without bulk tables each rendered member asked the registry per txid (its node, every ancestor's and descendant's for the size sums, every cluster member's for the chunk), and each `mpool_policy_entry_info` rebuilds the registry's children index, O(pool) — set × cluster × pool scans plus the JSON, all under `mpl()`. Now `mpe_snapshot_component` walks the transaction's connected component once under the lock (one entry_info per node; cap 256 nodes, the cluster limit being 64), copies each pool-present node's inputs into the per-call tables, and the render runs after `mpu()` in snapshot mode (`mpe_snapshot_index`, `mpe_tables_free`). Over the cap or on an allocation failure the old path answers. Non-verbose forms and single `getmempoolentry` unchanged.
+- **Proof:** `test_rpc_chunk_scale`'s second new section — 12 calls (chain heads, middles, tails, a singleton; both directions; 10 non-empty) byte-identical to the old path, longest hold 85.3 → 1.6 ms, takes == releases. Mutations each fail it: the walk following parents only, the component's priority or arrival time not copied, the index pass skipped, the release dropped.
+- **Found, not fixed:** `cmd_getrawmempool` sizes `g_mpe_inf` (and `g_mpe_vs`) by slot CAPACITY (`mp_slot_count` = mask + 1, 1,048,576 at `maxmempool=300MB`) × ~8.3 KB per `mp_entry_info` — ~8.7 GB of address space per verbose call, ~620 MB of it written by `pol_entry_info_all` at a 75k pool, under the lock, every 20 s under BlockYard's poll. Added to note item 24.
+- **Full suite:** 424 PASS, 11 SKIP, 14 N/A, 0 FAIL.
+
+## 2026-10-06 (late) — verbose `getrawmempool` holds the pool lock for the copy, not the build (shared C)
+
+The fix for note item 24, on our side. `cmd_getrawmempool` (rpc_node.c) used to build every entry's JSON — the cluster linearizations and ~75k `rj_*` trees — inside `mpl()`, so each BlockYard poll held the cross-process pool lock 1.1–1.9 s with the worker's p2p accepts waiting behind it. Now the pass under the lock records per entry what the builder used to read from the pool and its hooks (slot-cache weight and BIP125, the wtxid's sha256d over the bytes, `time_of`, the `prioritisetransaction` delta, the pool order), takes the one-pass graph, allocates the chunk cache, reads `mempool_sequence`, and releases; the sort, cluster builds and JSON then run on the call's tables (`g_mpe_snap` makes `mpe_entry_obj` / `mpe_member_vsize` / `mpc_lookup_bulk` touch nothing shared). The per-call tables were already guarded by the mempool lane's own mutex, not by the pool lock. The wtxid is NOT cached across calls in the slot cache: that cache is keyed on txid + length, which a same-length witness replacement would defeat. A call whose tables did not build keeps the old under-the-lock path (it needs the per-txid lookups).
+- **Proof:** `test_rpc_chunk_scale` (32,000-entry production-shaped pool, timed lock hooks, `time_of` / `sha256d` hooks, three priority deltas): hold 160.9 → 13.2 ms, wall unchanged, the answer byte-identical to the old path (`rpc_node_set_grm_snapshot(0)`, a new test knob), takes == releases. Mutations each fail it: no pri snapshot, no time snapshot, wtxid = txid, the pool order lost, the early release dropped (caught only by the takes/releases count — a timer-only lock reads a missed release as no hold).
+- **Full suite:** 424 PASS, 11 SKIP, 14 N/A, 0 FAIL. Docs: FEATURE_GAPS.md RPC-12 "2026-10-06", note item 24 marked fixed on bmc_osx with what main should take.
+- **Deployed and checked an hour on (`ed6f3455`, restarted 20:33Z; checked 21:34Z):** **zero** `[mempool] pool lock:` lines on mainnet or signet (the log threshold is the default 1,000 ms). The baseline poller was still at work: BlockYard's pool tier runs `getrawmempool(true)` per node every 20 s (~180 calls on `bmc-osx` in the hour; its `/api/nodes` shows the node online and synced, its mempool view 67,954 entries = the node's pool), with no `rpc-slow` warnings since the restart. Before the fix, the same poller against a ~75k pool produced four ≥1 s `getrawmempool` holds between 02:57 and 04:09Z on 10-02 (1.1–1.9 s, each with `tx_accept_validate_p2p` waiting 1.2–1.5 s). A verbose call by hand on the 68k pool now takes 0.42 s end to end and logs nothing. Heartbeats steady (mainnet 59 gaps, mean 60.3 s, max 62 s; signet mean 60.1, max 61); tips 970,235 / 325,250 = mempool.space; no crash/FATAL/REJECT/MUTATED. Caveat: the line only reports holds ≥ 1 s, so this shows the long holds are gone, not the new hold's size in production (13.2 ms on the 32k test pool).
+
+## 2026-10-06 (night) — fe_add / fe_sub in line in the point formulas; `a2ccdea7` deployed
+
+- **Deploy:** `a2ccdea7` (the native `glvj_ct`) on both nodes (snapshots `bmcbitcoind.pre-a2ccdea7`), restarted 18:07Z by stop.sh/start.sh; mainnet tip 970,211 and signet 325,225 = mempool.space, 10/10 peers each, no crash/FATAL/REJECT lines.
+- **Inlining (`port/osx/secp256k1_fe_inline.h`, new):** `FE_ADD_INLINE` / `FE_SUB_INLINE` are `secp256k1_fe.S`'s `_fe_add` / `_fe_sub` instruction for instruction on the same x0/x1/x2 (bit-identical, alias-safe, x3..x13 only); the `FE3` macro of `secp256k1_point.S` and `secp256k1_point_ct.S` emits them in place of the call (`.ifc`), and the ct module's direct `bl _fe_sub` negations in the loops too. x86's counterpart is `5501c764`. Two one-off negations outside the loops stay calls.
+- **Measured:** `point_double` 106 → 86 ns (1.23×, x86 saw 1.22×), `pointh_double` 91 → 89, `pointj_add_ge_ct` 122 → 122 (its time is its 12 multiplies), `glvj_ct` 22.9 → 20.5 µs, `glv_ct` unchanged at ~26. `fe_mul` is 5.2 ns, ~18 cycles for 16 mul + 16 umulh and the reduction — near what the multiplier allows; what is left is the store/load between steps, which only register-resident formulas (a rewrite of each formula, not a macro swap) would remove.
+- **Full suite:** 424 PASS, 11 SKIP, 14 N/A, 0 FAIL (449 commands; `test_pointj_add_ge_ct` runs now).
+- **Deploy:** `45fb3637` on both nodes (snapshots `bmcbitcoind.pre-45fb3637`), restarted 18:50Z; signet 325,232 and mainnet 970,215 = mempool.space, no crash/FATAL/REJECT/MUTATED lines, mainnet relay +276 accepted in its first tx window (64.6k pool).
+
+## 2026-10-06 (evening) — `point_scalar_mul_glvj_ct` native (the Jacobian body and `pointj_add_ge_ct`)
+
+The stand-in from the #366–#393 merge (a branch to `glv_ct`) is replaced by the port of x86's `dc63c274` in `secp256k1_point_ct.S`: libsecp256k1's `ecmult_const` — `(k + K)/2`, the λ-split, `v = s + 2^128`, 26 signed odd 5-bit digits, a 16-entry odd-multiples table of P on the isomorphic curve (`_point_double`, `_point_add_mixed_zr`, globalz) and its β twin, 125 Jacobian doubles + 51 `pointj_add_ge_ct` (gej_add_ge: the alternative λ and the a-infinity case by csel; Y3 halved in place). One csel scan (x86's AVX2/cmov probe has no counterpart). `test_pointj_add_ge_ct` is no longer N/A.
+- **Proof:** `test_pointmul_ct_variants` 9,136 and `test_pointj_add_ge_ct` 14,002 checks PASS; the ECDH / BIP324 / v2 transport / ellswift tests and the point/scalar/schnorr/wallet tests that link the module PASS (14 commands). Six mutations (no alternative-λ select, no a-infinity csel, Y3 halving without the odd fixup, y never negated, no globalz scaling, `sc_half` without the n/2 add) each fail at least one of the two tests.
+- **Speed:** 22.9 µs against `glv_ct`'s 25.9 (`win_ct` 35.8) — 11%, not x86's 36%. The pieces: `fe_mul` 5.6 ns, `fe_add` 1.4 ns, but the Jacobian `_point_double` costs 106 ns, more than the complete-formula `pointh_double` (91): its 13 add/sub calls each round-trip through memory. x86 inlined the field add/sub into its point formulas (`5501c764`, point_double 1.22×); the Mac's `secp256k1_point.S` has not. That inlining is the next speed step for this routine and for every Jacobian caller.
+
+## 2026-10-06 (17:15Z) — main #366–#393 merged (`60370d45`); both nodes back after 4.5 days down
+
+**The nodes had been down since 2026-10-02 04:28Z**: the Mac rebooted (23:28 local on 10-01) and nothing restarts them. Before that, `f0002ff7` on mainnet logged the Mac's first `[mempool] pool lock:` lines — 21 between 02:57Z and 04:25Z, single long holders, not x86's convoy: `getrawmempool` held 18,699 ms (a `tx_accept_validate_p2p` waited 16,970 ms behind it) and `tx_accept_validate_p2p` held 31,857 ms. Noted for the x86 side as item 24 (2026-10-06): the 1.1–1.9 s `getrawmempool` holds before 04:10 are the finding — verbose `getrawmempool` builds its whole JSON under `mpl()`, polled by BlockYard's monitor; the 18.7 s / 31.9 s holds after 04:10 were a host-wide stall (heartbeat gaps of 193 s and 169 s, Core on the same Mac answering RPC in 18–50 s), ending in the reboot.
+
+Merge: 95 commits, two conflicts — `tx_relay.c` (main's `txr_v2_buffered` skip now wraps our wake-fd poll; both kept) and `.gitignore`. The link failed on main's new code; the port steps:
+- **BIP339 (main 10-03, `9422df8b`)**: `bitcoind.S` sends `wtxidrelay` with `sendaddrv2` once the peer's version (≥ 70016) is in, in both roles, and sets `_g_peer_wtxidrelay` per handshake when the peer sends it (no echo); `bitcoin_serve.S` serves `getdata(MSG_WTX)` via `txann_txid_for_wtxid` → the pool, witness form. The Mac had never taken main's 10-01 withhold either: it sent `wtxidrelay` before the version exchange throughout, while announcing by txid — the shape Core drops. Every mainnet leg now logs `wtxid=1`.
+- **`point_scalar_mul_glvj_ct`** (main's libsecp256k1 `ecmult_const` port, the ECDH's k·P since 10-02): on the Mac a branch to the native `glv_ct` — same contract (k < n, Jacobian, canonical infinity), old speed. `test_pointmul_ct_variants` checks it against the ladder; `test_pointj_add_ge_ct` is N/A (`run_tests.py` `NOT_PORTED`). (Ported natively the same evening; see above.)
+- **New C in the link**: `crash_trace.c`, `index_worker.c` (plan B4), `benchlog.c`, `dlc_benchlog.c`. `crash_trace.c` needed Darwin branches (pc/sp/fp from `__ss`, `pthread_threadid_np`, `__text` bounds via `getsectiondata`) and **a real fix**: its stack scan read 2,048 words above the faulting sp; Darwin maps nothing above a thread's stack, so the read faulted inside the handler with SIGSEGV blocked and the thread spun forever (a crash would have become a hang). The scan now stops at `pthread_get_stackaddr_np`. `test_crash_trace` 8/8.
+- **`test_dlc_header_probe`** (new, 4 fake peers on 127.0.0.1–4): SKIPs without the aliases via `loopback_alias.h`, and a failed peer start stops the peers already up — it had aborted and orphaned a listener that held the harness's pipe for 17 minutes.
+- **Full suite:** 423 PASS, 11 SKIP, 15 N/A, **0 FAIL** (449 commands).
+- **Deploy:** `60370d45` on both nodes (snapshots `bmcbitcoind.pre-60370d45`), started 16:55Z. Mainnet caught up 969,531 → 970,205 (`[ready]` at 970,054 in 179 s; `[ixw] index worker` started), tip = mempool.space's hash, 58k pool, `limitclustercount 64, optimal true`. Signet 325,084 → 325,220 = mempool.space, 11/11 peers. No FATAL/REJECT/crash/pool-lock lines in the first 15 minutes.
+- **Restart at login (launchd):** `~/Library/LaunchAgents/com.bmc.{mainnet,signet}.plist` run each deploy home's `start.sh` at load (`RunAtLoad`, `AbandonProcessGroup` so the node survives `start.sh` exiting, no `KeepAlive` so `stop.sh` still stops it; output to `logs/launchd.log`). Loaded 17:20Z: both printed "already running" and left the nodes alone. They fire at login, not at boot; FileVault is on, so the boot unlock is the login and the nodes come up with it.
+
+## 2026-10-01 (22:00Z) — main #362–#365 merged (`c07d8602`): the mempool follows Core v31.1; one Core oracle; MAIN_C_HDRS
+
+Shared C and Python only; one conflict, `validation/fetch_taproot_blocks.py` (our `CORE_CLI` override kept, main's new default oracle path `/storage/bitcoin-core-v31.1/bin/bitcoin-cli` taken). **#363** is a policy change from BlockYard's differential (15 of 35 missing children refused by the 25-tx chain limit, 14 by the per-conflict RBF rule): cluster limits only (`limitclustercount` 64, `limitclustersize` 101,000; ancestor/descendant counts deprecated), v31.1 replacement rules (feerate-diagram check), optimal cluster linearization. **#362** `MAIN_C_HDRS` + `make header-check` (the Mac's `build_daemon.sh` already rebuilds on any newer header). **#364** is the x86 box's oracle move. **#365** their resume: their pool-lock log saw a convoy from the facade's per-tx batch after a restart and one `getrawmempool` hold of 1,071 ms; the 90 s stall has not recurred; run 32 (chunk 16) is running. They have not taken note 23 (the convoy count) yet.
+- **Full suite:** 417 PASS, 10 SKIP, 14 N/A, **1 FAIL** — `test_mempool_lock_log` case E under suite load: the convoy threads waited long enough on each other to log lines of their own, which pushed the waiter's line out of the 4-slot ring before the test read it. Fixed in the test (`f0002ff7`: the ring is read while the lock is still held, when every convoy thread is blocked; six convoy threads and eight attempts for the fair-handoff case): 0 failures in 96 loaded runs across six lanes. The lock code is unchanged. The nine tests #363 touches PASS natively (`test_mempool_policy` 82, `test_mempool_cluster` 2,000, `test_mempool_core_parity` 14).
+- **Deploy:** `f0002ff7` on both nodes (snapshots `bmcbitcoind.pre-f0002ff7`); signet 21:56Z, tip 324,552, `getmempoolinfo` → `limitclustercount 64, limitclustersize 101000, optimal true`; mainnet 21:57Z, tip 969,496 = mempool.space's hash, mempool.dat reload 78,341 of 78,372 in 3 m 10 s (10 refused by policy), relay gate opened at the first heartbeat. No `[mempool] pool lock:` line during the reload either — the convoy x86 saw at its reload did not show here (Darwin's pid-word lock hands off differently).
+
+## 2026-10-01 (17:00Z) — main #361 merged (`246d3202`): the download chunk is a setting, default 16; cursor help fires again
+
+Shared C only (`dlc_rules.h`, `main.c`, `node_config.*`, four tests, `validation/ab_dlcchunk.sh`), a clean merge, no port step. `bmc.dlcchunk` (4..64) defaults to 16 after two A/Bs to 300,000 in both orders (19.5% and 14.1% faster than 40); the committer's cursor help had been dead since the window became Core's 1,024 on 09-29 (its bar of 32 staged chunks could not be reached at 25 per window) and is a third of the window's chunks now. Tests run here: `test_dlc_rules`, `test_node_config`, `test_dialhelper`, `test_mempool_lock_log`, `test_rpc_responsive` PASS; `test_dlc_interleave` SKIP (Linux-only, as always). Nothing in the batch the Mac had not already gated apart from main's own gated code.
+- **Deploy:** `246d3202` on both nodes (snapshots `bmcbitcoind.pre-246d3202`); signet 17:12Z, tip 324,523; mainnet 17:12Z, tip 969,467 = mempool.space's hash. At the tip the chunk size changes nothing until the next restart with a gap.
+- **A deploy mistake, corrected:** the signet node was started from a shell command that the session later stopped, and the stop's signal took the node's process group with it — a clean shutdown at 17:00:23Z (`signal 15`, mempool saved), restarted at 17:12Z, 12 minutes off. Start a node from its own short command, never from one that waits on anything afterwards.
+- Still no `[mempool] pool lock:` line on the Mac (≈100 blocks on the convoy-aware line).
+
+## 2026-10-01 (00:00Z) — the pool-lock wait line tells a convoy from a holder (shared C, `530e6826`)
+
+x86's resume asked for it: their first lines were waits of ~1.2 s let in by releases that had held 0–3 ms — a convoy of short holds the last-releaser line could not name. The lock's page now counts every take, each release made while anyone waits keeps the convoy's longest hold and its site (reset by the last waiter out), and the wait line adds `N other take(s) went by during the wait, the longest of them held M ms (site)`. `test_mempool_lock_log` case E (36 checks): three threads taking 3 ms holds back to back — `waited 374 ms; the holder was convoy_site (held 3 ms); 101 other take(s) went by during the wait, the longest of them held 3 ms`, no hold line from anyone. Note item 23 for the x86 side; OPERATIONS.md and FEATURE_GAPS.md RPC-12 updated.
+- **Full suite:** 418 PASS, 10 SKIP, 14 N/A, 0 FAIL (442 commands).
+- **Deploy:** `530e6826` on both nodes (snapshots `bmcbitcoind.pre-530e6826`); signet 00:01Z, tip 324,415; mainnet 00:03Z, tip 969,369 = mempool.space's hash, 69,811 mempool transactions carried across. Still no `[mempool] pool lock:` line on the Mac at any point today.
+
+## 2026-09-30 (night) — main #357–#360 merged (`ba47f39f`): both of today's Mac fixes landed on main whole
+
+Main took `f8611830` (the relay gate at the heartbeat) as #357 and `71f4369d` (the pool-lock log, the `getrawtransaction` yield) as #359, each re-gated on x86 (442 tests, the revert check reproduced at 1,700 ms) and deployed as `deploy-20260930e`; #360 is their resume with the first pool-lock lines: **a convoy, not a long holder** — during the mempool.dat reload two waiters saw ~1.2 s, but the releases that let them in held 0 and 3 ms and nobody logged a hold ≥ 1 s. The line names only the last releaser, so it cannot name a convoy's source; their suggestion is a take count per site over a window, or the longest hold seen during a wait. One conflict, `mempool_cfg.c`, ours-against-theirs on the Darwin pid-word lock's four `#ifdef __APPLE__` branches inside the new code: ours kept, the file now differs from main only by that section. One Mac-side change on the way in: `getrawtransaction`'s 404 KB per-thread copy buffer became heap TLS (`BMC_TLS_BUF`, the port's convention after the TLV fault of 09-11) instead of a `__thread` array — main keeps its array.
+- **Tests run:** the seven that cover the changed handler (`test_rpc_responsive`, `test_rpc_chain`, `test_rpc_rawtx`, `test_rpc_core_fields`, `test_rest`, `test_rpc_esplora`, `test_mempool_lock_log`), all PASS; the merge brought no other code the Mac did not already have gated at 418/0 this evening.
+- **Deploy:** `ba47f39f` on both nodes (snapshots `bmcbitcoind.pre-ba47f39f`); signet 23:34Z, tip 324,409; mainnet 23:36Z, tip 969,365 = mempool.space's hash, 69,986 mempool transactions saved across the restart, the relay gate flipped open at the first heartbeat. **Pool-lock lines on the Mac so far: none** in 25 blocks at a ~70k pool on `71f4369d` (block connect removed up to 6,153 transactions and held the lock under 1 s every time), and none during either reload — the convoy shape x86 saw at its reload did not show here.
+
+## 2026-09-30 (evening) — the pool lock is timed and named; `getrawtransaction`'s consult of it left the execution lock (shared C)
+
+The x86 resume's finding (their 09-30 resume, "the finding that sets the next step"): the exec-lock holders it had named were handlers WAITING on `mpl()`, the mempool's cross-process lock, held by the download worker for seconds at a new block — and nothing timed that lock. Items 1 and 2 of their list, done here and noted for them (note item 22):
+- **`daemon/mempool_lock.h` (new) + `mempool_cfg.c`:** every take is `mp_lock_at(site)` (`__func__` at the ten C sites; the hooks' `mp_lock()` names the RPC thread by its method or facade route through a new `rpc_exec_current_label` export), every take and release is timed, and a wait or hold of `BMC_MEMPOOL_LOCK_LOG_MS` (default 1000 ms; 0 = off) is one `[mempool] pool lock:` line, after the release. `mp_lock_phase` names the holder's step: block connect reports `fest_begin`, `mark`, `remove_marked`, `rm/seq` … `rm/reindex`, `rejects_clear+note`, `fest_end`, `seq_C` with their ms. The lock's shared page is a struct now (mutex + holder pid/site + last release), so a waiter in the RPC process names the holder in the worker: `getrawtransaction (pid N) waited 3467 ms; the holder was tx_accept_block_connect_h/rm/reindex (pid M, held 3450 ms)`. On Darwin the pid-word lock sits in the page's first 128 bytes as before. `tests/test_mempool_lock_log`: 30 checks (both lines, the steps in order, a forked holder named across processes, quiet takes silent, 0 = off, the hook's label, a stray phase).
+- **`rpc_chain.c`:** `getrawtransaction`'s mempool consult runs with the execution lock yielded (`rpc_exec_yield_begin`/`_end`, weak), a `__thread` copy buffer, the tip re-read after. `test_rpc_responsive` scenario F: the hooks' lock a mutex the test holds 2 s; the trivial methods and an exclusive `getchaintips` answer within 100 ms while the consult waits; the call completes after the release; the yield counter moved. Revert-checked: `getchaintips` waited 1,710 ms — and a synchronous probe DEADLOCKED the test (main thread holding the pool mutex, waiting on a call waiting on the exec lock held by the consult waiting on the pool mutex): the production stall from inside, so the probe has its own thread.
+- **Docs:** OPERATIONS.md "Logging", FEATURE_GAPS.md RPC-12.
+- **Full suite:** 418 PASS, 10 SKIP, 14 N/A, 0 FAIL (442 commands; `test_mempool_lock_log` is new).
+- **Deploy:** `71f4369d` (not dirty) on both nodes, snapshots `bmcbitcoind.pre-71f4369d`. Signet restarted 19:15:25Z, tip 324,384, 10/10 peers; mainnet 19:17:05Z, tip 969,339 = mempool.space's hash, 71,430 mempool transactions saved across the restart. Now watching for the first `[mempool] pool lock:` line at a block connect.
+
+## 2026-09-30 (afternoon) — after the #343–#355 deploy the tx relay was dead until the next block; fixed at the heartbeat
+
+Both nodes accepted nothing for 20 minutes after the restart: #344's IBD gate (`g_dl_in_ibd`, evaluated once at boot in the parent and otherwise rewritten only when a new block connects) had stood at "in IBD" since boot. Found by the absence of `[tx_accept]` lines and a mempool frozen at the loaded count while the legs' inv bytes kept arriving unrequested. The heartbeat now refreshes the flag from the tip and prints `relay=off(ibd, N dropped)` while it is closed; the first heartbeat of the fixed build flipped it on both nodes and relay resumed (+214 accepted on mainnet in the next window). Note item 21 for the x86 side, which has the same code. The signet health gate in my deploy script was also too strict (it demanded an accepted-tx line inside the first minute, which a quiet signet mempool cannot promise) — the second deploy went on heartbeat + clean log, which is the real evidence.
+- **Full suite:** 416 PASS, 10 SKIP, 14 N/A, 1 FAIL — `test_cmpct_recv`'s 3× timing ratio, measured while both nodes restarted under the suite; PASS three times alone.
+
+## 2026-09-30 — main #343–#355 merged (`93a509e9`): the RPC lock work, Core's download shape, run 30/31 final
+
+Shared C only (no new assembly exports), so no port step. Two conflicts, both ours-against-theirs on the same lines: `rpc_node.c`'s five submit-wait loops take main's test-settable bound (`g_srt_wait_us`) and keep the ARM64 acquire fence after the ack; `test_tx_relay.c` keeps both new sections (our case 20, the gettxout wake; main's IBD announcement drop). Built and linked first time; full suite 417 PASS, 10 SKIP, 14 N/A, 0 FAIL with main's new RPC tests in. Deployed to signet and mainnet; the mainnet node serves the same RPCs the batch moved off the execution lock.
+
+## 2026-09-28 (night, 2) — the port's debug prints removed from the shared C
+
+The x86 side's audit of `bmc_osx` against `main` (their 09-28 worklog, #341) took every shared fix and left "Darwin-guarded code, ARM64 fences and Mac-side debug printfs" behind. The printfs were the port's own debugging from the twin era, never meant to stay: `[ls-cs]` and `[wv0-cs]` env-gated hex dumps in `bitcoin_scriptverify.c` / `bitcoin_witness_v0.c`, an unconditional `[dbg-ctx]` dump of the script, prevouts and witness on every failed tapscript in `bitcoin_taproot_sighash.c`, and `ibd_pipeline.c` writing a failing block to `/tmp/ibd_bad_*.bin`. All four removed, with the includes that served only them; those files now differ from `main` only by the `BMC_TLS_BUF` thread-local shims (`ibd_pipeline.c` is identical). The covering tests (scriptverify, segwit, tapscript, taproot block diff, IBD pipeline) pass unchanged.
+- **Full suite:** 416 PASS, 10 SKIP, 14 N/A, 1 FAIL — `test_net_timeouts`, a timing test on untouched code, PASS when rerun alone and in the three earlier full runs today: a load flake.
+
+## 2026-09-28 (night) — the reorg probe's rejection memo (shared C)
+
+The #304 cluster peer reappeared on the mainnet node at 19:23 and became the only leg with an empty pass, so the 30 s probe slot fell on it every time: 29 probes in 15 minutes, each fetching the 7,409-deep fork at 961,631 and rejecting it (correctly; the tip stayed at Core's). Now a leg whose probe rejected a candidate is not probed again for an hour (`probe_memo_*`, on a `host_memo_t` helper the #304 claim memo shares). `test_parallel_trigger` pins it. Note item 20 for the x86 side.
+- **Full suite:** 417 PASS, 10 SKIP, 14 N/A, 0 FAIL. The peer is on the Bitcoin Knots BIP-110 split (nodes enforcing it stopped accepting the SHA256d chain's blocks on 2026-08-08; our fork point 961,631): eight SHA256d blocks 961,632–961,639, of which Core holds two as headers-only (bits 1702353d, version 0x200be010, 08-06/08), then BLAKE2b proof-of-work from block 961,640 on 08-30 (bitcoin-blake2b.org/faq) with a new header format. The ~974k it announces is that chain's height (its coinbase-maturity rule starts at 973,440); neither node can read those headers, which is why the probe sees only the 961,631 fork and rejects it on depth.
+
+## 2026-09-28 (late) — the roadmap brought current; the wallet round-trip gate run
+
+- `OSX_ROADMAP.md` had not been touched since the C-twin era: 42 entries still said "as a C TWIN", four boxes were open (bip341/342, the script VM modules, the wallet CLI gate, Phase 4 parity). A dated status section at its top now states what is true (every daemon-linked x86 module has a `.S`; the 13 shadow twins; the suite; the nodes; parity by vectors), and each open box is closed in place with what closed it.
+- **The wallet round-trip against a running osx node** (the one gate that had never been run): on a throwaway regtest node from the Mac build, `bmc_wallet_cli init` → the daemon loads the store and serves the wallet RPCs (`private_keys_enabled=true`, `getnewaddress` → `bcrt1qe2kgnj…a0s3y`, `ismine`), and the CLI re-derives the same witness program from the mnemonic. `signmessage` over a bech32 address is refused as Core refuses it, so that leg is by design absent.
+- Nothing new from the x86 side since #336; PR #337 (#294/#304) waits on their gate; both nodes clean since the deploy (no FATAL/REJECT/MUTATED, no parallel-downloader run, tips at Core's).
+
+## 2026-09-28 (evening) — issues #294 and #304 fixed (shared C)
+
+Two open issues from the BlockYard sync of 09-24/25, both in the daemon's C:
+- **#294** — a restart mid-sync with a small gap, a just-under-threshold WAL and 17 runs of 42 GB took the 64 MB steady-state memtable and ground for 25 minutes in silence. A third sizing rule on the store's shape (`utxo_live_pick_bulk_shape`: runs ≥ the compaction threshold, or run bytes ≥ the 35%-of-RAM run budget), fed by a directory scan for `utxo_run_*.dat` before the load, and a "store shape" line either way so the silence has its reason. `test_utxo_sizing` pins it. On this Mac's mainnet node: 5 runs / 13 GB → steady-state, unchanged.
+- **#304** — a cluster of Knots peers on a rejected fork passed the two-agreeing-peers gate and ran the full parallel downloader (60–130 s, 0 blocks) after every start and re-arm. Now a leg whose sync pass is failing does not vote, and a peer whose claim ran the downloader for nothing is remembered by host for 6 h across tips. `test_parallel_trigger` pins both.
+- Note items 18 and 19 for the x86 side; the PR to main follows.
+- **Full suite:** 417 PASS, 10 SKIP, 14 N/A, 0 FAIL.
+
+## 2026-09-28 — main #327–#336 merged (`c891ce14`→): the comb, window and GLV multiplies, the SHA-1 second body, the chacha20/num3072 glue
+
+The x86 session's benchmark day (`worklog/2026-09-28.md`: #329 MuHash safegcd in C, #330 ElligatorSwift comb/window, #331 ChaCha20 AVX2, #332 SHA-1 SHA-NI / SHA-512 / Base58, #334 GLV ECDH + the comb for every k·G caller + SHA-256 runs + the filter builder, #336 the three testnet4 fixes cherry-picked from this tree) merged cleanly, then failed to link: the shared C now calls x86 exports the Mac did not have. What the Mac got:
+
+- **`secp256k1_point_ct.S`: `point_scalar_mul_gen_ct` (k·G over `g_comb_table_data`, 64 csel-scanned column reads, no doubling), `point_scalar_mul_win_ct` (w=4 window over a 16-entry table of P), `point_scalar_mul_glv_ct` (`sc_split_lambda`, the signs folded into the points by csel, 33 nibbles over two tables), `pointh_to_jac` (the ladder's tail as a function), `point_ct_force_scan` (x86's AVX2/csel scan knob: accepted, ignored — one scan here).** Same shape as x86: every table entry is read, the digit reaches only a `cmp`. Proof: main's `test_pointmul_ct_variants` (7,265 checks against the ladder and `point_scalar_mul`; edges 0, 1, n−1, n, n+1, 2²⁵⁶−1, every-nibble patterns, random bases incl. k = 1 and k = n−1). The first cut failed it: the scan/table macros used local label `1:` inside routines whose own loop was `1:`, so `b.pl 1b` re-entered the last scan; now `5:`/`6:`. **Timings:** ladder 56.2 µs → comb 9.5 µs, window 35.9 µs, GLV 25.7 µs (x86: 52 → 9 / 33 / 24.3). Every k·G caller (`bip340_sign`, `wallet_core`, `bip32_ckdpub`, `wallet_msgsign` via the shared C; `bitcoin_keys.S` by hand) is on the comb; the ECDH on the GLV routine (`test_ellswift_ecdh`, `test_bip324`, `test_v2transport` pass on it).
+- **`sha1.S`: two bodies.** x86's `test_sha1` drives `sha1_block_scalar` and `sha1_block_shani` against each other and the FIPS vectors, with `sha1_force_path` / `sha1_cpu_has_sha`. The crypto-extension body is now `sha1_block_shani`; a plain FIPS 180-4 round loop is the scalar body (1.87 ns/B against the crypto body's 0.336); `sha1_block` dispatches after one `sysctlbyname("hw.optional.arm.FEAT_SHA1")` probe, `sha256.S`'s pattern.
+- **`chacha20_paths_osx.c`**: `chacha20_cpu_has_avx2` = 0 and an unreachable `chacha20_xor_avx2`, so `crypto_chacha20.c` links and takes its C block; `chacha20_k0_force_path` is a no-op (the Mac's `bitcoin_muhash.S` has one keystream body). A NEON body is the counterpart if the v2 cipher ever shows in a Mac profile. `test_chacha20` / `test_muhash` report the vector body as not on this CPU, as x86 does without AVX2.
+- **`build_daemon.sh`**: `daemon/num3072_inv.c` (Core's safegcd for the MuHash inverse, shared C) added to the explicit source list.
+- **`bitcoin_keys.S`**: `point_scalar_mul_gen_ct` for k·G, as `bitcoin_keys.asm`.
+- Everything else in the batch was C on both sides (`num3072_inv`, `fe_is_square_var`'s Jacobi, the filter builder, the sighash session) or x86-only assembly whose Mac counterpart already had the property (SHA-512, Base58: `test_addr` 321 PASS; SHA-256 multi-block runs: `test_sha256` PASS).
+- **Full suite:** 417 PASS, 10 SKIP, 14 N/A, 0 FAIL (441 commands: main's `test_pointmul_ct_variants`, `test_sha1`, `test_num3072_inv` are in).
+
+## 2026-09-28 (early) — main #324–#326 merged (`c891ce14`); the CLI's two x86 parities dropped with x86's
+
+- **#325 (the mutated-block fix and the Darwin `legs_heard_within`) is on main** as `b022c0f9`/`f573b0ec`, with the x86 session's own addition `5c24fbc2` (`test_cmpct_fallback` links `block_witness.c` too — the Mac hunk covered only `test_cmpct_recv`'s rule; the Mac harness links every test against the daemon archive, so it never saw the gap).
+- **#324 (store CLI + `multisig_verify`).** `bitcoin_cli.S` had kept, on purpose, the two x86 behaviours the twin documented — uppercase hex digits rejected, and per-command stack block buffers (0x180 / 0x800 / 0x4000) that made a real block "not found"; x86 fixed both, so the Mac follows: `HEXVAL` takes `'A'-'F'`, and the five block-reading commands share one static 4 MiB `Lblockbuf` (the old frames stay, their buffer bytes unused). `bitcoin_multisig.S` already refused a push that does not fit the scriptSig (its header says so: the C twin's rule, which is how the differential caught x86's over-read), so main's guard-page test passes unchanged. Main's `test_cli` (uppercase, a 20 KB block through every command) and `test_multisig` PASS.
+- **`docs/PARITY_ATTESTATION.md`** merged by hand: x86's two 2026-09-27 rows above the Mac's 09-25 row.
+- **Full suite:** 413 PASS, 10 SKIP, 15 N/A, 0 FAIL.
+
+## 2026-09-27 (night) — safegcd inversion and the square-root chain in AArch64: `fe_inv_var`, `fe_pow_sqrt`, and `sc_inv_var` replaced
+
+Main #319/#320 gave x86 an addition-chain square root for `pubkey_parse` and a Bernstein-Yang safegcd inverse mod p for the public inversions; the Mac assembly now exports both, and its `sc_inv_var` is the same safegcd body instantiated for n.
+
+- **`port/osx/safegcd_var.h`** — the safegcd macro (`SAFEGCD_INV_VAR name, M62, MINV62, M4`), an assembly include the two .S files `#include` (the `.h` suffix is what `build_daemon.sh`'s staleness rule watches). Step for step the x86 `safegcd_var.inc`: 62 divsteps on the low words with the transition matrix in x22..x25, then the matrix applied to (d, e) mod m and to (f, g) over the live length, the top limb pair folded when both are 0/−1, d·sign(f) reduced into [0, m). Leaf; x19..x28 saved; a 160-byte frame. Variable-time: public inputs only, as on x86.
+- **`secp256k1_fe.S`**: `fe_inv_var` (p's 5×62 limbs and p⁻¹ mod 2⁶² re-derived in Python) and `fe_pow_sqrt` (`fe_inv`'s chain to x223 with the (p+1)/4 tail: 253 squarings, 13 multiplies; the same frame and macros). **`secp256k1_scalar.S`**: `sc_inv_var` is the n instance. The binary extended GCD it replaces (u=a, v=n, halve mod n) took 1.4 µs and **looped forever on a ≥ n** — `test_fe_inv_var`'s non-canonical section would have hung on it; nothing in the daemon passes such a scalar (ecdsa_verify checks s < n first), so this was latent.
+- **Users switched** (the same sites as x86): `schnorr_verify`'s Z⁻¹ for the even-Y test, `secp256k1_taproot.S`'s two affine conversions of the tweaked public point, `pubkey_parse`'s square root (the `Lexpqr` exponent constant is gone with `fe_pow`'s call; `fe_pow` itself stays exported for the test). `fe_inv` and `sc_inv` remain the constant-time paths for everything a signer computes.
+- **Method.** A C prototype of exactly the x86 steps first, checked against `fe_inv`/`sc_inv` on 4×10⁵ inputs (9 outer iterations on average, 10 at most, as on x86); then the assembly against the prototype, `fe_inv`, `sc_inv` and `fe_pow` on 10⁶ inputs of every shape — canonical, ≥ m, up to 2²⁵⁶−1, short, aliased r == a, 0, p and n (return 0, r untouched): 0 mismatches. Then main's own `test_fe_inv_var` (3,020,828 checks, including the `sc_inv_var` ≥ n section) and `test_fe_pow_sqrt`, both un-gated in `run_tests.py`, plus the ECDSA/schnorr/taproot/musig/ellswift tests and both ABI checks: all PASS.
+- **Timing on this Mac** (M-series, 2×10⁵ calls each): `fe_inv` 3.11 µs → `fe_inv_var` 0.84 µs; `sc_inv_var` 1.43 → 0.88 µs; `fe_pow` 5.79 µs → `fe_pow_sqrt` 3.19 µs per compressed-key parse.
+- **Full suite:** 413 PASS, 10 SKIP, 15 N/A, 0 FAIL (`test_taproot_block_diff`: 36 mainnet blocks, 0 failures, on the safegcd inversion).
+
+## 2026-09-27 (evening) — a mutated block is dropped and re-fetched, never marked invalid (mainnet 968824)
+
+**The incident.** At 10:00 the mainnet node invalidated the real block 968,824 (its hash is Core's). A peer's compact block prefilled a coinbase WITHOUT its witness; the reconstruction passed the sync drain's `cons_verify` (PoW, txid merkle root — the witness is not in either), was stored, and the apply's witness-commitment phase refused it with `bad-witness-nonce-size`. The apply took that for a consensus rejection: `invalid.dat` got the hash, the archive was truncated, headers rolled back. The chain moved on only because the next peer's compact block, applied 10 s later on a path that never consults the mark, was the block as it really is. The wrong mark stayed in `invalid.dat` for ten hours, until `reconsiderblock` removed it by hand — any header re-sync through that height would have refused the real chain.
+
+**Why it is wrong.** The block hash does not commit to witness data. Core (`IsBlockMutated`, `BLOCK_MUTATED`) never marks a header for a witness mismatch: the bytes are not the block, the block is fine; the peer misbehaved and the block is fetched again. `bad-witness-nonce-size`, `bad-witness-merkle-match` and `unexpected-witness` are all of that kind.
+
+**The fix, shared C on both platforms:**
+- `daemon/cmpct_recv.c`: every completed reconstruction is checked against the witness commitment before a caller sees it (Core's `FillBlock` → `CheckBlock`); a failure is a full `MSG_WITNESS_BLOCK` getdata, never a stored block. Both completion paths (mempool-only, and after `blocktxn`).
+- `daemon/utxo_live.c`: a witness-commitment failure at apply is a new failure kind, MUTATED, not REJECT. A new hook (`utxo_live_set_mutated_fn`) drops the bytes: `reorg.c`'s `chain_drop_mutated_block` takes the archive back to h−1 through the reorg module's disconnect, with no mark and no headers rollback; `main.c`'s `dl_drop_mutated_block` stops the helpers first and scores the delivering peer when known. The same height mutated three times running is said out loud.
+- Tests: `test_cmpct_recv` (a witness-stripped coinbase and a flipped nonce byte, on both completion paths → getdata, the real block → reconstructed) and `test_connect_reject` phase 5 (a mutated block at 151 is dropped: archive back to 150, headers.dat untouched, `invalid.dat` unchanged, then the real block at 151 connects).
+
+**For the x86 side:** the same code, the same bug (note item 16).
+
+**Main merged in the same evening (#316–#323, via the x86 session's `9e62e210`/`2087395d`):** `legs_heard_within` (#316) needed a Darwin branch (`tcp_connection_info`'s `tcpi_rxbytes`, seen-to-change per leg; note item 17); `test_fe_pow_sqrt`, `test_fe_inv_var` (x86 NASM exports the Mac assembly did not have: `fe_pow_sqrt`, `fe_inv_var` — carried to AArch64 the same night, next entry up) and `test_store_map_magic` (`/proc/self/maps`) were N/A on the Mac; the last still is. x86's map magic went to a dword at st+52 (#323); the Mac keeps st+384.
+
+## 2026-09-27 — the large fixtures fetch from the local Core; test_taproot_block_diff runs on the Mac
+
+- **WAL-3 on Darwin: `secure_lock` sets the core-file limit to 0, soft and hard.** Darwin has no `MADV_DONTDUMP`, so a wallet page could not be kept out of a core file per mapping; until today a Mac relied on the default soft limit of 0, which `ulimit -c` undoes. Now the process that holds a secret can never write a core, and cannot raise the limit back. `test_secure_lock` raises the soft limit first and asserts the zero, the refused raise, and the lock itself (wired, per the kernel's vm map). Trade: no core dumps of the daemon once a wallet is loaded, which is what "excluded from core dumps" in the startup line has meant on x86 all along.
+
+- **`port/osx/fetch_fixtures.sh`** fetches the gitignored fixtures from this Mac's Bitcoin Core (txindex) instead of the x86 box's scratch oracle: `validation/fetch_taproot_blocks.py` now honours `CORE_CLI`, and `port/osx/core_cli.py` is the bitcoin-cli stand-in it gets (JSON-RPC on 8332, credentials from bitcoin.conf, never printed).
+- **`test_taproot_block_diff`**: all 36 taproot-dense blocks (825000–825015, 840000–840007, 870000–870007, 850000/1, 860000/1), both directions, 0 failures on the assembly build. It was SKIP on the Mac until today.
+- **block413567.raw**: `run_tests.sh` exports `CORE_BENCH_BLOCK` when it is present. `bench_abi_audit` then audits 16 primitives (12 without it) and `test_strip_witness_diff` runs; both PASS. The remaining consumers of that block are the x86-only twin tests.
+
+## 2026-09-26 (night) — the C twins are assembly: every x86 module has an AArch64 assembly counterpart
+
+**Every `port/osx/*_twin.c` that the daemon linked is now AArch64 assembly**: 37 modules in 5 batches. Each twin moved to `port/osx/test_support/` as the differential oracle. The daemon build globs `port/osx/*.{c,S}`, so a twin there can never be linked again by accident. `sc_mul`/`sc_mul_512`, which still tail-called C, are assembly too.
+
+- **The modules:**
+  - EC: fe, point, point_ct, ecdsa, pubkey, schnorr, taproot;
+  - hashing: muhash, sha1 (the ARMv8 SHA-1 instructions), ripemd160;
+  - script: sighash, script, multisig, bech32;
+  - chain and consensus: chainwork, cons, headers;
+  - storage: utxo, utxo_stats, utxo_store, store, store_fast, idx, utxo_lsm;
+  - network and CLI: net, p2p, addrmgr, cli.
+- **The method, per module:**
+  - a differential fuzz against the renamed twin; where the twin itself was suspect, also against an independent answer (Python bigints, hashlib, real mainnet blocks, real file bytes);
+  - the module's own tests;
+  - the AAPCS64 probe (a 9/11-argument variant for the stack-argument functions);
+  - `run_tests.sh` in full after each batch: 406 PASS, 13 SKIP, 14 N/A, 0 FAIL every time.
+- **Real-data check (utxo_lsm):** `bmc_utxo_setinfo --muhash`, built against the assembly and against the twin, over a snapshot of the signet node's UTXO set: 77,497,355 coins at 323,861, identical counts, amount and MuHash.
+- **Darwin arm64 ABI points that mattered:**
+  - variadic arguments (`open`'s mode, `fcntl`'s arg, `snprintf`'s values) go on the stack;
+  - stack arguments are packed by natural size;
+  - thread-locals are Mach-O TLVs.
+  - Large stack buffers are taken in touched 4 KiB steps, or avoided: cons hashes the stripped tx in pieces rather than copying it into 1 MiB.
+- **Bugs the differential tests found in the twins** (production code until today; each twin is corrected with its assembly):
+  - `store_fast`: an evicted fd-cache slot kept its closed fd when the re-open failed. Once the number was reused, a read of the old file returned another file's bytes (x86 empties the slot). The map-cache magic sat inside fd-cache slot 7 (x86 too: note item 15), leaking a blk mapping each time.
+  - `utxo_lsm`: a failed recount or compaction closed fd 0, and whatever file had it next, because unreached slots were still zero-filled.
+  - `chainwork`: `u256_div` lost the borrow when a divisor limb was all-ones.
+  - `schnorr`: the e·P negation tested 3 of the 4 Y limbs.
+  - `store`: blk names past 99999 were cut to 12 characters.
+- **What remains C on the Mac, and why:**
+  - `utxo_lsm_mm.c`: the vendored mmap fast path, C on x86 as well;
+  - `base32.c`: C on x86 as well;
+  - `g_comb_table_data.c`: a data table;
+  - `tls_*.c`: thread-local definitions;
+  - `darwin_stubs.c`, `bmcshim.c`: Darwin glue.
+
+## 2026-09-26 — the native test sweep: every gated test runs on the Mac, bar 14 that are x86-only by nature
+
+The phase-4 sweep (every `./tests/*` command of `make test`, built natively against `port/osx/daemon_out`) is worked through. **It is repeatable: `port/osx/run_tests.sh` builds the daemon objects, tools and test helpers and runs the whole suite (or named tests) the same way; exit 0 = every test PASS, SKIP or N/A.** Real bugs it found today, all fixed:
+
+- **Mac port:**
+  - `node_log_open` used Linux open flags and AT_FDCWD (every open failed);
+  - no robust mempool lock on Darwin (MEM-20);
+  - `utxo_prefetch` was a no-op: 210 → 78 ns per memtable miss once it was implemented.
+- **Shared code:**
+  - `wallet_cli`'s passphrase prompt dropped an answer typed right after it (TCSAFLUSH after the prompt);
+  - `addr_hist` was not thread-safe under concurrent Esplora `/address`;
+  - `getmemoryinfo "mallocinfo"` now refuses as Core does without glibc.
+- **Missing twins:** `cli_main`, `multisig_verify`/`p2sh_hash`, an exported `schnorr_x_eq_r`, and `utxo_prefetch_n`.
+
+Test-only stand-ins live in `port/osx/test_support/`, outside the daemon build:
+
+- the frozen field, point and ECDSA references;
+- the fe-inline probe;
+- the bad-sparse LSM variant;
+- the AAPCS64 callee-saved probe (19 registers).
+
+The ABI audits, `test_abi_stack_align`, `test_elf_hardening` (Mach-O) and `test_mpool_get_once` (load emulation, no ptrace) have Darwin branches that check the same property.
+
+**Environment prerequisite.** `test_mux_dial_gate`, `test_dlc_interleave` and `test_dlc_wire_bytes` need distinct loopback IPs, and macOS answers only 127.0.0.1. Without aliases they SKIP with the command; with `sudo ifconfig lo0 alias 127.0.0.{2,3,4} up` all three pass (verified 2026-09-26, aliases removed afterwards).
+
+**x86-only by nature (not run on the Mac).** Each of these checks an x86 ASSEMBLY TWIN, bug for bug, against the C function it was converted from. No production code calls any of these twins on either platform (`txv_parse_asm`'s only reference is a test hook in `tx_verify.c`). Both daemons run the C side, which is covered on the Mac by its own tests.
+
+- `test_txv_parse_diff`, `test_txv_classify_diff`, `test_segwit_classify_diff`, `test_txvb_parse_diff`, `test_txv_pools_diff`, `test_tapagg_diff`, `test_txv_dispatch_diff`
+- `test_wv0_drv_diff`, `test_svs_drv_diff`, `test_checksig_diff`, `test_bip143_diff`, `test_taproot_verify_diff`, `test_bip341_diff`
+- `test_undo_asm_diff`: `bitcoin_undo.asm` against a frozen copy of the pre-rev-file `undo_log.c`. Both daemons now link `daemon/undo_log.c`, whose on-disk format moved to Core-style rev files in ec2979c2.
+
+## 2026-09-25 (evening) — phase 4: the UTXO set is identical to Core's; three real bugs fixed, one repaired in production
+
+- Attested against a local Bitcoin Core at mainnet 968,570: all five fields
+  identical (muhash once printed in Core's byte order). Sample of 16,528
+  coins identical to Core's gettxout.
+- Fixed: the muhash computation (9634b5a9) and display (c42cc03f, shared);
+  fe_mul's dropped fold carry (f4938f99); the LSM twin's duplicate keys and
+  unbloomed tombstones (0e3d6ed2), which made 17% of recently spent coins
+  answer as unspent on mainnet -- repaired by an offline full compaction
+  (set preserved, muhash identical before and after), 0 after.
+- Phase 4 is under way: the native sweep's remaining failures are listed in
+  the worklog (Round 6).
+
+## 2026-09-25 — the Mac sync pass drifted from x86; synced_headers on quiet legs
+
+- port/osx/bitcoind.S (node_sync_multi, the handshake) was last re-ported
+  2026-09-10 and missed x86's later changes. Fixed today (4500868c): the
+  fetch gate (one request per block across legs; skip stored blocks) and a
+  refused duplicate ending the pass well. Still missing: compact blocks in
+  the pass and the version message's live fields (timestamp, per-connection
+  nonce, start_height, addr_from port) -- test_cmpct_fallback and
+  test_bitcoind fail natively, identically before and after.
+- New legs get Core's getheaders from pprev (ad11ac5a, 61eaa0f9), so
+  getpeerinfo's synced_headers/synced_blocks read the tip within seconds.
+  Mainnet and signet run 61eaa0f9.
+
+## 2026-09-24 (night) — signet IBD green: phase 3 complete; getpeerinfo synced_blocks
+
+- **Signet synced from genesis on 2cb7a418** (`~/bmc_signet/`): 323,566
+  headers in 23 s, every block in 21:51, applied to the tip in 25 min, zero
+  rejects; tip 323,567 hash identical to mempool.space's. All four chains
+  (regtest, testnet4, signet, mainnet) have now synced natively: **phase 3
+  is done.** Left: the phase-4 parity sweep, and the LSM apply gap
+  (33-47 ms/blk in output-heavy stretches, vs x86's ~13).
+- getpeerinfo `synced_headers`/`synced_blocks` were constant -1 (aada0228,
+  shared, for main); live on mainnet. Remaining gap: a leg that has
+  announced nothing stays -1, where Core reads the tip via a getheaders from
+  `pprev` (docs/PARITY_RPC_FIELDS.md).
+- build_daemon.sh now rebuilds on any header change (2cb7a418); it had no
+  header dependencies, so struct changes could link mismatched objects.
+  Nothing stale was in production.
+
+## 2026-09-24 — mainnet at the tip in production; ad4f0d9b reverted; the reorg gap and the int/long twin returns fixed
+
+- **Production (m5ultra, `~/bmc_osx_deploy`):** mainnet IBD finished.
+  The UTXO set was rebuilt from the archive after the sorter fix
+  (f9368f9e: a u32 index wrapped on a 71M-entry flush, halting at
+  274,443). The node reached the tip, 968,463 with IBD false, and
+  follows it (968,467 at 23:28Z, 11 peers, 165.2M txouts). Redeployed
+  on 9e728d57 at 23:29Z; rollback `bmcbitcoind.pre-9e728d57`.
+- **Apply rate ~5 -> ~11.5-14 blk/s (343bc1a7):** the LSM per-thread
+  mapping cache was direct-mapped (run_no % 64). The 15 GB base run
+  shared a slot with a fresh run, so every lookup remapped both. It is
+  now fully associative with LRU. x86 had the same bug, ported to main
+  as #299.
+- **ad4f0d9b reverted (deab9fe2):** `tx_verify.c` is main's copy whole.
+  The testnet4 h=124,864 failure was 182c0d87's no-op semaphores
+  (Darwin has no unnamed `sem_init`), not a thread race: no second thread
+  calls into tx_verify.c. Shown three ways:
+  - on x86 (19f26cfc);
+  - natively with the same replay (main's file 18/18 in 3 of 3 runs,
+    ad4f0d9b SIGSEGV at 124,864 in 2 of 2;
+    `worklog/2026-09-24-ad4f0d9b-repro/build_osx.sh`);
+  - on a testnet4 node from the network (synced through all three
+    failure heights).
+  This also removes the tx_verify.c merge conflict and the gcc -Werror
+  blocker between main and bmc_osx.
+- **Found by the testnet4 node, fixed:**
+  - 56519b5b (shared): the archive check wrongly flagged non-mainnet
+    NET-15 frames, and STO-11 then blanked valid blocks.
+  - bd1700d4: a hole below the archive tip is now re-fetched under
+    `bmc.bootcatchup=0`.
+  - **05c01822 (shared, x86 porting to main):** a reorg forking above
+    the applied height moved the apply past never-connected blocks.
+    Testnet4, 23:01Z: applied 153,876 -> 153,892 with 153,877-887 never
+    applied, so the UTXO set was silently wrong. The rewind now only
+    moves down, and replacements apply only in turn.
+  - **a419e3e0 (osx only):** `chainwork_cmp` and nine store twins
+    returned `int` where callers declare `extern long` (the x86 returns
+    rax). On arm64 -1 read as 4294967295: lighter chains compared
+    heavier, and store_append's failure read as a valid height. main's
+    test_reorg passes on arm64 for the first time (19 failures -> 0).
+- Also today: the dial storm (Darwin ignores `SO_SNDTIMEO` on connect;
+  SCM_RIGHTS sockets arrive dead if the sender exits first), the
+  SIGTERM-deaf worker, the 10-minute stop (Darwin's 8 KB socketpair),
+  #297's NULL-TLS worker crash, and getpeerinfo 0 on a Mac (9e728d57:
+  `TCP_CONNECTION_INFO` for Linux's `TCP_INFO`).
+- **Tests that don't run on a Mac as written:**
+  - test_dlc_interleave, test_dlc_wire_bytes, test_mux_dial_gate: they
+    need 127.0.0.x aliases on `lo0` (root), and the first two use
+    Linux-only `TCP_QUICKACK`.
+  - test_ir5_sighash_cache: uses Linux's `cpu_set_t`.
+  - The six tx_verify `*_diff` tests: they compare against x86 asm twins
+    that were never ported.
+- Known degrade unchanged: tx_handoff's ring mutex isn't robust on macOS.
+  Remaining p3/p4 at the time: signet IBD (done that night), the phase-4
+  parity sweep.
+
+## 2026-09-23 — main merged (245 commits, #190–#292); five Darwin guards; serve/store/net re-ports; stop-wait e2e 35/35 on Darwin
+
+- Merge of #190–#292: index runs + trailing builders, the departure
+  journal, tx handoff to the download worker, zmq `sequence`, cluster
+  mempool completion, stop-waits-for-worker, RPC parity rounds, three new
+  harness suites. Conflicts: node_config.c (main's lazy `IV` parse
+  supersedes the branch's deferred note/report — same DMN-9 bug, main's
+  fix is the keeper) and the 09-12/09-14 worklogs (both streams, as
+  before).
+- New daemon sources in build_daemon.sh: index_runs, index_trail,
+  mempool_journal, tx_handoff, mempool_cluster (merge_index_runs is the
+  standalone bmc_merge_index_runs TOOL — own main — not a daemon object).
+- Darwin guards: SYS_close_range (notify.c; loop is the path), eventfd →
+  pipe pair (zmq_pub.c), posix_fadvise → F_RDADVISE (rpc_chain.c),
+  robust-mutex refuse (tx_handoff.c; MEM-20 road, degrade documented),
+  and main.c's stop-wait lock-holder scan rebuilt on libproc (KERN_PROC +
+  PROC_PIDLISTFDS + PROC_PIDFDVNODEPATHINFO by dev+ino; proc_pidpath for
+  comm; PROC_PIDTBSDINFO for is_my_child — the /proc version silently
+  orphaned every serve child's SIGTERM at stop; _NSGetExecutablePath for
+  /proc/self/exe; proc_exit_pending 0 with our own worker still tracked
+  via waitpid + kill(0)).
+- Re-ports of changed x86 asm: bitcoin_net's g_p2p_read_hook wrapper
+  (net_twin.c, v1+v2, announced plen), bitcoin_serve's
+  tx_accept_serve_tx + internal-order inv tip (bitcoin_serve.S),
+  bitcoin_store's pos_file_no (+44) invariant + drop-fd/frontier/retake
+  (store_twin.c). bitcoin_idx's probe-budget fix was born correct in the
+  twin (6fed3a71).
+- store_get_at meta[2] high-half garbage caught by main's new
+  test_append_unshared_frontier (4 file-no assertions at 2^32+k); masked.
+- Gates native green: stop-wait e2e 35/35 (real daemon, 4 cycles — the
+  libproc scan names/clears holders, never counts the stopping parent),
+  tx_handoff 13/13 (section 6 robust-recovery SKIPped on Darwin — no
+  robust mutexes; skipped, not weakened), node_config, frontier, store,
+  p2p_msgsize, net, zmq_queue. bmcbitcoind + bmc_wallet_cli LINK OK,
+  zero undefined.
+- Known degrade recorded: tx_handoff's ring mutex is not robust on
+  macOS; a crash mid-hold (two memcpys) stalls the survivor's next
+  push. Darwin death-safe lock = follow-up decision.
+
+## 2026-09-12 — main merged (131 commits); daemon relinked green; deploy home is ~/bmc_osx_deploy; mainnet IBD resumed after a 21.5h stall
+
+- Merge cce2f5d7 (#175–#189). Two add/add worklog conflicts resolved by
+  keeping both streams (x86 section annotated). Build fixes 045c8c07
+  (SYS_ioprio_set guard, build_gen.h generation in build_daemon.sh) and
+  061bfeca (four new C twins + four bitcoind.S data symbols). LINK OK,
+  zero undefined symbols.
+- The deploy runtime (binary, conf, 431 GB mainnet datadir, logs,
+  start.sh/stop.sh) moved from /tmp to ~/bmc_osx_deploy/ —
+  macOS clears /tmp at boot and daily-cleans 3-day-old files; a reboot
+  would have cost the whole IBD. /tmp paths remain as symlinks. The dev
+  repo is unchanged at ~/bmc_osx/bitcoinmachinecode.
+- Mainnet IBD had been frozen at 777,321 (80.43%) since 09-11 23:13 —
+  silent peer death, no redial ("peers exhausted", retry ring every
+  2 min). Relaunched on the merged binary (which carries main's newer
+  stall/redial work): resumed immediately, 777,681 -> 780,601 in the
+  first 90 s, zero consensus failures.
+- Push backlog cleared: origin is HTTPS via the gh credential helper,
+  pushed through 061bfeca. Remaining p3/p4: signet IBD, mainnet connect
+  green, parity sweep.
+
+## 2026-09-11 (night) — FOUR more root causes; testnet4 UTXO connect GREEN end-to-end; node synced + following tip
+
+The session took the port from "one known WV0 divergence" to a fully
+synced, live-following testnet4 node. Four distinct bugs, each found by a
+faithful differential driver, each with a committed gate:
+
+1. **TLS_ADDR dropped the getter result for CALLEE-SAVED destinations**
+   (253bb349). The macro delivered to x0-x17 via save slots only; for
+   x19-x28 destinations (three sites: TLS_ADDR x24,_hnd_tab in _hnd_end,
+   TLS_ADDR x27,_cms_scstrip0/1 in the CHECKMULTISIG strip) the getter's
+   return was silently discarded and the register kept stale garbage ->
+   hnd_end's cycle walk elem_move'd to wild addresses (the harness SIGBUS)
+   and records resolved through junk (the twin's final EQUAL pushed empty
+   -> EVAL_FALSE). The "WV0 zero-length-element divergence" entry below is
+   OBSOLETE: script_eval's zero-length handling was correct all along.
+   Evidence: wv0_zero_drv.c (real h=124,845 script+stack; was SIGBUS, now
+   byte-identical to x86), wv0_full_drv.c (the EXACT daemon entry
+   sv_verify_witness_v0 on all four p2wsh inputs: was 4x err=2, now 4x
+   err=0), wv0_rep.c (121-prefix-cut sweep, byte-identical).
+
+2. **tx_verify's arenas were shared across threads with no lock**
+   (c64ae055). The connect thread ran tx_verify_block_connect_all while
+   the same worker process's net thread accepted relayed txs (orphan/1p1c)
+   through txv_parse, which bump-resets g_wit_pool and grows g_spk_pool ->
+   a mid-connect admission rewrote the pools Phase 1 had just filled:
+   inputs classified against a real p2wpkh program verified against ANOTHER
+   transaction's spk bytes and witness lengths (witlens=64,64 -- no such
+   items exist in the real block) -> bogus rejects + invalidations
+   (h=124,864/125,673/126,361). glibc's realloc rarely moves; macOS's
+   moves near-always. All entry-path arenas are now __thread.
+
+3. **ecdsa_x_eq_mod_n: dead r+n branch + wrong p-n constant** (4f109a20).
+   The twin's compare chain returned on r[3]==PMN[3]==0 where the x86
+   falls through per limb -- the second candidate (affine R.x in [n,p))
+   was dead code -- AND its PMN_LIMBS transcription was two digits off
+   (0x402DA1732FC9BEBF vs asm 0x402DA1722FC9BAEE). Random differentials
+   hit the [n,p) band with probability ~2^-127; h=126,683 tx=93 carries a
+   CONSTRUCTED signature (sha256 of a brute-forced 16-byte preimage is a
+   valid DER signature; r=10B, s=15B) whose R.x sits there. Gate:
+   test_ecdsa_xmod.c -- contract pinned across both branches + p-n
+   boundary + three Z values; the SAME gate passes against the x86 asm.
+
+4. **txvb worker-pool semaphores are no-ops on macOS** (02b0d077). sem_init
+   fails on Darwin (no unnamed semaphores) so BOTH barriers silently
+   vanished: workers read uninitialized slots (SIGSEGV at
+   txvb_verify_one+100 through a wild spk_pool, killed the connect worker
+   four restarts in a row) and txvb_verify_all drained res[] before the
+   workers finished. Mutex+condvar with an explicit round generation;
+   identical semantics on Linux.
+
+   Also: the remaining static-TLS arrays converted to heap scratch
+   (63284ff2) -- p2wpkh_script's TLV getter faulted in the forked connect
+   worker (SIGSEGV ACCERR at the TLV write) in shapes no standalone driver
+   reproduces; bmc_thread.h's heap-TLS convention is now universal on the
+   verify path.
+
+**STATE: testnet4 FULLY SYNCED on the native daemon** -- getblockchaininfo
+verificationprogress=1, initialblockdownload=false, blocks=headers=151,987
+(151,988+ live), 14.2M txouts, heartbeats clean, DNS-seeded peers, zero
+consensus failures since the fixes. Mainnet catch-up continues on the same
+binary (79.8% stored at session end, connect engages at the .242 handoff).
+Remaining p3/p4: signet IBD, mainnet connect green, parity sweep, push (39+
+commits pending on this Mac -- origin publickey still blocked).
+
+## 2026-09-11 (late II) — vfexec zero-size TLS: the real tapscript root cause; one WV0 divergence left
+
+- The h=123,615 tapscript failure was NOT the script_eval semantics: the
+  generated TLS header had `__thread unsigned char vfexec[0]` — a
+  zero-length condition stack whose writes ALIASED vfexec_sp (the next
+  TLS variable). Every OP_IF/ELSE toggle wrote the condition byte over
+  the depth: TRUE at depth 1 survived by luck; the OP_ELSE toggle wrote
+  0x00 over depth 1 → UNBALANCED_CONDITIONAL at ENDIF. Fixed (ddb687d3):
+  vfexec is a lazily-allocated per-thread heap block behind the getter.
+  h=123,615 now PASSES; the p2wsh/p2tr driver passes 88/88 (x86 parity);
+  the whole script-VM gate set is green.
+- NEW divergence found by the continuing connect: h=124,032 and h=124,845
+  fail with "p2wpkh signature invalid"/"p2wsh script verification failed"
+  (err=2 EVAL_FALSE) — witness-v0 scripts with ZERO-LENGTH initial-stack
+  elements (witness {empty,empty,empty,71B-DER-sig,121B-script};
+  x86 verifies the same block). The checksig stub differential shows the
+  twin's CHECKSIG receiving sig DATA=zeros with the RIGHT length — the
+  stack element handling around zero-length elements diverges from the
+  x86 inside script_eval (the harness also crashes in hnd_end's cycle
+  walk — a second symptom of the same element-move class). This is the
+  one remaining consensus-path blocker; the reproducer is
+  /tmp/wv0_dbg.c (script+stack from block 124,845 tx#167, stub checksig,
+  SIGV_WITNESS_V0) against the ported interp objects.
+
+## 2026-09-11 (late) — the last known consensus blocker: one tapscript divergence
+
+- testnet4 chain IBD complete (151,869 headers+blocks stored, verified);
+  the UTXO connect verified 0..123,614 (13.9M txouts live, 6.06 ms/blk
+  with the mm path) and halts at h=123,615 on "p2tr tapscript execution
+  failed". Isolated with the new differential driver
+  (port/osx/tests/p2tr_block_drv.c + p2tr_block_123615.txt: all 88
+  taproot inputs of that block): **x86 88/88 pass, osx twin 86/88** --
+  tx#57 vin#0 and tx#62 vin#0 fail. Both are 6-item script-path spends
+  (witness {sig,sig,preimage,01,script,control}; script =
+  IF HASH256 <h> EQUALVERIFY CHECKSIG <32> CHECKSIGADD 2 LESSTHANOREQUAL
+  ELSE ... ENDIF). The interpreter mechanics are individually correct
+  (fragment bisect: IF/HASH256/EQUALVERIFY/args all fine; the only
+  in-fragment failures are the expected CLEANSTACK/EVAL_FALSE) and the
+  BIP342 sighash gate is 51/51 -- the divergence needs the REAL
+  checksig_fn context (taproot_sighash + schnorr under the 4-deep
+  initial stack). The driver itself had three context bugs on the way
+  in (num_inputs as byte length, 32-byte prevouts instead of 36-byte
+  outpoints, unprefixed spks) -- the x86 fails identically on a wrong
+  context, which is how the driver was trusted.
+- Status: the tapscript block at h=123,615 now PASSES (vfexec fix); the
+  connect advanced to h=124,032/124,845 where p2wsh inputs with
+  zero-length initial-stack elements fail with EVAL_FALSE (err=2).
+  The x86 verifies the same blocks (r=1). Isolated: the twin's
+  script_eval handles the CHECKSIG/SWAP/SHA256 sequence correctly
+  through the per-opcode trace (29 opcodes, one checksig callback,
+  matching x86), but the final NUMEQUAL evaluates false — the stack
+  element handling for ZERO-LENGTH initial-stack elements diverges
+  inside script_eval (the harness also faults in hnd_end's cycle walk
+  with the same elements). Reproducer: /tmp/wv0_dbg.c-style runs
+  against the ported interp objects with the block-124,845 tx#167
+  script+stack. THE ONE REMAINING consensus-path blocker.
+- Mainnet: 650k+/966k stored (67%) on the fully fixed binary, zero
+  consensus failures; the connect engages at the .242 tail handoff.
+
+## 2026-09-11 — testnet4 IBD green; two more real bugs (segwit txid, radix tie-break)
+
+- testnet4 (DNS seeds, public peers, 151,865 headers + all blocks from
+  genesis) exposed two bugs the daemon's store-only catch-up could not:
+  (1) cons_twin txid_of_span hashed the witness into segwit txids (the
+  legacy fix had moved `body` past the witness skip) -- every segwit
+  block failed cons_verify; (2) the utxo_lsm_twin radix sorter's 96-bit
+  tie-break was direction-inverted -- same-txid tie groups came out of
+  the flush DESCENDING and point lookups past the inversion missed, so
+  the UTXO apply halted deterministically at h=51,859 (the first memtable
+  flush). Both fixed and gated (test_lsm_tie_order.c new; the four LSM
+  harnesses + test_cons re-run green). Also: utxo_live_run_budget read
+  /proc/meminfo (Linux-only) -> zero compaction budget on macOS.
+- Mainnet: 449k+/966k stored, following .242's tail; UTXO connect will
+  engage at the handoff (the interp/TLS and LSM fixes above are IN that
+  binary now).
+
+## 2026-09-10 — MAINNET IBD RUNNING on Apple Silicon
+
+- The native bmcbitcoind (M1 Max, macOS 26.6) is doing a real mainnet IBD
+  right now: 966,400 headers stored (headers.dat 108,236,800 B, ~29 min),
+  then blocks from genesis via the boot catch-up against the x86 reference
+  node (`connect=192.168.5.242:8332`, which is itself mid-IBD -- the osx
+  node follows its tail live). 115,401/966,400 stored (11.9%) at elapsed
+  5:01, ~460 blk/s, zero consensus failures. No debugger was usable on
+  this machine (lldb attach/launch permission-gated); the crash backtraces
+  came from macOS DiagnosticReports .ips files plus an in-worker
+  siginfo+backtrace handler.
+- Enabling commits: bc38f9e8 (the p2/p3 wave: syscall .S ports + C shims +
+  native build + the fixes below) and the diagnostics commit. Regtest IBD
+  end-to-end green first: fresh node B pulled 113 blocks from node A over
+  the wire (3 chunks, ~10s), UTXO applied 113/113, tip hashes identical.
+- Four port bugs the IBD path caught (details in worklog/2026-09-10.md):
+  three raw-svc sites still using the Linux nr-in-x8 convention
+  (idxscan flock x2, node_log openat -- SIGSYS/SIGSEGV roulette in the
+  worker), node_make_version's double-deref of _node_services (SIGSEGV at
+  0x809 in the probe handshake), and cons_twin txid_of_span's legacy-tx
+  strip offset + cap-semantics confusion (caught by test_cons).
+
+## 2026-09-09 — secp256k1_taproot twin landed; bip341 gate scoped
+
+- **secp256k1_taproot -> taproot_twin.c** (C twin): tagged_hash256,
+  tap_branch_hash, tap_leaf_hash, taproot_tweak_pubkey (1 even / 2 odd,
+  parity captured before even-normalising), tap_merkle_root.  Gates:
+  upstream test_taproot ALL PASS native + 227-record cross-arch
+  differential byte-identical vs .242 (tags/msgs to 200 KB, leaf
+  compactsize boundaries, tweak rejections x>=p/t>=n, merkle depth 0..8).
+- bitcoin_taproot_sighash.c (the bip341/bip342 production C) is
+  arch-neutral and needs this twin at link time; its harness
+  test_taproot_sighash pulls bitcoin_interp/scriptcodec/sha1, so the
+  bip341/342 gate lands with the script VM wave -- the same deferral
+  pattern as test_ir10 (script) and test_segwit_sighash (witness_v0).
+- Session total so far: bitcoin_keys.S, bitcoin_addr.S, bitcoin_bip32.S
+  native; sighash/script/taproot twins; bip143 no-port gate; hmac x25 ABI
+  fix; harness UB fix; schnorr bench corrected 273 -> 80 us.  24 commits
+  pending push (origin publickey still blocked from this Mac).
+
+## 2026-09-09 — bip143 (no port needed) + bitcoin_script twin; schnorr bench was 3.4x inflated
+
+- **bitcoin_bip143: NO PORT NEEDED.** Production calls bitcoin_segwit.c
+  (arch-neutral) directly; the asm module is only the differential harness's
+  perf twin.  Gate: native test (BIP143 published example + real block-481824
+  tx 562 with the actual witness signature verified through ecdsa_twin under
+  the C's sighash + swtx_parse contract) and a 1,635-vector corpus dump
+  byte-identical three ways: osx-C == x86-C == x86-ASM.
+- **bitcoin_script -> script_twin.c** (C twin): test_script + test_p2pkh
+  green native; 18.7 KB cross-arch diff byte-identical; the differential
+  caught der_long_len re-masking the first length byte as the count (the
+  upstream short-form-only harnesses could not see long-form INTEGERs).
+- **pubkey_schnorr_twin.c carried committed bring-up debug inside
+  schnorr_verify** (two fe_inv + fprintf per call).  Removed; BIP340
+  19/19 re-verified; bench CORRECTED 273.11 -> 79.92 us/verify (3.4x;
+  BENCHMARKS_OSX.md updated).  Two process lessons recorded: (1) the first
+  removal pass dropped the real point_scalar_mul_fixed(SG,sL) call with the
+  debug block -- caught only because bench_schnorr refuses to time a
+  fixture that does not verify; (2) hand-transcribed fixture hex carried
+  two silent copy errors -- regenerate fixtures programmatically.
+- segwit-v0 sighash is now fully Darwin-covered.  Next: secp256k1_taproot
+  (tagged_hash256/tweaked_pubkey) to unlock the bip341 gate, then the
+  script VM wave.
+
+## 2026-09-09 — keys/addr/bip32 native + sighash twin: wallet derivation covered
+
+- Four modules landed, three as native AArch64 asm (details in
+  OSX_ROADMAP.md; commits 3db7bd97, 1092ebee, 5cfccf4d, 404f968b):
+  **bitcoin_keys.S** (test_keys 6/6 + 647-record diff), **bitcoin_addr.S**
+  (test_addr 5/5 + 56-record diff; the x11-cursor pitfall again),
+  **bitcoin_bip32.S** (all four upstream bip32 harnesses + 990-record diff;
+  frame-overrun, byte-0-skipping carry loops, and the AAPCS64
+  eight-register-arg extkey contract all caught by the gates), and
+  **sighash_twin.c** (test_legacy_sighash 500/500 Core vectors +
+  test_find_and_delete 23/23 + test_sighash_oob + 143 KB diff).
+- REAL PRE-EXISTING PORT BUG fixed: bitcoin_hmac.S used x25 without saving
+  it (callee-saved; main's GOT anchor) -- latent until the dbip32 driver,
+  which parks x25 across bip32_master -> hmac_sha512. Prologue/epilogue
+  now save/restore x25,x26; test_hmac re-verified green. First port bug
+  found by a caller's register pressure rather than a gate's value check
+  -- the differential drivers earn their keep as ABI stress.
+- UPSTREAM HARNESS UB fixed: test_bip32_master.c's sscanf %2x into
+  (unsigned*)&kg[i] spills 3 bytes into adjacent frame vars (zeroed
+  kg[0..2] and the caller's c[0..2] under clang's layout; the k/c outputs
+  were correct all along). Fixed to the unsigned-temp pattern; verified
+  green on BOTH arches (.242 re-run).
+- With this wave the wallet key-derivation path (seed -> master -> path ->
+  xprv/xpub/address) and the legacy sighash preimage builders are fully
+  Darwin-covered. Remaining p1: bip143/bip341/bip342, taproot, and the
+  script VM (interp/scriptcodec/script/multisig/script_flags).
+- Session housekeeping: removed a stale utxo_lsm_twin-*.o.tmp; push still
+  blocked from this Mac (origin publickey), 20 commits pending on bmc_osx.
+
+## 2026-09-09 — docs backfill: the point→cons wave (8b341e41..5b7f679f)
+
+- Ten modules landed in a fast wave without per-module state/roadmap
+  entries (the worklog jumped from fe_twin to net_twin). Durable record
+  now in OSX_ROADMAP.md, evidence from the commits + in-file headers:
+  - **secp256k1_point/point_ct** (point_twin.c, point_ct_twin.c,
+    g_comb_table_data.c): test_point + test_point_inf native, 1200 +
+    1740-record cross-arch diffs byte-identical (8b341e41, 93a4d015).
+  - **secp256k1_ecdsa + bitcoin_pubkey/secp256k1_schnorr**
+    (ecdsa_twin.c, pubkey_schnorr_twin.c): BIP340 verify native + first
+    cross-arch verify benches (BENCHMARKS_OSX.md); fixed sc_inv_var
+    `ldp x25,x25` SIGILL (b25968b9).
+  - **bitcoin_chainwork/muhash/utxo_stats** (chainwork_twin.c,
+    muhash_twin.c, utxo_stats_twin.c): test_chainwork 0F + test_muhash
+    green on Core-oracle vectors; test_tmpdir.h Darwin shim (50526b34).
+  - **bitcoin_utxo + bitcoin_store_fast** (utxo_twin.c,
+    store_fast_twin.c): test_utxo 0F, test_store 0F, bench_store_read
+    byte-exact (b611922b; store_twin born here, completed a253ef93).
+  - **bitcoin_cons** (cons_twin.c) and **bitcoin_headers**
+    (headers_twin.c): test_cons / test_headers green (5b7f679f,
+    9f112d91); cons + headers gates re-run green in this session.
+- Session housekeeping: removed a stale utxo_lsm_twin-*.o.tmp; push still
+  blocked from this Mac (origin publickey), 15 commits pending on bmc_osx.
+
+## 2026-09-09 — bitcoin_net twin: first p2 syscall module landed (C twin)
+
+- `port/osx/net_twin.c`: BIP314 v1 framing + fd plumbing + v2 dispatch +
+  upload-pacer hook, all 12 public symbols of asm/bitcoin_net.asm. Gates:
+  upstream test_net 19/19, test_p2p_msgsize 14/14 (oversize -3 + no-drain +
+  NET-11 checksum), hook-arg smoke, live tcp_connect_ip vs .242:8332, and
+  a 240-frame p2p_frame cross-arch differential byte-identical vs the x86
+  objects (dnet.c + gen_dnet_vecs.py; includes two 4MB P2P_MAX_MSG frames).
+  Commit 45fe22bb.
+- Twin bug the upstream-equivalent gates caught: a half-finished edit left a
+  DUPLICATED drain loop and checksum-before-drain ordering; x86 order is
+  checksum (only when announced<=cap) THEN drain, and *plen_out is written
+  AFTER the drain (test_net's post-drain-alignment check pins this).
+- headers_twin landed just before this (9f112d91, test_headers all green,
+  hst_append returns new count). IBD-path assembly pair bitcoin_net +
+  bitcoin_headers is now Darwin-covered. Next: bitcoin_p2p message builders
+  (p2p_getheaders etc. -- pure compute) then addrmgr/idx, keeping the
+  one-module-one-gate rhythm.
+
+## 2026-09-09 — bitcoin_p2p twin: IBD message layer complete (C twin)
+
+- `port/osx/p2p_twin.c`: p2p_getheaders (Stage A multi-hash locator,
+  count 1..252), p2p_getdata_block (MSG_WITNESS_BLOCK 0x40000002), p2p_ping,
+  p2p_headers_count, p2p_inv_count, p2p_inv_get. Gates: upstream test_p2p
+  18/18 + test_p2p_inv 12/12 native, 130-record cross-arch differential
+  byte-identical vs x86 (dp2p.c + gen_dp2p_vecs.py). Commit 57588bdb.
+- With net_twin + headers_twin the whole IBD wire path (framing, message
+  builders, header store) is Darwin-covered. Next: addrmgr/idx, then the
+  big store modules, keeping one-module-one-gate.
+
+## 2026-09-09 — bitcoin_addrmgr twin landed (C twin)
+
+- `port/osx/addrmgr_twin.c`: peers.dat book (init/count/add/get_i/lookup)
+  + addr v1/v2 codecs + addr_count. Gates: upstream test_addrmgr 28/28
+  (Core-reference codec bytes), 73-record cross-arch differential
+  byte-identical vs x86 -- result stream AND the resulting peers.dat file.
+  Commit 2725d14b.
+
+## 2026-09-09 — bitcoin_idx twin landed (C twin) + REAL x86 BUG found
+
+- `port/osx/idx_twin.c`: hash->height open-addressing index (init/put/get/
+  count/build_from_file), layout-compatible 48B slots. Gates: upstream
+  test_idx 12/12, 868-record cross-arch differential byte-identical.
+  Commit 6fed3a71.
+- THE DIFFERENTIAL FOUND A REAL X86 BUG: 100%-full table -> x86 idx_put
+  spins forever. memcmp_exact clobbers r8b; idx_put keeps the probe budget
+  in r8 across the call, so after one non-matching memcmp the budget is
+  garbage and `dec r8; jz .full` never fires. Production never fills its
+  1M-slot table so it was latent. Vectors regenerated to keep <100% load;
+  x86 asm fix goes on main (TODO.md).
+
+## 2026-09-09 — bitcoin_store twin landed (C twin); p2 store layer open
+
+- `port/osx/store_twin.c`: the full block store (init/reload/append/get_at/
+  get_tip/get_file_fd/prune family/append_shared family/reorg primitives/
+  truncate family), 19 public symbols. Gates: upstream test_store 42/42,
+  test_truncate 54/54, 69-record differential byte-identical (retval stream
+  AND the full cwd file set via tarball compare). Commit a253ef93.
+- Note: prune/truncate run against files by bare relative name -- differential
+  harness must start in a scratch cwd (stale prune.dat from a previous run
+  poisons store_init's gate restore).
+- GitHub push still blocked from this Mac (no gh auth, SSH key unregistered);
+  9 commits pending on bmc_osx.
+
+## 2026-09-09 — bitcoin_utxo_store twin landed (C twin)
+
+- `port/osx/utxo_store_twin.c`: WAL + checkpoint UTXO persistence (buffered
+  WAL, atomic checkpoint publish, torn-tail truncate, init_ro). Gates:
+  test_utxo_store + test_utxo_wal_buffer + test_utxo_torn_tail green,
+  124-record differential byte-identical (retvals + utxo.dat/utxo.idx).
+  Commit 55c76deb. utxo_struct_size added to utxo_twin.c.
+
+## 2026-09-09 — bitcoin_utxo_lsm twin landed (C twin) -- the whale is done
+
+- `port/osx/utxo_lsm_twin.c` (+ vendored utxo_lsm_mm.c): the LSM UTXO store
+  -- flush/sorted-runs/bloom/sparse-index/manifest, multi-run get,
+  recount/compact/walk k-way merge, tombstone hash. Gates: 6 upstream LSM
+  harnesses green native; 229-record differential byte-identical (retvals +
+  WAL/runs/manifest file set). Commit b65c12e1. macOS note: the upstream
+  mmap fast path is byte-identical but fails CONCURRENT gets under
+  clang-21/arm64 -- defaulted off on __APPLE__, twin path is the anchor
+  (documented in utxo_lsm_mm.c).
+
+## 2026-09-09 — bitcoin_hash native: first full 6-op module, x86-diff byte-identical
+
+- `port/osx/bitcoin_hash.S` (7 public symbols) gated three ways: upstream
+  test_pow_check 13/13 native, 6,485-vector Python-oracle differential 0
+  failures, and byte-identical results vs the x86 bitcoin_hash.o/sha256.o run
+  on the 9950X3D (192.168.5.242). Driver pair committed (dvh.c /
+  gen_bhash_vecs.py) — batched file-based oracles, no popen.
+- Driver bug caught by cross-arch diff: sha256d64 out stride is 32B per 64B
+  input (Core SHA256D64 shape); assuming 64B out stride silently compared
+  stale memory on BOTH arches and "agreed". Cross-arch diffing only proves
+  what the driver actually measures.
+- x86-vs-osx benchmarking now possible on shared shapes: bench_hash_core +
+  bench_fe build on both. x86 reference numbers captured (9950X3D, cores
+  16-19): sha256_1MB 2.40 GB/s, fe_mul THRU 5.54ns, ECDSA verify 47.1k/s/core,
+  Schnorr 38.4k/s/core.
+- IBD status: x86 full mainnet IBD COMPLETE on .242 (tip 961639, progress 1.0,
+  760G, /mnt/2tbssd/bmc-bench deployment). OSX native daemon (p3) still
+  blocked on p1/p2 module waves.
+
+## 2026-09-09 — p1 progressing: sha512 + ripemd160 + sha1 landed
+
+- sha1 joined ripemd160 as a C twin (gate 10/10 after fixing a LE length
+  field the gate caught). Committed straight to bmc_osx (3ee6c5a5).
+
+- sha512.S native, upstream test 4/4. ripemd160 shipped as C twin after
+  two failed asm translations (see OSX_ROADMAP pitfalls); 23/23 + 2.08M
+  digest thread-stress green. bitcoin_hash done earlier (PR #134).
+- Committed straight to bmc_osx (docs+module batch); next modules:
+  sha1, bech32, base32, then the secp256k1 family.
+
+## 2026-09-09 — p0 landed: sha256 is the first native module
+
+- `port/osx/sha256.S` (Mach-O AArch64, 7 public symbols) + native gate
+  `port/osx/tests/test_sha256_osx.c` (16 checks, 0 failures) + upstream
+  `test_cry6_sha_paths.c` linked unchanged against the Mach-O object (7/7).
+  Upstream C compiled untouched; only the x86-only CPUID section of
+  test_sha256.c needed replacing (Darwin has no CPUID) — the osx gate
+  replaces it with a sysctl cross-check. Full evidence in OSX_ROADMAP.md.
+- Recurring-pitfall list started in OSX_ROADMAP.md (sp alignment at bl
+  sites, x18/x28 reserved, @PAGEOFF, sysctl probes, python -c limits).
+- Next: bitcoin_hash (sha256d/block_hash/diff_target/pow_check) on top of
+  the proven sha256, then sha1/sha512/ripemd160.
+
+## 2026-09-09 — strategy locked: native port, phased, PR-per-layer
+
+- `port/OSX_STRATEGY.md` merged via PR #130: port-don't-emulate decision,
+  measured surface (238 raw syscalls; C layer POSIX-clean except 2 prctl
+  uses; no futex/epoll/eventfd), 5 phases (p0 build bridge → p1 pure-compute
+  → p2 syscall I/O → p3 daemon → p4 parity), PR branches `osx/pN-*` merged
+  --no-ff into bmc_osx with green gates.
+- First working PR target: p0 sha256 proof module (Mach-O build + native
+  harness + differential fuzz vs hashlib/Python).
+
+## 2026-09-09 — round 0: fresh start on `bmc_osx`
+
+- Branch `bmc_osx` forked from `main` @1dac38ae (upstream through PR #127,
+  addnode dials), pushed to origin, local clone at `~/bmc_osx/bitcoinmachinecode`.
+- `main` is declared the x86-64 development tree; `bmc_osx` merges from it,
+  never develops into it.
+- Toolchain verified: Apple clang 21.0.0, macOS 26.6.2, M1 Max (arm64).
+- Reuse strategy: arm-port branch (origin) is the algorithm reference — all
+  63 modules were ported and differential-verified there — but its syscall
+  layer is Linux-only (`svc #0`, nr in x8). Darwin needs `svc #0x80`,
+  nr in x16, Mach-O sections/symbols (`_` prefix), no x28 use, PIC via
+  adrp/add. Rough rework weight per module (svc counts from arm-port .S):
+  utxo_lsm 66, store 42, utxo_store 30, idxscan 19, undo 18, store_fast 17.
+- Docs created: `port/OSX_PORT.md`, `port/OSX_ROADMAP.md`, this file.
+- Next: pick the first module (pure-compute, no syscalls — e.g. sha256 or
+  bitcoin_hash) to prove the Mach-O build+verify loop end to end.
+
+## 2026-09-09 — bitcoin_tx native: bounds fuzz 55M calls + x86-diff byte-identical
+
+- port/osx/bitcoin_tx.S (tx_parse + tx_txid): test_tx 20/20, test_txtxid,
+  test_tx_bounds_fuzz 55,232,133 guarded calls 0 faults, 501-vector
+  differential byte-identical vs x86 objects on .242 (dtx.c/gen_tx_vecs.py).
+- NEW DARWIN PITFALL: `ldp x27,x27,[sp],#16` (Rt==Rt2) is CONSTRAINED
+  UNPREDICTABLE — SIGILL on Apple Silicon. Never pair-restore the same
+  register twice; pop odd slots with ldr + explicit sp adjust.
+- Delegation note: parallel subagent waves time out on this provider (5-12
+  API calls in 600s). Porting proceeds serially, coordinator-owned.
+
+## 2026-09-09 — secp256k1_scalar native: 2,306-vector x86-diff byte-identical
+port/osx/secp256k1_scalar.S: sc_add/sc_sub/sc_sqr/sc_inv/sc_inv_var/
+sc_mul_512/sc_split_lambda native AArch64. sc_mul + sc_mul_512 currently
+route to proven C twins (port/osx/sc_mul_c.c, sc_mul_512_c.c) — the AArch64
+asm fold drops a DELTA on dense products; root-cause later, C twins are the
+correctness baseline. Gates: test_scalar 12/12, test_glv_split 3 campaigns
+(1,001,018 + 1,000,000) 0 failures, cross-arch dsl diff vs .242 byte-identical
+(800 mul_512/split + 1500 mul/add/sub vectors). Three port bugs the gates
+caught: (1) add/adc vs adds/adcs — AArch64 add/adc do NOT write NZCV, every
+carry chain needs adds/adcs; (2) sc_mul_512/split frames were aliased over
+active locals until a real `sub sp, sp, #N` was added (same class as the
+tx epilogue leak); (3) my MULACC expansion dropped the hi term into the
+carry chain (cur[k+1] += hi + c, then propagate) — the x86 macro did the
+same math but the ARM rewrite skipped it. Commit 131e5171 on osx/p1-scalar,
+merged to bmc_osx (2e7b1f07).
+
+## 2026-09-09 — bitcoin_hmac native + sha512.S caller-frame corruption fix
+port/osx/bitcoin_hmac.S: hmac_sha512 native (CRY-4 frame-local buffers,
+WAL-3 zeroise).  The 400-vector differential vs .242 exposed a REAL bug in
+port/osx/sha512.S: the 128-bit BE length field zero loop ran with x13 =
+carrier+120 and offsets 112..127, writing carrier[232..247] — outside the
+sha512_full frame.  When rem>=112 (two-block pad path) the carrier is pad1
+at its_sp+0xc0, so the stray writes hit the CALLER's frame at caller_sp+8..
++23, zeroing hmac's kpad[8..23] and corrupting any HMAC with keylen>=16 and
+msglen in 112..127/255 (symptom: only some vectors fail, key-length
+dependent).  Fix: offsets -8..7 from x13.  sha512_NIST 4/4 re-verified;
+400/400 byte-identical after the fix.  Commit da3f4b6d.
+
+## 2026-09-09 — bitcoin_bip39 native; bitcoin_aes already pure C
+port/osx/bitcoin_bip39.S: all four ABI functions native + wordlist_gnu.inc
+(the 2048x9 table in __TEXT,__const — __cstring gets tail-merged by the
+Darwin linker and silently shifts fixed-width records).  Two port bugs the
+gate caught: (1) find_word_index clobbered x22/x23 (unsaved callee-saved in
+that helper) destroying the caller's token pointer after the first word —
+every mnemonic invalid; (2) the parse tail (entropy extract + checksum
+compare) initially fell through to the epilogue returning garbage.  Gate:
+test_bip39 24-vector oracle round + WAL-11 canary + negatives, ALL PASS,
+same harness green on x86.  bitcoin_aes: pure C upstream, test_aes passes
+natively unchanged.  Commits 0c259e99.

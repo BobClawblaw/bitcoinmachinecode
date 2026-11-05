@@ -21,6 +21,7 @@
 #include <arpa/inet.h>
 #include "../rpc_json.h"
 #include "../rpc_server.h"
+#include "loopback_alias.h"
 
 static int fails = 0, checks = 0;
 static void ok(int c, const char* w){ checks++; printf("  %s %s\n", c ? "ok  " : "FAIL", w); if (!c) fails++; }
@@ -73,6 +74,7 @@ static int honest_call(const char* src, double wait_s, char* out, size_t cap){
 }
 
 int main(void){
+    require_loopback_aliases(3);                             /* the dribblers dial from 127.0.0.2 and .3 */
     printf("---- RPC-24: the JSON-RPC intake ----\n");
     setenv("BMC_RPC_REQ_DEADLINE_SECS", "60", 1);           /* the default, stated */
     rpc_server_cfg cfg; memset(&cfg, 0, sizeof cfg);

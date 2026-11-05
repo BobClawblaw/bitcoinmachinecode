@@ -42,6 +42,18 @@ while read -r _local_ref local_sha _remote_ref remote_sha; do
 
     idents=$(git log --format='%H %an <%ae>%n%H %cn <%ce>' $range 2>/dev/null)
     msgs=$(git log --format='%H%n%B' $range 2>/dev/null)
+    # (3) tree CONTENT: every line any commit in the range ADDS. Identity and
+    # message checks cannot see what rides inside file text -- the
+    # 2026-09-23 incident: the deploy-home path under the operator's home
+    # directory landed in the worklog of a docs commit and was pushed, and
+    # no per-commit check noticed. Added lines only: a pattern already IN
+    # the tree was pushed before this check existed, and re-flagging it on
+    # every touch would wall the file. One pass for the whole range, matched
+    # per pattern below. The pseudonym's own public contact address is
+    # stripped first so a domain pattern cannot refuse it.
+    added=$(git log $range --format= --patch --unified=0 2>/dev/null \
+            | grep -E '^\+[^+]' \
+            | sed 's/bobclawblaw@protonmail\.com//g')
 
     while IFS= read -r pat; do
         case "$pat" in ''|'#'*) continue ;; esac
@@ -61,6 +73,16 @@ while read -r _local_ref local_sha _remote_ref remote_sha; do
         if printf '%s' "$msgs" | grep -Ei -- "$pat" >/dev/null 2>&1; then
             echo "pre-push: REFUSED -- a commit message matches a blocked pattern." >&2
             echo "  pattern: $pat" >&2
+            rc=1
+        fi
+
+        if printf '%s' "$added" | grep -Ei -- "$pat" >/dev/null 2>&1; then
+            echo "pre-push: REFUSED -- ADDED FILE CONTENT matches a blocked pattern" >&2
+            echo "  (a path, name or address riding inside a file's text)." >&2
+            echo "  pattern: $pat" >&2
+            echo "  find it:  git log $range --format=%h --patch | grep -iE -- '$pat'" >&2
+            echo "Rewrite before pushing; a force-push after the fact does not" >&2
+            echo "remove the content from GitHub (orphaned blobs stay by SHA)." >&2
             rc=1
         fi
     done < "$BLOCKLIST"

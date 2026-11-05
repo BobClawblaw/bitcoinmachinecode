@@ -6,6 +6,9 @@
  * core is byte-for-byte correct for the tested inputs.
  */
 #include <stdio.h>
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
 #include <string.h>
 #include <stdint.h>
 
@@ -135,9 +138,18 @@ int main(void)
      * must read 0; the pre-fix probe would have read F16C's 1. ---- */
     {
         unsigned f16c = 0, sha7 = 0, maxleaf = 0;
+#if defined(__x86_64__)
         { unsigned a=0,b,c,d; __asm__ volatile("cpuid" : "=a"(a),"=b"(b),"=c"(c),"=d"(d) : "a"(0)); maxleaf=a; (void)b;(void)c;(void)d; }
         { unsigned a=1,b,c,d; __asm__ volatile("cpuid" : "=a"(a),"=b"(b),"=c"(c),"=d"(d) : "a"(1)); f16c = (c>>29)&1; }
         if (maxleaf >= 7){ unsigned a=7,b,c,d; __asm__ volatile("cpuid" : "=a"(a),"=b"(b),"=c"(c),"=d"(d) : "a"(7),"c"(0)); sha7 = (b>>29)&1; }
+#else
+        /* Apple silicon: the independent read is the kernel's own feature
+         * flag, which port/osx/sha256.S's probe must agree with (its 09-25
+         * oldlenp bug made that probe read garbage). No F16C analogue. */
+        { int v = 0; size_t l = sizeof v;
+          if (sysctlbyname("hw.optional.arm.FEAT_SHA256", &v, &l, NULL, 0) == 0) sha7 = (unsigned)v;
+          f16c = sha7; maxleaf = 7; }
+#endif
         extern int sha256_cpu_has_sha(void);
         int got = sha256_cpu_has_sha();
         printf("info: cpuid max_leaf=%u F16C(1:ECX.29)=%u SHA(7:EBX.29)=%u probe=%d\n",

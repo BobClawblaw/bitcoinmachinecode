@@ -53,7 +53,19 @@
  *
  * Async-signal safety: the handler uses raw syscalls and fixed buffers only
  * (no stdio, no malloc); a spinlock serialises handlers of different
- * processes. */
+ * processes.
+ *
+ * bmc_osx (2026-11-04): Darwin has no seccomp, but the Mac's assembly and C
+ * reach fsync, fdatasync and open through libc, so this header DEFINES those
+ * three there: the static link binds every call in the test binary to them
+ * (libSystem's own internal calls are untouched). They record exactly what
+ * the SIGSYS handler records, and answer the same; a file's path comes from
+ * fcntl(F_GETPATH), its identity from fstat (st_ino + st_birthtimespec), the
+ * namespace from readdir. The armed open(".") failure applies to an open of
+ * "." WITHOUT O_DIRECTORY -- the assembly's Lfsync_dir -- matching Linux,
+ * where only the asm's raw open is trapped (the C publish path,
+ * lsm_manifest.c, opens "." with O_DIRECTORY through glibc's openat). Include
+ * it in one translation unit only. */
 #ifndef DURABLE_IMAGE_H
 #define DURABLE_IMAGE_H
 #define _GNU_SOURCE
@@ -65,16 +77,21 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
-#include <ucontext.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#ifdef __APPLE__
+#include <stdarg.h>
+#include <dlfcn.h>
+#else
+#include <ucontext.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <linux/audit.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
+#endif
 
 #define DI_MAXN 512
 #define DI_LOGN 256
@@ -101,12 +118,46 @@ static char* di_u64(char* d, unsigned long long v){
     while (n) *d++ = t[--n];
     *d = 0; return d;
 }
+#ifdef __APPLE__
+static long long di_btime(const struct stat* st){ return (long long)st->st_birthtimespec.tv_sec * 1000000000LL + st->st_birthtimespec.tv_nsec; }
+#else
 static int di_statx(int dfd, const char* path, int flags, struct statx* sx){
     return (int)syscall(SYS_statx, dfd, path, flags, STATX_INO | STATX_BTIME | STATX_SIZE | STATX_TYPE, sx);
 }
+#endif
 static void di_key(char* out, unsigned long long ino, long long bt){
     char* p = di_cat(out, di->snap); p = di_cat(p, "/i"); p = di_u64(p, ino); p = di_cat(p, "_"); di_u64(p, (unsigned long long)bt);
 }
+#ifdef __APPLE__
+/* (openat, not open: open is this header's own, below, and takes the lock) */
+static void di_copy_fd(int src, const char* dst){
+    static char buf[1 << 16];
+    int o = openat(AT_FDCWD, dst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (o < 0) return;
+    off_t off = 0;
+    for (;;){ ssize_t r = pread(src, buf, sizeof buf, off); if (r <= 0) break;
+              if (write(o, buf, (size_t)r) != r) break; off += r; }
+    close(o);
+}
+static void di_read_ns(struct di_ent* ents, int* cnt, int trunc){
+    int d = openat(AT_FDCWD, ".", O_RDONLY | O_DIRECTORY);
+    if (d < 0) return;
+    int d2 = dup(d); DIR* dp = d2 >= 0 ? fdopendir(d2) : NULL;
+    if (!dp){ if (d2 >= 0) close(d2); close(d); return; }
+    *cnt = 0; struct dirent* e;
+    while ((e = readdir(dp))){
+        if (e->d_type != DT_REG || di_strlen(e->d_name) >= 64 || *cnt >= DI_MAXN) continue;
+        struct stat sx; if (fstatat(d, e->d_name, &sx, AT_SYMLINK_NOFOLLOW) != 0) continue;
+        struct di_ent* x = &ents[(*cnt)++];
+        di_cat(x->name, e->d_name); x->ino = (unsigned long long)sx.st_ino; x->bt = di_btime(&sx);
+        if (!trunc) continue;
+        char k[480]; di_key(k, x->ino, x->bt);
+        struct stat ss;
+        if (stat(k, &ss) == 0 && ss.st_size > sx.st_size) truncate(k, sx.st_size);
+    }
+    closedir(dp); close(d);
+}
+#else
 static void di_copy_fd(int src, const char* dst){
     static char buf[1 << 16];
     int o = (int)syscall(SYS_openat, AT_FDCWD, dst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -143,6 +194,7 @@ static void di_read_ns(struct di_ent* ents, int* cnt, int trunc){
     }
     syscall(SYS_close, d);
 }
+#endif
 /* the namespace of "." now becomes durable (weak: a file's truncation is its
  * own, made durable by its own sync, which copies its content as it is) */
 static void di_commit_ns(void){ di_read_ns(di->ns, &di->nns, !di->weak); }
@@ -161,6 +213,71 @@ static void di_lose(void){
     di->frozen = 1; di_note("<power lost here>");
     di_read_ns(di->loss, &di->nloss, 0); di->have_loss = 1;
 }
+#ifdef __APPLE__
+/* a sync of fd, recorded as the Linux handler records it: 0, or -EIO armed */
+static long di_sync(int fd){
+    long ret = 0;
+    while (__atomic_exchange_n(&di->lock, 1, __ATOMIC_ACQUIRE)) {}
+    if (di->armed && !di->frozen){
+        struct stat sx;
+        if (fstat(fd, &sx) == 0){
+            char tgt[1024]; if (fcntl(fd, F_GETPATH, tgt) != 0) tgt[0] = 0;
+            const char* base = tgt; for (const char* q = tgt; *q; q++) if (*q == '/') base = q + 1;
+            di->nsync++;
+            if (S_ISDIR(sx.st_mode)){
+                if (di->dir_lose.fire){ di->dir_lose.fire = 0; di_lose(); }
+                else if (di->dir_fail.fire){ di->dir_fail.fire = 0; di_note("<dir EIO>"); ret = -EIO; }
+                else { di_note("<dir>"); di_commit_ns(); }
+            } else if (S_ISREG(sx.st_mode)){
+                di_note(base);
+                int r = tgt[0] ? openat(AT_FDCWD, tgt, O_RDONLY) : -1;
+                if (r >= 0){ char k[480]; di_key(k, (unsigned long long)sx.st_ino, di_btime(&sx)); di_copy_fd(r, k); close(r); }
+                if (!di->weak) di_commit_ns();
+                di_trig_count(&di->dir_fail, base); di_trig_count(&di->dir_lose, base); di_trig_count(&di->open_fail, base);
+                if (di->freeze_left > 0 && di_eq(base, di->freeze_name) && --di->freeze_left == 0) di_lose();
+                di_trig_count(&di->kill, base);
+            }
+        }
+    }
+    int die = di->kill.fire; if (die){ di->kill.fire = 0; di_note("<SIGKILL here>"); }
+    __atomic_store_n(&di->lock, 0, __ATOMIC_RELEASE);
+    if (die) kill(getpid(), SIGKILL);   /* the sync returned; the process dies */
+    return ret;
+}
+static int di_real_sync(const char* which, int fd){
+    int (*real)(int) = (int (*)(int))dlsym(RTLD_NEXT, which);
+    return real ? real(fd) : -1;
+}
+int fsync(int fd){
+    if (!di) return di_real_sync("fsync", fd);
+    long r = di_sync(fd); if (r < 0){ errno = (int)-r; return -1; } return 0;
+}
+int fdatasync(int fd){
+    if (!di) return di_real_sync("fdatasync", fd);
+    long r = di_sync(fd); if (r < 0){ errno = (int)-r; return -1; } return 0;
+}
+int open(const char* path, int flags, ...){
+    int mode = 0;
+    if (flags & O_CREAT){ va_list ap; va_start(ap, flags); mode = va_arg(ap, int); va_end(ap); }
+    if (di && path[0] == '.' && path[1] == 0 && !(flags & O_DIRECTORY)){
+        int fail = 0;
+        while (__atomic_exchange_n(&di->lock, 1, __ATOMIC_ACQUIRE)) {}
+        if (di->open_fail.fire){ di->open_fail.fire = 0; fail = 1; di_note("<open(.) EMFILE>"); }
+        __atomic_store_n(&di->lock, 0, __ATOMIC_RELEASE);
+        if (fail){ errno = EMFILE; return -1; }
+    }
+    return openat(AT_FDCWD, path, flags, mode);
+}
+static __attribute__((unused)) int di_install(const char* snapdir){
+    struct di_state* m = mmap(0, sizeof *di, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (m == MAP_FAILED) return -1;
+    memset(m, 0, sizeof *m);
+    di_cat(m->snap, snapdir);
+    mkdir(snapdir, 0755);
+    di = m;                             /* from here every fsync/fdatasync is recorded */
+    return 0;
+}
+#else
 static void di_on_sigsys(int sig, siginfo_t* si, void* ctx){
     (void)sig;
     ucontext_t* uc = (ucontext_t*)ctx;
@@ -237,6 +354,7 @@ static __attribute__((unused)) int di_install(const char* snapdir){
     if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &pr)) return -1;
     return 0;
 }
+#endif
 /* start recording in the live directory (the caller's cwd): what exists now counts as durable */
 static __attribute__((unused)) void di_arm(void){ di_commit_ns(); di->armed = 1; }
 static __attribute__((unused)) void di_freeze_now(void){ di_lose(); }

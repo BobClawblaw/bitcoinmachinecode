@@ -19,7 +19,11 @@
 #include <time.h>
 #include <unistd.h>
 #include <poll.h>
+#ifdef __APPLE__
+#include <malloc/malloc.h>
+#else
 #include <malloc.h>
+#endif
 #include <pthread.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -98,7 +102,12 @@ static int get(const char* path, char* out, long cap){
     long n = read_to_eof(fd, out, cap, 10); close(fd);
     return n < 0 ? -1 : 0;
 }
+#ifdef __APPLE__
+/* bmc_osx: no mallinfo2; every zone's bytes in use */
+static size_t heap_in_use(void){ malloc_statistics_t m; malloc_zone_statistics(NULL, &m); return m.size_in_use; }
+#else
 static size_t heap_in_use(void){ struct mallinfo2 m = mallinfo2(); return m.uordblks + m.hblkhd; }
+#endif
 
 /* a connection that sends its header one byte per 400 ms and never ends it */
 static volatile int g_dribble_stop = 0;

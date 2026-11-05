@@ -63,7 +63,14 @@ int txho_create(void){
     pthread_mutexattr_t a;
     pthread_mutexattr_init(&a);
     pthread_mutexattr_setpshared(&a, PTHREAD_PROCESS_SHARED);
+#ifndef __APPLE__
     pthread_mutexattr_setrobust(&a, PTHREAD_MUTEX_ROBUST);
+#endif
+    /* macOS has no robust mutexes (the MEM-20 compat stub refuses them the
+     * same way): the ring mutex is armed plain, so a crash mid-hold would
+     * stall the survivor's next txho_push instead of reporting
+     * EOWNERDEAD. Accepted degrade (osx port): the hold is two memcpys
+     * between two cooperating processes. */
     if (pthread_mutex_init(&r->mu, &a) != 0){ pthread_mutexattr_destroy(&a); munmap(p, sizeof(txho_ring_t)); return 0; }
     pthread_mutexattr_destroy(&a);
     g_r = r;
@@ -90,8 +97,11 @@ int txho_push(const unsigned char* tx, unsigned long len, int src_slot){
     if (!tx || len == 0 || len > TXHO_MAX_TX){ __sync_fetch_and_add(&r->dropped_big, 1ULL); return 0; }
     unsigned long need = rec_bytes(len);
     int lr = pthread_mutex_lock(&r->mu);
+#ifndef __APPLE__          /* no robust mutexes on Darwin: EOWNERDEAD cannot happen (see txho_create) */
     if (lr == EOWNERDEAD) pthread_mutex_consistent(&r->mu);   /* its record was never published */
-    else if (lr != 0) return 0;
+    else
+#endif
+    if (lr != 0) return 0;
     __sync_synchronize();
     unsigned long long head = r->head, tail = r->tail;
     if (head - tail + need > TXHO_RING_BYTES){

@@ -153,6 +153,13 @@ int main(int argc, char** argv){
     printf("      script lengths %llu..%llu, spanning both compact-size boundaries\n",
            (unsigned long long)SLEN[0], (unsigned long long)SLEN[NCASE-1]);
 
+    /* 2026-10-08 (macOS): each thread's 4 MiB tap_preimg buffer used to be
+     * malloc'd on first use and never freed, so every short-lived verify
+     * thread leaked one. It now comes from bmc_tls_alloc and is freed at
+     * thread exit. The counters exist only where bmc_thread.h's allocator
+     * is linked (the Mac port); on x86 the buffer is .tbss and this is N/A. */
+    extern long bmc_tls_live __attribute__((weak)), bmc_tls_made __attribute__((weak));
+    long tls_live0 = &bmc_tls_live ? bmc_tls_live : 0, tls_made0 = &bmc_tls_made ? bmc_tls_made : 0;
     pthread_t t[MAXT];
     for (long i = 0; i < NT; i++)
         if (pthread_create(&t[i], NULL, worker, (void*)i) != 0){
@@ -174,6 +181,17 @@ int main(int argc, char** argv){
     }
     printf("PASS  %d threads x %d iterations = %ld concurrent hashes: 0 wrong digests\n",
            NT, ITERS, total);
+    if (&bmc_tls_live && &bmc_tls_made){
+        long made = bmc_tls_made - tls_made0;
+        printf("      per-thread buffers: %ld allocated by the %d threads, held %ld -> %ld\n",
+               made, NT, tls_live0, bmc_tls_live);
+        if (made < NT || bmc_tls_live != tls_live0){
+            printf("FAIL  every thread's buffers must be freed when it exits\n");
+            printf("\nTESTS FAILED (1 failures)\n");
+            return 1;
+        }
+        printf("PASS  every thread's per-thread buffers were freed when it exited\n");
+    } else printf("N/A   per-thread buffer accounting (not linked here)\n");
     printf("\nALL TESTS PASSED (0 failures)\n");
     return 0;
 }

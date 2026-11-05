@@ -252,7 +252,7 @@ int main(void){
       /* HST-4 (audit 2026-10-23): the builder is exec'd with only fds 0-2.
        * It inherited every descriptor of the worker -- store files, peer
        * sockets, the datadir .lock -- here a marker on fd 77. */
-      write_script("stub_fds.sh", "#!/bin/sh\nls /proc/$$/fd | tr '\\n' ' ' > fds.out\nexit 1\n");
+      write_script("stub_fds.sh", "#!/bin/sh\nif [ -d /proc/$$/fd ]; then ls /proc/$$/fd; else ls /dev/fd; fi | tr '\\n' ' ' > fds.out\nexit 1\n");   /* bmc_osx: /dev/fd where there is no /proc */
       unlink(CSH_BASE_FILE); unlink("fds.out");
       { int mk = open("/dev/null", O_RDONLY); if (mk >= 0 && mk != 77){ dup2(mk, 77); close(mk); } }
       csi_hist_repair_configure("./stub_fds.sh", ".", "regtest", 2, 1);

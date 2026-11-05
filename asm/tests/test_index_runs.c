@@ -15,11 +15,13 @@
 #include <fcntl.h>
 #include <stddef.h>
 #include <dirent.h>
+#ifndef __APPLE__
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <linux/audit.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
+#endif
 #include "test_tmpdir.h"
 
 static int fails = 0;
@@ -69,6 +71,24 @@ static int cp_file(const char* from, const char* to){
     if (b && fclose(b)) ok = 0;
     return ok;
 }
+#ifdef __APPLE__
+/* bmc_osx: no seccomp. The txindex files present before the merge are marked
+ * user-immutable, so the merger's unlink of each input fails with EPERM, the
+ * filter's answer; its new output is not marked. Cleared after it exits. */
+static void flag_txindex_files(unsigned flags){
+    DIR* d = opendir("."); struct dirent* e;
+    while (d && (e = readdir(d))) if (!strncmp(e->d_name, "txindex", 7)) chflags(e->d_name, flags);
+    if (d) closedir(d);
+}
+static int run_merger(int fail_unlink){
+    if (fail_unlink) flag_txindex_files(UF_IMMUTABLE);
+    pid_t p = fork();
+    if (p == 0){ execl(tt_src("daemon/bmc_merge_index_runs"), "bmc_merge_index_runs", ".", "txindex", (char*)0); _exit(127); }
+    int st = 0; waitpid(p, &st, 0);
+    if (fail_unlink) flag_txindex_files(0);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 255;
+}
+#else
 /* run the merger; fail_unlink: under a seccomp filter that answers unlink and
  * unlinkat with EPERM (inherited across the exec) */
 static int run_merger(int fail_unlink){
@@ -93,6 +113,7 @@ static int run_merger(int fail_unlink){
     int st = 0; waitpid(p, &st, 0);
     return WIFEXITED(st) ? WEXITSTATUS(st) : 255;
 }
+#endif
 static int count_txindex_files(void){
     DIR* d = opendir("."); int n = 0; struct dirent* e;
     while (d && (e = readdir(d))){

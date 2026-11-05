@@ -29,6 +29,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include "test_tmpdir.h"
 
 extern int  store_init(void* st);
@@ -438,12 +439,23 @@ static void* race_lookups(void* a){
         }
     return NULL;
 }
-/* 2026-10-07: the facade's shape -- a thread that serves one request and exits */
-static long open_fds(void){
-    long n = 0; char p[32];
-    for (int fd = 0; fd < 4096; fd++){ snprintf(p, sizeof p, "/proc/self/fd/%d", fd); if (access(p, F_OK) == 0) n++; }
-    return n;
+/* ---- 2026-10-09: a thread that runs getblock and exits gives back what the
+ * reader lane gave it. An Esplora connection is a thread per connection
+ * (rpc_server.c esp_conn_thread) that calls getblock in-thread; each one
+ * used to leave its private archive handle open (index.dat plus block
+ * files) and ~32 MB behind -- the 8 MB block buffer, the verbosity 2/3 undo
+ * arrays, the txid scratch. Watched to fail first: with rpc_chain.c's lane
+ * allocations back on plain malloc, the descriptor count rises by one per
+ * thread and no handle is closed. */
+static int open_fds(void){ int n = 0; for (int fd = 0; fd < 4096; fd++) if (fcntl(fd, F_GETFD) != -1) n++; return n; }
+static void* exit_after_getblock(void* arg){
+    long ec; const char* em; char p[128];
+    snprintf(p, sizeof p, "[\"%s\", 3]", (const char*)arg);
+    rj_val* r = call("getblock", p, &ec, &em);
+    int ok = r && r->typ == RJ_OBJ; rj_free(r);
+    return (void*)(long)ok;
 }
+/* 2026-10-07 (main): the facade's shape -- a thread that serves one request and exits */
 static volatile long g_getblock_once_ok = 0;
 static void* getblock_once(void* a){
     (void)a; long ec; const char* em; char p[128]; snprintf(p, sizeof p, "[\"%s\", 0]", GENESIS_HASH);
@@ -585,6 +597,24 @@ int main(void){
     expect_err("getblockheader bad length", "getblockheader", "[\"abc\"]", -8, "parameter 1 must be of length 64 (not 3, for 'abc')");
     expect_err("getblockheader non-hex", "getblockheader", "[\"zz00000000000000000000000000000000000000000000000000000000000000\"]", -8, "parameter 1 must be hexadecimal string (not 'zz00000000000000000000000000000000000000000000000000000000000000')");
 
+    /* ---- getblock on short-lived threads (see exit_after_getblock) ---- */
+    { extern long g_rd_handles_closed; extern long bmc_tls_live, bmc_tls_made;
+      enum { NT = 6 };
+      int fds0 = open_fds(); long live0 = bmc_tls_live, made0 = bmc_tls_made, closed0 = g_rd_handles_closed; int all_ok = 1;
+      for (int i = 0; i < NT; i++){
+          pthread_t th; void* ok = 0;
+          if (pthread_create(&th, NULL, exit_after_getblock, (void*)g_hash[3]) != 0 || pthread_join(th, &ok) != 0 || !ok) all_ok = 0;
+      }
+      int fds1 = open_fds();
+      printf("      %d exiting threads: fds %d -> %d, handles closed %ld, buffers made %ld, held %ld -> %ld\n",
+             NT, fds0, fds1, g_rd_handles_closed - closed0, bmc_tls_made - made0, live0, bmc_tls_live);
+      ck("getblock answers on each short-lived thread", all_ok);
+      ck("each exiting thread's reader-lane handle is closed", g_rd_handles_closed - closed0 == NT);
+      ck("no descriptor outlives the threads", fds1 == fds0);
+      /* handle, block buffer, both undo arrays: on the exit list, then gone */
+      ck("each thread's reader-lane buffers went on the exit list", bmc_tls_made - made0 >= 4 * NT);
+      ck("no per-thread buffer outlives the threads", bmc_tls_live == live0); }
+
     /* ---- getblock on short-lived threads (2026-10-07) ----
      * The facade's thread per connection calls getblock in-process. Each
      * thread's reader lane (a store handle: index.dat, the current block
@@ -594,10 +624,10 @@ int main(void){
      * Watched to FAIL with the lane's pthread-key destructor removed:
      * 64 threads left 192 descriptors open. */
     { extern long g_rd_lane_entries;
-      long e0 = g_rd_lane_entries, f0 = open_fds();
+      long e0 = g_rd_lane_entries; int f0 = open_fds();
       for (int i = 0; i < 64; i++){ pthread_t th; pthread_create(&th, NULL, getblock_once, NULL); pthread_join(th, NULL); }
-      long f1 = open_fds();
-      printf("      64 one-call threads: %ld lane entries, open descriptors %ld -> %ld\n", g_rd_lane_entries - e0, f0, f1);
+      int f1 = open_fds();
+      printf("      64 one-call threads: %ld lane entries, open descriptors %d -> %d\n", g_rd_lane_entries - e0, f0, f1);
       ck("64 one-call threads each entered the reader lane", g_rd_lane_entries - e0 == 64);
       ck("...each read the genesis block through it", g_getblock_once_ok == 64);
       ck("...and their lanes were closed at thread exit (no descriptor left open)", f1 == f0); }

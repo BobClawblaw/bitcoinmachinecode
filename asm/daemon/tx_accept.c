@@ -1001,7 +1001,7 @@ long tx_accept_validate(void* mp_area, const u8 txid[32], const u8* tx, unsigned
     mp_lock_at(__func__);
     long padd = mpool_policy_add(g_pol, g_pol_state, mp_area, tx, txlen, txid, placeholder_utxo);
     if (padd != 1) snprintf(g_txacc_detail, sizeof g_txacc_detail, "%s", mpool_policy_detail(g_pol));   /* under the lock */
-    if (padd == 1) txacc_fee_note(txid);           /* fee estimation, under the same lock */
+    if (padd == 1){ mp_lock_phase("fee_note"); txacc_fee_note(txid); }   /* fee estimation, under the same lock */
     mp_unlock();
     if (padd != 1){
         g_alog.rej_policy++;
@@ -1202,7 +1202,7 @@ long tx_accept_validate_p2p(void* mp_area, const u8 txid[32], const u8* tx,
     txacc_rearm_sigops();                          /* the policy test consumed it */
     long padd = mpool_policy_add(g_pol, g_pol_state, mp_area, tx, txlen, txid, placeholder_utxo);
     if (padd != 1) snprintf(g_txacc_detail, sizeof g_txacc_detail, "%s", mpool_policy_detail(g_pol));   /* under the lock */
-    if (padd == 1) txacc_fee_note(txid);           /* fee estimation, under the same lock */
+    if (padd == 1){ mp_lock_phase("fee_note"); txacc_fee_note(txid); }   /* fee estimation, under the same lock */
     mp_unlock();
     if (padd != 1){
         g_alog.rej_policy++;
@@ -1302,7 +1302,7 @@ long tx_accept_validate_reason(void* mp_area, const u8 txid[32], const u8* tx,
     txacc_rearm_sigops();                          /* the policy test above consumed it */
     long padd = mpool_policy_add(g_pol, g_pol_state, mp_area, tx, txlen, txid, placeholder_utxo);
     if (padd != 1) snprintf(g_txacc_detail, sizeof g_txacc_detail, "%s", mpool_policy_detail(g_pol));   /* under the lock */
-    if (padd == 1) txacc_fee_note(txid);           /* fee estimation, under the same lock */
+    if (padd == 1){ mp_lock_phase("fee_note"); txacc_fee_note(txid); }   /* fee estimation, under the same lock */
     mp_unlock();
     if (padd != 1){
         const char* r = mpool_policy_reason(g_pol);

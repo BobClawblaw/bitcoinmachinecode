@@ -15,6 +15,9 @@
  * handler counts the calls made while the test has armed it, answers the k-th
  * with -EIO and every other one with a real fdatasync(fd) (syscall 75, not
  * filtered). Each scenario runs in its own forked child and directory.
+ * bmc_osx: the Mac's assembly calls libc's fsync, so this file's own fsync()
+ * stands in for the filter there (the static link binds the LSM's calls to
+ * it); it counts the same way and passes the others to the real one.
  *
  * STO-W (formal/storage, 2026-10-23) added a fourth site to each: a directory
  * fsync between the run's create and the manifest rename, so the sites are
@@ -37,14 +40,18 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#ifdef __APPLE__
+#include <dlfcn.h>
+#else
 #include <ucontext.h>
 #include <sys/prctl.h>
-#include <sys/stat.h>
 #include <sys/syscall.h>
-#include <sys/wait.h>
 #include <linux/audit.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
+#endif
 #include "test_tmpdir.h"
 
 typedef unsigned long long u64;
@@ -67,6 +74,15 @@ static void ck(const char* l, int c){ if (c) printf("ok  : %s\n", l); else { pri
 
 /* ---- the fsync trap ---- */
 static volatile int g_armed, g_fail_at, g_seen;
+#ifdef __APPLE__
+int fsync(int fd){
+    static int (*real)(int);
+    if (g_armed && ++g_seen == g_fail_at){ errno = EIO; return -1; }
+    if (!real) real = (int (*)(int))dlsym(RTLD_NEXT, "fsync");
+    return real(fd);
+}
+static int install_trap(void){ return 0; }
+#else
 static void on_sigsys(int sig, siginfo_t* si, void* ctx){
     (void)sig;
     ucontext_t* uc = (ucontext_t*)ctx;
@@ -94,6 +110,7 @@ static int install_trap(void){
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)) return -1;
     return prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &p);
 }
+#endif
 static void arm(int k){ g_seen = 0; g_fail_at = k; g_armed = 1; }
 static int  disarm(void){ g_armed = 0; return g_seen; }
 

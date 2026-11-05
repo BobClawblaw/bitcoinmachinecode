@@ -17,6 +17,7 @@
 #include <stdio.h>
 #define main daemon_main_disabled
 #include "../daemon/main.c"
+#include "loopback_alias.h"
 #undef main
 
 static int fails = 0;
@@ -32,6 +33,7 @@ static void drain(void){
 }
 
 int main(void){
+    require_loopback_aliases(4);   /* distinct peer IPs 127.0.0.2..4 */
     /* a loopback port nothing listens on: every dial is refused at once */
     int s = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in sa; memset(&sa, 0, sizeof sa); sa.sin_family = AF_INET; sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);

@@ -22,13 +22,17 @@
 #include <stddef.h>
 #include <errno.h>
 #include <signal.h>
-#include <ucontext.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <fcntl.h>
+#else
+#include <ucontext.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <linux/audit.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
+#endif
 #include "test_tmpdir.h"
 
 typedef unsigned char u8;
@@ -63,6 +67,22 @@ static void ck(const char* l, long got, long exp){
 /* ---- the sync trap: the order in which files were synced ---- */
 #define NLOG 64
 static char g_log[NLOG][64]; static volatile int g_nlog, g_armed;
+#ifdef __APPLE__
+/* bmc_osx: no seccomp, and the Mac's assembly and C sync through libc's
+ * fsync/fdatasync; these definitions bind every call in the test binary
+ * statically, record the file's name (fcntl F_GETPATH) and answer 0, as the
+ * Linux SIGSYS handler does */
+static void log_sync(int fd){
+    if (!g_armed || g_nlog >= NLOG) return;
+    char tgt[1024]; if (fcntl(fd, F_GETPATH, tgt) != 0) tgt[0] = 0;
+    const char* base = strrchr(tgt, '/'); base = base ? base + 1 : tgt;
+    size_t bl = strlen(base); if (bl >= sizeof g_log[0]) bl = sizeof g_log[0] - 1;
+    memcpy(g_log[g_nlog], base, bl); g_log[g_nlog][bl] = 0; g_nlog++;
+}
+int fsync(int fd){ log_sync(fd); return 0; }
+int fdatasync(int fd){ log_sync(fd); return 0; }
+static int install_trap(void){ return 0; }
+#else
 static void on_sigsys(int sig, siginfo_t* si, void* ctx){
     (void)sig; (void)si;
     ucontext_t* uc = (ucontext_t*)ctx;
@@ -96,6 +116,7 @@ static int install_trap(void){
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)) return -1;
     return prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &p);
 }
+#endif
 static int first_at(const char* name){ for (int i = 0; i < g_nlog; i++) if (!strcmp(g_log[i], name)) return i; return -1; }
 
 static void put32(u8* p, u32 v){ p[0]=(u8)v; p[1]=(u8)(v>>8); p[2]=(u8)(v>>16); p[3]=(u8)(v>>24); }

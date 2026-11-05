@@ -174,7 +174,11 @@ static double time_gets(void* u, const struct q* qs, u64 Q, int mode, int dist, 
 static void* big_alloc(u64 bytes, int thp){
     void* p = mmap(0, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED){ perror("mmap"); exit(2); }
+#ifdef MADV_HUGEPAGE
     if (thp) madvise(p, bytes, MADV_HUGEPAGE);
+#else
+    (void)thp;   /* no transparent huge pages (macOS) */
+#endif
     return p;
 }
 
@@ -277,8 +281,12 @@ int main(int argc, char** argv){
     }
     if (slen > 64) slen = 64;
     if (cpu < 0) cpu = (int)sysconf(_SC_NPROCESSORS_ONLN) - 2;
+#ifdef __APPLE__
+    (void)cpu;   /* macOS has no thread pinning; the scheduler picks the core */
+#else
     { cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(cpu, &cs);
       if (sched_setaffinity(0, sizeof cs, &cs) != 0){ perror("sched_setaffinity"); return 2; } }
+#endif
     printf("bench_utxo_probe: cpu %d, 2^%d queries per set, prefetch distance %d, %d reps (min reported), index %s, script %d B, prefetch %s\n",
            cpu, log2q, dist, reps, g_uniform_index ? "uniform" : "geometric", slen, g_pf_lines < 0 ? "utxo_prefetch" : "utxo_prefetch_n");
     int fails = 0;

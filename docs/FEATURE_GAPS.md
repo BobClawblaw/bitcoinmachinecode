@@ -2430,6 +2430,20 @@ cross-process naming (a forked holder), the threshold and the no-op cases
 (OPERATIONS.md, "Logging"). The next block-time stall names its pass; the
 fix follows the name, not the other way round.
 
+*Night:* x86's first lines (their 23:00Z resume) were a **convoy**, not a
+holder -- during the mempool.dat reload two waiters saw ~1.2 s while the
+releases that let them in had held 0 and 3 ms, and nobody logged a hold:
+the wait was many short holds, and a line that names only the last
+releaser cannot say so. Now every take is counted in the lock's page, each
+release made while anyone waits keeps the convoy's longest hold and its
+site, and a waiter's line adds `N other take(s) went by during the wait,
+the longest of them held M ms (site)`: many takes and a short longest hold
+is a convoy (`test_mempool_lock_log` case E: three threads taking 3 ms
+holds back to back, the waiter reports 101 takes gone by, longest 3 ms,
+wait 374 ms), zero takes and a long one is a holder. The remedies differ
+-- a convoy is fixed by fewer takes per unit of work (the reload's
+per-transaction takes are x86's suspect), a holder by a shorter hold.
+
 And the one exclusive handler that consults the pool on every poll --
 `getrawtransaction`, the facade's second most-dispatched call, which asks
 the mempool before the index as Core does -- no longer holds the execution
@@ -2461,6 +2475,108 @@ was not released at thread exit, and the facade's thread per connection turned
 that into a descriptor leak. Production RPC stopped accepting for 2 h 17 m on
 2026-10-07 at 1,023/1,024 descriptors. The release at thread exit is #402
 (`devlog/INCIDENT_2026-10-07_reader_lane_fd_leak.md`).
+
+**2026-10-06: verbose `getrawmempool` holds the pool lock for the copy, not
+the build** (bmc_osx; x86 note item 24). The Mac's mainnet node logged the
+holder shape on 10-02: `getrawmempool held 1919 ms` with a
+`tx_accept_validate_p2p` in the worker waiting 1,496 ms behind it, 1.1-1.9 s
+at a ~75k pool, polled by BlockYard's `getrawmempool(true)` -- the JSON for
+every entry (the cluster linearizations, the rj_* tree) was built inside
+`mpl()`. Now the pass under the lock records what the entry builder reads
+from the pool and its hooks (slot-cache weight and BIP125, the wtxid's
+sha256d over the bytes, the arrival time, the prioritisetransaction
+delta), takes the one-pass graph and the sequence number, and releases;
+the sort, the cluster builds and the JSON run on the call's own tables
+(`g_mpe_snap`). `tests/test_rpc_chunk_scale` on its 32,000-entry
+production-shaped pool: the hold went 160.9 ms -> 13.2 ms, the call's wall
+time unchanged, the answer byte-identical to the old path's
+(`rpc_node_set_grm_snapshot(0)`) with arrival times, wtxids and three
+priority deltas in play; the takes and releases are counted so a missed
+release cannot pass as a short hold. A call whose tables did not build
+(no one-pass graph, an allocation failure) keeps the old under-the-lock
+shape, because it still needs the per-txid lookups.
+
+*Same evening:* verbose `getmempoolancestors` / `getmempooldescendants`
+had a worse shape under the lock than the dump. With no bulk tables each
+rendered member asked the registry per txid -- its own node, each
+ancestor's and descendant's for the size sums, each cluster member's for
+the chunk -- and every `mpool_policy_entry_info` rebuilds the registry's
+children index, O(pool): set x cluster x pool scans, plus the JSON, all
+inside `mpl()`. Now `mpe_snapshot_component` walks the transaction's
+connected component once under the lock (one entry_info per node, the only
+nodes any of those lookups can reach), copies each pool-present node's
+inputs into the same per-call tables, and the render runs after `mpu()` in
+snapshot mode. A component above 256 nodes (the cluster limit is 64) or a
+failed allocation keeps the old path. `test_rpc_chunk_scale`: on chain
+heads, middles, tails and a singleton, both directions, the answers are
+byte-identical to the old path's and the longest hold went 85.3 ms ->
+1.6 ms. Non-verbose forms and single `getmempoolentry` are unchanged.
+
+*Night:* the same call's per-call tables were sized by the slot table's
+CAPACITY (`mp_slot_count` = mask + 1, 1,048,576 at `maxmempool=300MB`),
+and `g_mpe_inf`'s element is a ~8.3 KB `mp_entry_info`: ~8.7 GB asked of
+malloc per verbose call, under the lock. Now they are sized by the pool's
+live count plus an eighth; the vsize table grows if the walk outruns it
+and the one-pass graph is retried at capacity if the registry holds more
+nodes than the buffer (stale nodes after a pool removal) -- without that
+retry the call falls to the per-entry path, a ~45 s hold on the test pool.
+`test_rpc_chunk_scale 68000 1048576` (production's slot table): snapshot
+hold 55.8 -> 32.1 ms. Peak RSS per call is unchanged (~+790 MB): it is
+the 8.3 KB record per registry node that `pol_entry_info_all` writes, and
+only a compact graph format would shrink it.
+
+The copy no longer hashes either: the snapshot's wtxid is the pool slot's
+cached one (`MPOOL_SLOT_WTXID`, computed once by `mpool_put` over the
+bytes as stored, moved with the record by `mpool_del`, untouched by
+compaction, and read here under the lock every writer holds) rather than
+a fresh `sha256d` over every transaction -- ~25 MB of hashing per poll at
+a 68k pool. Hold at production shape 32.1 -> 25.7 ms; the test's
+singletons now carry a witness, so the comparison against the old path
+(which still hashes through the hook) checks the cache against a fresh
+hash, and copying the txid instead fails four checks.
+
+The one-pass graph is compact now (`mp_graph`, `mempool_entry.h`): a
+fixed header per registry node and one shared txid list holding its
+depends, spentby, ancestors and descendants, which `mp_graph_expand`
+turns back into the same `mp_entry_info` for the one entry being
+rendered. `pol_entry_info_all` became `pol_graph_all`, which sizes its
+own output, so the capacity retry is gone. At production shape the first
+call's peak RSS went from +794 to +318 MB and its hold from 51.9 to
+26.0 ms (steady 25.3 -> 21.4 ms). The verbose ancestors/descendants
+snapshot uses the same format.
+
+The reply is now built entry by entry, too. On the server's path every
+value lives in the request arena until the body is written, and the 68k
+entry trees came to 198 MB of arena for a 39 MB body. Each entry is now
+serialized as soon as it is built (`rj_freeze`): the arena is rewound to
+the mark taken before the entry and only its compact text is kept, as an
+`RJ_RAW` value the writer copies through. `rj_obj_get` expands a frozen
+value in place, so in-process readers (Esplora's `/mempool/recent`) are
+unchanged. Production shape, server path: arena 198 -> 49 MB, first-call
+peak RSS +356 -> +207 MB, end-to-end time unchanged (~350 ms). What is
+left is mostly the body buffer (39 MB of text in a doubling buffer) and
+the arena's copy of the same text.
+
+Then the body stopped being buffered at all (2026-10-07). `render_request`
+measures the reply (`rj_measure`, a pass that writes nothing) for an exact
+Content-Length and streams it from the tree to the socket through one
+64 KB buffer (`rj_write_to`); it used to serialize into a doubling buffer
+and then copy that behind the headers into a second one. Production shape:
+first-call peak RSS +211 -> +177 MB on the server's path, and the write now
+adds 0.1 MB to the handler's own peak, which is all that is left: the
+call's tables and the 49 MB arena. The cost is that the arena lives until
+the client has read the reply, where it was freed before the write; it
+never outweighed the two body copies it replaces.
+
+Then the handler's own peak (2026-10-08): +177 -> +88 MB at production
+shape. Two thirds of it was not the reply. The per-slot weight cache is the
+slot table's capacity long (1,048,576 at maxmempool=300MB), every page of it
+touched, at 56 bytes a slot; it is 16 now, keyed on txid and the slot's
+cached wtxid. And the one-pass graph stored each ancestor and descendant as
+a 32-byte txid; a member is now a 4-byte node index (mempool_entry.h), 204
+bytes per entry against ~960. The reply is byte-identical. What is left is
+the 49 MB arena -- the reply's text, kept until it is written -- and a ~9 MB
+table.
 
 ### The wallet has no reorg awareness (WAL-13)
 
