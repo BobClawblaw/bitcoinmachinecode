@@ -5,6 +5,7 @@
  * unclaimed rewards per block), and the MuHash at the tip against a direct
  * fold of the surviving coins -- which exercises the builder's removal
  * algebra (the denominator) and its bookkeeping end to end. */
+#include <sys/resource.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -92,6 +93,10 @@ static int tick_until_settled(long long* now){
     return 2;
 }
 int main(void){
+    /* 2026-11-05: the builder failed on macOS, whose soft open-file limit
+     * starts at 256, while Linux's 1024 hid it (daemon/fd_limit.h). Run
+     * this test, and the builder it spawns, under the Mac's limit. */
+    { struct rlimit r; if (getrlimit(RLIMIT_NOFILE, &r) == 0 && (r.rlim_cur == RLIM_INFINITY || r.rlim_cur > 256)){ r.rlim_cur = 256; if (setrlimit(RLIMIT_NOFILE, &r) != 0) return 1; } }
     char tool[4096]; if (!getcwd(tool, sizeof tool - 48)) return 1;
     if (getenv("BMC_CSH_BUILDER")) snprintf(tool, sizeof tool, "%s", getenv("BMC_CSH_BUILDER")); else strcat(tool, "/daemon/bmc_build_coinstats_hist");
     /* 2026-09-12: say WHY, once, instead of failing 34 assertions. Every test

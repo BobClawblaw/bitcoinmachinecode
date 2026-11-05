@@ -68,6 +68,7 @@ extern int  tx_txid(void* out, const void* tx, unsigned long txlen, void* buf, u
  * shared with the daemon's incremental tail writer (tx_index_tail.c) so the
  * two writers cannot drift on what a record means */
 #include "txi_format.h"
+#include "fd_limit.h"
 
 #define SPARSE_STRIDE 256
 #define NBUCKETS    256
@@ -97,6 +98,7 @@ static void emit(void* ctxv, const u8* tx, u32 off, u32 len){
 
 int main(int argc, char** argv){
     if (argc < 2){ fprintf(stderr, "usage: build_tx_index <datadir> [from] [to] [out]\n"); return 2; }
+    bmc_raise_nofile(NBUCKETS + 32);   /* one bucket file each; fd_limit.h */
     const char* dir = argv[1];
     long from_h = argc > 2 ? atol(argv[2]) : 0;
     long to_h   = argc > 3 ? atol(argv[3]) : -1;

@@ -1014,7 +1014,7 @@ daemon/bmc_utxo_probe_one: daemon/utxo_probe_one.c bitcoin_utxo_lsm.o utxo_lsm_m
 # build_addr_index -- offline address->UTXO snapshot from a compacted LSM
 # run (two-pass external sort). The classifier is shared with the live tail
 # (daemon/addr_index_fmt.h) so the two can never disagree.
-daemon/bmc_build_addr_index: daemon/build_addr_index.c daemon/addr_index_fmt.h
+daemon/bmc_build_addr_index: daemon/build_addr_index.c daemon/fd_limit.h daemon/addr_index_fmt.h
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) $(HARDENFLAGS) -o $@ daemon/build_addr_index.c
 
 # build_block_filters -- whole-chain BIP158 filter backfill, prevouts
@@ -1038,11 +1038,11 @@ tests/test_index_worker: tests/test_index_worker.c daemon/index_worker.c daemon/
 tests/test_index_trail: tests/test_index_trail.c daemon/index_trail.c daemon/index_trail.h daemon/index_runs.c $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_index_trail.c daemon/index_trail.c daemon/index_runs.c
 
-daemon/bmc_build_tx_index: daemon/build_tx_index.c daemon/txi_format.h bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o
+daemon/bmc_build_tx_index: daemon/build_tx_index.c daemon/fd_limit.h daemon/txi_format.h bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) $(HARDENFLAGS) -o $@ daemon/build_tx_index.c bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o
 
 # txo-spender index base build (Core -txospenderindex), 2026-09-01
-daemon/bmc_build_txospender_index: daemon/build_txospender_index.c daemon/txosp_format.h bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o
+daemon/bmc_build_txospender_index: daemon/build_txospender_index.c daemon/fd_limit.h daemon/txosp_format.h bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) $(HARDENFLAGS) -o $@ daemon/build_txospender_index.c bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o
 
 # ---- the daemon's RUNTIME SET (2026-09-19) --------------------------------
@@ -3134,9 +3134,9 @@ tests/test_addr_hist: tests/test_addr_hist.c daemon/bmc_build_addr_hist daemon/b
 daemon/addr_hist.o: daemon/addr_hist.c daemon/addr_hist_fmt.h
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -c -o $@ daemon/addr_hist.c
 # the address history index builder (offline; see daemon/addr_hist_fmt.h)
-daemon/bmc_build_coinstats_hist: daemon/build_coinstats_hist.c daemon/coinstats_hist_fmt.h bitcoin_store.o bitcoin_store_fast.o bitcoin_hash.o sha256.o bitcoin_tx.o bitcoin_utxo_stats.o bitcoin_muhash.o chacha20_avx2.o
+daemon/bmc_build_coinstats_hist: daemon/build_coinstats_hist.c daemon/fd_limit.h daemon/coinstats_hist_fmt.h bitcoin_store.o bitcoin_store_fast.o bitcoin_hash.o sha256.o bitcoin_tx.o bitcoin_utxo_stats.o bitcoin_muhash.o chacha20_avx2.o
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) $(HARDENFLAGS) -o $@ daemon/build_coinstats_hist.c bitcoin_store.o bitcoin_store_fast.o bitcoin_hash.o sha256.o bitcoin_tx.o bitcoin_utxo_stats.o bitcoin_muhash.o chacha20_avx2.o
-daemon/bmc_build_addr_hist: daemon/build_addr_hist.c daemon/addr_hist_fmt.h daemon/addr_index_fmt.h daemon/undo_log.o $(UTXOLSMOBJS) bitcoin_store.o bitcoin_store_fast.o bitcoin_hash.o sha256.o bitcoin_tx.o
+daemon/bmc_build_addr_hist: daemon/build_addr_hist.c daemon/fd_limit.h daemon/addr_hist_fmt.h daemon/addr_index_fmt.h daemon/undo_log.o $(UTXOLSMOBJS) bitcoin_store.o bitcoin_store_fast.o bitcoin_hash.o sha256.o bitcoin_tx.o
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) $(HARDENFLAGS) -o $@ daemon/build_addr_hist.c daemon/undo_log.o $(UTXOLSMOBJS) bitcoin_store.o bitcoin_store_fast.o bitcoin_hash.o sha256.o bitcoin_tx.o
 rest.o: rest.c rest.h rpc_json.h rpc_commands.h
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -c -o $@ rest.c

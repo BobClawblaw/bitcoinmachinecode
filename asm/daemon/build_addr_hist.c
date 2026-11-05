@@ -26,6 +26,7 @@
 #include <sys/stat.h>
 #include "addr_hist_fmt.h"
 #include "addr_index_fmt.h"
+#include "fd_limit.h"
 typedef uint8_t u8; typedef uint32_t u32; typedef uint64_t u64;
 extern long store_init(void* st); extern void store_reload(void* st); extern void store_rd_init(void* st);
 extern long store_read_at(void* st, unsigned long h, void* out, long cap);
@@ -146,6 +147,7 @@ static void* load(const char* path, size_t rec, size_t* n){
 int main(int argc, char** argv){
     if (argc < 2){ fprintf(stderr, "usage: build_addr_hist <datadir> [to_height]          (whole chain, outref join)\n"
                                    "       build_addr_hist <datadir> <from> <to> <out>     (a RUN from blocks + undo)\n"); return 2; }
+    bmc_raise_nofile(3 * NB + 32);   /* key, outref and spendref files per bucket; fd_limit.h */
     if (chdir(argv[1])){ perror("chdir"); return 1; }
     static u8 store_buf[4096]; if (store_init(store_buf) != 1){ fprintf(stderr, "store_init failed\n"); return 1; }
     store_reload(store_buf); store_rd_init(store_buf);

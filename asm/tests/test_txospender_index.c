@@ -7,6 +7,7 @@
  * A four-block synthetic archive: h0 coinbase; h1 spends (h0,0); h2 spends
  * (h1,0) and creates a second output; h3 spends (h2,1). The base is built
  * for [0,1] by the real tool; the tail then covers h2..h3. */
+#include <sys/resource.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,6 +42,10 @@ static long mk_tx(u8* p, int tag, const u8* prev_txid, unsigned prev_vout, int n
     *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0; return p - s;
 }
 int main(void){
+    /* 2026-11-05: the builder failed on macOS, whose soft open-file limit
+     * starts at 256, while Linux's 1024 hid it (daemon/fd_limit.h). Run
+     * this test, and the builder it spawns, under the Mac's limit. */
+    { struct rlimit r; if (getrlimit(RLIMIT_NOFILE, &r) == 0 && (r.rlim_cur == RLIM_INFINITY || r.rlim_cur > 256)){ r.rlim_cur = 256; if (setrlimit(RLIMIT_NOFILE, &r) != 0) return 1; } }
     char tool[4096]; if (!getcwd(tool, sizeof tool - 40)) return 1; strcat(tool, "/daemon/bmc_build_txospender_index");
     tt_isolate();
     memset(store_buf, 0, sizeof store_buf);

@@ -38,6 +38,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include "addr_index_fmt.h"
+#include "fd_limit.h"
 
 typedef uint8_t u8; typedef uint64_t u64; typedef uint32_t u32; typedef uint16_t u16;
 
@@ -74,6 +75,7 @@ static int cmp_rec(const void* a, const void* b) {
 
 int main(int argc, char** argv) {
     if (argc < 3) { fprintf(stderr, "usage: %s <run_file> <out_file>\n", argv[0]); return 2; }
+    bmc_raise_nofile(NBUCKETS + 32);   /* one bucket file each; fd_limit.h */
     const char* run_path = argv[1];
     const char* out_path = argv[2];
 

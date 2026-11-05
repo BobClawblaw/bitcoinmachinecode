@@ -4,6 +4,31 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-11-05 — the index builders raise their open-file limit
+
+The three tests that failed on every fresh-clone run below
+(`test_coinstats_hist_build`, `test_txospender_index`, `test_addr_hist`)
+failed because macOS starts a process with a soft `RLIMIT_NOFILE` of 256 and
+the builders hold one open file per bucket through pass 1: 256 for
+`bmc_build_tx_index`, `_txospender_index` and `_addr_index`, 512 in each
+forked `bmc_build_coinstats_hist` worker, 768 for a whole-chain
+`bmc_build_addr_hist`. Each exited at the first bucket file it could not
+open (`bmc_build_coinstats_hist`: "FATAL: open bucket"). A shell with a raised `ulimit -n` hid it (with `ulimit -n 8192`
+all three passed), and so did Linux's usual 1024. It was not only a test
+failure: a Mac node runs these builders for its indexes.
+
+Each builder now calls `bmc_raise_nofile(need)` (`daemon/fd_limit.h`) first:
+the soft limit goes up to what that builder holds, capped by the hard limit
+and `OPEN_MAX`, and is never lowered, so where the soft limit already covers
+it, as on Linux, nothing changes. The three tests drop their own soft limit
+to 256 before running the builder, so the x86 gate catches a regression
+too: with main's builders they fail on x86 with the Mac's messages (40, 4
+and 24 failures).
+
+Full suite on a fresh clone with this change: 448 PASS, 16 SKIP, 16 N/A,
+0 FAIL (480 commands). The run-dependent pair noted below did not appear in
+this run; that is not evidence it is fixed.
+
 ## 2026-11-05 — the Mac build is `-Wall -Werror`; main builds both platforms
 
 `main` holds the port since PRs #453 and #457 (from x86). `build_daemon.sh`
