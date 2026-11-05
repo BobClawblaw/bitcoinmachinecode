@@ -2254,3 +2254,40 @@ were still on disk. Nothing in them is new measurement.
 - **Rollback:** relink to `deploy-20261025b`. The only on-disk change is the
   new `headers_forks2.dat`, which the older build does not read; production
   had no `headers_forks.dat`, so there is nothing to restore.
+
+## 2026-11-05 02:07Z — `deploy-20261105b`: the macOS port merged into main (PR #453)
+
+- **What:** `main` at `3aed07af`: `bmc_osx` merged into main (PR #453). Most
+  of it is `port/osx/`; the shared code the x86 daemon builds changed too
+  (RPC reply and memory handling in `rpc_node.c`, `rpc_server.c` and
+  `rpc_json.c`; download slots and sync strikes in `daemon/main.c`; the
+  mempool lock's wait log; `utxo_live.c`; ZMQ; the crash trace), and the
+  pre-push hook also checks added file content.
+- **Found merging it:** `tests/test_mempool_lock_log`'s convoy section hung the
+  x86 gate (it relies on the Mac lock's fair handoff; Linux's process-shared
+  mutex let the convoy starve the waiter for over four minutes). It is now
+  Mac-only, as `test_mempool_lock_fair` already was (a47a5dd1, on
+  `bmc_osx`).
+- **Checked before the merge, on the merge tree (`4884df1f`, the tree of
+  `3aed07af`):** `make test` passes; against Core v31.1 on regtest
+  `echo_core_diff.py` 41/41, `stale_header_core_diff.py` 18/18,
+  `config_surface_core_diff.sh` 18/18; `lightning_regtest_e2e.py` passes.
+  `zmq_sequence_core_diff.py` matches Core's stream through its add, RBF and
+  block phases and then stops at `invalidateblock` -5, exactly as it does on
+  `deploy-20261105a` (the open `headers.dat` defect in
+  `docs/FEATURE_GAPS.md`).
+- Built from clean (`make -B`) in a worktree at the merge commit, with no
+  compiler warnings; `bmc_build_commit` 3aed07af, not dirty. All five
+  exec'd helpers were byte-identical; none was replaced. Wallet files were
+  copied first.
+- **Started:** 02:07:00Z at tip 974,612 (= the oracle). RPC came up at
+  02:07:53Z.
+- **Verified live:**
+  - New block 974,613 applied at 02:17:42Z in 0.10 s, hash-identical to the
+    Core v31.1 oracle's
+    (`0000000000000000000077d857001b32894cd4ef78ac623af14150e524296140`);
+    the heartbeat reads `tip=974613` at 02:18:16Z.
+  - `NRestarts=0` and `active` at 10 minutes; no `[crash]` line; 59 fds;
+    11 of 12 peers.
+  - RPC and Esplora clients back (211 TIME-WAIT sockets on 8331/3005).
+- **Rollback:** relink to `deploy-20261105a`. No on-disk format changed.
