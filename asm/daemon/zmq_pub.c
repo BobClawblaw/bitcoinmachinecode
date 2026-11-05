@@ -94,7 +94,11 @@ typedef unsigned int  u32;
 #define ZP_HANDSHAKE_S   30
 static long g_zp_handshake_s = ZP_HANDSHAKE_S;
 void zmqpub_set_handshake_ivl_for_test(long secs){ g_zp_handshake_s = secs; }
-static long zp_now_s(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (long)t.tv_sec; }
+/* Milliseconds, not whole seconds (2026-11-05): with tv_sec a connection
+ * accepted at x.9 s was due at second x+2, 1.1 s later, and
+ * test_zmq_handshake's 32 idle connections expired while it was still
+ * checking that they held the slots. */
+static long zp_now_ms(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (long)t.tv_sec * 1000 + t.tv_nsec / 1000000; }
 
 /* One published message, framed for the wire ONCE and shared by every
  * subscriber queue holding it: a 2 MB rawblock sent to five subscribers is
@@ -110,7 +114,7 @@ typedef struct {
 typedef struct {
     int  fd;
     int  state;          /* 0 = awaiting greeting, 1 = awaiting READY, 2 = live */
-    long since;          /* CLOCK_MONOTONIC second it connected: the handshake deadline (RPC-27) */
+    long since;          /* CLOCK_MONOTONIC millisecond it connected: the handshake deadline (RPC-27) */
     u8   inbuf[512];
     int  inlen;
     u8   filter[ZP_MAX_FILTERS][ZP_FILTER_LEN];
@@ -272,7 +276,11 @@ static int zp_bind(const char* addr){
     }
     if (inet_pton(AF_INET, host, &sa.sin_addr) != 1){ close(fd); return -1; }
     if (bind(fd, (struct sockaddr*)&sa, sizeof sa) != 0){ close(fd); return -1; }
-    if (listen(fd, 8) != 0){ close(fd); return -1; }
+    /* 100 is libzmq's ZMQ_BACKLOG default, which Core's publisher inherits.
+     * It was 8: a burst of more than nine connections while this thread was
+     * busy overflowed the accept queue, and the kernel's 1 s SYN retransmit
+     * held each extra dialer back (test_zmq_handshake, 2026-11-05). */
+    if (listen(fd, 100) != 0){ close(fd); return -1; }
     zp_nonblock(fd);
     return fd;
 }
@@ -518,12 +526,12 @@ static void zp_compact(zp_endpoint* e){
 /* RPC-27: drop the subscribers still handshaking past the deadline, and
  * free their slots before anything new is accepted */
 static void zp_expire_locked(void){
-    long now = zp_now_s();
+    long now = zp_now_ms();
     for (int i = 0; i < g_nep; i++){
         zp_endpoint* e = &g_ep[i]; int n = 0;
         for (int k = 0; k < e->nsubs; k++){
             zp_sub* s = &e->subs[k];
-            if (s->fd >= 0 && s->state != 2 && now - s->since >= g_zp_handshake_s){ close(s->fd); s->fd = -1; n++; }
+            if (s->fd >= 0 && s->state != 2 && now - s->since >= g_zp_handshake_s * 1000){ close(s->fd); s->fd = -1; n++; }
         }
         if (n){
             fprintf(stderr, "[zmq] %d connection(s) on %s did not finish the handshake in %ld s; dropped\n", n, e->addr, g_zp_handshake_s);
@@ -548,7 +556,7 @@ static void zp_poll_locked(void){
             setsockopt(c, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one);   /* Core: ZMQ_TCP_KEEPALIVE=1 */
             zp_sub* s = &e->subs[e->nsubs++];
             memset(s, 0, sizeof *s);
-            s->fd = c; s->since = zp_now_s();
+            s->fd = c; s->since = zp_now_ms();
             zp_send_greeting(c);
             fprintf(stderr, "[zmq] subscriber connected on %s (%d total)\n", e->addr, e->nsubs);
         }
