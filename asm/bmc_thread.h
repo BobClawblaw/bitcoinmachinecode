@@ -39,8 +39,9 @@ static inline int bmc_pthread_create(pthread_t* t, void* (*fn)(void*), void* arg
  *
  * FREED WHEN THE THREAD EXITS (2026-10-08). These were "process-lifetime,
  * never freed", which holds only for threads that live as long as the
- * process. txv_verify_all (daemon/tx_verify.c) creates fresh threads for every
- * mempool transaction with TXV_PARALLEL_MIN or more inputs, and each one
+ * process. txv_verify_all (daemon/tx_verify.c) created fresh threads for every
+ * mempool transaction with TXV_PARALLEL_MIN or more inputs (a persistent pool
+ * since 2026-11-05), and each one
  * allocated the interpreter's whole scratch set -- ~11 MB of address space:
  * the 4 MB segwit midstate buffer, the 2.3 MB offset table, three 528 KB
  * stacks, 1 MB of work space... -- and exited without freeing it. On the
