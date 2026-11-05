@@ -288,9 +288,7 @@ tools link against the system libc, so no NASM, no GNU toolchain. The daemon
 compiles with `-Wall -Werror`, the same bar as the x86 build, and a file that
 fails to compile stops the build before the link. The Mac's gate runs 480
 commands. On a fresh clone of `main` (2026-11-05) it gives 448 PASS,
-16 SKIP, 16 N/A, 0 FAIL. Two earlier fresh-clone runs each had two tests
-fail in the full run that pass alone, different ones each time; that is
-open. The N/A rows are the x86-only differential tests of shadow twins
+16 SKIP, 16 N/A, 0 FAIL. The N/A rows are the x86-only differential tests of shadow twins
 that no daemon links. Both a mainnet and a signet node run
 from `bmc_osx` on an M-series Mac, at Bitcoin Core's tip, with the mainnet
 UTXO set identical to Core's on every `gettxoutsetinfo` field

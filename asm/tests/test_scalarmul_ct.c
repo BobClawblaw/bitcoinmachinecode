@@ -10,6 +10,9 @@
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
 typedef unsigned long long u64;
 
 extern void point_scalar_mul   (u64 r[12], const u64 xy[8], const u64 k[4]);
@@ -78,6 +81,15 @@ static double min_cost(mulfn fn, u64* r, const u64* k, int reps, int rounds){
 
 int main(void){
     u64 r[12], ax[4], ay[4];
+#ifdef __APPLE__
+    /* macOS has no core pinning, and Apple silicon mixes performance and
+     * efficiency cores: on an efficiency core the timing section below
+     * scattered both ways, 0.696..1.122 over 30 runs (`taskpolicy -c
+     * background`, 2026-11-05), where performance cores gave 0.980..1.009
+     * over 20. Ask for the performance cores, the nearest thing to a pin;
+     * TIMING_TRIES below covers the times the scheduler says no. */
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
 
     /* ---------- 1. known-answer tests ---------- */
     u64 k1[4]={1,0,0,0};
@@ -179,25 +191,41 @@ int main(void){
     u64 tiny[4] = {0xFF, 0, 0, 0};
     u64 dense[4]= {0xFFFFFFFFFFFFFFFFULL,0xFFFFFFFFFFFFFFFFULL,0xFFFFFFFFFFFFFFFFULL,0x7FFFFFFFFFFFFFFFULL};
     const int REPS = 200, ROUNDS = 40;
-    double t_v_tiny = 1e30, t_v_dense = 1e30, t_c_tiny = 1e30, t_c_dense = 1e30;
+    /* One measurement on x86, as calibrated below. On macOS a CT ratio
+     * outside the window is measured again, up to three times, and only
+     * three misses fail: efficiency-core noise lands either side of 1.0
+     * (5 of 42 runs confined there missed, both ways), while a real
+     * data-dependent cost moves every measurement the same way and fails
+     * all three. */
+#ifdef __APPLE__
+    const int TIMING_TRIES = 3;
+#else
+    const int TIMING_TRIES = 1;
+#endif
+    double v_ratio = 0, c_ratio = 0;
 
     /* warm-up: fault in code/data, let the core settle */
     for (int i = 0; i < 50; i++){ point_scalar_mul_ct(r, Gaff, dense); point_scalar_mul(r, Gaff, dense); }
 
-    for (int j = 0; j < ROUNDS; j++){
-        double t;
-        t = min_cost(point_scalar_mul,    r, tiny,  REPS, 1); if (t < t_v_tiny)  t_v_tiny  = t;
-        t = min_cost(point_scalar_mul,    r, dense, REPS, 1); if (t < t_v_dense) t_v_dense = t;
-        t = min_cost(point_scalar_mul_ct, r, tiny,  REPS, 1); if (t < t_c_tiny)  t_c_tiny  = t;
-        t = min_cost(point_scalar_mul_ct, r, dense, REPS, 1); if (t < t_c_dense) t_c_dense = t;
+    for (int attempt = 1; attempt <= TIMING_TRIES; attempt++){
+        double t_v_tiny = 1e30, t_v_dense = 1e30, t_c_tiny = 1e30, t_c_dense = 1e30;
+        for (int j = 0; j < ROUNDS; j++){
+            double t;
+            t = min_cost(point_scalar_mul,    r, tiny,  REPS, 1); if (t < t_v_tiny)  t_v_tiny  = t;
+            t = min_cost(point_scalar_mul,    r, dense, REPS, 1); if (t < t_v_dense) t_v_dense = t;
+            t = min_cost(point_scalar_mul_ct, r, tiny,  REPS, 1); if (t < t_c_tiny)  t_c_tiny  = t;
+            t = min_cost(point_scalar_mul_ct, r, dense, REPS, 1); if (t < t_c_dense) t_c_dense = t;
+        }
+        v_ratio = t_v_dense / t_v_tiny;
+        c_ratio = t_c_dense / t_c_tiny;
+        printf("\n  variable-time : tiny %.3f ms  dense %.3f ms  ratio %.2fx   (control, must leak)\n",
+               t_v_tiny*1e3, t_v_dense*1e3, v_ratio);
+        printf("  constant-time : tiny %.3f ms  dense %.3f ms  ratio %.3fx\n",
+               t_c_tiny*1e3, t_c_dense*1e3, c_ratio);
+        if (c_ratio <= 1.03 && c_ratio >= 0.97) break;
+        if (attempt < TIMING_TRIES) printf("  (CT ratio %.3f outside the window: measurement %d of %d, measuring again)\n",
+                                           c_ratio, attempt, TIMING_TRIES);
     }
-
-    double v_ratio = t_v_dense / t_v_tiny;
-    double c_ratio = t_c_dense / t_c_tiny;
-    printf("\n  variable-time : tiny %.3f ms  dense %.3f ms  ratio %.2fx   (control, must leak)\n",
-           t_v_tiny*1e3, t_v_dense*1e3, v_ratio);
-    printf("  constant-time : tiny %.3f ms  dense %.3f ms  ratio %.3fx\n",
-           t_c_tiny*1e3, t_c_dense*1e3, c_ratio);
     /* Control: if the variable-time routine does NOT show a clear leak, the
      * measurement itself is broken and a CT pass would be meaningless. */
     if (v_ratio < 2.0) {

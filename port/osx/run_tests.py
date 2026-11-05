@@ -307,6 +307,20 @@ def main():
         return 0
 
     b = Builder(out)
+    # `make test` builds every prerequisite before it runs anything; this
+    # loop builds each test just before running it. A helper the recipe runs
+    # as a command of its own (tests/verify_p2sh_shim) was therefore built
+    # only when its turn came, and test_taproot_parity and
+    # test_multisig_opcount, which come earlier and exec it, died of SIGPIPE
+    # in 0.1 s on any tree a previous run had not left it in. Build the
+    # gated helpers the selected tests spawn first (Builder caches them).
+    gated = {c.split()[0][len("./tests/"):] for c in cmds}
+    selected = gated if only is None else gated & only
+    for h in sorted(n for n in gated if not n.startswith("test_")):
+        if any(f'"tests/{h}"' in open(f"tests/{t}.c", errors="replace").read()
+               for t in selected if t != h and os.path.exists(f"tests/{t}.c")):
+            bstat, bnote = b.build(h)
+            print(f"helper {h}: {bstat} {bnote[:60]}".rstrip(), flush=True)
     results = []
     res = open(os.path.join(out, "results.jsonl"), "w")
     print(f"run_tests: {len(cmds)} gated test commands; results in {out}", flush=True)

@@ -42,6 +42,9 @@ static int shim_verify(FILE* in, FILE* out, const char* spk){
 
 int main(void){
     const char* shim = tt_src("tests/verify_p2sh_shim");
+    /* Without the shim the child's exec fails and the first write to it
+     * kills this process with SIGPIPE, silently: say what is missing. */
+    if (access(shim, X_OK) != 0){ printf("FAIL: %s is not built (make tests/verify_p2sh_shim)\n", shim); return 1; }
     int pin[2], pout[2];
     if (pipe(pin) || pipe(pout)){ printf("FAIL: pipe\n"); return 1; }
     pid_t pid = fork();
