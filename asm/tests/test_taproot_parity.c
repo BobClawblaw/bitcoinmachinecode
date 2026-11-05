@@ -49,6 +49,9 @@ static int shim_verify(FILE* in, FILE* out, const char* txhex){
 
 int main(void){
     const char* shim = tt_src("tests/verify_p2sh_shim");
+    /* Without the shim the child's exec fails and the first write to it
+     * kills this process with SIGPIPE, silently: say what is missing. */
+    if (access(shim, X_OK) != 0){ printf("FAIL: %s is not built (make tests/verify_p2sh_shim)\n", shim); return 1; }
     char cmd[1024];
     snprintf(cmd, sizeof cmd, "%s", shim);
     FILE* out = NULL; FILE* in = NULL;

@@ -4,6 +4,34 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-11-05 — the run-dependent pairs: run order and efficiency cores
+
+The two tests per run that failed in a full run and passed alone (below)
+were two separate harness problems, not code defects.
+
+`test_taproot_parity` and `test_multisig_opcount` exec
+`tests/verify_p2sh_shim`, which the recipe also runs as a command of its own
+(index 397). `run_tests.py` builds each test just before running it, so on a
+tree no earlier run had left the shim in, both died of SIGPIPE in 0.1 s
+(rc -13, no output): reproduced every time on a fresh clone. `make test`
+builds every prerequisite first, so x86 never saw it. `run_tests.py` now
+builds the gated helpers the selected tests spawn before the run, and both
+tests report a missing shim instead of dying silently.
+
+`test_scalarmul_ct` (CT ratio 0.956) and `test_cmpct_recv` (stamped build
+under 3x) are timing checks that macOS cannot pin. Confined to the
+efficiency cores (`taskpolicy -c background`) the CT ratio scattered
+0.696..1.122 over 30 runs, both directions (noise, not a leak), against
+0.980..1.009 over 20 on the performance cores; the cmpct speedup measured
+1.9x..4.9x there against 3.7x..5.6x. On macOS both tests now ask for the
+performance cores (QoS user-interactive) and measure a missed timing check
+again, up to three times; x86 is unchanged. Confined to the efficiency
+cores with the change: 30 of 30 and 15 of 15 pass (one cmpct run needed
+all three measurements).
+
+Full suite on a fresh clone with this change, shim deleted first: 448 PASS,
+16 SKIP, 16 N/A, 0 FAIL (480 commands). x86 gate: MAKE_EXIT=0.
+
 ## 2026-11-05 — the index builders raise their open-file limit
 
 The three tests that failed on every fresh-clone run below
