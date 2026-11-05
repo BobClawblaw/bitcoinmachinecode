@@ -30,8 +30,16 @@ and cookie, so no other flags are usually needed.
 
 ### Prerequisites
 
-- Linux x86-64 (NASM ELF64, System V ABI).
-- `nasm`, `gcc`, `make`, `python3` (build, test suite, build audits).
+- One of:
+  - Linux on x86-64 (NASM ELF64, System V ABI): `nasm`, `gcc`, `make`,
+    `python3` (build, test suite, build audits). The build steps below are
+    this platform's.
+  - macOS on Apple silicon (Darwin, arm64): Apple clang and `python3`. Build
+    with `port/osx/build_daemon.sh` (the daemon and tools land in
+    `port/osx/daemon_out/`) and test with `port/osx/run_tests.sh`; the
+    port's state and procedures are in `port/OSX_STATE.md` and
+    `port/OSX_PORT.md`. The rest of this guide applies to both, except where
+    it names Linux tools (systemd, `/proc`).
 - Disk: the mainnet block archive is about 0.7 TB at the current height
   (713 GB across 5,733 `blk*.dat` files) and grows with the chain; the UTXO
   store is about 13–15 GB; the optional indexes add about 27 GB (the txid

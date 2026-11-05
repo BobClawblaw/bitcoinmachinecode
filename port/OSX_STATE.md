@@ -4,6 +4,34 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-11-05 — the Mac build is `-Wall -Werror`; main builds both platforms
+
+`main` holds the port since PRs #453 and #457 (from x86). `build_daemon.sh`
+now compiles with `-Wall -Werror`, as the x86 Makefile does, and a file that
+fails to compile deletes its object and stops the build before the link (it
+used to log the failure and link whatever object an earlier build left).
+Clearing the warnings: `benchlog.h`'s GCC-only `access` attribute is GCC-only
+in the source too; `crash_trace.c` defines `_DARWIN_C_SOURCE` only when the
+command line has not; three `utxo_live.c` buffers are `uint64_t`, the type
+`lsm_manifest.h` takes (`u64` is `unsigned long`, `uint64_t` is `unsigned long
+long` here); `main.c`'s `/proc/<pid>/io` helpers are Linux-only, as their
+callers are; two variables that were set and never read are gone
+(`bitcoin_mempool_policy.c`'s output value, `wallet_core.c`'s `payload_msk`,
+which `signed_mask_out` already reports); two unclosed comments in
+`bitcoin_interp.S` and `bitcoin_serve.S` are closed (the second hid an
+unlabelled, unreferenced `.quad`). On x86 every changed file compiles to
+the same instructions; `main.c` differs only in 347 `__LINE__` constants.
+
+Full suite on a fresh clone of main, with and without these changes: 443
+PASS, 16 SKIP, 16 N/A, 5 FAIL each. Three fail every run, here and before
+the change: `test_coinstats_hist_build`, `test_txospender_index`,
+`test_addr_hist` (each runs an index builder and checks what it produced).
+Two more fail in a full run and pass alone, different ones each run
+(`test_scalarmul_ct` and `test_cmpct_recv` before; `test_taproot_parity`
+and `test_multisig_opcount`, SIGPIPE at 0.1 s, after). Neither set is
+explained yet. This working tree's 0 FAIL (below) is not reproduced by a
+fresh clone.
+
 ## 2026-11-05 — merged main through #452 (#451, #452)
 
 Merge of `origin/main` at b3892db3 into `bmc_osx` (backup tag `pre-merge-452` = a47a5dd1). #451 makes Core Lightning and LND work against the RPC (`echo`/`echojson`/`echoipc`, `getnetworkinfo` version 310100 and Core's subversion shape, `getblockheader` for a block reorged off); #452 is docs. Shared C only, no conflicts. One Mac build change: `build_daemon.sh` compiles #451's new `daemon/hdr_tree_read.c`. Full suite: 452 PASS, 12 SKIP, 16 N/A, 0 FAIL (480 commands).
