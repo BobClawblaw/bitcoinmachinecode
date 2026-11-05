@@ -2298,9 +2298,7 @@ _node_announce_tip:
 	ret
 
 /* serve-violation hook (x86 bitcoin_serve.asm): NULL by default, filled by
-        .section __DATA,__data
-	.align 3
-	.quad 0
+ * daemon/main.c at boot; defined with the gates below. */
 
 /* ---- relay-policy gates (x86 2026-09-01 parity, commit e8adcca): NULL =
  * old behaviour. daemon/main.c installs the relay_policy hooks at boot. */

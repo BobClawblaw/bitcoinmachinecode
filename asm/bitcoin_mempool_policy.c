@@ -1053,8 +1053,7 @@ static const char* standard_checks(const mpol_cfg* pol, const unsigned char* tx,
     { const unsigned char* p = m->out_start; const unsigned char* end = tx + txlen;
       int ok; uint64_t datacarrier_used = 0;
       for (unsigned long i = 0; i < m->n_out; i++){
-          uint64_t v = 0; for (int k=0;k<8;k++) v |= ((uint64_t)p[k])<<(8*k);
-          p += 8;
+          p += 8;                                            /* the value: dust is judged below, by mpol_dust_outputs */
           uint64_t sl = rd_varint(&p, end, &ok); if (!ok) return "malformed";
           int t = classify_spk(p, (unsigned long)sl);
           if (t == SPK_NONSTD) return "scriptpubkey";

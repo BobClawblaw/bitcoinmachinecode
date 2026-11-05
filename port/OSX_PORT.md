@@ -1,11 +1,15 @@
 # macOS / Apple Silicon port — branch & sync model
 
-This branch is `bmc_osx`, a long-lived port of the x86-64 assembly Bitcoin
-core to Apple silicon (AArch64 + Darwin/Mach-O), so the project builds and
-runs NATIVELY on macOS hosts (development machine: M1 Max).
+`port/osx/` is the port of the x86-64 assembly Bitcoin core to Apple
+silicon (AArch64 + Darwin/Mach-O), so the project builds and runs NATIVELY on
+macOS hosts (development machine: M1 Max).
 
-`main` remains the x86-64 development tree. **Do not develop against main**;
-it is touched only to merge new features into `bmc_osx`.
+> **2026-11-05: the port is in `main`.** `bmc_osx` was merged into `main`
+> (PRs #453, #457), so `main` builds on Linux x86-64 (`asm/Makefile`) and on
+> macOS arm64 (`port/osx/build_daemon.sh`), both with `-Wall -Werror`.
+> `bmc_osx` stays the Mac's working branch: Mac work lands there first and
+> reaches `main` through PRs, and `main` is still merged into it as it
+> advances (below). Production (x86) runs `main` with the port merged in.
 
 > **CURRENT STATUS (2026-09-28): the port is complete and in production.**
 > Every x86 assembly module the daemon runs has an AArch64 `.S` in
@@ -25,10 +29,14 @@ it is touched only to merge new features into `bmc_osx`.
 > and `worklog/*-note-for-x86*.md`.
 
 ## Branch model
-- `main`   : upstream x86-64 development tree. x86 is where features land.
-- `bmc_osx`: our port branch, kept in sync by periodically merging
-  `origin/main` into it. Never rebase (merge points stay visible), same
-  model the arm-port branch used.
+- `main`   : the tree both platforms build from. x86 features land here
+  first; the Mac port arrives from `bmc_osx` by PR (since 2026-11-05).
+- `bmc_osx`: the Mac's working branch, kept in sync by periodically merging
+  `origin/main` into it and merged back into `main` by PR. Never rebase
+  (merge points stay visible), same model the arm-port branch used. A
+  criss-cross (both sides merged the same two commits) can make GitHub call
+  the PR conflicting when git merges it cleanly: merge locally onto a branch
+  and PR that (#457).
 
 ## Keeping in sync (do after upstream `main` advances)
     git checkout bmc_osx   # (we are already here in ~/bmc_osx/bitcoinmachinecode)

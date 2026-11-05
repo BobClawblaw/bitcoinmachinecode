@@ -73,7 +73,13 @@ int benchlog_mem_line(char* out, size_t cap, const char* tag);
  * dependency. */
 #include <sys/syscall.h>
 #include <unistd.h>
-static __attribute__((unused, access(none, 1))) void benchlog_mem_name_region(const void* p, size_t len, const char* name){
+/* access(none, 1) is GCC's (the x86 build); clang has no such attribute */
+#if defined(__GNUC__) && !defined(__clang__)
+#define BENCHLOG_ACCESS_NONE_1 , access(none, 1)
+#else
+#define BENCHLOG_ACCESS_NONE_1
+#endif
+static __attribute__((unused BENCHLOG_ACCESS_NONE_1)) void benchlog_mem_name_region(const void* p, size_t len, const char* name){
     /* access(none, 1): the pointer is only cast to an address, never read
      * through. Without it gcc 13 -O2 infers a read through the const pointer
      * and reports a caller that names a fresh malloc'd block as "'<unknown>'

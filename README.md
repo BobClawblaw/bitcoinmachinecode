@@ -1,7 +1,9 @@
 # Bitcoin Machine Code
 
-Bitcoin Machine Code (`bmc`) is a full validating Bitcoin node for Linux
-x86-64, written in hand-authored NASM assembly with a C orchestration layer.
+Bitcoin Machine Code (`bmc`) is a full validating Bitcoin node for Linux on
+x86-64 and macOS on Apple silicon (Darwin, arm64), written in hand-authored
+assembly (NASM for x86-64, AArch64 for Apple silicon) with a C orchestration
+layer shared by both. Both build from `main`.
 Every line of assembly and C in the tree is AI-authored. It downloads and
 verifies the chain from genesis (with Core's `assumevalid` default;
 `assumevalid=0` evaluates every script), maintains a chain-scale UTXO set that matches Bitcoin Core's
@@ -219,12 +221,13 @@ testnet4, signet (public or custom) and regtest.
 
 ## Requirements
 
-- Linux on x86-64. The assembly is NASM ELF64 targeting the System V ABI.
-  On macOS / Apple silicon the `bmc_osx` branch builds the same node
-  natively from an AArch64 rewrite of every module (see
-  [macOS / Apple silicon](#macos--apple-silicon) below).
-- `nasm`, `gcc`, GNU `ld`, `make`, and `python3` (build tooling, audits and
-  test oracles).
+- **Linux on x86-64:** the assembly is NASM ELF64 targeting the System V
+  ABI. Needs `nasm`, `gcc`, GNU `ld`, `make`, and `python3` (build tooling,
+  audits and test oracles).
+- **macOS on Apple silicon (Darwin, arm64):** every assembly module has an
+  AArch64 / Mach-O counterpart in `port/osx/`, built with Apple clang and
+  `python3` only (no NASM, no GNU toolchain). See
+  [macOS / Apple silicon](#macos--apple-silicon) below.
 - Disk: about 1 TB for a full mainnet archive plus the UTXO store. A pruned
   node fits in a few GB.
 - Memory: several GB. The UTXO memtable (`dbcache`, default 450 MiB, Core's) grows
@@ -235,6 +238,8 @@ testnet4, signet (public or custom) and regtest.
   tier; the dispatcher falls back to CPU without it.
 
 ## Build
+
+On Linux / x86-64 (for macOS see [macOS / Apple silicon](#macos--apple-silicon)):
 
 ```sh
 cd asm
@@ -264,10 +269,12 @@ and the archive tools (`check_chain`, `verify`, `dumpblock`, `unified_ibd`,
 
 ## macOS / Apple silicon
 
-The `bmc_osx` branch carries the node to Apple silicon: every x86 assembly
-module the daemon runs has an AArch64 / Mach-O counterpart in `port/osx/`
-(the same exported symbols, so the shared C — daemon, RPC, tests — is
-unchanged), and the repo's own test harness runs natively.
+`main` builds the node natively on Apple silicon (since 2026-11-05, PR
+#453): every x86 assembly module the daemon runs has an AArch64 / Mach-O
+counterpart in `port/osx/` (the same exported symbols, so the shared C —
+daemon, RPC, tests — is one source for both platforms), and the repo's own
+test harness runs natively. The Mac work happens on the `bmc_osx` branch and
+reaches `main` through PRs, as x86 work does.
 
 ```sh
 port/osx/build_daemon.sh        # bmcbitcoind + the tools, into port/osx/daemon_out/
@@ -277,11 +284,18 @@ port/osx/fetch_fixtures.sh      # the large gitignored fixtures, from a local Bi
 ```
 
 Requirements: Apple clang (`cc -arch arm64`), `python3`; the daemon and the
-tools link against the system libc, so no NASM, no GNU toolchain. The gate
-reports 417 PASS, 10 SKIP, 14 N/A, 0 FAIL on 441 commands (2026-09-28): the
-N/A rows are the x86-only differential tests of shadow twins that no daemon
-links; the SKIPs are self-declared. Both a mainnet and a signet node run
-from this branch on an M-series Mac, at Bitcoin Core's tip, with the mainnet
+tools link against the system libc, so no NASM, no GNU toolchain. The daemon
+compiles with `-Wall -Werror`, the same bar as the x86 build, and a file that
+fails to compile stops the build before the link. The Mac's gate runs 480
+commands. In the Mac's working tree it recorded 452 PASS, 12 SKIP, 16 N/A,
+0 FAIL (2026-11-04). A fresh clone of `main` (2026-11-05) gives 443 PASS,
+16 SKIP, 16 N/A, 5 FAIL: three index-builder tests fail there every run
+(`test_coinstats_hist_build`, `test_txospender_index`, `test_addr_hist`),
+two other tests fail in a full run and pass alone (different ones each
+run), and the extra SKIPs are the large fixtures a fresh clone lacks. Both
+are open. The N/A rows are the x86-only differential tests of shadow twins
+that no daemon links. Both a mainnet and a signet node run
+from `bmc_osx` on an M-series Mac, at Bitcoin Core's tip, with the mainnet
 UTXO set identical to Core's on every `gettxoutsetinfo` field
 ([`docs/PARITY_ATTESTATION.md`](docs/PARITY_ATTESTATION.md)).
 
@@ -671,5 +685,6 @@ the untrusted-input parsers found more. Every finding is fixed (PRs #424 to
 sync with its UTXO set MuHash-identical to Core v31.1's at 972,848. What is
 still open, and what changed for operators, are the review's two appendices
 ([`docs/history/2026-10-23-the-review/`](docs/history/2026-10-23-the-review/)).
-Production has run that build since 2026-10-24
-([`docs/devlog/DEPLOYMENT_HISTORY.md`](docs/devlog/DEPLOYMENT_HISTORY.md)).
+Production ran that build from 2026-10-24; since 2026-11-05 it runs `main`
+with the macOS port merged in (`deploy-20261105b`), and every deploy is listed
+in [`docs/devlog/DEPLOYMENT_HISTORY.md`](docs/devlog/DEPLOYMENT_HISTORY.md).
