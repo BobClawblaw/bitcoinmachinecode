@@ -1,11 +1,11 @@
-/* test_tx_verify_parallel.c -- 2026-08-19: the fork-based parallel path in
+/* test_tx_verify_parallel.c -- 2026-08-19: the parallel path in
  * daemon/tx_verify.c's txv_verify_all (used once a tx has >= TXV_PARALLEL_MIN
  * non-taproot inputs) against the pre-existing sequential path.
  *
  * A single genuinely-signed 10-input P2WPKH transaction (validation/
  * gen_modern_vectors.py's own proven BIP143 oracle, never hand-rolled
  * crypto -- see tests/multi_p2wpkh_vec.h / /tmp .../gen_multi_p2wpkh.py),
- * well above TXV_PARALLEL_MIN=8, so this genuinely exercises the forked
+ * well above TXV_PARALLEL_MIN=8, so this genuinely exercises the parallel
  * workers, not the small-tx sequential fallback every other test in this
  * suite happens to take.
  *
@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/wait.h>
 
 typedef unsigned char u8;
 typedef unsigned long u64;
@@ -181,15 +182,21 @@ int main(void){
     int badlen = hex2bin(MPV_BAD_TX_HEX, badtx, sizeof badtx);
     printf("bad tx (input %d corrupted): %d bytes\n", MPV_BAD_INDEX, badlen);
 
-    /* 2026-10-08: each call above runs on FRESH threads, and every one of
-     * them allocates the interpreter's per-thread scratch (BMC_TLS_BUF,
-     * ~11 MB of address space a thread). Those buffers were never freed, so
-     * the Mac's mainnet worker grew by one set per mempool transaction with 8+
-     * inputs -- 195 GB of address space in two hours. They are freed at
-     * thread exit now: across the 20 calls below the workers allocate, and
-     * what is held afterwards is what was held before. */
-    extern long bmc_tls_live, bmc_tls_made;
-    long live0 = bmc_tls_live, made0 = bmc_tls_made;
+    /* 2026-11-05: the workers are a persistent pool. Each call used to
+     * create and join fresh threads (a clone, a stack mapping and the
+     * interpreter's scratch set per thread; on the Mac each one leaked its
+     * scratch until 2026-10-08). The call above started the pool; the 20
+     * below must reuse it: no new worker, one dispatch round per call.
+     * (Per-thread scratch is not counted: a worker that claimed no input in
+     * the first round makes its scratch in a later one, without a new
+     * thread.)
+     * The pool's two readers are weak so that, against a build without the
+     * pool, these checks fail instead of the link. */
+    extern int txv_pool_size(void) __attribute__((weak));
+    extern unsigned long long txv_pool_rounds(void) __attribute__((weak));
+    int have_pool = txv_pool_size && txv_pool_rounds;
+    int size0 = have_pool ? txv_pool_size() : 0;
+    unsigned long long rounds0 = have_pool ? txv_pool_rounds() : 0;
     int all_consistent = 1;
     for (int iter = 0; iter < 20; iter++){
         const char* r2 = "?";
@@ -201,10 +208,26 @@ int main(void){
         }
     }
     ck("corrupted-input tx: REJECTED with the right reason, 20/20 consistent runs", all_consistent);
-    printf("    per-thread scratch over 20 calls: %ld allocated, held %ld -> %ld\n",
-           bmc_tls_made - made0, live0, bmc_tls_live);
-    ck("the worker threads allocated per-thread scratch (the path under test ran)", bmc_tls_made - made0 >= 20);
-    ck("...and every buffer was freed when its thread exited: none held afterwards", bmc_tls_live == live0);
+    if (have_pool) printf("    pool: %d workers -> %d, %llu dispatch rounds over 20 calls\n",
+                          size0, txv_pool_size(), txv_pool_rounds() - rounds0);
+    ck("the parallel path ran: one pool dispatch per call", have_pool && txv_pool_rounds() - rounds0 == 20);
+    ck("...on the workers the first call started: none created since", have_pool && size0 > 0 && txv_pool_size() == size0);
+
+    /* FORK: threads do not survive fork(). A child of this process sees a
+     * pool whose workers do not exist; it must start its own, not wait on
+     * the parent's forever. The alarm turns a hang into a failure. */
+    { fflush(stdout);
+      pid_t pid = fork();
+      if (pid == 0){
+          alarm(30);
+          const char* rc = "?";
+          long a = tx_verify_block_connect(tx, (u64)txlen, 600000, blockhash, &g_lst, g_table, &rc);
+          const char* rd = "?";
+          long b = tx_verify_block_connect(badtx, (u64)badlen, 600000, blockhash, &g_lst, g_table, &rd);
+          _exit(a == 1 && b == 0 && !strcmp(rd, "p2wpkh signature invalid") ? 0 : 1);
+      }
+      int st = 0; waitpid(pid, &st, 0);
+      ck("a forked child verifies on a pool of its own (accept + reject, no hang)", pid > 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0); }
     /* assumevalid (2026-09-01): with script evaluation switched off the same
      * corrupted signature passes block connection (every structural and UTXO
      * check still ran); switched back on it is rejected again. */

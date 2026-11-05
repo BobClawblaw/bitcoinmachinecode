@@ -748,14 +748,64 @@ static void txv_session_end(void){ swsig_session_end(); tapsig_session_end(); }
  * keys never collide with the plain per-tx keys txv_verify_all hands out. */
 static u64 g_txvb_round;
 
+/* ---- the per-transaction worker pool (2026-11-05) -------------------------
+ * txv_verify_all used to pthread_create a fresh set of workers for every
+ * transaction with TXV_PARALLEL_MIN or more inputs and join them at the end.
+ * The block path stopped doing that in 2026-08 (the persistent pool below,
+ * "persistent worker pool"); this path stayed, on the belief that only tests
+ * reached it. Mempool admission does: tx_verify_mempool -> txv_connect_body
+ * -> here, for every relayed transaction with 8+ inputs.
+ *
+ * What that cost: a clone, a fresh 64 MB stack mapping (mmap, faulted in,
+ * munmap'd at exit) and the interpreter's per-thread scratch set, allocated
+ * and freed again, for up to 16 threads per such transaction -- the same
+ * churn the block path's strace showed in 2026-08. It is NOT shown to be the
+ * cause of the download worker's glibc arena-heap growth (2026-11-03 OOM,
+ * contained by MALLOC_ARENA_MAX=4 since 2026-11-05): 3,000 calls of the old
+ * create/join loop, uncapped, left 2 arena heaps, since glibc hands an
+ * exited thread's arena to the next new thread. With this pool the same loop
+ * held 18 heaps with its 10 workers, flat from the first 1,000 calls on.
+ *
+ * Same shape as the block pool: workers started lazily, never shut down,
+ * parked on their own condition variable between rounds, pulling the next
+ * input index off one shared counter, and a done count as the barrier. The
+ * per-thread scratch (sv_work and the interpreter's BMC_TLS_BUF set) is
+ * allocated once per worker for the process's lifetime.
+ *
+ * A pool of its own, not the block pool: each path keeps its state in its
+ * own file-scope statics (g_txv_in / g_txv_results here, the flat array and
+ * g_spk_pool there), and the two need not be serialized against each other.
+ * Like the code it replaces, this path is not re-entrant: one transaction at
+ * a time per process.
+ *
+ * FORK: threads do not survive fork(). A child of a process that already
+ * started the pool would find g_txv_pool_size workers that do not exist and
+ * wait for them forever, so the pool is keyed to the pid that started it and
+ * a different pid starts over (fresh locks; the old ones may have been held
+ * by a thread that is not in the child). */
 typedef struct {
+    pthread_t tid;
+    pthread_mutex_t lock;
+    pthread_cond_t  cv;
+    u64 round;                   /* bumped per dispatch; a worker runs when round != seen */
+    u64 seen;                    /* worker-private: the last round it ran */
     const u8* tx; u64 txlen; unsigned long long flags;
-    u64 lo, hi;
     u64 key;                     /* IR-5: this transaction's session key */
-} txv_worker_arg_t;
+    u64* next;                   /* shared claim counter for this round */
+    u64  total;                  /* one past the last claimable input */
+} txv_worker_slot_t;
 
-static void* txv_worker_thread(void* argp){
-    txv_worker_arg_t* a = (txv_worker_arg_t*)argp;
+static txv_worker_slot_t g_txv_pool[TXV_MAX_WORKERS];
+static int   g_txv_pool_size = 0;
+static pid_t g_txv_pool_pid  = 0;
+static struct { pthread_mutex_t lock; pthread_cond_t cv; u64 count; }
+    g_txv_done = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0 };
+static unsigned long long g_txv_pool_rounds;   /* dispatches; read by tests */
+unsigned long long txv_pool_rounds(void){ return g_txv_pool_rounds; }
+int txv_pool_size(void){ return g_txv_pool_pid == getpid() ? g_txv_pool_size : 0; }
+
+static void* txv_worker_loop(void* argp){
+    txv_worker_slot_t* w = (txv_worker_slot_t*)argp;
     static __thread u8* sv_work; BMC_TLS_BUF(sv_work, 1<<20);   /* per-THREAD, not per-process --
                                           * threads share g_txv_results and
                                           * the process's other statics, so
@@ -765,17 +815,57 @@ static void* txv_worker_thread(void* argp){
                                           * class of bug
                                           * test_scriptverify_thread_stress.c
                                           * was built to catch). */
-    txv_session_begin(a->key);                                   /* IR-5 */
-    for (u64 i=a->lo;i<a->hi;i++){
-        const char* r = 0;
-        t_txv_serr = 0;
-        int ok = txv_verify_one(a->tx, a->txlen, i, a->flags, sv_work, 1<<20, &r);
-        g_txv_results[i].ok = ok ? 1 : 0;
-        g_txv_results[i].serr = ok ? 0 : t_txv_serr;
-        if (!ok) { size_t n=strlen(r); if(n>63)n=63; memcpy(g_txv_results[i].reason, r, n); g_txv_results[i].reason[n]=0; }
+    for (;;){
+        /* the slot lock and the done count are the round's memory barriers,
+         * as in txvb_worker_loop: what the caller wrote into g_txv_in before
+         * bumping round is visible here, and what is written into
+         * g_txv_results here is visible to the caller once the count reaches
+         * the number it woke. */
+        pthread_mutex_lock(&w->lock);
+        while (w->seen == w->round)
+            pthread_cond_wait(&w->cv, &w->lock);
+        w->seen = w->round;
+        pthread_mutex_unlock(&w->lock);
+        txv_session_begin(w->key);                               /* IR-5 */
+        for (;;){
+            u64 i = __atomic_fetch_add(w->next, 1, __ATOMIC_RELAXED);
+            if (i >= w->total) break;
+            const char* r = 0;
+            t_txv_serr = 0;
+            int ok = txv_verify_one(w->tx, w->txlen, i, w->flags, sv_work, 1<<20, &r);
+            g_txv_results[i].ok = ok ? 1 : 0;
+            g_txv_results[i].serr = ok ? 0 : t_txv_serr;
+            if (!ok) { size_t n=strlen(r); if(n>63)n=63; memcpy(g_txv_results[i].reason, r, n); g_txv_results[i].reason[n]=0; }
+        }
+        txv_session_end();
+        pthread_mutex_lock(&g_txv_done.lock);
+        g_txv_done.count++;
+        pthread_cond_signal(&g_txv_done.cv);
+        pthread_mutex_unlock(&g_txv_done.lock);
     }
-    txv_session_end();
-    return 0;
+    return 0;   /* unreachable */
+}
+
+/* Starts workers until the pool has `need` of them (never shuts any down);
+ * returns how many it has, which is fewer than `need` only if pthread_create
+ * failed -- the caller's inline sweep verifies whatever no worker took. */
+static int txv_pool_ensure(int need){
+    pid_t me = getpid();
+    if (g_txv_pool_pid != me){            /* first use, or a forked child: see FORK above */
+        g_txv_pool_size = 0;
+        pthread_mutex_init(&g_txv_done.lock, 0);
+        pthread_cond_init(&g_txv_done.cv, 0);
+        g_txv_pool_pid = me;
+    }
+    while (g_txv_pool_size < need){
+        txv_worker_slot_t* w = &g_txv_pool[g_txv_pool_size];
+        pthread_mutex_init(&w->lock, 0);
+        pthread_cond_init(&w->cv, 0);
+        w->round = 0; w->seen = 0;
+        if (bmc_pthread_create(&w->tid, txv_worker_loop, w) != 0) break;
+        g_txv_pool_size++;
+    }
+    return g_txv_pool_size;
 }
 
 /* txv_verify_all(): verify EVERY input in g_txv_in[0..nin) -- taproot
@@ -816,26 +906,27 @@ static int txv_verify_all(const u8* tx, u64 txlen, u64 nin, unsigned long long f
 
     memset(g_txv_results, 0, sizeof(txv_result_t)*(size_t)nin);
 
-    u64 per = (nin + (u64)nworkers - 1) / (u64)nworkers;
-    pthread_t tids[TXV_MAX_WORKERS];
-    txv_worker_arg_t args[TXV_MAX_WORKERS];
-    int spawned = 0;
-    for (int w=0; w<nworkers; w++){
-        u64 lo = (u64)w*per, hi = lo+per; if (hi>nin) hi=nin;
-        if (lo >= hi) break;
-        args[spawned].tx = tx; args[spawned].txlen = txlen; args[spawned].flags = flags;
-        args[spawned].lo = lo; args[spawned].hi = hi;
-        args[spawned].key = key;                                   /* IR-5 */
-        if (bmc_pthread_create(&tids[spawned], txv_worker_thread, &args[spawned]) != 0){
-            /* thread creation failed partway: whatever didn't get a thread
-             * (including this one) stays at its zeroed g_txv_results slot
-             * and is picked up by the "finish inline" sweep below -- same
-             * fallback story fork() had, just for pthread_create instead. */
-            break;
-        }
-        spawned++;
+    int pool_avail = txv_pool_ensure(nworkers);
+    int nspawn = nworkers < pool_avail ? nworkers : pool_avail;
+    static u64 claim;            /* one round at a time: not re-entrant */
+    claim = 0;
+    pthread_mutex_lock(&g_txv_done.lock);
+    g_txv_done.count = 0;                    /* this round's baseline */
+    pthread_mutex_unlock(&g_txv_done.lock);
+    for (int w=0; w<nspawn; w++){
+        txv_worker_slot_t* slot = &g_txv_pool[w];
+        pthread_mutex_lock(&slot->lock);
+        slot->tx = tx; slot->txlen = txlen; slot->flags = flags; slot->key = key;
+        slot->next = &claim; slot->total = nin;
+        slot->round++;                       /* release this worker */
+        pthread_cond_signal(&slot->cv);
+        pthread_mutex_unlock(&slot->lock);
     }
-    for (int w=0; w<spawned; w++) pthread_join(tids[w], 0);
+    pthread_mutex_lock(&g_txv_done.lock);    /* join: every woken worker finished THIS round */
+    while (g_txv_done.count < (u64)nspawn)
+        pthread_cond_wait(&g_txv_done.cv, &g_txv_done.lock);
+    pthread_mutex_unlock(&g_txv_done.lock);
+    if (nspawn > 0) g_txv_pool_rounds++;
 
     static u8 sv_work_main[1<<20];
     int all_ok = 1;
@@ -848,9 +939,9 @@ static int txv_verify_all(const u8* tx, u64 txlen, u64 nin, unsigned long long f
             t_txv_fail_serr = g_txv_results[i].serr; t_txv_fail_input = (long)i;
             all_ok = 0; break;
         }
-        /* blank: pthread_create failure above left this index untouched --
-         * verify it inline now, in this thread, so a transient resource
-         * failure never silently skips a check. */
+        /* blank: no worker took this index (the pool could not start one) --
+         * verify it inline now, in this thread, so a resource failure never
+         * silently skips a check. */
         const char* r = 0;
         t_txv_serr = 0;
         if (!txv_verify_one(tx, txlen, i, flags, sv_work_main, sizeof sv_work_main, &r)) {
@@ -1522,10 +1613,9 @@ static int txvb_verify_one(const u8* tx, u64 txlen, txvb_in_t* in, unsigned long
  * fan-out/barrier shape as before, just without tearing down and
  * recreating the OS threads themselves every time.
  *
- * NOT applied to the OLD single-tx txv_worker_thread/txv_verify_all above:
- * apply_block_inner no longer calls the single-tx tx_verify_block_connect
- * at all (only tx_verify_block_connect_all), so that path is exercised by
- * tests only, never by the live daemon -- not on the hot path this fixes. */
+ * The single-tx txv_verify_all above was left on fresh threads at the time,
+ * on the belief that only tests reached it; mempool admission does, and it
+ * has its own persistent pool since 2026-11-05 (see there). */
 /* WORK CLAIMING (2026-08-23): a round used to hand each worker a fixed,
  * contiguous [lo,hi) slice of the flat array. That was defensible while
  * every entry was a single ECDSA-ish check of roughly equal cost; it stopped
@@ -1565,7 +1655,7 @@ static struct { pthread_mutex_t lock; pthread_cond_t cv; u64 count; }
  * calls _exit(0), which tears down every thread regardless of state). */
 static void* txvb_worker_loop(void* argp){
     txvb_worker_slot_t* w = (txvb_worker_slot_t*)argp;
-    static __thread u8* sv_work; BMC_TLS_BUF(sv_work, 1<<20);  /* per-THREAD -- see txv_worker_thread's
+    static __thread u8* sv_work; BMC_TLS_BUF(sv_work, 1<<20);  /* per-THREAD -- see txv_worker_loop's
                                          * own comment above, identical reasoning.
                                          * Now allocated once for this worker's
                                          * whole process-lifetime, not once per
