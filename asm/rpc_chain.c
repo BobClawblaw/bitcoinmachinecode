@@ -2039,6 +2039,20 @@ static long long size_on_disk(void){
     if (stat(nm, &sb) != 0) return sod_full_scan();
     return prefix + sb.st_size;
 }
+/* -maxtipage, latched as Core's m_cached_is_ibd: once the node has left IBD
+ * it does not go back (v31.1 UpdateIBDStatus). `tip_time` is the tip
+ * header's nTime. */
+static int ibd_at(u32 tip_time){
+    return !(g_ibd_left && *g_ibd_left) && (time_t)tip_time < time(NULL) - g_maxtipage;
+}
+/* getblockchaininfo's "initialblockdownload", for the node-side RPCs that
+ * Core refuses in IBD (importmempool, 2026-10-25). No tip yet counts as IBD. */
+int rpc_chain_in_ibd(void){
+    long tip = refresh();
+    if (tip < 0) return 1;
+    u8 hdr[80]; if (read_block_prefix(tip, hdr, 80) != 1) return 1;
+    return ibd_at(rd32(hdr + 68));
+}
 static int cmd_getblockchaininfo(rj_val** res, long* ec, const char** em){
     long tip = refresh();
     if (tip < 0){ *ec = -28; *em = "Loading block index..."; return 0; }
@@ -2061,9 +2075,7 @@ static int cmd_getblockchaininfo(rj_val** res, long* ec, const char** em){
     double prog = hh >= 0 ? (double)(tip + 1) / (double)(hh + 1) : 1.0;
     if (prog > 1.0) prog = 1.0;
     rj_obj_set(o, "verificationprogress", rj_double(prog));
-    /* -maxtipage, latched as Core's m_cached_is_ibd: once the node has left
-     * IBD it does not go back (v31.1 UpdateIBDStatus) */
-    rj_obj_set(o, "initialblockdownload", rj_bool(!(g_ibd_left && *g_ibd_left) && (time_t)t < time(NULL) - g_maxtipage));
+    rj_obj_set(o, "initialblockdownload", rj_bool(ibd_at(t)));
     u8 cw[16]; if (chainwork_at(tip, cw)){ chainwork_hex(cw, hx); rj_obj_set(o, "chainwork", rj_str(hx)); }
     rj_obj_set(o, "size_on_disk", rj_numf("%lld", size_on_disk()));
     int pruned = g_prune_mib != 0 || ST_PRUNE_H(CUR_ST) > 0;
@@ -2179,7 +2191,11 @@ static long g_lanes_gen;
  * descriptors. The pool threads keep theirs for the process lifetime, as
  * before. An Esplora connection thread (rpc_server.c) is one thread per
  * connection and reaches this through getblock: each one used to leave an
- * open archive handle and the 8 MB buffer behind. */
+ * open archive handle and the 8 MB buffer behind. main fixed the same leak
+ * on 10-07 with a pthread-key destructor, after production reached 1,023
+ * descriptors and the RPC listener stopped accepting (deploy-20261006d); the
+ * 2026-11 merge keeps this version, which also frees the undo arrays and the
+ * txid scratch. */
 typedef struct { u8 st[ST_SIZE]; int ok; } rd_handle_t;
 long g_rd_handles_closed;  /* test seam: handles closed at thread exit */
 static void rd_handle_fin(void* p){ rd_handle_t* h = p; if (h->ok){ lane_handle_close(h->st); h->ok = 0; __sync_fetch_and_add(&g_rd_handles_closed, 1); } }
@@ -5264,9 +5280,27 @@ static int cmd_dumptxoutset(const rj_val* params, rj_val** res, long* ec, const 
         return 0;
     }
     if (!g_utxo_dump){ *ec = -1; *em = "UTXO dump unavailable in this process"; return 0; }
+    /* ST2-3 (audit 2026-10-23): resolve the path the way Core does --
+     * fsbridge::AbsPathJoin(GetDataDirNet(), path): an absolute path stands,
+     * a relative one (an empty one included) is joined to the per-chain
+     * datadir, which is this process's working directory (main.c chdir()s
+     * into it). The runner then refuses an existing file exactly as Core
+     * does (-2 here -> RPC_INVALID_PARAMETER) and the reply names the
+     * resolved path, as Core's "path" field does. */
+    static char abspath[1024];
+    if (path[0] == '/'){
+        if (snprintf(abspath, sizeof abspath, "%s", path) >= (int)sizeof abspath){ *ec = -8; *em = "path too long"; return 0; }
+    } else {
+        char cwd[PATH_MAX];
+        if (!getcwd(cwd, sizeof cwd)){ *ec = -1; *em = "cannot resolve the datadir"; return 0; }
+        int w = path[0] ? snprintf(abspath, sizeof abspath, "%s%s%s", cwd, strcmp(cwd, "/") ? "/" : "", path)
+                        : snprintf(abspath, sizeof abspath, "%s", cwd);
+        if (w < 0 || w >= (int)sizeof abspath){ *ec = -8; *em = "path too long"; return 0; }
+    }
     long height = 0; unsigned long long coins = 0;
-    static char msg[256];
-    long r = g_utxo_dump(path, gdump_hash_at, &height, &coins, msg, sizeof msg);
+    static char msg[1280];
+    long r = g_utxo_dump(abspath, gdump_hash_at, &height, &coins, msg, sizeof msg);
+    if (r == -2){ *ec = -8; *em = msg[0] ? msg : "invalid path"; return 0; }
     if (r == 0){ *ec = -1; *em = msg[0] ? msg : "UTXO set busy"; return 0; }
     if (r != 1){ *ec = -1; *em = msg[0] ? msg : "UTXO dump failed"; return 0; }
     rj_val* o = rj_obj();
@@ -5274,7 +5308,7 @@ static int cmd_dumptxoutset(const rj_val* params, rj_val** res, long* ec, const 
     { u8 rec[48]; char hx[65];
       if (read_idx_rec(height, rec)){ hex_rev(hx, rec, 32); rj_obj_set(o, "base_hash", rj_str(hx)); } }
     rj_obj_set(o, "base_height", rj_numf("%ld", height));
-    rj_obj_set(o, "path", rj_str(path));
+    rj_obj_set(o, "path", rj_str(abspath));
     *res = o;
     return 1;
 }

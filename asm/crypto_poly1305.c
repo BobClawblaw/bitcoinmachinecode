@@ -19,6 +19,7 @@
 #include <string.h>
 #include "crypto_poly1305.h"
 #include "crypto_chacha20.h"
+#include "daemon/secure_zero.h"   /* CRY-4: key material is wiped with a barrier */
 
 static unsigned rd32le(const unsigned char* p){
     return (unsigned)p[0] | ((unsigned)p[1] << 8) | ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24);
@@ -131,7 +132,7 @@ void poly1305_finish(poly1305_ctx* st, unsigned char mac[16]){
     t = (unsigned long long)f2 + st->pad[2] + (t >> 32); f2 = (unsigned)t;
     t = (unsigned long long)f3 + st->pad[3] + (t >> 32); f3 = (unsigned)t;
     wr32le(mac + 0, f0); wr32le(mac + 4, f1); wr32le(mac + 8, f2); wr32le(mac + 12, f3);
-    memset(st, 0, sizeof *st);
+    secure_zero(st, sizeof *st);
 }
 
 void poly1305_auth(unsigned char mac[16], const unsigned char* m, unsigned long bytes,
@@ -184,6 +185,10 @@ void chacha20poly1305_encrypt(unsigned char* out, unsigned char tag[16],
     aead_len64(&st, alen);
     aead_len64(&st, plen);
     poly1305_finish(&st, tag);
+    /* CRY-4 (audit 2026-10-23): the ChaCha20 state holds the key and the
+     * block-0 keystream is the one-time Poly1305 key; both were left in the
+     * dead frame. */
+    secure_zero(&c, sizeof c); secure_zero(polykey, sizeof polykey);
 }
 
 int chacha20poly1305_decrypt(unsigned char* out,
@@ -205,10 +210,12 @@ int chacha20poly1305_decrypt(unsigned char* out,
     aead_len64(&st, alen);
     aead_len64(&st, clen);
     poly1305_finish(&st, want);
+    secure_zero(polykey, sizeof polykey);
     /* AUTHENTICATE BEFORE DECRYPTING. Writing plaintext for a bad tag hands
      * an attacker a decryption oracle even if the caller checks the return. */
-    if (!poly1305_verify(want, tag)) return 0;
+    if (!poly1305_verify(want, tag)){ secure_zero(&c, sizeof c); return 0; }
     chacha20_seek(&c, nonce, 1);
     if (clen) chacha20_crypt(&c, cipher, out, clen);
+    secure_zero(&c, sizeof c);
     return 1;
 }

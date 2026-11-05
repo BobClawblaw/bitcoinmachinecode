@@ -275,6 +275,74 @@ int main(void){
           } }
     }
 
+    /* ---- formal/parsers F1: a non-canonical locator count is dropped ----
+     * Core reads the CBlockLocator of getheaders and getblocks with
+     * ReadCompactSize, which throws "non-canonical ReadCompactSize()" for a
+     * count spelled longer than it needs (fd 0100 for 1); ProcessMessages
+     * catches it and the message is dropped, no reply and no score. Both
+     * handlers used to serve it: getheaders through serve_locator_from, which
+     * took the long spelling, and getblocks by reading a hash at pl+5 whatever
+     * the count said. Each message below names bhash[3] behind the 3-byte
+     * spelling of 1 and is followed by a ping with its own nonce; everything
+     * up to THAT pong is the reply, and it must hold no headers/inv. The
+     * canonical spelling of the same request must still be answered, from
+     * height 4 -- the Core-matching side, so the check cannot pass by
+     * dropping everything. A first draft took "the first reply is a pong" as
+     * the test and read the previous case's pong: replies are matched by
+     * nonce here. */
+    {
+        static const char* kinds[2] = { "getheaders", "getblocks" };
+        for (int kd = 0; kd < 2; kd++){
+            for (int canon = 0; canon < 2; canon++){
+                unsigned char m[4 + 3 + 32 + 32]; int mp = 0;
+                m[mp++]=1; m[mp++]=0; m[mp++]=0; m[mp++]=0;              /* nVersion */
+                if (canon) m[mp++] = 1;                                   /* count 1 */
+                else { m[mp++] = 0xfd; m[mp++] = 1; m[mp++] = 0; }        /* count 1, 3-byte spelling */
+                memcpy(m+mp, bhash[3], 32); mp += 32;                     /* known: height 3 */
+                memset(m+mp, 0, 32); mp += 32;                            /* hashStop = none */
+                p2p_write(fd, kinds[kd], (unsigned)strlen(kinds[kd]), m, (unsigned)mp);
+                uint64_t nonce = 0x46314c4f43000000ull + (uint64_t)(kd * 2 + canon);
+                int answered = 0, served_from4 = 0, got_pong = 0;
+                /* Up to three receive timeouts are waited through before the
+                 * case gives up on its pong. (The serve loop used to answer
+                 * 10 s late after a getheaders, past the 8 s timeout: its log
+                 * write to fd -1 sat out fd_write_all's poll. Fixed
+                 * 2026-10-23; tests/test_getblocks pins it.) */
+                p2p_write(fd, "ping", 4, &nonce, 8);
+                int timeouts = 0;
+                for (int k = 0; k < 64; k++){
+                    char c9[12]; static unsigned char rb9[1<<20]; unsigned rl9 = 0;
+                    if (p2p_read(fd, c9, rb9, sizeof rb9, &rl9) <= 0){ if (++timeouts < 3) continue; break; }
+                    if (!strncmp(c9, "pong", 4)){
+                        if (rl9 == 8 && !memcmp(rb9, &nonce, 8)){ got_pong = 1; break; }
+                        continue;                                       /* an earlier case's pong */
+                    }
+                    if (kd == 0 && !strncmp(c9, "headers", 7)){
+                        answered = 1;
+                        if (rl9 >= 1 + 80 && !memcmp(rb9 + 1, blk[4], 80)) served_from4 = 1;
+                    }
+                    if (kd == 1 && !strncmp(c9, "inv", 3)){
+                        answered = 1;
+                        /* MSG_BLOCK, block 4's hash in wire order: block_hash's
+                         * output as-is, what a getdata carries back. This took
+                         * either byte order while the handler still reversed
+                         * it (fixed 2026-10-23; tests/test_getblocks pins it). */
+                        if (rl9 >= 1 + 36 && rb9[1] == 2 && !memcmp(rb9 + 5, bhash[4], 32)) served_from4 = 1;
+                    }
+                }
+                char lbl[160];
+                if (!canon){
+                    snprintf(lbl, sizeof lbl, "F1 %s with a non-canonical count (fd 0100) is dropped (no %s before its pong)",
+                             kinds[kd], kd ? "inv" : "headers");
+                    cki(lbl, got_pong && !answered, 1);
+                } else {
+                    snprintf(lbl, sizeof lbl, "F1 the canonical %s for the same locator is served from height 4", kinds[kd]);
+                    cki(lbl, got_pong && served_from4, 1);
+                }
+            }
+        }
+    }
+
     /* ---- NET-7: a getdata whose count needs a 3-byte CompactSize ----
      * Core's MAX_GETDATA_SZ is 1000, so it routinely asks for 253 or more
      * items in one message -- and 253 is the first count that does not fit a

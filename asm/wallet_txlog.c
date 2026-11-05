@@ -44,6 +44,7 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 #define BMCTX_MAGIC "BMCTX v1"
 
@@ -73,32 +74,45 @@ static unsigned long txlog_crc(const char* s, long n) {
     return h;
 }
 
+/* HST-7 (audit 2026-10-23): wallet files were created with fopen and only
+ * chmod'ed 0600 afterwards (or, for the labels file, never), so under the
+ * usual umask they were world-readable while being written, an existing
+ * file kept its old mode, and a symlink planted at the name was followed.
+ * Open with O_NOFOLLOW, create 0600, and fchmod the fd before any byte is
+ * written. */
+static FILE* fopen_0600(const char* path, int append){
+    int fd = open(path, O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC) | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) return NULL;
+    if (fchmod(fd, 0600) != 0){ close(fd); return NULL; }
+    FILE* f = fdopen(fd, append ? "a" : "w");
+    if (!f) close(fd);
+    return f;
+}
+
 /* Append bytes to a file as 0600, and fsync them to stable storage so a durable
  * write is reported before the caller advertises success (FINDING P2-1).
  * Returns 0 on success, -1 on error. */
 static int append_sync0600(const char* path, const char* data, long len) {
-    FILE* f = fopen(path, "a");
+    FILE* f = fopen_0600(path, 1);
     if (!f) return -1;
     int ok = 1;
     if (fwrite(data, 1, (size_t)len, f) != (size_t)len) ok = 0;
     if (ok && fflush(f) != 0) ok = 0;
     if (ok && fsync(fileno(f)) != 0) ok = 0;   /* durability gate */
     if (fclose(f) != 0) ok = 0;
-    chmod(path, 0600);
     return ok ? 0 : -1;
 }
 
 /* Create (truncate) a file with 0600 perms and fsync it. Used only for the
  * journal header. Returns 0 on success, -1 on error. */
 static int create_sync0600(const char* path, const char* data, long len) {
-    FILE* f = fopen(path, "w");
+    FILE* f = fopen_0600(path, 0);
     if (!f) return -1;
     int ok = 1;
     if (fwrite(data, 1, (size_t)len, f) != (size_t)len) ok = 0;
     if (ok && fflush(f) != 0) ok = 0;
     if (ok && fsync(fileno(f)) != 0) ok = 0;
     if (fclose(f) != 0) ok = 0;
-    chmod(path, 0600);
     return ok ? 0 : -1;
 }
 

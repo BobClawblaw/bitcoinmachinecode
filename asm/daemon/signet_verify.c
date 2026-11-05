@@ -21,6 +21,7 @@ extern int sv_verify_script(const unsigned char* scriptSig, unsigned long ssl,
                             unsigned long long flags, unsigned long nIn,
                             const unsigned char* tx, unsigned long txlen,
                             unsigned char* work, unsigned long workcap);
+extern int sv_witness_program_true(const unsigned char* prog, unsigned int n);   /* bitcoin_witness_v0.c, CON-2 */
 extern int sv_classify_segwit(const unsigned char* spk, unsigned int spl,
                               const unsigned char* ss, unsigned int ssl,
                               unsigned int* version, const unsigned char** prog,
@@ -82,6 +83,10 @@ int signet_check_solution(int nversion, const unsigned char prev32[32],
     if (cls < 0) return 0;                     /* malformed P2SH-wrapped push */
 
     if (cls > 0){
+        /* CON-2: Core evaluates the challenge (or redeemScript) first and
+         * fails EVAL_FALSE on a false program push -- before the witness
+         * branch, for every version. */
+        if (!sv_witness_program_true(wprog, wplen)) return 0;
         /* Core's VerifyScript: a NATIVE witness program requires an empty
          * scriptSig, or witness malleability comes back. The P2SH-wrapped
          * form's exact-single-push requirement is what sv_classify_segwit

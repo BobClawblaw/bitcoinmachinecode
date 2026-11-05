@@ -14,5 +14,11 @@ struct lsm_state {
     void* scratch_buf; uint64_t scratch_cap;
     uint64_t next_run_no;
     void* tomb_hash_buf; uint64_t tomb_hash_mask; /* LSM-owned, see bitcoin_utxo_lsm.asm */
+    /* the frozen generation (plan B3, 2026-10-06): read by the asm only after
+     * utxo_lsm_fz_enable(1); see the asm's struct comment for each field */
+    void* fz_u;                                   /* +168 the copy of the live table (its own blob at +16) */
+    void* fz_tomb_buf; uint64_t fz_tomb_n;        /* +176 the spare/frozen tombstone list, +184 its count */
+    void* fz_tomb_hash_buf; uint64_t fz_tomb_hash_mask;   /* +192/+200 LSM-owned */
+    uint64_t fz_active, fz_gen, fz_run_no, fz_wal_end;    /* +208..+232 */
 };
 #endif

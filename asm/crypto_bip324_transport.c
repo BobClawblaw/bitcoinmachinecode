@@ -35,6 +35,7 @@
 #include <stdlib.h>
 #include "crypto_bip324_transport.h"
 #include "crypto_ellswift.h"
+#include "daemon/secure_zero.h"   /* CRY-4: key material is wiped with a barrier */
 
 /* ------------------------------- buffers --------------------------------- */
 
@@ -124,7 +125,11 @@ int bip324_t_init(bip324_transport_t* t, const unsigned char seckey32[32],
 void bip324_t_free(bip324_transport_t* t){
     buf_free(&t->recv); buf_free(&t->send);
     buf_free(&t->recv_garbage); buf_free(&t->sent_garbage); buf_free(&t->msg);
-    memset(t->our_seckey, 0, sizeof t->our_seckey);
+    /* CRY-4 (audit 2026-10-23): the session keys, not only the ephemeral
+     * secret -- the caller frees the struct next, and a store before free
+     * is one the optimiser may drop */
+    secure_zero(t->our_seckey, sizeof t->our_seckey);
+    secure_zero(&t->cipher, sizeof t->cipher);
 }
 
 int bip324_t_is_v1(const bip324_transport_t* t){ return t->recv_state == BIP324_RECV_V1; }
@@ -180,7 +185,7 @@ static int advance(bip324_transport_t* t){
             buf_drop_front(&t->recv, 64);
             if (!bip324_init(&t->cipher, t->our_seckey, t->our_ellswift,
                              t->their_ellswift, t->net_magic, t->initiator, 0)) return 0;
-            memset(t->our_seckey, 0, sizeof t->our_seckey);
+            secure_zero(t->our_seckey, sizeof t->our_seckey);
             t->keys_ready = 1;
             if (!queue_terminator_and_version(t)) return 0;
             t->recv_state = BIP324_RECV_GARBAGE;
@@ -268,11 +273,24 @@ static int advance(bip324_transport_t* t){
                 unsigned char id = plain[0];
                 unsigned long off;
                 if (id == 0){
-                    if (t->pending_len < 13){ free(plain); return 0; }
+                    /* Core's V2Transport::GetMessageType (net.cpp): a long
+                     * type is 12 bytes, printable ASCII (0x20..0x7f) up to
+                     * the first NUL and NUL after it; anything else -- or
+                     * fewer than 12 bytes -- is no type, and
+                     * GetReceivedMessage rejects THAT message (reject_message)
+                     * while the session carries on. This delivered a control
+                     * byte or a byte above 0x7f as part of the type, cut the
+                     * type at the first NUL whatever followed, and ended the
+                     * session on a short one (formal/parsers F3). */
+                    int valid = t->pending_len >= 13, i = 0;
+                    if (valid){
+                        const unsigned char* mt = plain + 1;
+                        for (; i < 12 && mt[i]; i++) if (mt[i] < 0x20 || mt[i] > 0x7f) valid = 0;
+                        for (; i < 12; i++) if (mt[i]) valid = 0;
+                    }
+                    if (!valid){ free(plain); break; }    /* invalid type: drop the message */
                     memcpy(t->msg_type, plain + 1, 12);
                     t->msg_type[12] = 0;
-                    for (int i = 0; i < 12; i++)   /* NUL-padded, like v1 */
-                        if (t->msg_type[i] == 0){ for (int j = i; j < 12; j++) t->msg_type[j] = 0; break; }
                     off = 13;
                 } else {
                     const char* nm = bip324_shortid_name(id);
@@ -398,8 +416,8 @@ int bip324_t_import(bip324_transport_t* t, const unsigned char* in, unsigned lon
     t->initiator = h.initiator; t->recv_state = h.recv_state; t->keys_ready = h.keys_ready;
     t->sent_version = h.sent_version; t->msg_ready = h.msg_ready; t->have_len = h.have_len;
     memcpy(t->net_magic, h.net_magic, 4); t->pending_len = h.pending_len; memcpy(t->msg_type, h.msg_type, 13);
-    if (h.recv_len && !buf_append(&t->recv, in + o, h.recv_len)) return 0;
+    if (h.recv_len && !buf_append(&t->recv, in + o, h.recv_len)){ secure_zero(&t->cipher, sizeof t->cipher); return 0; }
     o += h.recv_len;
-    if (h.msg_len && !buf_append(&t->msg, in + o, h.msg_len)){ buf_free(&t->recv); return 0; }
+    if (h.msg_len && !buf_append(&t->msg, in + o, h.msg_len)){ buf_free(&t->recv); secure_zero(&t->cipher, sizeof t->cipher); return 0; }
     return 1;
 }

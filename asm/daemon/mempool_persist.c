@@ -51,14 +51,17 @@ static int put_cs(u8* p, u64 v){
     if (v <= 0xffffffffULL){ p[0]=254; for(int i=0;i<4;i++) p[1+i]=(u8)(v>>(8*i)); return 5; }
     p[0]=255; for(int i=0;i<8;i++) p[1+i]=(u8)(v>>(8*i)); return 9;
 }
+/* As Core's ReadCompactSize (range-checked, which both of its uses here
+ * are: the key vector and the delta map): 0 when truncated, spelled in more
+ * bytes than the value needs, or above MAX_SIZE (formal/parsers F6). */
+#define MPD_MAX_SIZE 0x02000000ULL                 /* Core serialize.h MAX_SIZE */
 static int get_cs(const u8* p, u64 avail, u64* out){
     if (avail < 1) return 0;
     if (p[0] < 253){ *out = p[0]; return 1; }
-    if (p[0] == 253){ if (avail < 3) return 0; *out = (u64)p[1] | ((u64)p[2]<<8); return 3; }
-    if (p[0] == 254){ if (avail < 5) return 0; *out = 0; for(int i=0;i<4;i++) *out |= (u64)p[1+i]<<(8*i); return 5; }
-    if (avail < 9) return 0;
-    *out = 0; for(int i=0;i<8;i++) *out |= (u64)p[1+i]<<(8*i);
-    return 9;
+    if (p[0] == 253){ if (avail < 3) return 0; *out = (u64)p[1] | ((u64)p[2]<<8); return *out < 253 ? 0 : 3; }
+    if (p[0] == 254){ if (avail < 5) return 0; *out = 0; for(int i=0;i<4;i++) *out |= (u64)p[1+i]<<(8*i);
+                      return (*out <= 0xffff || *out > MPD_MAX_SIZE) ? 0 : 5; }
+    return 0;                                      /* 9 bytes: non-canonical below 2^32, above MAX_SIZE from it */
 }
 
 /* ---- writer -------------------------------------------------------------
@@ -194,10 +197,18 @@ long mempool_dump_read(const char* path,
      * length only. Deltas for transactions NOT in the dump would need a
      * prioritisetransaction path at load time, which this node does not wire
      * up -- stated rather than silently dropped. */
+    /* formal/parsers F6 (2026-10-23): the fit check was `pos + nd*40 >
+     * fsz`, which wraps: a delta-map count of 0x0666666666666667 (*40 is 24
+     * mod 2^64) read as a valid dump. Core's ReadCompactSize throws "size
+     * too large" on it, LoadMempool logs "Failed to deserialize mempool
+     * data" and returns false; this returns -1 with the reason. get_cs now
+     * refuses above MAX_SIZE, and the fit is checked by division. */
     { u64 nd = 0; int k = get_cs(buf + pos, (u64)fsz - pos, &nd);
+      if (!k && pos < (u64)fsz && (u64)(buf[pos] < 253 ? 1 : buf[pos] == 253 ? 3 : buf[pos] == 254 ? 5 : 9) <= (u64)fsz - pos){
+          free(buf); MPD_ERR("delta map count is non-canonical or above MAX_SIZE"); return -1; }
       if (!k){ free(buf); MPD_ERR("truncated delta map"); return -1; }
       pos += (u64)k;
-      if (pos + nd * 40 > (u64)fsz){ free(buf); MPD_ERR("delta map overruns the file"); return -1; }
+      if (nd > ((u64)fsz - pos) / 40){ free(buf); MPD_ERR("delta map overruns the file"); return -1; }
       pos += nd * 40; }
     free(buf);
     return done;

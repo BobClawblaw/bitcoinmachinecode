@@ -382,6 +382,18 @@ static long usi_stub_run(int want_muhash, void* outv, char* msg, unsigned long m
     return 1;
 }
 
+/* dumptxoutset stub runner (ST2-3): records the path the RPC layer resolved
+ * and returns g_dump_ret (-2 = the runner refused as Core refuses) */
+static char g_dump_path[1100]; static long g_dump_ret = 1;
+static long dump_stub_run(const char* path, int (*hash_at)(long, unsigned char*),
+                          long* h, unsigned long long* coins, char* msg, unsigned long mcap){
+    (void)hash_at;
+    snprintf(g_dump_path, sizeof g_dump_path, "%s", path);
+    if (g_dump_ret == -2){ if (msg && mcap) snprintf(msg, mcap, "%s already exists. If you are sure this is what you want, move it out of the way first", path); return -2; }
+    *h = 3; *coins = 7;
+    return 1;
+}
+
 /* scantxoutset stub scanner: reports one hit for the FIRST target spk at
  * height 2, scan height 3 (the fixture tip, so bestblock/blockhash resolve). */
 static long scan_stub_run(const unsigned char* spks, const unsigned int* spklens, int nspk,
@@ -443,6 +455,16 @@ static void* exit_after_getblock(void* arg){
     int ok = r && r->typ == RJ_OBJ; rj_free(r);
     return (void*)(long)ok;
 }
+/* 2026-10-07 (main): the facade's shape -- a thread that serves one request and exits */
+static volatile long g_getblock_once_ok = 0;
+static void* getblock_once(void* a){
+    (void)a; long ec; const char* em; char p[128]; snprintf(p, sizeof p, "[\"%s\", 0]", GENESIS_HASH);
+    rj_val* r = call("getblock", p, &ec, &em);
+    if (r && r->str && !strcmp(r->str, GENESIS_HEX)) __sync_fetch_and_add(&g_getblock_once_ok, 1);
+    rj_free(r);
+    return NULL;
+}
+
 int main(void){
     /* ---- -blockversion is honoured ONLY where Core honours it (2026-09-06) --
      * Core: node/miner.cpp:148 applies -blockversion under
@@ -592,6 +614,23 @@ int main(void){
       /* handle, block buffer, both undo arrays: on the exit list, then gone */
       ck("each thread's reader-lane buffers went on the exit list", bmc_tls_made - made0 >= 4 * NT);
       ck("no per-thread buffer outlives the threads", bmc_tls_live == live0); }
+
+    /* ---- getblock on short-lived threads (2026-10-07) ----
+     * The facade's thread per connection calls getblock in-process. Each
+     * thread's reader lane (a store handle: index.dat, the current block
+     * file, the reader's fd cache) must be closed when the thread exits:
+     * production leaked three descriptors per facade request and the RPC
+     * listener stopped accepting at 1,023 (deploy-20261006d, 10-07 16:26Z).
+     * Watched to FAIL with the lane's pthread-key destructor removed:
+     * 64 threads left 192 descriptors open. */
+    { extern long g_rd_lane_entries;
+      long e0 = g_rd_lane_entries; int f0 = open_fds();
+      for (int i = 0; i < 64; i++){ pthread_t th; pthread_create(&th, NULL, getblock_once, NULL); pthread_join(th, NULL); }
+      int f1 = open_fds();
+      printf("      64 one-call threads: %ld lane entries, open descriptors %d -> %d\n", g_rd_lane_entries - e0, f0, f1);
+      ck("64 one-call threads each entered the reader lane", g_rd_lane_entries - e0 == 64);
+      ck("...each read the genesis block through it", g_getblock_once_ok == 64);
+      ck("...and their lanes were closed at thread exit (no descriptor left open)", f1 == f0); }
 
     /* ---- getblock ---- */
     { char p[128]; snprintf(p, sizeof p, "[\"%s\", 0]", GENESIS_HASH);
@@ -1691,6 +1730,34 @@ int main(void){
         rj_free(r1); rj_free(p1); }
       g_usi_stub_busy = 0;
       rpc_chain_set_utxosetinfo(0);
+    }
+
+    /* ---- dumptxoutset: the path is resolved as Core resolves it,
+     * AbsPathJoin(GetDataDirNet(), path) -- relative to the per-chain datadir
+     * (the working directory), an absolute one kept -- and the reply's "path"
+     * is the resolved one (ST2-3). The runner's refusal (-2) is Core's
+     * RPC_INVALID_PARAMETER. ---- */
+    {
+      extern void rpc_chain_set_utxodump(long (*)(const char*, int (*)(long, unsigned char*),
+                                          long*, unsigned long long*, char*, unsigned long));
+      rpc_chain_set_utxodump(dump_stub_run);
+      char cwd[1024]; if (!getcwd(cwd, sizeof cwd)) cwd[0] = 0;
+      char want[1100]; snprintf(want, sizeof want, "%s/snap.dat", cwd);
+      g_dump_ret = 1; g_dump_path[0] = 0;
+      r = call("dumptxoutset", "[\"snap.dat\", \"latest\"]", &ec, &em);
+      ck("dumptxoutset: a relative path reaches the runner joined to the datadir", !strcmp(g_dump_path, want));
+      if (strcmp(g_dump_path, want)) printf("      runner got [%s], want [%s]\n", g_dump_path, want);
+      ck_str("dumptxoutset: the reply names the resolved path", r ? S(r,"path") : NULL, want);
+      ck_str("dumptxoutset: coins_written from the runner", r ? S(r,"coins_written") : NULL, "7");
+      rj_free(r);
+      r = call("dumptxoutset", "[\"/abs/where/snap.dat\"]", &ec, &em);
+      ck("dumptxoutset: an absolute path stands", !strcmp(g_dump_path, "/abs/where/snap.dat"));
+      rj_free(r);
+      g_dump_ret = -2;
+      { char msgw[1300]; snprintf(msgw, sizeof msgw, "%s/utxo_manifest.dat already exists. If you are sure this is what you want, move it out of the way first", cwd);
+        expect_err("dumptxoutset: the runner's refusal is RPC_INVALID_PARAMETER with Core's text", "dumptxoutset", "[\"utxo_manifest.dat\"]", -8, msgw); }
+      g_dump_ret = 1;
+      rpc_chain_set_utxodump(0);
     }
 
     /* ---- scantxoutset: dispatch + shape over an injected STUB scanner (the

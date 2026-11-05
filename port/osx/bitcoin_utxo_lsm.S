@@ -19,7 +19,11 @@
  *   +64 tomb_buf, +72 tomb_cap, +80 tomb_n, +88 total_live, +96 next_gen,
  *   +104 manifest_buf, +112 manifest_cap, +120 manifest_n, +128 scratch_buf,
  *   +136 scratch_cap, +144 next_run_no, +152 tomb hash (LSM-owned mmap),
- *   +160 tomb hash mask.
+ *   +160 tomb hash mask. The frozen generation (main 2026-10-06, plan B3;
+ *   read only after utxo_lsm_fz_enable(1)): +168 fz_u (a memtable-shaped
+ *   copy, caller-sized), +176 fz_tomb_buf (the spare list), +184 fz_tomb_n,
+ *   +192/+200 the spare hash set and mask, +208 fz_active, +216 fz_gen,
+ *   +224 fz_run_no, +232 fz_wal_end.
  * Descriptor (64 bytes, flush scratch): key36 @0 (txid @0, index @32),
  * type @36 (1 PUSH / 2 DEL), value @40, slen @48, height @50, cb @54,
  * script pointer @56.
@@ -67,6 +71,12 @@
 #define MAGIC_MANIFEST   0x4E414D55
 #define MAGIC_MANIFEST2  0x324E4D55
 #define BLOOM_MAX_BYTES  0x400000
+/* RUN_BLOOM_MAX_BYTES (main 2026-10-09): the largest bloom a run is written
+ * with. At 4 MiB a ~19M-record bulk run got 1.76 bits a key and passed 55%
+ * of absent keys. 256 MiB = 2^31 bits, 10 bits a key for ~200M records (the
+ * masks are 32-bit). A flush bloom past BLOOM_MAX_BYTES gets its own
+ * anonymous mapping; readers take the size from the header. */
+#define RUN_BLOOM_MAX_BYTES 0x10000000
 #define SCRIPT_MAX       65536
 #define SPARSE_STRIDE    64
 #define SPARSE_ENT       44
@@ -192,11 +202,13 @@ Lopen3:
     ldp   x29, x30, [sp], #16
     ret
 
-/* Lfsync_dir: fsync(".") best effort */
+/* Lfsync_dir -> x0 0 / -1: fsync(".") (the chain directory). STO-D/STO-W
+ * (main 2026-10-23): a failed open used to skip the fsync silently, and the
+ * fsync's own result was not looked at (ST2-1); both fail now. */
     .p2align 2
 Lfsync_dir:
     stp   x29, x30, [sp, #-32]!
-    str   x19, [sp, #16]
+    stp   x19, x20, [sp, #16]
     mov   x29, sp
     ADR_  x0, Ldot
     mov   w1, #O_RDONLY
@@ -204,9 +216,14 @@ Lfsync_dir:
     tbnz  w0, #31, 1f
     mov   w19, w0
     bl    _fsync
+    mov   w20, w0
     mov   w0, w19
     bl    _close
-1:  ldr   x19, [sp, #16]
+    tbnz  w20, #31, 1f
+    mov   x0, #0
+    b     2f
+1:  mov   x0, #-1
+2:  ldp   x19, x20, [sp, #16]
     ldp   x29, x30, [sp], #32
     ret
 
@@ -233,6 +250,8 @@ Lfmt_runname:
 #define G_DEFPUB  32
 #define G_HOOK    40
 #define G_SORT    48
+#define G_FREEZE  56                      /* plan B3: long hook(lst, u) replaces Lflush at the threshold */
+#define G_FZON    64                      /* utxo_lsm_fz_enable: the frozen fields (+168..) may be read */
 
 /* Lfl_drain(fd=w0) -> 0 / -1 */
     .p2align 2
@@ -490,46 +509,59 @@ Ltomb_reset:
     ret
 
 /* Ltomb_probe(lst=x0, key=x1) -> x0 = the slot's address (empty -1, or the
- * index of the tomb holding key) ; lst x19, key x20, off x21, mask x22 */
+ * index of the tomb holding key): the live set (+152/+160 over +64) */
     .p2align 2
 Ltomb_probe:
+    mov   x3, x1
+    ldr   x2, [x0, #64]
+    ldr   x1, [x0, #160]
+    ldr   x0, [x0, #152]
+    b     Ltomb_probe_raw
+
+/* Ltomb_probe_raw(hash=x0, mask=x1, tomb=x2, key=x3) -> x0 = &slot: the probe
+ * over an explicit set, so utxo_lsm_get can ask the FROZEN generation's
+ * (+192/+200 over +176) as well (plan B3). The home slot is utxo_hash's mix
+ * (main 2026-10-10): the txid's first 8 bytes ^ the index, times
+ * 0x9E3779B97F4A7C15, bits 32.. under the mask. FNV ^ index put a
+ * transaction's spent outputs in neighbouring slots. The set is rebuilt from
+ * the list, never persisted. hash x19, mask x20, tomb x21, key x22, off x23 */
+    .p2align 2
+Ltomb_probe_raw:
     stp   x29, x30, [sp, #-48]!
     stp   x19, x20, [sp, #16]
     stp   x21, x22, [sp, #32]
     mov   x29, sp
+    str   x23, [sp, #-16]!
     mov   x19, x0
     mov   x20, x1
-    MOVW  w9, SEED0                       /* FNV-1a over the txid's first 8 bytes */
-    MOVW  w10, 16777619
-    mov   x11, #0
-1:  ldrb  w12, [x20, x11]
-    eor   w9, w9, w12
-    mul   w9, w9, w10
-    add   x11, x11, #1
-    cmp   x11, #8
-    b.lo  1b
-    ldr   w12, [x20, #32]
-    eor   w9, w9, w12
-    ldr   x22, [x19, #160]
-    and   x21, x9, x22
-2:  ldr   x9, [x19, #152]
-    add   x9, x9, x21, lsl #3
+    mov   x21, x2
+    mov   x22, x3
+    ldr   x9, [x22]
+    ldr   w10, [x22, #32]
+    eor   x9, x9, x10
+    movz  x10, #0x7c15
+    movk  x10, #0x7f4a, lsl #16
+    movk  x10, #0x79b9, lsl #32
+    movk  x10, #0x9e37, lsl #48
+    mul   x9, x9, x10
+    lsr   x9, x9, #32
+    and   x23, x9, x20
+2:  add   x9, x19, x23, lsl #3
     ldr   x10, [x9]
     cmn   x10, #1
     b.eq  3f
-    ldr   x11, [x19, #64]                 /* tomb + idx * 36 */
-    mov   x12, #36
-    madd  x0, x10, x12, x11
-    mov   x1, x20
+    mov   x12, #36                        /* tomb + idx * 36 */
+    madd  x0, x10, x12, x21
+    mov   x1, x22
     bl    Lcmp_key
     cmp   w0, #1
     b.eq  4f
-    add   x21, x21, #1
-    and   x21, x21, x22
+    add   x23, x23, #1
+    and   x23, x23, x20
     b     2b
-4:  ldr   x9, [x19, #152]
-    add   x9, x9, x21, lsl #3
+4:  add   x9, x19, x23, lsl #3
 3:  mov   x0, x9
+    ldr   x23, [sp], #16
     ldp   x21, x22, [sp, #32]
     ldp   x19, x20, [sp, #16]
     ldp   x29, x30, [sp], #48
@@ -1116,6 +1148,24 @@ _utxo_lsm_set_flush_hook:
     str   x0, [x9, #G_HOOK]
     ret
 
+/* plan B3 (main 2026-10-06): the freeze hook, long hook(lst, u), replaces
+ * Lflush at put/del's threshold (the freeze + the forked writer; -1 is a
+ * flush error to the caller, as Lflush's was); fz_enable gates every read of
+ * the frozen fields, so a caller that never freezes needs none of them. */
+    .p2align 2
+    .globl _utxo_lsm_set_freeze_hook
+_utxo_lsm_set_freeze_hook:
+    ADR_  x9, Lg
+    str   x0, [x9, #G_FREEZE]
+    ret
+
+    .p2align 2
+    .globl _utxo_lsm_fz_enable
+_utxo_lsm_fz_enable:
+    ADR_  x9, Lg
+    str   x0, [x9, #G_FZON]
+    ret
+
 /* ==========================================================================
  * the public API: init, flush, put, del, count, close
  * ======================================================================== */
@@ -1164,22 +1214,39 @@ _utxo_lsm_init:
     ret
 
 /* ============================================================================
- * Lflush(lst=x0, u=x1): the memtable's live entries + this generation's
- * not-live-again tombstones -> a new MAGIC_RUN3 run; publish the manifest;
- * reset the WAL; clear the memtable and the tombstones.
+ * Lbuild_run(lst=x0, u=x1, tomb=x2, tomb_n=x3, gen=x4, run_no=x5)
+ *   -> x0 1 run written / 0 nothing to write / -1 err
+ * The run writer that was the middle of Lflush (main 2026-10-06, plan B3):
+ * every live slot of memtable u and every tombstone of the given list whose
+ * key is not live in u become one sorted, Bloom-filtered run file
+ * utxo_run_<run_no>.dat with generation gen in its header, fsynced and
+ * closed. It reads no lst field but scratch_buf/scratch_cap and publishes
+ * nothing: the caller owns the manifest, the WAL and the memtable. Lflush
+ * calls it on the live memtable and this generation's list; the async flush
+ * (daemon/utxo_live.c) calls it in a forked child on the FROZEN copy,
+ * through utxo_lsm_build_run.
  * lst x19, u x20, n_desc x21, desc (scratch) x22, desc_cap x23, i x24,
  * fd x25, bloom bits x26, sparse_n x27, sparse buffer x28 ;
- * frame: hdr 0 (48), runname 48 (32), get outputs 80 (48),
- *        manifest hdr 128 (24) -> 160
+ * frame: hdr 0 (48), runname 48 (32), get outputs 80 (48), (128..159 free),
+ *        tomb 160, tomb_n 168, gen 176, run_no 184, bloom 192, bloom map 200
  * ========================================================================== */
 #define FL_HDR    0
 #define FL_NAME   48
 #define FL_GET    80
 #define FL_MH     128
 #define FL_SIZE   160
+#define BR_TOMB   160
+#define BR_TN     168
+#define BR_GEN    176
+#define BR_RUN    184
+#define BR_BLOOM  192
+#define BR_BMAP   200
+#define BR_SIZE   208
 
     .p2align 2
-Lflush:
+    .globl _utxo_lsm_build_run
+_utxo_lsm_build_run:
+Lbuild_run:
     stp   x29, x30, [sp, #-96]!
     stp   x19, x20, [sp, #16]
     stp   x21, x22, [sp, #32]
@@ -1187,17 +1254,13 @@ Lflush:
     stp   x25, x26, [sp, #64]
     stp   x27, x28, [sp, #80]
     mov   x29, sp
-    sub   sp, sp, #FL_SIZE
+    sub   sp, sp, #BR_SIZE
     mov   x19, x0
     mov   x20, x1
-    ADR_  x9, Lg                          /* the flush hook FIRST */
-    ldr   x9, [x9, #G_HOOK]
-    cbz   x9, 1f
-    blr   x9
-1:  mov   x0, x19
-    bl    _utxo_store_wal_drain
-    cmn   x0, #1
-    b.eq  Lfl_no
+    stp   x2, x3, [sp, #BR_TOMB]
+    stp   x4, x5, [sp, #BR_GEN]
+    stp   xzr, xzr, [sp, #BR_BLOOM]
+    mov   x26, #0
     ldr   x9, [x19, #136]                 /* desc_cap = (cap - bloom - script) / 128 */
     MOVW  x10, (BLOOM_MAX_BYTES + SCRIPT_MAX)
     mov   x23, #0
@@ -1216,7 +1279,7 @@ Lflush:
     cmn   w10, #1
     b.eq  4f
     cmp   x21, x23
-    b.hs  Lfl_no                          /* out of descriptor room */
+    b.hs  Lbr_no                          /* out of descriptor room */
     add   x11, x22, x21, lsl #6           /* d */
     ldp   x12, x13, [x9, #8]              /* txid */
     stp   x12, x13, [x11]
@@ -1242,10 +1305,10 @@ Lflush:
     b     3b
 5:  /* tombstones -> DEL descriptors, unless the key is live again */
     mov   x24, #0
-6:  ldr   x9, [x19, #80]
+6:  ldr   x9, [sp, #BR_TN]
     cmp   x24, x9
     b.hs  8f
-    ldr   x9, [x19, #64]
+    ldr   x9, [sp, #BR_TOMB]
     mov   x10, #36
     madd  x25, x24, x10, x9               /* key (x25 free until the file opens) */
     mov   x0, x20
@@ -1260,7 +1323,7 @@ Lflush:
     cmp   x0, #1
     b.eq  7f                              /* still live: skip */
     cmp   x21, x23
-    b.hs  Lfl_no
+    b.hs  Lbr_no
     add   x11, x22, x21, lsl #6
     ldp   x12, x13, [x25]
     stp   x12, x13, [x11]
@@ -1273,10 +1336,7 @@ Lflush:
     add   x21, x21, #1
 7:  add   x24, x24, #1
     b     6b
-8:  cbz   x21, Lfl_reset                  /* nothing to write */
-    ldp   x9, x10, [x19, #112]            /* manifest cap, n */
-    cmp   x10, x9
-    b.hs  Lfl_no
+8:  cbz   x21, Lbr_none                   /* every tombstone shadowed by a live key */
     mov   x0, x22                         /* sort by key */
     add   x1, x22, x23, lsl #6
     mov   x2, x21
@@ -1292,36 +1352,55 @@ Lflush:
     b.hs  10f
     lsl   x26, x26, #1
     b     9b
-10: mov   x9, #(BLOOM_MAX_BYTES * 8)
+10: mov   x9, #RUN_BLOOM_MAX_BYTES
+    lsl   x9, x9, #3
     cmp   x26, x9
     csel  x26, x26, x9, ls
-    add   x0, x22, x23, lsl #7            /* the bloom at scratch + 2 * desc_cap * 64 */
-    mov   x1, #0
+    /* the bloom at scratch + 2 * desc_cap * 64, or, past BLOOM_MAX_BYTES (the
+     * scratch's bloom area), its own mapping -- fresh, so already zero */
+    add   x0, x22, x23, lsl #7
+    str   x0, [sp, #BR_BLOOM]
+    lsr   x1, x26, #3
+    mov   x9, #BLOOM_MAX_BYTES
+    cmp   x1, x9
+    b.ls  101f
+    mov   x0, #0
+    mov   w2, #PROT_RW
+    mov   w3, #MAP_PRIV_ANON
+    mov   w4, #-1
+    mov   x5, #0
+    bl    _mmap
+    cmn   x0, #1
+    b.eq  Lbr_no
+    str   x0, [sp, #BR_BLOOM]
+    str   x0, [sp, #BR_BMAP]
+    b     102f
+101: mov  x1, #0
     lsr   x2, x26, #3
     bl    _memset
-    mov   x24, #0
+102: mov  x24, #0
 11: cmp   x24, x21
     b.hs  12f
     add   x0, x22, x24, lsl #6
-    add   x1, x22, x23, lsl #7
+    ldr   x1, [sp, #BR_BLOOM]
     sub   w2, w26, #1
     bl    Lbloom_set3
     add   x24, x24, #1
     b     11b
 12: /* the run file */
     add   x0, sp, #FL_NAME
-    ldr   w1, [x19, #144]
+    ldr   w1, [sp, #BR_RUN]
     bl    Lfmt_runname
     add   x0, sp, #FL_NAME
     mov   w1, #(O_WRONLY | O_CREAT | O_TRUNC)
     bl    Lopen3
-    tbnz  w0, #31, Lfl_no
+    tbnz  w0, #31, Lbr_no
     mov   w25, w0
     ADR_  x9, Lg
     str   xzr, [x9, #G_FLFILL]
     MOVW  w9, MAGIC_RUN3                  /* header: magic gen nrec bits 0 0 */
     str   w9, [sp, #FL_HDR]
-    ldr   x9, [x19, #96]
+    ldr   x9, [sp, #BR_GEN]
     stur  x9, [sp, #FL_HDR + 4]
     stur  x21, [sp, #FL_HDR + 12]
     stur  x26, [sp, #FL_HDR + 20]
@@ -1331,12 +1410,12 @@ Lflush:
     add   x1, sp, #FL_HDR
     mov   x2, #44
     bl    Lwrite_exact
-    cbnz  x0, Lfl_fail
+    cbnz  x0, Lbr_fail
     mov   w0, w25
-    add   x1, x22, x23, lsl #7
+    ldr   x1, [sp, #BR_BLOOM]
     lsr   x2, x26, #3
     bl    Lwrite_exact
-    cbnz  x0, Lfl_fail
+    cbnz  x0, Lbr_fail
     add   x28, x22, x23, lsl #6           /* the sparse staging: the pong slack */
     mov   x27, #0
     mov   x24, #0
@@ -1348,7 +1427,7 @@ Lflush:
     mov   x1, #0
     mov   w2, #SEEK_CUR
     bl    _lseek
-    tbnz  x0, #63, Lfl_fail
+    tbnz  x0, #63, Lbr_fail
     ADR_  x9, Lg
     ldr   x9, [x9, #G_FLFILL]
 #ifndef LSM_REPRO_BAD_SPARSE
@@ -1369,7 +1448,7 @@ Lflush:
     add   x1, x22, x24, lsl #6
     mov   x2, #37
     bl    Lfl_write
-    cbnz  x0, Lfl_fail
+    cbnz  x0, Lbr_fail
     add   x9, x22, x24, lsl #6
     ldrb  w10, [x9, #36]
     cmp   w10, #1
@@ -1378,24 +1457,24 @@ Lflush:
     add   x1, x9, #40
     mov   x2, #15
     bl    Lfl_write
-    cbnz  x0, Lfl_fail
+    cbnz  x0, Lbr_fail
     add   x9, x22, x24, lsl #6
     ldrh  w2, [x9, #48]
     cbz   w2, 141f
     mov   w0, w25
     ldr   x1, [x9, #56]
     bl    Lfl_write
-    cbnz  x0, Lfl_fail
+    cbnz  x0, Lbr_fail
 141: add  x24, x24, #1
     b     13b
 15: mov   w0, w25
     bl    Lfl_drain
-    cbnz  x0, Lfl_fail
+    cbnz  x0, Lbr_fail
     mov   w0, w25                         /* the sparse index after the records */
     mov   x1, #0
     mov   w2, #SEEK_CUR
     bl    _lseek
-    tbnz  x0, #63, Lfl_fail
+    tbnz  x0, #63, Lbr_fail
     stur  x0, [sp, #FL_HDR + 28]
     stur  x27, [sp, #FL_HDR + 36]
     cbz   x27, 16f
@@ -1404,21 +1483,104 @@ Lflush:
     mov   x9, #SPARSE_ENT
     mul   x2, x27, x9
     bl    Lwrite_exact
-    cbnz  x0, Lfl_fail
+    cbnz  x0, Lbr_fail
 16: mov   w0, w25                         /* patch sparse_off / sparse_n */
     mov   x1, #28
     mov   w2, #SEEK_SET
     bl    _lseek
-    tbnz  x0, #63, Lfl_fail
+    tbnz  x0, #63, Lbr_fail
     mov   w0, w25
     add   x1, sp, #FL_HDR + 28
     mov   x2, #16
     bl    Lwrite_exact
-    cbnz  x0, Lfl_fail
+    cbnz  x0, Lbr_fail
+    /* ST2-1 (main 2026-10-23): the run's fsync result decides the flush. A
+     * writeback error used to fall through to "run written", and the
+     * manifest was then published naming a run the kernel had just said it
+     * could not make durable. */
     mov   w0, w25
     bl    _fsync
+    mov   w24, w0
     mov   w0, w25
     bl    _close
+    tbnz  w24, #31, Lbr_no
+    mov   x0, #1
+    b     Lbr_ret
+Lbr_none:
+    mov   x0, #0
+    b     Lbr_ret
+Lbr_fail:
+    mov   w0, w25
+    bl    _close
+Lbr_no:
+    mov   x0, #-1
+Lbr_ret:
+    ldr   x1, [sp, #BR_BMAP]              /* the bloom's own mapping, if any */
+    cbz   x1, 1f
+    mov   x19, x0                         /* the result (x19 is restored below) */
+    mov   x0, x1
+    lsr   x1, x26, #3
+    bl    _munmap
+    mov   x0, x19
+1:  add   sp, sp, #BR_SIZE
+    ldp   x27, x28, [sp, #80]
+    ldp   x25, x26, [sp, #64]
+    ldp   x23, x24, [sp, #48]
+    ldp   x21, x22, [sp, #32]
+    ldp   x19, x20, [sp, #16]
+    ldp   x29, x30, [sp], #96
+    ret
+
+/* ============================================================================
+ * Lflush(lst=x0, u=x1): the memtable's live entries + this generation's
+ * not-live-again tombstones -> a new MAGIC_RUN3 run (Lbuild_run); publish
+ * the manifest; empty utxo.idx; reset the WAL; clear the memtable and the
+ * tombstones. lst x19, u x20, fd x25 ; frame: Lbuild_run's first 160
+ * ========================================================================== */
+    .p2align 2
+Lflush:
+    stp   x29, x30, [sp, #-96]!
+    stp   x19, x20, [sp, #16]
+    stp   x21, x22, [sp, #32]
+    stp   x23, x24, [sp, #48]
+    stp   x25, x26, [sp, #64]
+    stp   x27, x28, [sp, #80]
+    mov   x29, sp
+    sub   sp, sp, #FL_SIZE
+    mov   x19, x0
+    mov   x20, x1
+    ADR_  x9, Lg                          /* the flush hook FIRST */
+    ldr   x9, [x9, #G_HOOK]
+    cbz   x9, 1f
+    blr   x9
+1:  mov   x0, x19
+    bl    _utxo_store_wal_drain
+    cmn   x0, #1
+    b.eq  Lfl_no
+    ldr   x9, [x20]                       /* an empty generation: just the reset */
+    ldr   x10, [x19, #80]
+    orr   x9, x9, x10
+    cbz   x9, Lfl_reset
+    /* manifest capacity BEFORE any run-file work: a run written and then
+     * refused by the manifest would be an orphan */
+    ldp   x9, x10, [x19, #112]            /* manifest cap, n */
+    cmp   x10, x9
+    b.hs  Lfl_no
+    mov   x0, x19
+    mov   x1, x20
+    ldr   x2, [x19, #64]                  /* tomb_buf */
+    ldr   x3, [x19, #80]                  /* tomb_n */
+    ldr   x4, [x19, #96]                  /* gen = next_gen */
+    ldr   x5, [x19, #144]                 /* run_no = next_run_no */
+    bl    Lbuild_run
+    cmn   x0, #1
+    b.eq  Lfl_no
+    cbz   x0, Lfl_reset                   /* nothing written */
+    /* STO-W (main 2026-10-23): the run's create durable before the manifest
+     * rename that names it; POSIX orders nothing between two name ops of
+     * one directory */
+    bl    Lfsync_dir
+    cbnz  x0, Lfl_no
     /* the manifest: append, publish */
     ldp   x9, x10, [x19, #112]
     cmp   x10, x9
@@ -1459,16 +1621,32 @@ Lflush:
 17: mov   w0, w25
     bl    _close
     b     Lfl_no
-18: mov   w0, w25
-    bl    _fsync
+18: mov   w0, w25                         /* ST2-1: a failed fsync of the tmp */
+    bl    _fsync                          /* manifest is a failed publish */
+    tbnz  w0, #31, 17b
     mov   w0, w25
     bl    _close
     ADR_  x0, Lman_tmp
     ADR_  x1, Lman_name
     bl    _rename
     tbnz  w0, #31, Lfl_no
+    /* ST2-1/STO-D: a failed directory fsync fails the flush BEFORE the WAL
+     * reset: the rename may not be durable, so the WAL keeps this generation */
     bl    Lfsync_dir
+    cbnz  x0, Lfl_no
 Lfl_reset:
+    /* plan B3 (main 2026-10-06): the checkpoint offset retires WITH the WAL.
+     * An async adopt advances utxo.idx's log_off past the generations it
+     * retired; a WAL truncated to 0 with that offset still on disk would have
+     * the next reload skip the records appended below it. The idx is emptied
+     * FIRST: a failure leaves the run published and the WAL intact. (idx fd
+     * -1 = a read-only store, which never flushes.) */
+    ldr   x0, [x19, #8]
+    tbnz  x0, #63, 19f
+    mov   x1, #0
+    bl    _ftruncate
+    tbnz  w0, #31, Lfl_no
+19: stp   xzr, xzr, [x19, #24]            /* ckpt_log_off, ckpt_n */
     ldr   x0, [x19]                       /* UTX-8: the WAL reset first */
     mov   x1, #0
     bl    _ftruncate
@@ -1489,9 +1667,6 @@ Lfl_reset:
     b.ne  Lfl_no
     mov   x0, #1
     b     Lfl_ret
-Lfl_fail:
-    mov   w0, w25
-    bl    _close
 Lfl_no:
     mov   x0, #-1
 Lfl_ret:
@@ -1509,8 +1684,111 @@ Lfl_ret:
 _utxo_lsm_flush:
     b     Lflush
 
-/* Lmaybe_flush(lst=x0, u=x1) -> x0 0 / -1: flush when op_count >= its
- * threshold or the memtable holds >= the fill threshold */
+/* ============================================================================
+ * utxo_lsm_freeze(lst=x0, u=x1, fz=x2) -> 1 frozen / 0 nothing / -1 err
+ * Plan B3 (main 2026-10-06): the applier's half of a flush, O(copy) instead
+ * of O(sort + write + fsync). The live table and its blob's used prefix are
+ * copied into fz (a memtable-shaped buffer the caller sized like the live
+ * one), this generation's tombstone list and hash set swap with the spare
+ * pair (+176, +192/+200), the generation's gen and run number are reserved,
+ * fz_wal_end records where its WAL bytes end, fz_active is set, and the live
+ * table is cleared for the next generation. The caller writes the run from
+ * the copy (utxo_lsm_build_run), publishes it and retires the WAL bytes below
+ * fz_wal_end (daemon/utxo_live.c), then clears fz_active. One frozen set at a
+ * time: a freeze while fz_active is set is refused (-1). The flush hook (the
+ * compaction gate) runs first, as in Lflush, and the WAL buffer is drained
+ * so fz_wal_end is a file offset. lst x19, u x20, fz x21, fz blob x22, cap x23
+ * ========================================================================== */
+    .p2align 2
+    .globl _utxo_lsm_freeze
+_utxo_lsm_freeze:
+    stp   x29, x30, [sp, #-64]!
+    stp   x19, x20, [sp, #16]
+    stp   x21, x22, [sp, #32]
+    str   x23, [sp, #48]
+    mov   x29, sp
+    mov   x19, x0
+    mov   x20, x1
+    mov   x21, x2
+    ADR_  x9, Lg
+    ldr   x9, [x9, #G_HOOK]
+    cbz   x9, 1f
+    blr   x9
+1:  mov   x0, x19
+    bl    _utxo_store_wal_drain
+    cmn   x0, #1
+    b.eq  Lfz_no
+    ldr   x9, [x20]
+    ldr   x10, [x19, #80]
+    orr   x9, x9, x10
+    cbz   x9, Lfz_none
+    ldr   x9, [x19, #208]
+    cbnz  x9, Lfz_no                      /* a frozen set exists: wait for its writer */
+    ldp   x22, x23, [x21, #16]            /* the copy's own blob and cap */
+    ldr   x9, [x20, #32]                  /* the copy's blob must hold the live fill */
+    cmp   x9, x23
+    b.hi  Lfz_no
+    ldr   x2, [x20, #8]                   /* header + slots */
+    add   x2, x2, #1
+    mov   x9, #48
+    mul   x2, x2, x9
+    add   x2, x2, #40
+    mov   x0, x21
+    mov   x1, x20
+    bl    _memcpy
+    stp   x22, x23, [x21, #16]
+    mov   x0, x22                         /* the blob's used prefix */
+    ldr   x1, [x20, #16]
+    ldr   x2, [x20, #32]
+    bl    _memcpy
+    ldr   x9, [x19, #64]                  /* the list and its set swap with the spares */
+    ldr   x10, [x19, #176]
+    str   x10, [x19, #64]
+    str   x9, [x19, #176]
+    ldr   x9, [x19, #80]
+    str   x9, [x19, #184]                 /* fz_tomb_n */
+    str   xzr, [x19, #80]
+    ldp   x9, x10, [x19, #152]
+    ldp   x11, x12, [x19, #192]
+    stp   x11, x12, [x19, #152]
+    stp   x9, x10, [x19, #192]
+    mov   x0, x19
+    bl    Ltomb_reset                     /* the (possibly first-time) live set, emptied */
+    cmp   x0, #1
+    b.ne  Lfz_no
+    ldr   x9, [x19, #96]                  /* the numbers are reserved now */
+    str   x9, [x19, #216]                 /* fz_gen */
+    add   x9, x9, #1
+    str   x9, [x19, #96]
+    ldr   x9, [x19, #144]
+    str   x9, [x19, #224]                 /* fz_run_no */
+    add   x9, x9, #1
+    str   x9, [x19, #144]
+    ldr   x9, [x19, #16]
+    str   x9, [x19, #232]                 /* fz_wal_end = log_len */
+    str   x21, [x19, #168]                /* fz_u */
+    mov   x9, #1
+    str   x9, [x19, #208]                 /* fz_active: readers consult the copy */
+    mov   x0, x20
+    bl    Lclear_memtable
+    str   xzr, [x19, #40]                 /* op_count */
+    mov   x0, #1
+    b     Lfz_ret
+Lfz_none:
+    mov   x0, #0
+    b     Lfz_ret
+Lfz_no:
+    mov   x0, #-1
+Lfz_ret:
+    ldr   x23, [sp, #48]
+    ldp   x21, x22, [sp, #32]
+    ldp   x19, x20, [sp, #16]
+    ldp   x29, x30, [sp], #64
+    ret
+
+/* Lmaybe_flush(lst=x0, u=x1) -> x0 0 / -1: flush (or freeze, through the
+ * freeze hook) when op_count >= its threshold or the memtable holds >= the
+ * fill threshold */
     .p2align 2
 Lmaybe_flush:
     ldr   x9, [x0, #40]
@@ -1525,8 +1803,13 @@ Lmaybe_flush:
     ret
 1:  stp   x29, x30, [sp, #-16]!
     mov   x29, sp
-    bl    Lflush
-    cmn   x0, #1
+    ADR_  x9, Lg                          /* plan B3: the freeze hook replaces */
+    ldr   x9, [x9, #G_FREEZE]             /* the inline flush when set */
+    cbz   x9, 2f
+    blr   x9
+    b     3f
+2:  bl    Lflush
+3:  cmn   x0, #1
     mov   x9, #0
     csel  x0, x0, x9, eq                  /* -1 stays, 1 -> 0 */
     ldp   x29, x30, [sp], #16
@@ -1722,10 +2005,10 @@ Lrl_fallback:
     ldp   x9, x10, [x21, #16]
     stp   x9, x10, [sp, #RL_KEY + 16]
     str   w22, [sp, #RL_KEY + 32]
-    ldr   x9, [sp, #RL_HDR + 16]          /* bloom bytes */
-    mov   x10, #BLOOM_MAX_BYTES
-    cmp   x9, x10
-    b.hi  Lrl_errc
+    ldr   x9, [sp, #RL_HDR + 16]          /* bloom bytes: up to RUN_BLOOM_MAX_BYTES */
+    mov   x10, #RUN_BLOOM_MAX_BYTES       /* (main's fallback copies the bloom to a */
+    cmp   x9, x10                         /* 4 MiB TLS buffer and skips a larger one; */
+    b.hi  Lrl_errc                        /* this one preads its three bytes) */
     mov   w0, w24                         /* the whole bloom must be there */
     add   x1, sp, #RL_STAT
     bl    _fstat
@@ -1922,7 +2205,7 @@ _utxo_lsm_get:
     str   x27, [sp, #80]
     mov   x29, sp
     ldr   x26, [x29, #96]                 /* slen*: the 9th argument */
-    sub   sp, sp, #80
+    sub   sp, sp, #96
     mov   x19, x0
     mov   x20, x2
     mov   w21, w3
@@ -1952,7 +2235,50 @@ _utxo_lsm_get:
     ldr   x9, [x0]
     cmn   x9, #1
     b.ne  Lg_zero
-    ldr   x27, [x19, #120]                /* the runs, newest manifest index first */
+    /* the frozen generation (plan B3): a put before the freeze that the run
+     * writer has not published yet. After the live generation (a live
+     * tombstone shadows it), before the runs. A hit's script is copied to
+     * this thread's script buffer, the run-hit contract (valid until the
+     * next get): the copy is overwritten by the next freeze. */
+    ADR_  x9, Lg
+    ldr   x9, [x9, #G_FZON]
+    cbz   x9, 3f
+    ldr   x9, [x19, #208]                 /* fz_active */
+    cbz   x9, 3f
+    ldr   x0, [x19, #168]                 /* fz_u */
+    mov   x1, x20
+    mov   w2, w21
+    mov   x3, x22
+    mov   x4, x23
+    mov   x5, x24
+    add   x6, sp, #80                     /* script, slen: own slots */
+    add   x7, sp, #88
+    bl    _utxo_get
+    cmp   x0, #1
+    b.ne  4f
+    ldr   x27, [sp, #88]
+    cmp   x27, #SCRIPT_MAX
+    b.hi  Lg_err                          /* cannot happen: the memtable refuses such scripts */
+    adrp  x0, _bmc_lsm_script_tlv@TLVPPAGE
+    ldr   x0, [x0, _bmc_lsm_script_tlv@TLVPPAGEOFF]
+    ldr   x8, [x0]
+    blr   x8
+    str   x0, [x25]                       /* *script = this thread's copy */
+    str   x27, [x26]
+    ldr   x1, [sp, #80]
+    mov   x2, x27
+    bl    _memcpy
+    mov   x0, #1
+    b     Lg_ret
+4:  ldr   x0, [x19, #192]                 /* the frozen generation's tombstones */
+    ldr   x1, [x19, #200]
+    ldr   x2, [x19, #176]
+    mov   x3, sp
+    bl    Ltomb_probe_raw
+    ldr   x9, [x0]
+    cmn   x9, #1
+    b.ne  Lg_zero
+3:  ldr   x27, [x19, #120]                /* the runs, newest manifest index first */
 1:  cbz   x27, Lg_zero
     sub   x27, x27, #1
     ldr   x9, [x19, #104]
@@ -1984,8 +2310,11 @@ _utxo_lsm_get:
     b     Lg_ret
 Lg_zero:
     mov   x0, #0
+    b     Lg_ret
+Lg_err:
+    mov   x0, #-1
 Lg_ret:
-    add   sp, sp, #80
+    add   sp, sp, #96
     ldr   x27, [sp, #80]
     ldp   x25, x26, [sp, #64]
     ldp   x23, x24, [sp, #48]
@@ -2548,6 +2877,14 @@ Lreload:
     b.hs  8f
     add   x14, x10, x13, lsl #4
     ldp   x15, x16, [x14]
+    /* F7 (main 2026-10-23): a gen or run_no of 2^64-1 has no successor --
+     * next = max + 1 would wrap to 0 and break newest-wins. Nothing this
+     * node writes comes near it: the manifest is corrupt, a hard failure
+     * like any unreadable one (the fd is closed above) */
+    cmn   x15, #1
+    b.eq  Lre_no
+    cmn   x16, #1
+    b.eq  Lre_no
     cmp   x15, x11
     csel  x11, x15, x11, hi
     cmp   x16, x12
@@ -2577,6 +2914,14 @@ Lre_wal:
     bl    _open
     tbnz  w0, #31, Lre_no
     mov   w22, w0
+    /* from ckpt_log_off, not 0 (plan B3, main 2026-10-06): utxo_store_reload
+     * replayed the memtable from there, and the bytes below it are retired
+     * generations -- a punched hole that reads as zeros, which the loop
+     * below would take for the end of the log, dropping every tombstone */
+    ldr   x1, [x19, #24]
+    mov   w2, #SEEK_SET
+    bl    _lseek
+    tbnz  x0, #63, Lre_noc
     mov   x26, #0
     mov   x27, #0
 9:  mov   w0, w22                         /* while the offset < log_len */
@@ -2779,7 +3124,8 @@ _utxo_lsm_compact_range:
     b.hs  5f
     lsl   x10, x10, #1
     b     4b
-5:  mov   x9, #(BLOOM_MAX_BYTES * 8)
+5:  mov   x9, #RUN_BLOOM_MAX_BYTES
+    lsl   x9, x9, #3
     cmp   x10, x9
     csel  x10, x10, x9, ls
     str   x10, [sp, #CF_BITS]
@@ -2972,11 +3318,24 @@ Lcf_merged:
     mov   x2, #16
     bl    Lwrite_exact
     cbnz  x0, Lcf_fail
+    /* ST2-1 (main 2026-10-23): the merged run's fsync result decides the
+     * compaction (a failure used to publish the merge and unlink its
+     * inputs) */
     mov   w0, w26
     bl    _fsync
+    mov   w28, w0                         /* (sparse_n is spent) */
     mov   w0, w26
     bl    _close
-    /* the manifest: the merged entry at lo, the survivors shifted down */
+    tbnz  w28, #31, Lcf_cleanup
+    /* STO-W: the merged run's create durable before the manifest rename that
+     * names it (as in Lflush); a deferred publish leaves that to the
+     * parent's lsm_manifest_publish */
+    ADR_  x9, Lg
+    ldr   x9, [x9, #G_DEFPUB]
+    cbnz  x9, 91f
+    bl    Lfsync_dir
+    cbnz  x0, Lcf_cleanup
+91: /* the manifest: the merged entry at lo, the survivors shifted down */
     ldr   x9, [x19, #104]
     add   x10, x9, x20, lsl #4
     ldr   x11, [x19, #96]
@@ -3078,8 +3437,9 @@ Lcf_merged:
 17: mov   w0, w26
     bl    _close
     b     Lcf_cleanup_ok_files
-18: mov   w0, w26
+18: mov   w0, w26                         /* ST2-1: checked, as the flush's */
     bl    _fsync
+    tbnz  w0, #31, 17b
     mov   w0, w26
     bl    _close
     ADR_  x9, Lg
@@ -3089,7 +3449,10 @@ Lcf_merged:
     ADR_  x1, Lman_name
     bl    _rename
     tbnz  w0, #31, Lcf_cleanup_ok_files
+    /* ST2-1/STO-D: a failed directory fsync (or open) keeps the inputs: the
+     * rename may not be durable, the old manifest may come back naming them */
     bl    Lfsync_dir
+    cbnz  x0, Lcf_cleanup_ok_files
 19: mov   x26, #0                         /* close the inputs; unlink them */
 20: cmp   x26, x21                        /* unless deferred */
     b.hs  21f
@@ -3175,8 +3538,9 @@ Lwal_name:  .asciz "utxo.dat"
     .data
     .p2align 3
 Lg:         /* flush fill, compaction fd, compaction fill, defer_unlink,
-               defer_publish, flush hook, sort mode (1 = radix) */
-    .quad 0, 0, 0, 0, 0, 0, 1
+               defer_publish, flush hook, sort mode (1 = radix), freeze hook,
+               frozen fields on */
+    .quad 0, 0, 0, 0, 0, 0, 1, 0, 0
 Lrs_final:  .quad 0
 Lwalk_cb:   .quad 0
 

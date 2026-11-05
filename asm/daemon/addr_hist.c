@@ -54,6 +54,18 @@ static ah_tbuf* ah_tbuf_get(void){
 }
 static pthread_mutex_t g_ah_mu = PTHREAD_MUTEX_INITIALIZER;
 
+/* ST2-7 (audit 2026-10-23): the header's regions must lie inside the file,
+ * checked without wrapping -- a crafted body_off/body_len or sparse_n made
+ * the unchecked sums small again and the lookups read past the mapping. */
+static int ah_header_fits(const ah_header* h, uint64_t size){
+    uint64_t end;
+    if (h->body_off < AH_HDR_BYTES) return 0;
+    if (__builtin_add_overflow(h->body_off, h->body_len, &end) || end > size) return 0;
+    if (__builtin_mul_overflow(h->sparse_n, (uint64_t)AH_SPARSE_BYTES, &end)
+        || __builtin_add_overflow(end, h->sparse_off, &end) || end > size) return 0;
+    if (h->sparse_n && h->sparse_off < AH_HDR_BYTES) return 0;
+    return 1;
+}
 static int ah_open_one(ah_run* r){
     struct stat sb;
     if (stat(r->path, &sb) != 0 || (size_t)sb.st_size < AH_HDR_BYTES) return 0;
@@ -61,8 +73,7 @@ static int ah_open_one(ah_run* r){
     void* m = mmap(0, (size_t)sb.st_size, PROT_READ, MAP_SHARED, fd, 0); close(fd);
     if (m == MAP_FAILED) return 0;
     ah_header h; memcpy(&h, m, sizeof h);
-    if (h.magic != AH_MAGIC || h.version != AH_VERSION || h.body_off + h.body_len > (uint64_t)sb.st_size
-        || h.sparse_off + h.sparse_n * AH_SPARSE_BYTES > (uint64_t)sb.st_size){ munmap(m, (size_t)sb.st_size); return 0; }
+    if (h.magic != AH_MAGIC || h.version != AH_VERSION || !ah_header_fits(&h, (uint64_t)sb.st_size)){ munmap(m, (size_t)sb.st_size); return 0; }
     r->map = m; r->len = (size_t)sb.st_size; r->ino = sb.st_ino; r->hdr = h;
     r->to = (long)h.to_height;
     r->from = (long)h.pad;               /* a run writes its from_height here; the legacy base has 0 */
@@ -80,6 +91,16 @@ static int cmp_run(const void* a, const void* b){
     if (x->from != y->from) return x->from < y->from ? -1 : 1;
     if (x->to != y->to) return x->to < y->to ? -1 : 1;
     return strcmp(x->path, y->path);
+}
+/* is run i's [from,to] inside another run's? (same range: the earlier one
+ * in cmp_run order yields to the later) -- found[] is sorted by cmp_run */
+static int ah_range_superseded(const ah_run* f, int n, int i){
+    for (int j = 0; j < n; j++){
+        if (j == i || f[j].from > f[i].from || f[j].to < f[i].to) continue;
+        if (f[j].from == f[i].from && f[j].to == f[i].to && j < i) continue;
+        return 1;
+    }
+    return 0;
 }
 static int ah_scan(void){
     time_t now = time(NULL); struct stat ds;
@@ -103,7 +124,18 @@ static int ah_scan(void){
     closedir(d);
     for (int i = 0; i < g_n; i++) if (g_runs[i].map) ah_close_one(&g_runs[i]);
     qsort(found, (size_t)nf, sizeof found[0], cmp_run);
-    memcpy(g_runs, found, (size_t)nf * sizeof found[0]); g_n = nf;
+    /* ST2-2 (audit 2026-10-23): a run whose range lies inside another run's
+     * is that run's input left behind -- the merger renames its output into
+     * place and only then unlinks the inputs, so a crash in between leaves
+     * both. Concatenating them counted every event of the overlap twice.
+     * Keep only the widest; of two with the same range, the later in name
+     * order (the merged addr_hist.r* sorts after the legacy addr_hist.dat). */
+    int keep = 0;
+    for (int i = 0; i < nf; i++){
+        if (ah_range_superseded(found, nf, i)){ ah_close_one(&found[i]); continue; }
+        found[keep++] = found[i];
+    }
+    memcpy(g_runs, found, (size_t)keep * sizeof found[0]); g_n = keep;
     return g_n > 0;
 }
 int  ah_available(void){ pthread_mutex_lock(&g_ah_mu); int a = ah_scan(); pthread_mutex_unlock(&g_ah_mu); return a; }
@@ -127,14 +159,21 @@ static long ah_lookup_run(const ah_run* r, uint8_t type, const uint8_t hash[32],
         if (ah_key_cmp(e[0], e + 1, type, hash) <= 0) lo = mid + 1; else hi = mid;
     }
     if (lo == 0) return 0;
+    /* ST2-7: every offset and count below comes from the file. Positions are
+     * kept as offsets into the body (bounded by body_len, which the header
+     * check holds inside the mapping) and compared by subtraction, so no
+     * on-disk value can carry a pointer past the end. */
     uint64_t off; memcpy(&off, sp + (lo - 1) * AH_SPARSE_BYTES + 33, 8);
-    const uint8_t* p = r->map + r->hdr.body_off + off; const uint8_t* end = r->map + r->hdr.body_off + r->hdr.body_len;
-    for (int k = 0; k < AH_SPARSE_STRIDE && p + AH_GROUP_HDR <= end; k++){
-        ah_group_hdr gh; memcpy(&gh, p, AH_GROUP_HDR);
+    const uint8_t* body = r->map + r->hdr.body_off; const uint64_t blen = r->hdr.body_len;
+    if (off > blen) return 0;
+    for (int k = 0; k < AH_SPARSE_STRIDE && blen - off >= AH_GROUP_HDR; k++){
+        ah_group_hdr gh; memcpy(&gh, body + off, AH_GROUP_HDR);
+        uint64_t room = (blen - off - AH_GROUP_HDR) / AH_EVENT_BYTES;
+        if ((uint64_t)gh.n > room) return 0;                /* a group longer than the body: corrupt */
         int c = ah_key_cmp(gh.type, gh.hash, type, hash);
-        if (c == 0){ *events = p + AH_GROUP_HDR; return (long)gh.n; }
+        if (c == 0){ *events = body + off + AH_GROUP_HDR; return (long)gh.n; }
         if (c > 0) return 0;
-        p += AH_GROUP_HDR + (size_t)gh.n * AH_EVENT_BYTES;
+        off += AH_GROUP_HDR + (uint64_t)gh.n * AH_EVENT_BYTES;
     }
     return 0;
 }

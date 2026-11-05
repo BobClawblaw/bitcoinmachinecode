@@ -56,7 +56,9 @@ _scalar_small_nonzero:
     add     w10, w10, #1
     cmp     w10, #32
     b.lt    .Lnz_cmp
-    // all 32 equal (k == n): the x86 loop exits via `jae .ok` -> 1.
+    // all 32 equal: k == n, which is NOT < n (audit 2026-10-23; x86 had
+    // `jae .ok` here, and this port mirrored it, so k == n passed 0 < k < n)
+    b       .Lnz_bad
 .Lnz_ok:
     mov     w0, #1
     ret

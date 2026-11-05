@@ -55,7 +55,10 @@
 #define PUSH_HDR   59
 #define DEL_SIZE   44
 #define IDX_HDR    20
-#define WALCAP     1048576
+/* 32 MB since STO-A (main 2026-10-23): every drain is preceded by the
+ * durable prefix (utxo_live.c: archive + undo fsyncs), so the buffer size is
+ * the prefix rate. At 1 MB a late-chain block drained once a block. */
+#define WALCAP     33554432
 #define O_RDONLY   0x0000
 #define O_WRONLY   0x0001
 #define O_RDWR     0x0002
@@ -128,7 +131,20 @@ Lwal_drain_fd:
     str   x21, [sp, #32]
     mov   x29, sp
     mov   x19, x0
-    WALBUF x20
+    /* STO-A (main 2026-10-23): with bytes pending, the pre-drain hook runs
+     * first and the drain fails without writing if it fails. Once write(2)
+     * returns, the kernel may put these bytes on the disk at any moment; the
+     * hook (utxo_live.c's live_durable_prefix) makes the undo and archive
+     * records they depend on durable first, in Core's FlushStateToDisk
+     * order. */
+    WALADDR x9
+    ldr   x21, [x9]
+    cbz   x21, 5f
+    bl    Lwal_predrain
+    cbz   x0, 5f
+    mov   x0, #-1
+    b     4f
+5:  WALBUF x20
     WALADDR x9
     ldr   x21, [x9]
 1:  cbz   x21, 2f
@@ -168,6 +184,53 @@ _utxo_store_wal_drain:
 1:  mov   x0, #0
     ret
 
+/* Lwal_predrain() -> x0 0 / -1: call the pre-drain hook (C) if one is set.
+ * Not reentrant: a drain from inside the hook (the hook never writes the
+ * WAL) skips it. */
+    .p2align 2
+Lwal_predrain:
+    adrp  x9, Lwal_hook@PAGE
+    add   x9, x9, Lwal_hook@PAGEOFF
+    ldp   x10, x11, [x9]                  /* hook, in_predrain */
+    cbz   x10, 1f
+    cbnz  x11, 1f
+    stp   x29, x30, [sp, #-16]!
+    mov   x29, sp
+    mov   x11, #1
+    str   x11, [x9, #8]
+    blr   x10
+    adrp  x9, Lwal_hook@PAGE
+    add   x9, x9, Lwal_hook@PAGEOFF
+    str   xzr, [x9, #8]
+    ldp   x29, x30, [sp], #16
+    cbz   x0, 1f
+    mov   x0, #-1
+    ret
+1:  mov   x0, #0
+    ret
+
+/* utxo_store_forget_buffer() -- drop the buffered bytes without writing them.
+ * For a forked child (utxo_live registers it with pthread_atfork): the buffer
+ * it inherited is its parent's, and the parent lands it. Since STO-A the
+ * buffer holds many blocks, so a child that drains for any reason would
+ * append the parent's records to the parent's WAL through the shared file
+ * offset, and the parent would write them again. */
+    .p2align 2
+    .globl _utxo_store_forget_buffer
+_utxo_store_forget_buffer:
+    WALADDR x9
+    str   xzr, [x9]
+    ret
+
+/* utxo_store_set_predrain_hook(long (*fn)(void)) -- 0 clears it. fn returns
+ * 0 to let the drain go ahead, nonzero to fail it (the bytes stay buffered). */
+    .p2align 2
+    .globl _utxo_store_set_predrain_hook
+_utxo_store_set_predrain_hook:
+    adrp  x9, Lwal_hook@PAGE
+    str   x0, [x9, Lwal_hook@PAGEOFF]
+    ret
+
 /* Lwr_log(st=x0, buf=x1, len=x2) -> x0 0 / -1 ; st x19, buf x20, len x21,
  * log fd x22 */
     .p2align 2
@@ -198,7 +261,9 @@ Lwr_log:
     mov   x0, x22
     bl    Lwal_drain_fd
     cbnz  x0, Lwl_no
-2:  mov   w0, w22
+2:  bl    Lwal_predrain                   /* these bytes reach the file now: the same pre-drain step first */
+    cbnz  x0, Lwl_no
+    mov   w0, w22
     mov   x1, x20
     mov   x2, x21
     bl    Lwrite_all
@@ -649,7 +714,43 @@ Lrl_ckclose:
     mov   w0, w21
     bl    _close
 Lrl_replay:
-    adrp  x0, Llogname@PAGE
+    /* ---- STO-E (main 2026-10-23): the WAL ends BELOW log_off. utxo.idx
+     * names log_off only once the generation below it is in a run, so the
+     * missing bytes are retired ones, but a log_len taken from the physical
+     * size would put every new record below log_off, where no reload reads
+     * it. The WAL is extended to log_off by one zero byte written at
+     * log_off-1 (a retired byte no replay reads; never an ftruncate, which a
+     * reader's reload racing the writer could use to cut it). A read-only
+     * store (idx fd -1) writes nothing. The size is measured again, which
+     * also parks the fd at the end for Lwr_log. */
+    ldr   x9, [x19, #24]                  /* ckpt_log_off */
+    cmp   x9, x22
+    b.ls  8f
+    ldr   x10, [x19, #8]
+    cmn   x10, #1
+    b.eq  8f
+    strb  wzr, [sp]                       /* a zero byte (fixed[] is free here) */
+    ldr   x0, [x19]
+    mov   x1, sp
+    mov   x2, #1
+    sub   x3, x9, #1
+    bl    _pwrite
+    cmp   x0, #1
+    b.ne  Lrl_no
+    ldr   x0, [x19]
+    mov   x1, #0
+    mov   w2, #2                          /* SEEK_END */
+    bl    _lseek
+    tbnz  x0, #63, Lrl_no
+    ldr   x9, [x19, #24]
+    cmp   x0, x9
+    b.lo  Lrl_no
+    sub   x10, x9, x22
+    adrp  x11, _utxo_store_logoff_healed@PAGE
+    str   x10, [x11, _utxo_store_logoff_healed@PAGEOFF]
+    mov   x22, x0
+    str   x22, [x19, #16]
+8:  adrp  x0, Llogname@PAGE
     add   x0, x0, Llogname@PAGEOFF
     mov   w1, #O_RDONLY
     bl    _open
@@ -810,5 +911,16 @@ Lidxtmp:
     .p2align 3
 Lwal:       /* fill, owner fd */
     .quad 0, 0
+Lwal_hook:  /* pre-drain hook (STO-A), set while it runs */
+    .quad 0, 0
+    .globl _utxo_store_logoff_healed
+_utxo_store_logoff_healed:   /* STO-E: bytes the last reload extended the WAL by (0: none) */
+    .quad 0
+
+    .section __TEXT,__const
+    .p2align 3
+    .globl _utxo_store_walbuf_cap
+_utxo_store_walbuf_cap:      /* for tests that fill the buffer */
+    .quad WALCAP
 
 .zerofill __DATA,__bss,Lwal_buf,WALCAP,4

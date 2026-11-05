@@ -53,6 +53,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/syscall.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <signal.h>
@@ -452,6 +453,15 @@ static void repair_spawn(long to, long long now){
     if (pid == 0){
         setpriority(PRIO_PROCESS, 0, 10);                 /* best-effort I/O follows the nice value */
         setenv("BMC_CHAIN", g_rep.chain, 1);
+        /* HST-4 (audit 2026-10-23): the builder is a separate program that
+         * opens what it needs by path; it inherited every descriptor of the
+         * worker (store files, peer sockets, the datadir .lock), and held
+         * the lock for as long as it ran. Closed here as notify.c does. */
+        { long maxfd = sysconf(_SC_OPEN_MAX); if (maxfd < 0 || maxfd > 65536) maxfd = 65536;
+#ifdef SYS_close_range
+          if (syscall(SYS_close_range, 3U, ~0U, 0U) != 0)
+#endif
+              for (long fd = 3; fd < maxfd; fd++) close((int)fd); }   /* Darwin: no close_range, the loop is the whole path (osx port) */
         execl(g_rep.builder, "bmc_build_coinstats_hist", g_rep.chaindir, to_s, w_s, (char*)0);
         fprintf(stderr, "[coinstats] repair: exec %s failed (%s)\n", g_rep.builder, strerror(errno));
         _exit(127);
@@ -934,13 +944,19 @@ static int ring_wait_room(unsigned long n){
     }
 }
 
+/* A sequence lock per slot: ready = 0, the body, ready = seq + 1; the worker
+ * reads ready, the body, ready again. The order needs release fences here and
+ * acquire fences in the worker, not full barriers (2026-10-10): x86 keeps
+ * stores in order and loads in order, so these are compiler barriers there and
+ * dmb on ARM. The two mfences per record were paid 7.2 billion times a sync
+ * on the connect thread. */
 static void slot_fill(u64 seq, unsigned kind, unsigned slen, const void* body, unsigned blen){
     volatile typeof(g_st->csi_ring[0])* e = &g_st->csi_ring[seq % RPC_CSI_RING];
     e->ready = 0;
-    __sync_synchronize();
+    __atomic_thread_fence(__ATOMIC_RELEASE);
     e->kind = kind; e->slen = slen;
     if (blen) memcpy((void*)e->body, body, blen);
-    __sync_synchronize();
+    __atomic_thread_fence(__ATOMIC_RELEASE);
     e->ready = seq + 1;
 }
 
@@ -1025,7 +1041,7 @@ static void worker_run(u64 cursor, pid_t parent){
             __atomic_thread_fence(__ATOMIC_ACQUIRE);
             unsigned kind = e->kind, slen = e->slen;
             u8 body[RPC_CSI_BODY]; memcpy(body, (const void*)e->body, RPC_CSI_BODY);
-            __sync_synchronize();
+            __atomic_thread_fence(__ATOMIC_ACQUIRE);           /* ...and before ready is read again */
             if (e->ready != cursor + 1) break;                 /* overwritten under us */
             unsigned long n = 1;
             int coin = (kind == CSI_K_ADD || kind == CSI_K_REMOVE);
@@ -1044,7 +1060,7 @@ static void worker_run(u64 cursor, pid_t parent){
                         unsigned cl = c->slen;
                         if (c->kind != CSI_K_CONT || cl > RPC_CSI_BODY || off + cl > slen){ ok = -1; break; }
                         memcpy(script + off, (const void*)c->body, cl);
-                        __sync_synchronize();
+                        __atomic_thread_fence(__ATOMIC_ACQUIRE);
                         if (c->ready != cursor + i + 1){ ok = 0; break; }
                         off += cl;
                     }

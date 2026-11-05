@@ -462,7 +462,13 @@ long archive_check_collect(long nblocks, int level, long* bad, long bad_cap, lon
     long problems = 0, examined = 0, holes = 0;
     unsigned char rec[48];
     unsigned char* body = NULL;
-    unsigned char  txids[64 * 32];
+    /* CON-14 (audit 2026-10-23): cons_verify's scratch holds one 32-byte
+     * txid per transaction. 64 slots refused every block of more than 64
+     * transactions at -checklevel 4 ("cons_verify failed"); sized like the
+     * sync paths' SYNC_TXID_CAP, above 4,000,000 / 60, the wire maximum. */
+    enum { AV_TXID_CAP = 80000 };
+    unsigned char* txids = malloc((size_t)AV_TXID_CAP * 32);
+    if (!txids){ close(ifd); fprintf(stderr,"[check] out of memory\n"); return -1; }
     long body_cap = 0;
     int  cur_file = -1, cur_fd = -1;
 
@@ -550,7 +556,7 @@ long archive_check_collect(long nblocks, int level, long* bad, long bad_cap, lon
         if (level < 4) continue;
 
         /* level 4: PoW + merkle integrity of the body itself */
-        if (cons_verify(body, (long)dsz, txids, 64) != 1){
+        if (cons_verify(body, (long)dsz, txids, AV_TXID_CAP) != 1){
             fprintf(stderr,"[check] height %ld: cons_verify failed (PoW/merkle)\n", h);
             problems++;
         }
@@ -558,6 +564,7 @@ long archive_check_collect(long nblocks, int level, long* bad, long bad_cap, lon
 
     if (cur_fd >= 0) close(cur_fd);
     free(body);
+    free(txids);
     close(ifd);
 
     /* level 2+: layout ordering over the checked range. Cheap (index only) and
@@ -648,9 +655,10 @@ static long archive_index_tip(void){
  *
  * out_height receives the first height to RETAIN; out_detail receives the
  * offending height for the refusal verdicts (-1 otherwise). */
-/* STO-12: Core's MIN_BLOCKS_TO_KEEP. 288 > REORG_MAX_DEPTH (100); undo data
- * is kept for every block since 2026-09-08, so the reorg depth is the one
- * window this floor has to cover.
+/* STO-12: Core's MIN_BLOCKS_TO_KEEP. Undo data is kept for every block since
+ * 2026-09-08 and there is no reorg depth cap since CON-10 (2026-10-23), so,
+ * exactly as in Core, a pruned node can reorg as deep as this floor (and
+ * whatever its budget keeps beyond it); deeper, the reorg pre-flight refuses.
  *
  * INJECTABLE, and that is not test-only convenience. The prune verdicts are
  * exercised on a two- or three-block fixture precisely so all five outcomes
@@ -674,8 +682,8 @@ archive_prune_verdict_t archive_prune_decide(long long budget_bytes,
 
     /* ---- STO-12 (audit 2026-09-03): a minimum-retention floor ----
      * Pruning was purely budget-driven, so a small -prune could delete inside
-     * the windows the node needs to stay correct: REORG_MAX_DEPTH (100) for a
-     * reorg's disconnect, and UTXO_UNDO_WINDOW (200) for the undo files. Core
+     * the windows the node needs to stay correct: a reorg's disconnect (then
+     * capped at 100 deep), and UTXO_UNDO_WINDOW (200) for the undo files. Core
      * keeps MIN_BLOCKS_TO_KEEP = 288 for exactly this, which subsumes both.
      *
      * It fails CLOSED today -- read_stored_block returns -1/-3 and the reorg

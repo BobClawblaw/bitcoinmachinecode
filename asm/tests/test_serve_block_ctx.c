@@ -109,6 +109,32 @@ int main(void){
     serve_set_header_rules(1, 0, 0, LIM, 1000000);
     ck("armed: v1 below BIP34 activation is ACCEPTED",  serve_block_ctx_ok(store_buf, bad_ver),  1);
 
+    /* ---- CON-8 (audit 2026-10-23): BIP94's time-timewarp-attack ----------
+     * Extend the chain to height 2015 so the next header is the first of a
+     * difficulty period (2016 % 2016 == 0). The last stored block jumps
+     * 3000 s ahead, so the parent's MTP sits far below the parent's own
+     * time and only the timewarp rule can refuse a header 601 s before it. */
+    puts("-- CON-8: BIP94 timewarp at a retarget boundary --");
+    {
+        unsigned int t = tip_times[NBLK-1];
+        for (int i = NBLK; i < 2016; i++){
+            unsigned char blk[90], hash[32];
+            t += (i == 2015) ? 3000u : 1u;
+            mk_hdr(blk, 4, prev, t, LIM);
+            memset(hash, 0, 32); hash[0] = (unsigned char)i; hash[1] = (unsigned char)(i >> 8); hash[2] = 0x5a;
+            if (store_append(store_buf, hash, blk, 90) != i){ printf("FAIL store_append at %d\n", i); return 1; }
+            memcpy(prev, hash, 32);
+        }
+        unsigned char warp[90], edge[90];
+        mk_hdr(warp, 4, prev, t - 601, LIM);
+        mk_hdr(edge, 4, prev, t - 600, LIM);
+        serve_set_header_rules(1, 0, 1 /*enforce_bip94*/, LIM, 0);
+        ck("BIP94: a height-2016 header 601 s before its parent -> REJECTED", serve_block_ctx_ok(store_buf, warp), 0);
+        ck("BIP94: 600 s before is ACCEPTED",                                serve_block_ctx_ok(store_buf, edge), 1);
+        serve_set_header_rules(1, 0, 0 /*no BIP94*/, LIM, 0);
+        ck("no BIP94 (mainnet): the 601 s header is ACCEPTED",               serve_block_ctx_ok(store_buf, warp), 1);
+    }
+
     if (failures){ printf("TESTS FAILED (%d failures)\n", failures); return 1; }
     printf("ALL TESTS PASSED (0 failures)\n");
     return 0;

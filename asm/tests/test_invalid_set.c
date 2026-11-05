@@ -22,9 +22,14 @@ int main(void){
     FILE* f = fopen(P, "wb"); fwrite("abc", 1, 3, f); fclose(f);
     ok(invset_load(P) == -1 && invset_count() == 0, "a file that is not a multiple of 32 bytes: -1 and empty");
     unlink(P);
-    printf("== capacity ==\n");
-    invset_clear(); int added = 0; for (int i = 0; i < INVSET_MAX + 5; i++){ unsigned char h[32]; memset(h, 0, 32); h[0] = (unsigned char)i; h[1] = (unsigned char)(i>>8); if (invset_add(h) == 1) added++; }
-    ok(added == INVSET_MAX && invset_count() == INVSET_MAX, "bounded at INVSET_MAX; the rest refused with -1");
+    printf("== capacity (CON-11: the set grows; it was a fixed 64) ==\n");
+    invset_clear(); int added = 0; for (int i = 0; i < 1000; i++){ unsigned char h[32]; memset(h, 0, 32); h[0] = (unsigned char)i; h[1] = (unsigned char)(i>>8); h[2] = 0xc1; if (invset_add(h) == 1) added++; }
+    ok(added == 1000 && invset_count() == 1000, "CON-11: 1,000 marks are all held (no -1 at 65)");
+    { unsigned char h[32]; memset(h, 0, 32); h[0] = (unsigned char)(999 & 0xff); h[1] = (unsigned char)(999 >> 8); h[2] = 0xc1;
+      ok(invset_has(h), "CON-11: the 1,000th mark is found"); }
+    ok(invset_save(P) == 0, "CON-11: 1,000 marks saved");
+    invset_clear(); ok(invset_load(P) == 1000 && invset_count() == 1000, "CON-11: ...and all 1,000 reloaded");
+    unlink(P);
     printf("== negative control: nothing marked means nothing refused ==\n");
     invset_clear(); ok(!invset_has(a) && !invset_has(b), "control: an empty set matches no hash (the pre-CC-10 node had no marks at all)");
     printf("\n%s (%d checks, %d failures)\n", fails?"TESTS FAILED":"ALL TESTS PASSED", checks, fails); return fails?1:0;

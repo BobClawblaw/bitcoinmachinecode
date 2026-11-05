@@ -114,6 +114,13 @@ fd_write_all:
 .wa:
     cmp  rbx, r14
     jae  .done
+    ; A negative fd fails at once. poll(2) IGNORES an entry whose fd is
+    ; negative, so the bounded wait below sat out its full 10 s and only then
+    ; failed: every node_log_event to a log fd of -1 (what the serve-loop
+    ; harnesses pass) stalled the serve loop 10 s after each getheaders
+    ; (2026-10-23; test_serve's F1 cases had to wait through it).
+    test r12d, r12d
+    js   .fail
     ; ---- bound the write: poll({fd, POLLOUT}, 1, 10000) first. A peer that
     ; stops reading (a dead Tor circuit, a stalled subscriber, the other end
     ; of an IPC pair busy elsewhere) otherwise holds a blocking write() for

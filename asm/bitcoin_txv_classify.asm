@@ -39,6 +39,7 @@ extern sv_classify_segwit             ; int (spk, u32 spl, ss, u32 ssl,
                                       ;      u32* wver, const u8** wprog,
                                       ;      u32* wplen, int* wrapped) -- C
 extern txv_bytepool_alloc             ; u64 (bytepool_t*, const u8*, u64) -- C
+extern sv_witness_program_true        ; int (const u8* prog, u32 n) -- C, CON-2 EVAL_FALSE
 
 %define TXV_SPK_CAP       10000
 %define COINBASE_MATURITY 100
@@ -73,6 +74,7 @@ c_wpss:     db "witness program scriptSig must be empty",0
 c_wpkh2:    db "p2wpkh needs exactly 2 witness items",0
 c_wsh1:     db "p2wsh needs a witnessScript",0
 c_unexwit:  db "unexpected witness on a non-witness script",0
+c_wfalse:   db "witness program evaluates false (EVAL_FALSE)",0
 
 section .text
 
@@ -141,6 +143,11 @@ txvb_classify_asm:
     mov  rax, [rbp+40]                   ; *has_taproot = 1
     mov  dword [rax], 1
     mov  byte [rbx+IN_SHAPE], SHAPE_P2TR
+    lea  rdi, [r12+2]                    ; CON-2: the program push must CastToBool true
+    mov  esi, 32
+    call sv_witness_program_true
+    test eax, eax
+    jz   .r_wfalse
     cmp  dword [rbx+IN_SSLEN], 0
     jne  .r_tapss
     cmp  dword [rbx+IN_NWIT], 0
@@ -167,6 +174,11 @@ txvb_classify_asm:
     js   .r_wrapss                       ; cls < 0
     jz   .not_witprog                    ; cls == 0
     ; cls > 0: a witness program
+    mov  rdi, [rbp-0x40]                 ; CON-2: wprog must CastToBool true
+    mov  esi, [rbp-0x34]                 ; wplen
+    call sv_witness_program_true
+    test eax, eax
+    jz   .r_wfalse
     cmp  dword [rbp-0x38], 0             ; wrapped?
     jne  .have_wrap
     cmp  dword [rbx+IN_SSLEN], 0         ; native: scriptSig must be empty
@@ -230,6 +242,8 @@ txvb_classify_asm:
 .r_wpkh2:   lea rsi, [c_wpkh2]
             jmp .reject
 .r_wsh1:    lea rsi, [c_wsh1]
+            jmp .reject
+.r_wfalse:  lea rsi, [c_wfalse]
             jmp .reject
 .r_unexwit: lea rsi, [c_unexwit]
 .reject:

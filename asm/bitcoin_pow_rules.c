@@ -43,7 +43,11 @@ static void powr_target_bytes(u32 bits, u8 t[32]){
 }
 
 /* arith_uint256::GetCompact (fNegative=false) over a big-endian target.
- * Mirrors rpc_chain.c's gbt_compact. */
+ * The byte loop reads the top three bytes from the first non-zero one, zero
+ * padded on the right, so a target under 2^24 comes out already shifted the
+ * way Core's `GetLow64() << 8*(3-nSize)` shifts it; it is not shifted again
+ * (F1, formal verification 2026-10-23: the second shift encoded every target
+ * below 2^16 wrong, e.g. 64 as 0x01000000 for Core's 0x01400000). */
 static u32 powr_compact(const u8 t[32]){
     int size = 32; while (size > 0 && t[32-size] == 0) size--;
     u32 word = 0;
@@ -51,7 +55,6 @@ static u32 powr_compact(const u8 t[32]){
         int pos = 32 - size + i;
         word = (word << 8) | (u8)(pos < 32 && i < size ? t[pos] : 0);
     }
-    if (size < 3) word <<= 8 * (3 - size);
     if (word & 0x00800000){ word >>= 8; size++; }
     return ((u32)size << 24) | (word & 0x007fffff);
 }

@@ -58,6 +58,7 @@ extern int  pow_check(const u8 hdr[80]);
 extern int  tx_txid(u8 out[32], const u8* tx, unsigned long txlen, u8* buf, unsigned long buflen);
 
 extern int  utxo_live_init(const char* dir);
+extern int  utxo_live_assumevalid_skips(long h, const u8 hash[32]);   /* CON-7 */
 extern long utxo_live_assumevalid_resolve_now(void);   /* 2026-09-07: re-runs the resolver, returns the height (-1 = none) */
 #include "../daemon/node_config.h"
 extern long utxo_live_catchup(void* store_buf);
@@ -193,6 +194,27 @@ int main(void){
         ck("0 the assumed-valid block is found on the HEADER chain at 7, with no block stored", utxo_live_assumevalid_resolve_now(), 7);
         FILE* fi = fopen("index.dat", "wb"); for (int h = 0; h < 3; h++){ u8 rec[48]; memset(rec, (u8)(0xa0 + h), 48); fwrite(rec, 1, 48, fi); } fclose(fi);
         ck("0 ...and still at 7 when the archive holds only 3 blocks (headers-first)", utxo_live_assumevalid_resolve_now(), 7);
+        /* CON-7 (audit 2026-10-23): scripts are skipped for ANCESTORS of the
+         * assumed-valid block on the header chain, not for every height at
+         * or below it. headers.dat record h carries hash = 32 bytes of h. */
+        { u8 hh[32];
+          memset(hh, 5, 32);
+          ck("0 CON-7 the header chain's block at 5 skips scripts", utxo_live_assumevalid_skips(5, hh), 1);
+          memset(hh, 0x55, 32);
+          ck("0 CON-7 a side-branch block at 5 (not an ancestor) evaluates scripts", utxo_live_assumevalid_skips(5, hh), 0);
+          memset(hh, 9, 32);
+          ck("0 CON-7 the header chain's block at 9 (above it) evaluates scripts", utxo_live_assumevalid_skips(9, hh), 0);
+          ck("0 CON-7 the assumed-valid block itself skips", utxo_live_assumevalid_skips(7, want), 1);
+          /* the header chain reorganised below 7 after the resolve: record 7
+           * now carries a different block, so nothing at or below it is an
+           * ancestor any more */
+          int fd = open("headers.dat", O_RDWR); u8 other[32]; memset(other, 0x77, 32);
+          ck("0 CON-7 fixture: rewrite header 7", fd >= 0 && pwrite(fd, other, 32, 7*112 + 80) == 32, 1);
+          if (fd >= 0) close(fd);
+          memset(hh, 5, 32);
+          ck("0 CON-7 after a header reorg past it, height 5 evaluates scripts", utxo_live_assumevalid_skips(5, hh), 0);
+          fd = open("headers.dat", O_RDWR);
+          if (fd >= 0){ if (pwrite(fd, want, 32, 7*112 + 80) != 32) ck("0 CON-7 restore header 7", 0, 1); close(fd); } }
         g_cfg.assumevalid_mode = 2;
         ck("0 assumevalid=0: nothing is assumed (-1)", utxo_live_assumevalid_resolve_now(), -1);
         g_cfg.assumevalid_mode = 1; want[0] ^= 1; memcpy(g_cfg.assumevalid, want, 32);

@@ -67,6 +67,8 @@ _fd_write_all:
     mov   x22, #0
 1:  cmp   x22, x21
     b.hs  3f
+    tbnz  w19, #31, 2f                    /* a negative fd fails at once: poll ignores it, and the */
+                                          /* 10 s wait ran out first (main 2026-10-23) */
     str   w19, [sp]                       /* {fd, POLLOUT, 0} */
     mov   w9, #POLLOUT
     str   w9, [sp, #4]
@@ -427,8 +429,11 @@ Lread_v1:
     mov   x2, #24
     bl    _fd_read_full
     cmp   x0, #24
-    b.ne  Lrv_err
-    ldr   w9, [sp]
+    b.eq  1f
+    tbnz  x0, #63, Lrv_err                /* a read error: -1 */
+    b     Lrv_zero                        /* EOF or a short header: 0, as x86's .eof_or_err
+                                           * (this said -1 for a clean close too) */
+1:  ldr   w9, [sp]
     adrp  x10, _net_magic@PAGE
     ldr   w10, [x10, _net_magic@PAGEOFF]
     cmp   w9, w10

@@ -20,8 +20,12 @@
  *   ulong utxo_struct_size(ulong slots);                40 + 48*slots + 8
  *   void  utxo_prefetch_n(u, txid, index, lines);  void utxo_prefetch(...)
  *
- * The home slot: FNV-1a (32-bit) over the first 8 txid bytes, xor the full
- * index, and mask. Linear probing wraps and stops back at home. A match is
+ * The home slot (main 2026-10-10): the first 8 txid bytes xor the index
+ * (zero-extended), times 0x9E3779B97F4A7C15, the product's bits 32.. under
+ * the mask. It was FNV-1a over those bytes xor the index, which put a
+ * transaction's outputs in neighbouring slots: one run of full slots for
+ * linear probing to walk. Nothing persists a slot position; utxo_live.c's
+ * outpoint_hash is the same mix. Linear probing wraps and stops back at home. A match is
  * index (low 32 bits) and all 32 txid bytes. del is backward-shift: the hole
  * pulls in any later slot of the cluster whose probe distance lets it move
  * (distance from its home to the hole < to its own slot); blob space is not
@@ -39,19 +43,16 @@
  * x10..x13 (and reads the mask into x13) */
     .p2align 2
 Lhome:
-    movz  w9, #0x9dc5
-    movk  w9, #0x811c, lsl #16
-    movz  w10, #0x0193
-    movk  w10, #0x0100, lsl #16           /* 16777619 */
-    mov   x11, #0
-1:  ldrb  w12, [x1, x11]
-    eor   w9, w9, w12
-    mul   w9, w9, w10
-    add   x11, x11, #1
-    cmp   x11, #8
-    b.lo  1b
+    ldr   x9, [x1]                        /* the txid's first 8 bytes */
+    mov   w10, w2                         /* ^ the index, zero-extended (x86: esi) */
+    eor   x9, x9, x10
+    movz  x10, #0x7c15                    /* UTXO_HASH_MUL 0x9E3779B97F4A7C15 */
+    movk  x10, #0x7f4a, lsl #16
+    movk  x10, #0x79b9, lsl #32
+    movk  x10, #0x9e37, lsl #48
+    mul   x9, x9, x10
+    lsr   x9, x9, #32                     /* the product's bits 32.. */
     ldr   x13, [x0, #8]                   /* mask */
-    eor   x9, x9, x2
     and   x9, x9, x13
     mov   x10, #SLOT
     mov   x11, #SLOTBASE

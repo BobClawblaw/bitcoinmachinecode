@@ -140,7 +140,30 @@
 ;                                  every other struct field.
 ;   +160 qword tomb_hash_mask  -- LSM-OWNED: (capacity-1) of tomb_hash_buf,
 ;                                  capacity = next_pow2(max(tomb_cap,1)*2).
-;   (total struct size: 168 bytes)
+;   ---- the frozen generation (2026-10-06, plan B3: the flush off the
+;        applier). Read by the LSM only when utxo_lsm_fz_enable(1) was
+;        called; a caller that never freezes may hand in the 168-byte
+;        struct as before. ----
+;   +168 qword fz_u            -- CALLER SETS: a memtable-shaped buffer of
+;                                  the live table's size whose +16/+24 name
+;                                  its OWN blob (>= the live blob's fill at
+;                                  every freeze). utxo_lsm_freeze copies the
+;                                  live table and blob prefix into it.
+;   +176 qword fz_tomb_buf     -- CALLER SETS: a second tomb_cap-entry list;
+;                                  the freeze swaps it with tomb_buf
+;   +184 qword fz_tomb_n       -- the frozen generation's tombstone count
+;   +192 qword fz_tomb_hash_buf -- LSM-OWNED: the spare hash set (swapped)
+;   +200 qword fz_tomb_hash_mask
+;   +208 qword fz_active       -- 1 from a freeze until the caller adopts the
+;                                  run (sets it 0): utxo_lsm_get consults the
+;                                  copy and its tombstones between the live
+;                                  generation and the runs
+;   +216 qword fz_gen          -- the frozen run's generation (reserved from
+;                                  next_gen at the freeze)
+;   +224 qword fz_run_no       -- its file number (reserved from next_run_no)
+;   +232 qword fz_wal_end      -- log_len at the freeze: the WAL bytes below
+;                                  it are the frozen generation's
+;   (total struct size: 240 bytes; 168 without the frozen fields)
 ;
 ; Exports (System V AMD64):
 ;   long utxo_lsm_init(void* lst)                              -> 1 / -1
@@ -208,7 +231,20 @@ MAGIC_MANIFEST   equ 0x4E414D55      ; "UMAN" little-endian dword -- OLD format,
 ; one-time full dedup recount (mac_lsm_recount) to establish the baseline,
 ; mirroring the MAGIC_RUN -> MAGIC_RUN2 discipline for run files above.
 MAGIC_MANIFEST2  equ 0x324E4D55      ; "UMN2" little-endian dword -- adds trailing total_live qword
-BLOOM_MAX_BYTES  equ 4*1024*1024     ; 4MB bloom scratch (~3.35M entries @10 bits/entry)
+BLOOM_MAX_BYTES  equ 4*1024*1024     ; 4MB: the get-time bloom scratch (lsm_get_scratch, static TLS) and the
+                                     ; flush scratch's bloom area (the callers' scratch_cap counts it)
+; RUN_BLOOM_MAX_BYTES (2026-10-09): the largest bloom a run is written with.
+; The bloom was capped at BLOOM_MAX_BYTES, sized for ~3.35M entries at 10
+; bits each; a bulk flush run holds ~19M records, so it got 1.76 bits per
+; key and passed 55% of absent keys (run 45's files), each pass then a
+; ~500 ns sparse search + scan, ~350 ns per run per lookup that reaches the
+; runs. 256 MiB = 2^31 bits, 10 bits per key for up to ~200M records (the
+; masks are 32-bit, so 2^31 is within reach of every bit helper). A bloom
+; over BLOOM_MAX_BYTES gets its own anonymous mapping in the writer (the
+; flush scratch keeps its layout) and the merge's own scratch grows to fit;
+; readers take the size from the header, and the asm fallback lookup, whose
+; TLS copy is BLOOM_MAX_BYTES, skips the filter of a larger run.
+RUN_BLOOM_MAX_BYTES equ 256*1024*1024
 SCRIPT_MAX_BYTES equ 65536           ; get-time script-read scratch
 
 ; mac_run_lookup (utxo_lsm_get's disk-run-hit path) used to stage its bloom
@@ -226,7 +262,7 @@ SCRIPT_MAX_BYTES equ 65536           ; get-time script-read scratch
     mov  %1, [rel %2 wrt ..gottpoff]
     add  %1, qword [fs:0]
 %endmacro
-section .tbss alloc noexec nowrite tls align=16
+section .tbss nobits alloc noexec write tls align=16
 global lsm_get_scratch
 lsm_get_scratch: resb BLOOM_MAX_BYTES + SCRIPT_MAX_BYTES
 section .text
@@ -269,7 +305,7 @@ SLOT_RD_POS        equ SLOT_RD_FILL + 8              ; bytes consumed
 SLOT_RD_BUF        equ SLOT_RD_FILL + 16             ; the buffer itself
 COMPACT_SLOT_SIZE  equ SLOT_RD_BUF + COMPACT_RDBUF
 COMPACT_SLOTS_BYTES equ COMPACT_MAX_RUNS * COMPACT_SLOT_SIZE
-COMPACT_SCRATCH_BYTES equ COMPACT_SLOTS_BYTES + BLOOM_MAX_BYTES
+COMPACT_SCRATCH_BYTES equ COMPACT_SLOTS_BYTES + RUN_BLOOM_MAX_BYTES
 
 manifest_name:     db "utxo_manifest.dat", 0
 manifest_tmp_name:  db "utxo_manifest.tmp", 0
@@ -359,18 +395,17 @@ mac_fl_drain:
 
 ; ============================================================================
 
-; mac_memcpy(dst=rdi, src=rsi, n=rdx) -- preserves nothing special, trivial
+; mac_memcpy(dst=rdi, src=rsi, n=rdx) -- rdi, rsi, rdx and rcx come back
+; unchanged, as the per-byte loop it replaced (2026-10-10) left them; rep movsb
+; (FSRM) is a few cycles for the 32-48 byte keys and slots it mostly copies.
 mac_memcpy:
     push rcx
-    xor  ecx, ecx
-.ml:
-    cmp  rcx, rdx
-    jae  .md
-    mov  al, [rsi+rcx]
-    mov  [rdi+rcx], al
-    inc  rcx
-    jmp  .ml
-.md:
+    push rsi
+    push rdi
+    mov  rcx, rdx
+    rep  movsb
+    pop  rdi
+    pop  rsi
     pop  rcx
     ret
 
@@ -447,6 +482,31 @@ mac_write_exact:
 mac_fsync2:
     mov  eax, 74
     syscall
+    ret
+
+; mac_dirsync() -> rax: 0 = the working directory (the chain directory) is
+; fsynced, negative = its open or its fsync failed. STO-D/STO-W (formal/storage,
+; 2026-10-23): a failed open used to skip the fsync silently. Clobbers rax, rcx,
+; rdx, rdi, rsi, r11; no call, no stack operand.
+mac_dirsync:
+    push rbx
+    lea  rdi, [rel dot_name]
+    xor  esi, esi
+    mov  eax, 2
+    syscall
+    test rax, rax
+    js   .ret
+    mov  rbx, rax
+    mov  rdi, rax
+    mov  eax, 74
+    syscall
+    mov  rdx, rax
+    mov  rdi, rbx
+    mov  eax, 3
+    syscall
+    mov  rax, rdx
+.ret:
+    pop  rbx
     ret
 
 ; mac_cmp_key(p=rdi, q=rsi) -> eax: 0 = p<q, 1 = p==q, 2 = p>q (36-byte unsigned)
@@ -590,27 +650,40 @@ mac_tomb_hash_reset:
 ; though used internally) and rdi/rsi (values, not contents pointed-to,
 ; since neither mac_cmp_key nor this function ever assigns to them).
 mac_tomb_hash_probe:
+    push rdi
+    push rsi
+    mov  rcx, rsi                   ; key
+    mov  rdx, [rdi+64]              ; tomb_buf
+    mov  rsi, [rdi+160]             ; mask
+    mov  rdi, [rdi+152]             ; hash
+    call mac_tomb_probe_raw
+    pop  rsi
+    pop  rdi
+    ret
+; mac_tomb_probe_raw(hash=rdi, mask=rsi, tomb_buf=rdx, key=rcx) -> rax = &slot
+;   The probe above over an explicit triple, so utxo_lsm_get can ask the
+;   FROZEN generation's set (lst+192/+200/+176) as well as the live one
+;   (plan B3). Clobbers rax,rcx,rdx,r8,r9,r10,rdi,rsi.
+mac_tomb_probe_raw:
     push rbx
     push r12
     push r13
-    mov  r8, 0x811c9dc5
-    xor  ecx, ecx
-.hp_hl:
-    cmp  ecx, 8
-    jae  .hp_hdone
-    movzx eax, byte [rsi+rcx]
-    xor  r8d, eax
-    imul r8d, r8d, 16777619
-    inc  ecx
-    jmp  .hp_hl
-.hp_hdone:
+    mov  r9, rdi                     ; hash base
+    mov  r12, rsi                    ; mask
+    mov  r10, rdx                    ; tomb_buf base
+    mov  rsi, rcx                    ; key
+    ; utxo_hash's mix (bitcoin_utxo.asm, 2026-10-10): the txid's first 8
+    ; bytes ^ the index, times an odd 64-bit constant, bits 32.. under the
+    ; mask. FNV ^ index put a transaction's spent outputs in neighbouring
+    ; slots; the diagnostic sync measured 1-6 probes a call, each a random
+    ; read of tomb_buf. The set is rebuilt from tomb_buf, never persisted.
+    mov  r8, [rsi]
     mov  eax, [rsi+32]              ; vout index
     xor  r8, rax
-    and  r8, [rdi+160]               ; tomb_hash_mask -> starting probe index
-    mov  r9, [rdi+152]                ; tomb_hash_buf base
-    mov  r10, [rdi+64]                 ; tomb_buf base
-    mov  r12, [rdi+160]                 ; mask (kept for wraparound)
-    mov  r13, rdi                        ; save lst -- rdi gets repurposed below
+    mov  rax, 0x9E3779B97F4A7C15
+    imul r8, rax
+    shr  r8, 32
+    and  r8, r12                     ; mask -> starting probe index
 .hp_probe:
     lea  rbx, [r9 + r8*8]                  ; &slot
     mov  rcx, [rbx]                         ; slot value (tomb_buf index or -1)
@@ -627,7 +700,6 @@ mac_tomb_hash_probe:
     jmp  .hp_probe
 .hp_ret:
     mov  rax, rbx
-    mov  rdi, r13
     pop  r13
     pop  r12
     pop  rbx
@@ -1742,7 +1814,16 @@ utxo_lsm_put:
 .lp_do_flush:
     mov  rdi, r12
     mov  rsi, r13
+    mov  rax, [rel mac_freeze_hook]
+    test rax, rax
+    jz   .lp_inline
+    and  rsp, -16
+    call rax                      ; plan B3: long hook(lst, u) -- the freeze + the forked writer
+    lea  rsp, [rbp-0x68]          ; 5 pushes + 0x40 frame
+    jmp  .lp_flushed
+.lp_inline:
     call mac_flush
+.lp_flushed:
     cmp  rax, -1
     jne  .lp_skip_flush
     mov  r15d, 1
@@ -1829,7 +1910,16 @@ utxo_lsm_del:
 .ld_do_flush:
     mov  rdi, r12
     mov  rsi, r13
+    mov  rax, [rel mac_freeze_hook]
+    test rax, rax
+    jz   .ld_inline
+    and  rsp, -16
+    call rax                      ; plan B3, as in utxo_lsm_put
+    lea  rsp, [rbp-0x68]
+    jmp  .ld_flushed
+.ld_inline:
     call mac_flush
+.ld_flushed:
     cmp  rax, -1
     jne  .ld_skip_flush
     mov  r15d, 1
@@ -1950,6 +2040,8 @@ mac_run_lookup:
     mov  rcx, [rbp-0x200+24]
     mov  [rbp-0x58], rcx        ; bits_mask
     mov  rax, [rbp-0x200+16]    ; bloom_bytes
+    cmp  rax, BLOOM_MAX_BYTES
+    ja   .ml_nobloom            ; larger than the TLS copy (RUN_BLOOM_MAX_BYTES): search without it
 
     mov  rdi, [rbp-0x68]
     TLS_ADDR rsi, lsm_get_scratch
@@ -1992,7 +2084,20 @@ mac_run_lookup:
     call mac_bloom_testbit
     test eax, eax
     jz   .ml_absent_close
+    jmp  .ml_sparse
 
+    ; a run whose bloom is past the TLS copy: the filter is only a shortcut,
+    ; so this (rare, mmap-declined) path goes to the sparse index directly.
+    ; The key is built here as the bloom path builds it above.
+.ml_nobloom:
+    lea  rdi, [rbp-0x100]
+    mov  rsi, [rbp-0x30]
+    mov  rdx, 32
+    call mac_memcpy
+    mov  eax, [rbp-0x38]
+    mov  [rbp-0x100+32], eax
+
+.ml_sparse:
     ; ---- sparse index acceleration ----
     ; records_start = header_size + bloom_bytes: the position the file is
     ; ALREADY sitting at (untouched since the bloom-bytes read above) --
@@ -2323,6 +2428,53 @@ utxo_lsm_get:
     jmp  .lg_not_found
 .lg_tomb_done:
 
+    ; ---- the frozen generation (plan B3): a put before the freeze that the
+    ; run writer has not published yet. Its copy is consulted after the live
+    ; generation (a live tombstone shadows it: the del of a frozen key went
+    ; to the live list) and before the runs. A hit's script is copied to the
+    ; per-thread scratch, the run-hit contract (valid until the next get):
+    ; the copy is overwritten by the next freeze. ----
+    cmp  qword [rel mac_fz_on], 0
+    je   .lg_no_fz
+    cmp  qword [r12+208], 0          ; fz_active
+    je   .lg_no_fz
+    mov  rdi, [r12+168]              ; fz_u
+    mov  rsi, rbx
+    mov  edx, [rbp-0x30]
+    mov  rcx, [rbp-0x38]             ; &value
+    mov  r8, [rbp-0x40]              ; &height
+    mov  r9, [rbp-0x68]              ; &is_coinbase
+    sub  rsp, 0x10
+    lea  rax, [rbp-0x118]
+    mov  [rsp], rax                  ; &script -> own slot (copied below)
+    lea  rax, [rbp-0x110]
+    mov  [rsp+8], rax                ; scratch &slen
+    call utxo_get
+    add  rsp, 0x10
+    cmp  eax, 1
+    jne  .lg_fz_tomb
+    TLS_ADDR rdi, lsm_get_scratch
+    add  rdi, BLOOM_MAX_BYTES        ; the script area of the per-thread scratch
+    mov  rsi, [rbp-0x118]
+    mov  rdx, [rbp-0x110]
+    cmp  rdx, SCRIPT_MAX_BYTES
+    ja   .lg_err                     ; cannot happen: the memtable refuses such scripts
+    push rdi
+    call mac_memcpy
+    pop  rdi
+    mov  rax, [rbp-0x48]
+    mov  [rax], rdi                  ; *script = the scratch copy
+    jmp  .lg_found
+.lg_fz_tomb:
+    mov  rdi, [r12+192]              ; the frozen generation's tombstone set
+    mov  rsi, [r12+200]
+    mov  rdx, [r12+176]
+    lea  rcx, [rbp-0x100]            ; key36 (built above for the live probe)
+    call mac_tomb_probe_raw
+    cmp  qword [rax], -1
+    jne  .lg_not_found
+.lg_no_fz:
+
     mov  rax, [r12+120]
     mov  [rbp-0x50], rax
 .lg_run_loop:
@@ -2401,6 +2553,125 @@ utxo_lsm_get:
     ret
 
 ; ============================================================================
+; utxo_lsm_freeze(lst=rdi, u=rsi, fz=rdx) -> 1 frozen / 0 nothing / -1 err
+;   Plan B3 (2026-10-06): the applier's half of a flush, O(copy) instead of
+;   O(sort + write + fsync). The live table and its blob's used prefix are
+;   copied into fz (a memtable-shaped buffer the caller sized like the live
+;   one, +168), this generation's tombstone list and hash set swap with the
+;   spare pair (+176, +192/+200), the generation's gen and run number are
+;   reserved, fz_wal_end records where its WAL bytes end, fz_active is set,
+;   and the live table is cleared for the next generation. The caller then
+;   writes the run from the copy (utxo_lsm_build_run, in a forked child or
+;   inline), appends {fz_gen, fz_run_no} to the manifest, publishes, retires
+;   the WAL bytes below fz_wal_end (daemon/utxo_live.c: a utxo.idx
+;   checkpoint offset plus a punched hole; the WAL is never truncated on
+;   this path) and clears fz_active. Reads between the freeze and that adopt
+;   consult the copy (utxo_lsm_get). One frozen set at a time: a second
+;   freeze while fz_active is set is refused (-1); the caller waits for its
+;   writer first. The compaction gate (mac_flush_hook) runs first, as in
+;   mac_flush, and the WAL buffer is drained so fz_wal_end is a file offset.
+; ============================================================================
+global utxo_lsm_freeze
+utxo_lsm_freeze:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub  rsp, 0x28
+    mov  r12, rdi           ; lst
+    mov  r13, rsi            ; u
+    mov  r14, rdx             ; fz
+    mov  rax, [rel mac_flush_hook]
+    test rax, rax
+    jz   .fz_nohook
+    and  rsp, -16
+    call rax
+    lea  rsp, [rbp-0x50]                     ; 5 pushes + 0x28 frame
+.fz_nohook:
+    mov  rdi, r12
+    call utxo_store_wal_drain
+    cmp  rax, -1
+    je   .fz_err
+    mov  rax, [r13]
+    or   rax, [r12+80]
+    jz   .fz_none
+    cmp  qword [r12+208], 0
+    jne  .fz_err                             ; a frozen set exists: the caller waits for its writer first
+    ; ---- the table: header + slots, keeping the copy's own blob pointer and cap ----
+    mov  rbx, [r14+16]                       ; fz blob
+    mov  r15, [r14+24]                       ; fz blob cap
+    mov  rcx, [r13+8]
+    inc  rcx
+    imul rcx, rcx, 48
+    add  rcx, 40                             ; struct bytes
+    mov  rdi, r14
+    mov  rsi, r13
+    rep  movsb
+    mov  [r14+16], rbx
+    mov  [r14+24], r15
+    ; ---- the blob's used prefix ----
+    mov  rcx, [r13+32]                       ; fill
+    cmp  rcx, r15
+    ja   .fz_err                             ; the copy's blob is smaller than the live fill: sized wrong
+    mov  rdi, rbx
+    mov  rsi, [r13+16]
+    rep  movsb
+    ; ---- the tombstone list and its hash set swap with the spare pair ----
+    mov  rax, [r12+64]
+    mov  rcx, [r12+176]
+    mov  [r12+64], rcx
+    mov  [r12+176], rax
+    mov  rax, [r12+80]
+    mov  [r12+184], rax                      ; fz_tomb_n
+    mov  qword [r12+80], 0
+    mov  rax, [r12+152]
+    mov  rcx, [r12+192]
+    mov  [r12+152], rcx
+    mov  [r12+192], rax
+    mov  rax, [r12+160]
+    mov  rcx, [r12+200]
+    mov  [r12+160], rcx
+    mov  [r12+200], rax
+    mov  rdi, r12
+    call mac_tomb_hash_reset                 ; the (possibly first-time) live set, emptied
+    cmp  rax, 1
+    jne  .fz_err
+    ; ---- the generation's numbers are reserved now; the writer uses them ----
+    mov  rax, [r12+96]
+    mov  [r12+216], rax                      ; fz_gen
+    inc  qword [r12+96]
+    mov  rax, [r12+144]
+    mov  [r12+224], rax                      ; fz_run_no
+    inc  qword [r12+144]
+    mov  rax, [r12+16]
+    mov  [r12+232], rax                      ; fz_wal_end = log_len
+    mov  [r12+168], r14                      ; fz_u
+    mov  qword [r12+208], 1                  ; fz_active: readers consult the copy from here
+    ; ---- the live table starts the next generation ----
+    mov  rdi, r13
+    call mac_clear_memtable
+    mov  qword [r12+40], 0                   ; op_count
+    mov  eax, 1
+    jmp  .fz_ret
+.fz_none:
+    xor  eax, eax
+    jmp  .fz_ret
+.fz_err:
+    mov  rax, -1
+.fz_ret:
+    add  rsp, 0x28
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
+; ============================================================================
 ; utxo_lsm_flush(lst=rdi, u=rsi) -> 1 ok / -1 err
 ;   mac_flush by its public name, for the ONE caller that needs a flush
 ;   without an accompanying put/del: daemon/utxo_live.c, at the moment
@@ -2426,7 +2697,25 @@ utxo_lsm_flush:
 ;   See header comment for full algorithm. Called by utxo_lsm_put/del once
 ;   op_count or memtable fill crosses its threshold.
 ; ============================================================================
-mac_flush:
+; ============================================================================
+; mac_build_run(lst=rdi, u=rsi, tomb_buf=rdx, tomb_n=rcx, gen=r8, run_no=r9)
+;   -> 1 run written / 0 nothing to write / -1 err
+;   The run writer that was the middle of mac_flush (2026-10-06, plan B3):
+;   every live slot of memtable `u` and every tombstone of the given list
+;   whose key is not live in `u` become one sorted, Bloom-filtered run file
+;   utxo_run_<run_no>.dat with generation `gen` in its header, fsynced and
+;   closed. It touches no lst field but scratch_buf/scratch_cap (the sort
+;   arena) and publishes nothing: the caller owns the manifest, the WAL and
+;   the memtable. mac_flush calls it on the live memtable and this
+;   generation`s list; the async flush (daemon/utxo_live.c) calls it in a
+;   forked child on the FROZEN copy, through utxo_lsm_build_run.
+;   Frame: the same 5-push + 0x300 layout mac_flush had, so the body moved
+;   verbatim; the four parameters live at [rbp-0x1B0..-0x1C8], below every
+;   local the body uses ([rbp-0x1A8] is its deepest).
+; ============================================================================
+global utxo_lsm_build_run
+utxo_lsm_build_run:
+mac_build_run:
     push rbp
     mov  rbp, rsp
     push rbx
@@ -2434,27 +2723,17 @@ mac_flush:
     push r13
     push r14
     push r15
-    sub  rsp, 0x300
+    sub  rsp, 0x308
     mov  r12, rdi           ; lst
     mov  r13, rsi            ; u
-    ; background-compaction gate: see mac_flush_hook. r12/r13 are callee-saved
-    ; in the C hook. mac_flush is entered from asm callers with rsp%16 == 0
-    ; (abi-check: "entry 0"), so the frame is aligned here by accident of the
-    ; prologue; align explicitly and restore from rbp so a future caller with
-    ; the other parity cannot break the one call that leaves assembly.
-    mov  rax, [rel mac_flush_hook]
-    test rax, rax
-    jz   .mf_nohook
-    and  rsp, -16
-    call rax
-    lea  rsp, [rbp-0x328]                    ; 5 pushes + 0x300 frame
-.mf_nohook:
-    ; the flush ends by truncating the WAL: every buffered byte must be in the file before
-    ; anything here can fail and leave the WAL as the only copy of the memtable
-    mov  rdi, r12
-    call utxo_store_wal_drain
-    cmp  rax, -1
-    je   .fl_err
+    mov  [rbp-0x1B0], rdx    ; tomb_buf
+    mov  [rbp-0x1B8], rcx    ; tomb_n
+    mov  [rbp-0x1C0], r8     ; gen
+    mov  [rbp-0x1C8], r9     ; run_no
+    mov  qword [rbp-0x1D0], 0 ; the bloom's own mapping (0 = it lives in the scratch)
+    ; (frame 0x308, not mac_flush's 0x300: this function has an ABI entry
+    ; (rsp 8 mod 16) where mac_flush has the compensated one, and the moved
+    ; body's calls were tuned to the latter)
 
     mov  rdi, r12
     call mac_calc_desc_cap
@@ -2529,9 +2808,9 @@ mac_flush:
     mov  qword [rbp-0x60], 0     ; tomb cursor
 .fl_tomb_loop:
     mov  rax, [rbp-0x60]
-    cmp  rax, [r12+80]
+    cmp  rax, [rbp-0x1B8]
     jae  .fl_tomb_done
-    mov  rbx, [r12+64]
+    mov  rbx, [rbp-0x1B0]
     mov  rcx, rax
     imul rcx, rcx, 36
     add  rbx, rcx                  ; tomb entry ptr
@@ -2573,17 +2852,7 @@ mac_flush:
 
     mov  rax, [rbp-0x38]
     test rax, rax
-    jz   .fl_finish_reset
-
-    ; Check manifest capacity BEFORE doing any sort/bloom/run-file work --
-    ; catching this after writing the run file (as the later manifest-
-    ; append check does, kept as a defensive backstop) would leave an
-    ; orphaned run file on disk that's never referenced by the manifest,
-    ; silently losing whatever it would have shadowed (fatal for a
-    ; tombstone: an older run's stale PUSH stays visible to get()).
-    mov  rax, [r12+120]
-    cmp  rax, [r12+112]
-    jae  .fl_err
+    jz   .br_none
 
     ; ---- sort descriptors ----
     mov  rdi, [r12+128]
@@ -2606,7 +2875,7 @@ mac_flush:
     shl  rcx, 1
     jmp  .fl_bb_loop
 .fl_bb2:
-    mov  rdx, BLOOM_MAX_BYTES*8
+    mov  rdx, RUN_BLOOM_MAX_BYTES*8
     cmp  rcx, rdx
     jbe  .fl_bb3
     mov  rcx, rdx
@@ -2617,6 +2886,29 @@ mac_flush:
     mov  [rbp-0x68], rax           ; bloom_bytes
     dec  rcx
     mov  [rbp-0x78], rcx           ; bits_mask
+
+    ; ---- a bloom past the scratch's BLOOM_MAX_BYTES area gets its own
+    ; mapping (fresh, so already zero). off_bloom becomes the mapping's
+    ; distance from scratch_buf (mod 2^64), so every "scratch_buf +
+    ; off_bloom" below lands on it unchanged; .fl_ret unmaps it. ----
+    mov  rax, [rbp-0x68]
+    cmp  rax, BLOOM_MAX_BYTES
+    jbe  .fl_bz_scratch
+    xor  edi, edi
+    mov  rsi, rax
+    mov  edx, 3                     ; PROT_READ|PROT_WRITE
+    mov  r10d, 0x22                  ; MAP_PRIVATE|MAP_ANONYMOUS
+    mov  r8, -1
+    xor  r9d, r9d
+    mov  eax, 9                       ; mmap
+    syscall
+    cmp  rax, -4095
+    jae  .fl_err
+    mov  [rbp-0x1D0], rax
+    sub  rax, [r12+128]
+    mov  [rbp-0x48], rax            ; off_bloom -> the mapping
+    jmp  .fl_bz_done
+.fl_bz_scratch:
 
     ; ---- zero bloom region ----
     mov  rdi, [r12+128]
@@ -2668,7 +2960,7 @@ mac_flush:
 
     ; ---- write run file ----
     lea  rdi, [rbp-0x140]
-    mov  esi, [r12+144]              ; this run's file number = next_run_no
+    mov  esi, [rbp-0x1C8]              ; this run's file number = next_run_no
     call fmt_runname
     lea  rdi, [rbp-0x140]
     mov  esi, 1 | 0x40 | 0x200
@@ -2681,7 +2973,7 @@ mac_flush:
     mov  qword [rel mac_fl_fill], 0  ; fresh record buffer for this run
 
     mov  dword [rbp-0x100], MAGIC_RUN3     ; new PUSH record shape (Stage D)
-    mov  rax, [r12+96]                ; next_gen
+    mov  rax, [rbp-0x1C0]             ; gen
     mov  [rbp-0x100+4], rax
     mov  rax, [rbp-0x38]
     mov  [rbp-0x100+12], rax
@@ -2835,11 +3127,118 @@ mac_flush:
     test rax, rax
     jnz  .fl_err_close
 
+    ; ST2-1 (audit 2026-10-23): the run's fsync result decides the flush. A
+    ; writeback error (EIO/ENOSPC) here used to fall through to "run written",
+    ; and the manifest was then published naming a run the kernel had just
+    ; said it could not make durable. rdx survives close (syscall clobbers
+    ; rax/rcx/r11 only).
     mov  rdi, [rbp-0x88]
     call mac_fsync2
+    mov  rdx, rax
     mov  rdi, [rbp-0x88]
     mov  eax, 3
     syscall
+    test rdx, rdx
+    js   .fl_err
+
+    mov  rax, 1
+    jmp  .fl_ret
+.br_none:
+    xor  eax, eax
+    jmp  .fl_ret
+.fl_err_close:
+    mov  rdi, [rbp-0x88]
+    mov  eax, 3
+    syscall
+.fl_err:
+    mov  rax, -1
+.fl_ret:
+    mov  rdi, [rbp-0x1D0]
+    test rdi, rdi
+    jz   .fl_ret_nomap
+    mov  rbx, rax                    ; the result (rbx is restored by the epilogue)
+    mov  rsi, [rbp-0x68]
+    mov  eax, 11                     ; munmap
+    syscall
+    mov  qword [rbp-0x1D0], 0
+    mov  rax, rbx
+.fl_ret_nomap:
+    add  rsp, 0x308
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
+mac_flush:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub  rsp, 0x300
+    mov  r12, rdi           ; lst
+    mov  r13, rsi            ; u
+    ; background-compaction gate: see mac_flush_hook. r12/r13 are callee-saved
+    ; in the C hook. mac_flush is entered from asm callers with rsp%16 == 0
+    ; (abi-check: "entry 0"), so the frame is aligned here by accident of the
+    ; prologue; align explicitly and restore from rbp so a future caller with
+    ; the other parity cannot break the one call that leaves assembly.
+    mov  rax, [rel mac_flush_hook]
+    test rax, rax
+    jz   .mf_nohook
+    and  rsp, -16
+    call rax
+    lea  rsp, [rbp-0x328]                    ; 5 pushes + 0x300 frame
+.mf_nohook:
+    ; the flush ends by truncating the WAL: every buffered byte must be in the file before
+    ; anything here can fail and leave the WAL as the only copy of the memtable
+    mov  rdi, r12
+    call utxo_store_wal_drain
+    cmp  rax, -1
+    je   .fl_err
+
+    ; nothing in this generation -> just the reset (the body used to find
+    ; n_desc == 0 after its walks; the memtable count and the tombstone
+    ; count say the same thing before any work)
+    mov  rax, [r13]
+    or   rax, [r12+80]
+    jz   .fl_finish_reset
+    ; Check manifest capacity BEFORE doing any sort/bloom/run-file work --
+    ; catching this after writing the run file (as the later manifest-
+    ; append check does, kept as a defensive backstop) would leave an
+    ; orphaned run file on disk that's never referenced by the manifest,
+    ; silently losing whatever it would have shadowed (fatal for a
+    ; tombstone: an older run's stale PUSH stays visible to get()).
+    mov  rax, [r12+120]
+    cmp  rax, [r12+112]
+    jae  .fl_err
+
+    ; ---- the run: live slots + this generation`s tombstones, sorted, Bloom, sparse index ----
+    mov  rdi, r12
+    mov  rsi, r13
+    mov  rdx, [r12+64]               ; tomb_buf
+    mov  rcx, [r12+80]               ; tomb_n
+    mov  r8,  [r12+96]               ; gen = next_gen
+    mov  r9,  [r12+144]              ; run_no = next_run_no
+    call mac_build_run
+    cmp  rax, -1
+    je   .fl_err
+    test rax, rax
+    jz   .fl_finish_reset            ; every tombstone was shadowed by a live key: nothing written
+
+    ; STO-W (formal/storage, 2026-10-23): the run's create durable before the
+    ; manifest rename that names it. POSIX orders nothing between two name ops
+    ; of one directory (ext4's journal does): a power loss could keep the
+    ; rename and lose the create, a manifest naming a missing run. A failure
+    ; fails the flush before anything names the run (an orphan for the sweep).
+    call mac_dirsync
+    test rax, rax
+    js   .fl_err
 
     ; ---- append to in-memory manifest, advance next_gen/next_run_no ----
     mov  rax, [r12+120]
@@ -2891,8 +3290,12 @@ mac_flush:
     call mac_write_exact
     test rax, rax
     jnz  .fl_merr_close
+    ; ST2-1: a failed fsync of the tmp manifest is a failed publish -- the
+    ; rename below would put a manifest of unknown durability over the old one
     mov  rdi, rbx
     call mac_fsync2
+    test rax, rax
+    js   .fl_merr_close
     mov  rdi, rbx
     mov  eax, 3
     syscall
@@ -2904,20 +3307,34 @@ mac_flush:
     test rax, rax
     jl   .fl_err
 
-    lea  rdi, [rel dot_name]
-    xor  esi, esi
-    mov  eax, 2
-    syscall
+    ; ST2-1: and a failed directory fsync fails the flush BEFORE the WAL
+    ; reset below: the rename may not be durable, so the WAL stays the copy
+    ; of this generation (a reload replays it over the old manifest). STO-D:
+    ; so does a failed open of the directory, which skipped the fsync and
+    ; went on to the reset.
+    call mac_dirsync
     test rax, rax
-    jl   .fl_finish_reset
-    mov  rbx, rax
-    mov  rdi, rbx
-    call mac_fsync2
-    mov  rdi, rbx
-    mov  eax, 3
-    syscall
+    js   .fl_err
 
 .fl_finish_reset:
+    ; ---- plan B3 (2026-10-06): the checkpoint offset retires WITH the WAL.
+    ; An async adopt advances utxo.idx's log_off past the generations it
+    ; retired; a WAL truncated to 0 here with that offset still on disk would
+    ; have the next reload skip the records appended below it. The idx is
+    ; emptied FIRST: a failure leaves the run published and the WAL intact
+    ; (a reload then replays bytes the run also holds -- duplicates, not a
+    ; loss). idx_fd is -1 for a read-only store, which never flushes. ----
+    mov  rdi, [r12+8]
+    cmp  rdi, 0
+    jl   .fl_idx_done
+    xor  esi, esi
+    mov  eax, 77                         ; ftruncate(idx_fd, 0)
+    syscall
+    test rax, rax
+    js   .fl_err
+.fl_idx_done:
+    mov  qword [r12+24], 0
+    mov  qword [r12+32], 0
     ; ---- UTX-8 (audit 2026-09-03): the WAL reset must SUCCEED ----
     ; Both syscalls below had their results discarded and log_len was then set
     ; to 0 regardless. On EIO the old generation stays in utxo.dat while new
@@ -2963,10 +3380,6 @@ mac_flush:
     mov  eax, 3
     syscall
     jmp  .fl_err
-.fl_err_close:
-    mov  rdi, [rbp-0x88]
-    mov  eax, 3
-    syscall
 .fl_err:
     mov  rax, -1
 .fl_ret:
@@ -3134,11 +3547,15 @@ mac_lsm_reload_impl:
     mov  rdx, [r12+104]
     add  rdx, rcx
     mov  rax, [rdx]              ; this entry's gen
+    cmp  rax, -1                 ; F7: 2^64-1 has no successor (next_gen
+    je   .rl_manifest_wrap       ; = max + 1 below would wrap to 0)
     cmp  rax, [r12+96]
     jbe  .rl_mscan_g
     mov  [r12+96], rax
 .rl_mscan_g:
     mov  rax, [rdx+8]            ; this entry's run_no
+    cmp  rax, -1                 ; F7: likewise for next_run_no
+    je   .rl_manifest_wrap
     cmp  rax, [r12+144]
     jbe  .rl_mscan_r
     mov  [r12+144], rax
@@ -3151,6 +3568,16 @@ mac_lsm_reload_impl:
     inc  qword [r12+96]
     inc  qword [r12+144]
     jmp  .rl_manifest_done
+.rl_manifest_wrap:
+    ; ---- formal/parsers F7 (2026-10-23): an entry whose gen or run_no is
+    ; 2^64-1. next_gen/next_run_no are 1 + the largest seen, and that +1
+    ; wrapped to 0, so the next flush could write a run no newer than an
+    ; existing one -- breaking newest-wins. Saturating cannot restore the
+    ; order (2^64-1 is not greater than 2^64-1) and nothing this node writes
+    ; comes near it: the manifest is corrupt, and reloading it fails like any
+    ; other unreadable manifest (UTX-6, below). The fd was closed at
+    ; .rl_manifest_close; daemon/lsm_manifest.c refuses the same entries.
+    jmp  .rl_fail
 .rl_manifest_bad:
     ; ---- UTX-6: a manifest that EXISTS but cannot be read is a HARD FAILURE.
     ;
@@ -3205,7 +3632,19 @@ mac_lsm_reload_impl:
     test rax, rax
     jl   .rl_fail
     mov  rbx, rax
-    mov  qword [rbp-0x90], 0
+    ; from ckpt_log_off, not 0 (plan B3, 2026-10-06): utxo_store_reload
+    ; replayed the memtable from there, and the bytes below it are retired
+    ; generations -- a punched hole that reads as zeros, which the loop
+    ; below would take for the end of the log and drop EVERY tombstone.
+    mov  rax, [r12+24]
+    mov  [rbp-0x90], rax
+    mov  rdi, rbx
+    mov  rsi, rax
+    xor  edx, edx                    ; SEEK_SET
+    mov  eax, 8
+    syscall
+    test rax, rax
+    js   .rl_fail
 .rl_wal_loop:
     mov  rax, [rbp-0x90]
     cmp  rax, [r12+16]
@@ -3486,6 +3925,14 @@ mac_fl_buf:  resb MAC_FLBUF
 mac_compact_defer_unlink:  resq 1
 mac_compact_defer_publish: resq 1
 mac_flush_hook:            resq 1
+; plan B3 (2026-10-06): mac_freeze_hook replaces mac_flush at the threshold
+;   crossing inside utxo_lsm_put/del -- long hook(lst, u) runs the freeze
+;   (utxo_lsm_freeze) and forks the run writer (daemon/utxo_live.c); -1 is a
+;   flush error to the caller, as mac_flush's was. mac_fz_on gates every read
+;   of the struct's frozen fields (+168..), so a caller with the 168-byte
+;   struct and no freeze is never read past its end.
+mac_freeze_hook:           resq 1
+mac_fz_on:                 resq 1
 ; utxo_lsm_compact_range's arguments, parked here so the range entry can share
 ; utxo_lsm_compact's body: lo = first manifest index of the batch, k = run
 ; count (0 = the classic "oldest min(n,64)" batch). See .cc_bs_default.
@@ -3504,6 +3951,14 @@ utxo_lsm_set_defer_publish:
 global utxo_lsm_set_flush_hook
 utxo_lsm_set_flush_hook:
     mov  [rel mac_flush_hook], rdi
+    ret
+global utxo_lsm_set_freeze_hook
+utxo_lsm_set_freeze_hook:
+    mov  [rel mac_freeze_hook], rdi
+    ret
+global utxo_lsm_fz_enable
+utxo_lsm_fz_enable:
+    mov  [rel mac_fz_on], rdi
     ret
 
 
@@ -4303,7 +4758,7 @@ utxo_lsm_compact:
     shl  rcx, 1
     jmp  .cc_bb_loop
 .cc_bb2:
-    mov  rdx, BLOOM_MAX_BYTES*8
+    mov  rdx, RUN_BLOOM_MAX_BYTES*8
     cmp  rcx, rdx
     jbe  .cc_bb3
     mov  rcx, rdx
@@ -4315,18 +4770,9 @@ utxo_lsm_compact:
     dec  rcx
     mov  [rbp-0x48], rcx             ; bits_mask
 
-    ; zero the bloom region in OUR scratch
-    mov  rdi, r13
-    add  rdi, COMPACT_SLOTS_BYTES
-    mov  rcx, [rbp-0x50]
-.cc_bz:
-    test rcx, rcx
-    jz   .cc_bz_done
-    mov  byte [rdi], 0
-    inc  rdi
-    dec  rcx
-    jmp  .cc_bz
-.cc_bz_done:
+    ; the bloom region of OUR scratch needs no zeroing: the scratch is this
+    ; call's own fresh anonymous mmap (above), and a byte loop over a
+    ; RUN_BLOOM_MAX_BYTES region would touch every page of it
 
     ; ---- second, separate mmap for the sparse-index build buffer ----
     ; Sized from upper_bound (the sum of input runs' own nrec, already known
@@ -4712,11 +5158,30 @@ utxo_lsm_compact:
     test rax, rax
     jnz  .cc_err_close
 
+    ; ST2-1: the merged run's fsync result decides the compaction (a failure
+    ; used to publish the merge and unlink its inputs). The fd is closed here
+    ; and marked -1: .cc_dirsync_skip and .cc_err_close close it again, and by
+    ; then the number may belong to another thread's open (inline compaction
+    ; runs in the daemon process).
     mov  rdi, [rbp-0x58]
     call mac_fsync2
+    mov  rdx, rax
     mov  rdi, [rbp-0x58]
     mov  eax, 3
     syscall
+    mov  qword [rbp-0x58], -1
+    test rdx, rdx
+    js   .cc_err
+
+    ; STO-W (formal/storage, 2026-10-23): the merged run's create durable
+    ; before the manifest rename below names it (as in mac_flush). Deferred
+    ; publish: the parent's lsm_manifest_publish makes it durable instead.
+    cmp  qword [rel mac_compact_defer_publish], 0
+    jne  .cc_pre_dirsync_done
+    call mac_dirsync
+    test rax, rax
+    js   .cc_err
+.cc_pre_dirsync_done:
 
     ; ---- write the merged (OLDEST surviving generation) entry FIRST, at
     ;      index 0, then shift the surviving (newer, un-merged) entries
@@ -4890,8 +5355,10 @@ utxo_lsm_compact:
     call mac_write_exact
     test rax, rax
     jnz  .cc_merr_close
-    mov  rdi, rbx
+    mov  rdi, rbx                           ; ST2-1: checked, as the flush's
     call mac_fsync2
+    test rax, rax
+    js   .cc_merr_close
     mov  rdi, rbx
     mov  eax, 3
     syscall
@@ -4905,18 +5372,12 @@ utxo_lsm_compact:
     test rax, rax
     jl   .cc_err_close
 
-    lea  rdi, [rel dot_name]
-    xor  esi, esi
-    mov  eax, 2
-    syscall
+    ; ST2-1: a failed dir fsync keeps the inputs (the rename may not be
+    ; durable, the old manifest may come back naming them). STO-D: so does a
+    ; failed open of the directory, which skipped the fsync and unlinked them.
+    call mac_dirsync
     test rax, rax
-    jl   .cc_dirsync_skip
-    mov  rbx, rax
-    mov  rdi, rbx
-    call mac_fsync2
-    mov  rdi, rbx
-    mov  eax, 3
-    syscall
+    js   .cc_err
 .cc_dirsync_skip:
 
     ; ---- close output fd, close+unlink old input runs, free scratch ----

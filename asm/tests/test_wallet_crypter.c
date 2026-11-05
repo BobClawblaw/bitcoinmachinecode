@@ -181,6 +181,48 @@ int main(void){
            wcrypt_open("pw", 2, t, bl, got, sizeof got) < 0);
     }
 
+    /* ---- CRY-5 (audit 2026-10-23): wcrypt_rewrap parsed the container on
+     * its own and never applied the WAL-16 bound, so the same tampered file
+     * that wcrypt_open refuses still ground ~4e9 SHA-512 rounds through
+     * walletpassphrasechange. It also took the seed ciphertext length from
+     * the file without checking it against the blob. Both now share
+     * wcrypt_open's parser. The control: an untampered container rewraps
+     * (section 4 above). */
+    {
+        u8 seed[32]; for (int i = 0; i < 32; i++) seed[i] = (u8)(0xB0 + i);
+        static u8 blob[4096], t[8192], o[8192];
+        long bl = wcrypt_seal("pw", 2, seed, 32, blob, sizeof blob);
+        ck("CRY-5 sealed a container", bl > 0);
+        ck("CRY-5 control: the untampered container rewraps",
+           wcrypt_rewrap("pw", 2, "pw2", 3, blob, bl, o, sizeof o) > 0);
+
+        memcpy(t, blob, (size_t)bl);
+        unsigned it = 0xffffffffu; memcpy(t + 8 + 8, &it, 4);
+        sha256_full(t + bl - 32, t, (unsigned long)(bl - 32));
+        alarm(30);    /* without the bound this grinds for hours: the alarm turns that into a failure */
+        long r = wcrypt_rewrap("pw", 2, "pw2", 3, t, bl, o, sizeof o);
+        alarm(0);
+        ck("CRY-5 rewrap REFUSES a 4-billion-iteration container", r < 0);
+
+        memcpy(t, blob, (size_t)bl);
+        it = 0; memcpy(t + 8 + 8, &it, 4);
+        sha256_full(t + bl - 32, t, (unsigned long)(bl - 32));
+        ck("CRY-5 rewrap refuses a zero iteration count",
+           wcrypt_rewrap("pw", 2, "pw2", 3, t, bl, o, sizeof o) < 0);
+
+        /* a seed ciphertext length past the end of the blob: the old rewrap
+         * copied that many bytes from beyond it into the new container */
+        memcpy(t, blob, (size_t)bl);
+        unsigned short wl; memcpy(&wl, t + 20, 2);
+        unsigned sl; memcpy(&sl, t + 22 + wl + 16, 4);
+        sl += 256; memcpy(t + 22 + wl + 16, &sl, 4);
+        sha256_full(t + bl - 32, t, (unsigned long)(bl - 32));
+        ck("CRY-5 the over-long seed length still passes the checksum", wcrypt_is_encrypted(t, bl) == 1);
+        ck("CRY-5 wcrypt_open refuses it", wcrypt_open("pw", 2, t, bl, seed, sizeof seed) < 0);
+        ck("CRY-5 ...and so does rewrap (it read past the blob)",
+           wcrypt_rewrap("pw", 2, "pw2", 3, t, bl, o, sizeof o) < 0);
+    }
+
     printf("\n%s (%d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);
     return fails ? 1 : 0;
 }

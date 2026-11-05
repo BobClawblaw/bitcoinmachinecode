@@ -92,6 +92,17 @@ int main(void){
       wallet_pass_set_file(inside);
       ck("a 0600 file inside the datadir is still refused", try_load(got, sizeof got) == 0);
       printf("        (correct modes are not enough -- a datadir backup carries it)\n");
+      /* audit 2026-10-23 (INFO): the check compared the configured STRING
+       * with the datadir, so a path that only resolves into it passed */
+      char viasym[700]; snprintf(viasym, sizeof viasym, "%s/link.pass", DIR);
+      unlink(viasym);
+      ck("(setup) a symlink outside the datadir pointing at the file inside", symlink(inside, viasym) == 0);
+      wallet_pass_set_file(viasym);
+      ck("a symlink outside the datadir to a file inside it is refused", try_load(got, sizeof got) == 0);
+      unlink(viasym);
+      char dotdot[9000]; snprintf(dotdot, sizeof dotdot, "%s/../..%s/wp_inside.pass", DIR, cwd);   /* DIR is /tmp/<name>: two levels up is / */
+      wallet_pass_set_file(dotdot);
+      ck("a \"..\" path that resolves into the datadir is refused", try_load(got, sizeof got) == 0);
       unlink(inside); }
 
     printf("== an empty or missing file yields nothing ==\n");

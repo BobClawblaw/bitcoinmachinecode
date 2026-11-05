@@ -21,8 +21,8 @@
 ;     (Core SignatureHashSchnorr; a 0x04 hash_type was previously accepted);
 ;   - SIGHASH_SINGLE with n_in >= nout FAILS (BIP341), rather than
 ;     substituting the zero hash the way BIP143 does.
-; Also preserved: the spks run walk's TS_SPK_RUN_CAP ceiling (that run has
-; no length parameter -- see the C's note), sha_outputs / sha_single_output
+; Also preserved: the spks run walk's ceiling, num_inputs * (3 + 10000)
+; since CON-6 (that run has no length parameter -- see the C's note), sha_outputs / sha_single_output
 ; hashed IN PLACE over the transaction's own bytes, the annex's
 ; sha256(compactsize||annex) with its overflow-safe bound, and every cap
 ; check in the C's order.
@@ -81,10 +81,10 @@ extern ts_tx_seq_export               ; C seam: nSequence of input i
 %define TS_OFF_ENTRIES 600000
 %define TS_OFF_BYTES   (TS_OFF_ENTRIES * 4)
 %define TS_SEQ_CAP     (4 * TS_OFF_ENTRIES)
-%define TS_SPK_RUN_CAP (4 << 20)
+%define TS_SPK_RUN_ENTRY_MAX (3 + 10000)   ; CON-6: the ceiling is n * this, as the C's TS_SPK_RUN_MAX
 %define TS_ANNEX_CAP   ((4 << 20) + 9)
 
-section .tbss alloc noexec nowrite tls align=8
+section .tbss nobits alloc noexec write tls align=8
 global b341_off
 b341_off:  resq 1                     ; u32* offset table (tx_parse)
 global b341_seq
@@ -268,7 +268,8 @@ ts_agg_hashes_asm:
     mov  rbx, [r13+C_SPKS]
     mov  [rbp-0x70], rbx
     mov  r12, rbx
-    add  r12, TS_SPK_RUN_CAP
+    imul rax, r15, TS_SPK_RUN_ENTRY_MAX  ; n * (3 + MAX_SCRIPT_SIZE)
+    add  r12, rax
     xor  eax, eax
     mov  [rbp-0x60], rax                 ; i = 0
 .spk_loop:

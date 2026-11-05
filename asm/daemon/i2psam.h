@@ -34,4 +34,7 @@ int  i2psam_accept(i2psam_t* s, const char* sam_ip, int sam_port,
                    char* peer_b32, long cap, int timeout_ms);
 /* the .b32.i2p name of a base64 destination (test/utility) */
 int  i2psam_dest_to_b32(char* out, long cap, const char* dest_b64);
+/* our own .b32.i2p from the private key a bridge hands back (and the key
+ * file holds): only its public Destination prefix is hashed */
+int  i2psam_privkey_to_b32(char* out, long cap, const char* priv_b64);
 #endif

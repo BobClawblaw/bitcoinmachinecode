@@ -129,6 +129,8 @@ Lopen_file:
     ldr   x0, [x19]
     tbnz  x0, #63, 1f
     bl    _close                          /* no fd leak */
+    mov   x9, #-1                         /* ST2-5 (main 2026-10-23): if the open below fails, */
+    str   x9, [x19]                       /* no caller may see the closed number as an open fd */
 1:  mov   x0, sp
     mov   w1, w20
     bl    _fmt_blkname

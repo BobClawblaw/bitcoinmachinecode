@@ -3,7 +3,7 @@
  * Exports: node_log_event, node_log_open, node_log_str */
 /* node_log.S -- AArch64 port of asm/node_log.asm: tiny leveled text logger.
  *
- *   long _node_log_open(const char* path)            -> log fd, or 0 on error
+ *   long _node_log_open(const char* path)            -> log fd, or -1 on error
  *   void _node_log_event(long fd, int kind, u32 a, u32 b, u32 c) "<KIND> a b c\n"
  *   void _node_log_str  (long fd, int kind, const char* s, long len) "<KIND> s\n"
  *   kinds: 0 INFO 1 HSHK 2 HDRS 3 BLOCK 4 CONS 5 STORE 6 ERROR 7 SERVE
@@ -44,7 +44,8 @@ _node_log_open:
 	b.cs .nlo_fail
 	ret
 .nlo_fail:
-	mov  w0, #0
+	mov  x0, #-1		/* -1, not 0 (main 2026-10-23): every writer then fails at once in
+				 * fd_write_all, where 0 sent the lines to whatever fd 0 is */
 	ret
 
 /* ---- emit_u32(buf x0, val w1) -> ptr after "VAL " in x0 ---- */

@@ -13,10 +13,13 @@ Tor, I2P and CJDNS, with BIP324 encrypted transport, and runs on mainnet,
 testnet4, signet (public or custom) and regtest.
 
 > **Status: experimental.** The code has been through internal and external
-> security review (see `docs/audits/`) but has not received an independent
-> human audit of its consensus and cryptographic assembly. Run it for study
-> and evaluation, on a machine you can afford to lose, with no funds near it.
-> For a production node, run [Bitcoin Core](https://bitcoincore.org).
+> security review (see `docs/audits/`), most recently the 2026-10-23 review
+> and a formal verification of four areas
+> ([`docs/history/2026-10-23-the-review/`](docs/history/2026-10-23-the-review/)).
+> It has not received an independent human audit of its consensus and
+> cryptographic assembly. Run it for study and evaluation, on a machine you
+> can afford to lose, with no funds near it. For a production node, run
+> [Bitcoin Core](https://bitcoincore.org).
 
 ## Highlights
 
@@ -52,17 +55,23 @@ testnet4, signet (public or custom) and regtest.
 
 **Initial block download**
 
-- Headers-first, then 16 download workers each fetching a 40-block chunk
-  with one `getdata` per chunk (blocks placed by hash as they arrive), inside
-  a 4,096-block window above the first unfilled height — Core's
-  `BLOCK_DOWNLOAD_WINDOW` scaled to this node's in-flight count — so the
-  archive consolidates monotonically and a chunk a worker gives up on goes
-  to a retry ring, never a hole left behind. An idle worker fetches the
-  chunk blocking the window after 2 s (Core's stalling timeout). Workers
-  stage each verified chunk to a file and one committer process appends
-  the archive in height order, so the block files are laid out
-  monotonically and the archive never holds a hole (unlike Core's
-  arrival-order `blk*.dat`).
+- Headers first. Four peers are asked for the first header page at once
+  and the fastest leads. A leader that slows to under half the runner-up's
+  rate is switched, and the runner-up continues from where it stopped
+  (2026-10-07). Then blocks: 10 download workers (`bmc.catchupworkers`,
+  Core's preferred-download set), each fetching a 16-block chunk
+  (`bmc.dlcchunk`) with one `getdata` per chunk, with blocks placed by hash
+  as they arrive. Requests stay inside Core's 1,024-block window above the
+  connected tip (`BLOCK_DOWNLOAD_WINDOW`). A chunk a worker gives up on goes
+  to a retry ring, never a hole left behind. Core's stall rule judges the
+  window's tail: while the window is full, the holder of its oldest missing
+  chunk has 2 s (doubling to 64 s). Then it is disconnected and the chunk
+  goes to an idle worker at once. A peer that stalls a second time is banned
+  for the run. Workers stage each verified chunk to a file, and one committer
+  process appends the archive in height order, so the block files are laid
+  out monotonically and the archive never holds a hole (unlike Core's
+  arrival-order `blk*.dat`). `bmc.dlshape=core` downloads by Core's own rules
+  instead, for benchmarks.
 - Peers are ranked by a timed header sample before the download; a peer is
   dropped only by a stall clock (nothing for 120 s) or, at a chunk boundary
   with nothing discarded, for running under half the pool's median. Every
@@ -88,6 +97,10 @@ testnet4, signet (public or custom) and regtest.
   delete anything below a sync hole.
 - Startup verification (`checkblocks`/`checklevel`) at Core's defaults;
   `reindex` and `reindex-chainstate`.
+- A UTXO store that exists but will not reload, or whose manifest names a
+  missing run, halts the boot with the tip held; the node never starts on a
+  partial set (2026-10-23). Block files, the index and undo data are synced
+  before each WAL drain.
 
 **Mempool (Core policy)**
 
@@ -102,7 +115,9 @@ testnet4, signet (public or custom) and regtest.
 - TRUC (BIP431 / v3) topology rules, ephemeral dust, `submitpackage` with
   child-pays-for-parent effective feerate, and 1-parent-1-child (1p1c)
   package relay.
-- Taproot witness standardness, `datacarrier`/`datacarriersize`,
+- Taproot witness standardness; spends of unknown witness versions are
+  non-standard (not relayed or mined) and stay consensus-valid, as in Core.
+  `datacarrier`/`datacarriersize`,
   `permitbaremultisig`, `dustrelayfee`, `minrelaytxfee`,
   `incrementalrelayfee`, `mempoolexpiry`, `acceptnonstdtxn`.
 - Mempool admission runs the consensus verifier (legacy + full taproot)
@@ -187,7 +202,9 @@ testnet4, signet (public or custom) and regtest.
   proofs, the mempool, fee estimates, and address pages from a native
   address history index (about 200 GB on mainnet, built during the sync).
   mempool.space runs against the node unpatched; see
-  [`docs/MEMPOOL_SPACE.md`](docs/MEMPOOL_SPACE.md).
+  [`docs/MEMPOOL_SPACE.md`](docs/MEMPOOL_SPACE.md). The listener sends no
+  wildcard CORS header, bounds its batches, and serves from a fixed thread
+  pool with total deadlines.
 - `getblocktemplate`/`submitblock`/`submitheader`,
   `prioritisetransaction`, `dumptxoutset` (assumeutxo snapshot export).
 - ZMQ publishers for `hashblock`, `hashtx`, `rawblock`, `rawtx` and Core's
@@ -210,7 +227,7 @@ testnet4, signet (public or custom) and regtest.
   test oracles).
 - Disk: about 1 TB for a full mainnet archive plus the UTXO store. A pruned
   node fits in a few GB.
-- Memory: several GB. The UTXO memtable (`dbcache`, default 1024 MiB) grows
+- Memory: several GB. The UTXO memtable (`dbcache`, default 450 MiB, Core's) grows
   to multiple GB in bulk catch-up mode during initial sync.
 - Optional: a `tor` daemon (SOCKS and control port), an I2P router with the
   SAM bridge (`i2pd`), and `cjdroute` for the respective networks.
@@ -294,7 +311,7 @@ UTXO set identical to Core's on every `gettxoutsetinfo` field
    else, put the file at `<datadir>/bitcoin.conf` (or export
    `BITCOIN_CONF`). A daemon that finds no file logs `[config] no config
    file at ... -- using compiled defaults` and runs on the defaults: P2P
-   port 8333, RPC on loopback, `dbcache=1024`. The fresh-install acceptance
+   port 8333, RPC on loopback, `dbcache=450` (1024 until 2026-09-29). The fresh-install acceptance
    test (`validation/fresh_install_ibd.sh`) hit exactly this on its first
    run, 2026-09-02.
 
@@ -306,9 +323,14 @@ UTXO set identical to Core's on every `gettxoutsetinfo` field
 
    `serve` is the production mode: it binds the P2P listener, discovers
    peers, syncs headers, fills any archive gap with parallel download
-   workers (default 16), builds the UTXO set with full script verification,
-   then follows the tip while serving inbound peers and RPC. A first mainnet
-   sync takes days and is CPU-bound on signature verification. The `[dl]
+   workers (default 10, Core's preferred-download set: the 8 full-relay and
+   2 block-relay-only outbound peers; `bmc.catchupworkers` overrides), builds
+   the UTXO set with full script verification, then follows the tip while
+   serving inbound peers and RPC. A first mainnet sync on the benchmark box
+   (Ryzen 9 9950X3D, 16 cores, 123 GiB RAM, NVMe; default settings, so
+   `assumevalid` on) reached the tip with every index in 4 h 2 m (run 44,
+   2026-10-08); Core v31.1 took 9 h 50 m there. With `assumevalid=0` it took
+   8 h 0 m. Expect longer on fewer cores, a slower disk or a slower link. The `[dl]
    heartbeat:` log line reports tip height, live peers, UTXO count and uptime.
    The daemon honours `SIGTERM` and the `stop` RPC.
 
@@ -384,7 +406,10 @@ the service account needs read access to tor's control cookie
 the node reads at its default value and is the reference. Keys are Bitcoin
 Core's names and units; unknown keys are ignored with a message, and any
 Core option the node does not implement is named at startup as having no
-effect. Values are read once at startup. The `[config]` block in the console
+effect. An error Core's reader stops on (a parse error, an unknown chain, an
+invalid `rpcport` or `bind`, a failed `includeconf`) stops the boot here too, and
+RPC credentials apply only to their own chain's section, as in Core
+(2026-10-23). Values are read once at startup. The `[config]` block in the console
 log echoes the resolved values.
 
 | key | default | meaning |
@@ -411,7 +436,7 @@ log echoes the resolved values.
 | `mempoolfullrbf` | — | not an option in Core v31.1 (full RBF is unconditional); logged as an unknown configuration value |
 | `datacarrier` / `datacarriersize` / `permitbaremultisig` / `acceptnonstdtxn` | `1` / `100000` / `1` / `0` | relay policy |
 | `bytespersigop` | `20` | fee rate is judged against `max(vsize, sigops * bytespersigop / 4)` |
-| `dbcache` | `1024` MiB | UTXO memtable sizing |
+| `dbcache` | `450` MiB | UTXO memtable sizing (Core v31.1's default since 2026-09-29; it was 1024). Like Core's, it is the total: with `bmc.asyncflush=1` the live memtable and the flush writer's frozen copy get half each (2026-10-08, plan M2) |
 | `par` | `0` (auto) | script-verification threads |
 | `prune` | `0` | `0` off, `1` manual-only, `>=550` target size in MiB |
 | `txindex` / `txospenderindex` / `addrindex` / `blockfilterindex` / `coinstatsindex` | `0` | optional indexes, all built by the daemon during the sync; `addrindex` must be set BEFORE syncing (historic spends need undo) |
@@ -432,6 +457,10 @@ log echoes the resolved values.
 | `bmc.coinstatshistrepair` / `bmc.coinstatshistworkers` | `1` / `0` | the coinstats history base (`gettxoutsetinfo` at any height) is checked once a heartbeat and rebuilt by a supervised, niced child when missing or broken: never during initial block download, three attempts per boot; skipped on a node synced from block 0, whose live rows already start at genesis; workers `0` = cores/4 (2..8), pass 3 sizes itself by free RAM |
 | `bmc.utxocompactthreshold` / `bmc.bootcatchup` | `12` / `0` | project-specific: UTXO runs that trigger compaction; run the parallel downloader inside the BOOT phase. `bmc.bootcatchup` defaults to 0 since 2026-09-24: with 1 the RPC server does not start until that download finishes, so a fresh node answers no RPC for its whole first sync. The worker's far-behind trigger still runs the downloader. Every published benchmark used 0 |
 | `bmc.benchlog` | `0` | project-specific (2026-10-04): `1` writes `[bench]` stage-timing lines for benchmark runs -- per connected block (UTXO apply split), per block's index work (txindex, txospender, bfilter, addr, zmq), per UTXO memtable flush, per download chunk; Core's counterpart is `debug=bench` + `debug=coindb`. The `[ready]` line (every enabled index at the tip after IBD) prints regardless |
+| `bmc.asyncflush` | `1` | project-specific (2026-10-06, plan B3): the UTXO memtable flush (sort, run file, Bloom filter, fsync) runs in a forked writer while the applier continues; the applier pays a copy of the memtable. The copy and the live memtable share the `dbcache` (half each); the copy keeps its pages between flushes (releasing them, as plan M2 did on 2026-10-08, made every freeze wait on the kernel's memory compaction: 2.4 s a freeze against 0.2 s). `0` runs the flush inline in the applier with the whole `dbcache` for one memtable, as before. Core's counterpart is its own background flush of the dbcache |
+| `bmc.lsmreads` | `mmap` | project-specific (2026-10-11): how the UTXO run lookups read records. `mmap` is the mapped fast path; `pread` reads the records with `pread()` into a per-thread window (the Bloom filter and the sparse index stay mapped), one syscall per run a lookup reaches, so the run files stay page cache and leave the process's PSS -- run 46's worker held ~49 GB of mapped run pages before a full compaction. The answers are identical (`tests/test_lsm_reads_pread`). An opt-in low-memory mode, with `bmc.dropappends=1`: a from-genesis sync with both (run 51, 2026-10-25) peaked at 22.1 GB PSS against run 46's 56.3, but took 5:52 against 3:17, the lookups 4.4x slower. |
+| `bmc.dropappends` | `0` | project-specific (2026-10-11, plan B16): drop the blk and rev append streams from the page cache behind the applier (`sync_file_range` + `POSIX_FADV_DONTNEED`, once per 16 MB of undo and once per 128 MB block file). Those streams, 400 GB in the first 650,000 blocks, share the kernel's inactive list with the UTXO run files, and with `bmc.lsmreads=pread` they evicted the run pages the lookups read (run 49: 76% of the run bytes resident at block 650,000, 212 GB re-read from disk). `0` leaves the page cache to the kernel. The bytes on disk are the same either way (`tests/test_drop_appends`). |
+| `bmc.memtableanon` | `1` | project-specific (2026-10-07, plan B11): the live UTXO memtable's table and blob in anonymous memory (huge-page eligible, never written back) instead of `MAP_SHARED` file mappings; the files are kept at their sizes and the table's header page is shared, so the offline tools and the tx-validation snapshot's writer-count cross-check read what they always did. `0` restores the file mappings. |
 
 ## Networks: Tor, I2P, CJDNS, IPv6
 
@@ -444,8 +473,9 @@ log echoes the resolved values.
   node creates its own ephemeral v3 onion service (ED25519 key persisted in
   the datadir) that targets a loopback-only listener, keeps the control
   connection open for the daemon's lifetime, and announces the onion address
-  to onion peers only. Cookie authentication on the control port is used
-  when offered; `torpassword` is the fallback. Setting `proxy=` also stops
+  to onion peers only. Control-port authentication follows Core: with
+  `torpassword` set, HASHEDPASSWORD or nothing; otherwise NULL when offered,
+  then SAFECOOKIE. The plain cookie is never sent (2026-10-23). Setting `proxy=` also stops
   the node using the system resolver for peer hostnames (names are handed to
   the proxy), skips the DNS seeds, gives every proxied connection its own
   SOCKS5 credentials (`proxyrandomize`) so Tor isolates circuits, and never
@@ -525,9 +555,6 @@ in [`docs/FEATURE_GAPS.md`](docs/FEATURE_GAPS.md):
   (Core: `bitcoind.pid`) — nothing this node ships or writes carries a
   Bitcoin Core file name, so both can live on one box. Every other config
   default matches Core's (`docs/audits/CONFIG_DEFAULTS_VS_CORE_2026-09-06.md`).
-- **Download window.** 4,096 blocks above the first unfilled height against
-  Core's 1,024: Core keeps ~128–160 blocks in flight, this node 640, and the
-  window preserves Core's slack ratio rather than its constant.
 - **Wallet.** The seed wallet always carries bech32 (wpkh); `createwalletdescriptor`
   adds legacy (pkh, 44'), p2sh-segwit (sh(wpkh), 49') and bech32m (tr, 86'),
   after which `getnewaddress`/`getrawchangeaddress` accept that address type,
@@ -581,11 +608,10 @@ in [`docs/FEATURE_GAPS.md`](docs/FEATURE_GAPS.md):
   Bitcoin Core itself ships only the negotiation (its `-txreconciliation` is
   off by default and its message processing has no `reqrecon`/`sketch`).
 - **Not implemented:** UPnP/NAT-PMP, BIP37 bloom filters
-  (`peerbloomfilters`), `whitelistrelay`/`whitelistforcerelay`, GUI,
-  `loadtxoutset` (assumeutxo import; export via `dumptxoutset` works),
-  `walletnotify`, `maxtxfee` enforcement, `uacomment`,
-  `includeconf`/`settings`. Each unimplemented
-  Core option is named in the startup log when set.
+  (`peerbloomfilters`), GUI, `loadtxoutset` (assumeutxo import; export via
+  `dumptxoutset` works), and `settings` (values set over RPC are not
+  persisted). Each option that has no effect here is named in the startup
+  log when set, with the reason (`k_noeffect` in `asm/daemon/node_config.c`).
 - **Chains.** Legacy testnet3 (`testnet=1`, `chain=test`) is refused.
 - **One relay edge.** A transaction announced exactly once during a leg's
   sync pass can be drained unexamined; Core's periodic re-announcement
@@ -604,7 +630,9 @@ in [`docs/FEATURE_GAPS.md`](docs/FEATURE_GAPS.md):
 | [`docs/ENGINEERING.md`](docs/ENGINEERING.md) | architecture, binaries and command lines, on-disk formats, validation gates |
 | [`docs/ENGINEERING_RULES.md`](docs/ENGINEERING_RULES.md) | the rules the codebase is written under |
 | [`docs/ABI_STACK_ALIGNMENT.md`](docs/ABI_STACK_ALIGNMENT.md) | the SysV stack-alignment contract and the audit that enforces it |
-| [`docs/audits/`](docs/audits/) | external security audits and the project's responses |
+| [`SECURITY.md`](SECURITY.md) | how to report a vulnerability |
+| [`docs/audits/`](docs/audits/) | security audits and reviews, and the project's responses |
+| [`docs/history/`](docs/history/) | long-form accounts of the larger pieces of work, each with a PDF edition |
 | [`docs/devlog/`](docs/devlog/) | development log: incident log, plans, benchmarks, assessments |
 | `worklog/` | dated development action logs (`*-osx.md` the Mac side's; `*-note-for-osx*.md` / `*-note-for-x86*.md` the two sides' notes to each other) |
 | [`port/OSX_STATE.md`](port/OSX_STATE.md) | the macOS / Apple silicon port: state, roadmap and branch model under `port/` |
@@ -622,9 +650,26 @@ September 2026. The clean pair (2026-09-21): Core 19 h 32 m 54 s, this node
 18 h 24 m 02 s, with the UTXO set identical by MuHash. A full-verification
 sync (`assumevalid=0`, every script of every block) completed on 2026-09-27
 in 8 h 0 m at nice 10 on the benchmark box, its per-height digests equal to
-Core's throughout. Signature verification is level with libsecp256k1 on one
+Core's throughout. The release report's latest default sync (run 46, 2026-10-10)
+reached the tip with every index in 3 h 17 m 55 s against Core rerun #7's
+9 h 50 m 04 s, with a heap peak of 13.3 GB against Core's 12.0 and a mean of
+8.2 against 10.0
+([`docs/releases/2026-10-07-faster-than-core-in-every-stage-of-the-sync.md`](docs/releases/2026-10-07-faster-than-core-in-every-stage-of-the-sync.md),
+addendum).
+Signature verification is level with libsecp256k1 on one
 core (2026-09-27). The landing notes in [`docs/releases/`](docs/releases/)
 record each change and the run that measured it; the daily record is in
 [`worklog/`](worklog/).
 mempool.space runs against the production node through the Esplora facade
 ([`docs/MEMPOOL_SPACE.md`](docs/MEMPOOL_SPACE.md)).
+
+The 2026-10-23 review found 9 HIGH, 18 MEDIUM and 36 LOW findings, five of
+the HIGHs consensus splits from Core. Formal verification of the consensus
+arithmetic, the secp256k1 assembly, the UTXO store's crash consistency and
+the untrusted-input parsers found more. Every finding is fixed (PRs #424 to
+#435), and the fixed build passed the full test gate and a from-genesis
+sync with its UTXO set MuHash-identical to Core v31.1's at 972,848. What is
+still open, and what changed for operators, are the review's two appendices
+([`docs/history/2026-10-23-the-review/`](docs/history/2026-10-23-the-review/)).
+Production has run that build since 2026-10-24
+([`docs/devlog/DEPLOYMENT_HISTORY.md`](docs/devlog/DEPLOYMENT_HISTORY.md)).

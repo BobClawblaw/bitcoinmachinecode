@@ -40,6 +40,27 @@ int i2psam_dest_to_b32(char* out, long cap, const char* dest_b64){
     memcpy(out + l, ".b32.i2p", 9);
     return 1;
 }
+/* Our OWN address. A SAM bridge answers SESSION CREATE with the PRIVATE key
+ * (SAM v3: "DESTINATION=$privkey", the Destination followed by its private
+ * keys), and that is also what the key file holds. This used to hash the
+ * whole blob, so the .b32.i2p we derived and announced was not our address
+ * at all. Core's Session::MyDestination: the public Destination is the
+ * first 387 bytes plus the certificate length stored big-endian at bytes
+ * 385-386 (geti2p.net/spec/common-structures#destination); the address is
+ * base32(sha256()) of exactly that. A peer's destination (STREAM ACCEPT) is
+ * public already and goes through i2psam_dest_to_b32, as Core's
+ * DestB64ToAddr hashes it whole. */
+int i2psam_privkey_to_b32(char* out, long cap, const char* priv_b64){
+    static unsigned char raw[4096];
+    long n = i2p_b64decode(raw, sizeof raw, priv_b64);
+    if (n < 387 || cap < 62) return 0;
+    long dest_len = 387 + (((long)raw[385] << 8) | raw[386]);
+    if (n < dest_len) return 0;
+    unsigned char h[32]; sha256_full(h, raw, dest_len);
+    long l = base32_encode(out, h, 32);
+    memcpy(out + l, ".b32.i2p", 9);
+    return 1;
+}
 static int send_line(int fd, const char* s, int timeout_ms){
     long n = (long)strlen(s);
     struct pollfd pf = { fd, POLLOUT, 0 };
@@ -106,7 +127,7 @@ int i2psam_session(i2psam_t* s, const char* sam_ip, int sam_port, const char* ke
         int kf = open(keyfile, O_WRONLY | O_CREAT | O_TRUNC, 0600);
         if (kf >= 0){ (void)!write(kf, dest, strlen(dest)); (void)!write(kf, "\n", 1); close(kf); }
     }
-    if (!i2psam_dest_to_b32(s->b32, sizeof s->b32, dest)){
+    if (!i2psam_privkey_to_b32(s->b32, sizeof s->b32, dest)){
         snprintf(s->err, sizeof s->err, "cannot derive our .b32.i2p from the destination"); close(fd); return 0; }
     s->ctrl = fd;
     return 1;

@@ -228,6 +228,14 @@ int main(void){
         ok(signet_check_solution(1, prev, T, mrk, wsh, sizeof wsh,
                                  v1, 34, work, sizeof work) == 1,
            "an unknown witness version is accepted, as Core does (not rejected)");
+
+        /* CON-2 (audit 2026-10-23): ...but not when the program push is
+         * FALSE. Core's VerifyScript evaluates the challenge first and fails
+         * EVAL_FALSE on OP_2 <0x0000> before it reaches the witness. */
+        unsigned char v2f[4] = { 0x52, 0x02, 0x00, 0x00 };
+        ok(signet_check_solution(1, prev, T, mrk, wsh, sizeof wsh,
+                                 v2f, 4, work, sizeof work) == 0,
+           "an unknown witness version with a false program is rejected (EVAL_FALSE)");
     }
 
     /* A custom signet with a P2WSH challenge, signed for real. The trivial

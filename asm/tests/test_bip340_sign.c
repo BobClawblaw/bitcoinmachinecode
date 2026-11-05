@@ -104,6 +104,53 @@ int main(void){
         ck("CRY-5   and verifies", schnorr_verify(s4, q, m192, sizeof m192) == 1);
     }
 
+    /* ---- CRY-2 (audit 2026-10-23): neg_n lost its borrow on an all-ones
+     * limb, so a key with odd-Y P (negated before signing) and a limb of
+     * 0xffffffffffffffff signed with the wrong d and returned 1 with a
+     * signature that does not verify. The reviewer's key below has limb 1
+     * all ones and odd Y. The sweep puts an all-ones limb at each position
+     * under varied other limbs; about half of those have odd Y and go
+     * through the negation. Every signature the signer returns must verify
+     * through the consensus verifier. */
+    printf("== CRY-2: keys with an all-ones limb ==\n");
+    {
+        u8 sk[32], q[32], aux[32], m[32], sg[64];
+        unhex(sk, "001e43bb6cad4a268d116ece1738f7d9ffffffffffffffffc7bd7705c2d34eeb");
+        memset(aux, 0, 32); memset(m, 0x42, 32);
+        ck("CRY-2 PoC key: pubkey derives", bip340_pubkey(q, sk) == 1);
+        int r = bip340_sign(sg, m, 32, sk, aux);
+        ck("CRY-2 PoC key: signs", r == 1);
+        ck("CRY-2 PoC key: ...and the signature VERIFIES", r == 1 && schnorr_verify(sg, q, m, 32) == 1);
+
+        /* the tweak path negates the same way (BIP341 key-path spend) */
+        u8 t[32]; memset(t, 0x07, 32);
+        u8 qt[32], dq[32], qq[32];
+        ck("CRY-2 PoC key: tweaked key derives", bip340_tweak_privkey(dq, sk, t) == 1);
+        ck("CRY-2 PoC key: Q = P + t*G", bip32_xonly_tweak_add(q, t, qt) == 1);
+        ck("CRY-2 PoC key: ...and the tweaked key's x-only pubkey IS Q", bip340_pubkey(qq, dq) == 1 && !memcmp(qq, qt, 32));
+
+        int signed_n = 0, bad = 0, refused = 0;
+        for (int limb = 0; limb < 4; limb++){
+            for (int v = 0; v < 24; v++){
+                u8 k[32];
+                for (int i = 0; i < 32; i++) k[i] = (u8)(0x31 + 7 * i + 13 * v);
+                k[0] = (u8)(v & 0x3f);                  /* below n (overwritten when limb 3 is the all-ones one) */
+                /* big-endian bytes: limb L is bytes [24-8L, 32-8L) */
+                memset(k + 24 - 8 * limb, 0xff, 8);
+                if (limb == 3) k[8] = 0x12;                /* top limb all ones: limb 2 keeps it below n */
+                u8 kx[32]; if (!bip340_pubkey(kx, k)) continue;
+                m[0] = (u8)v; m[1] = (u8)limb;
+                int rr = bip340_sign(sg, m, 32, k, aux);
+                if (!rr){ refused++; continue; }
+                signed_n++;
+                if (schnorr_verify(sg, kx, m, 32) != 1) bad++;
+            }
+        }
+        printf("    sweep: %d signed, %d refused, %d did not verify\n", signed_n, refused, bad);
+        ck("CRY-2 sweep: every key signed (none refused by the self-check)", refused == 0 && signed_n > 0);
+        ck("CRY-2 sweep: every signature returned verifies", bad == 0);
+    }
+
     printf("\n%s (%d checks, %d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", checks, fails);
     return fails ? 1 : 0;
 }

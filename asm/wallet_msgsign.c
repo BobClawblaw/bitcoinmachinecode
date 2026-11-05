@@ -110,7 +110,9 @@ int msg_sign(const unsigned char priv_be[32], const char* message,
     unsigned char zbe[32], pub[33];
     uint64_t r[4], s[4];
     if (msg_digest(zbe, message) != 0) return -1;
-    wallet_ecdsa_sign(r, s, zbe, priv_be);
+    /* the signer refuses (returns 0) for an invalid key or a zero nonce, r
+     * or s, leaving r/s unset; that used to be printed as a signature */
+    if (wallet_ecdsa_sign(r, s, zbe, priv_be) != 1) return -1;
     unsigned char rbe[32], sbe[32];
     limbs_to_be(rbe, r);
     limbs_to_be(sbe, s);
@@ -443,7 +445,7 @@ int msg_sign_core(const unsigned char priv_be[32], const char* message,
     unsigned char zbe[32];
     if (msg_digest(zbe, message) != 0) return -1;
     uint64_t r[4], s[4];
-    wallet_ecdsa_sign(r, s, zbe, priv_be);
+    if (wallet_ecdsa_sign(r, s, zbe, priv_be) != 1) return -1;   /* refused: no signature */
     /* digest -> limbs for recovery */
     uint64_t z[4];
     be_to_limbs(z, zbe, 32);

@@ -1,6 +1,6 @@
 /* bitcoind.S -- adapted from the verified arm-port (origin/arm-port
  * port/arm64/bitcoind.S) to Mach-O by adapt_armport.py, then hand-gated.
- * Exports: drain_txid_scratch, g_accept_version_hook, g_cmpct_hook_blocktxn, g_cmpct_hook_cmpct, g_cmpct_hook_type, g_peer_sendcmpct, g_peer_version_len, g_peer_version_payload, g_peer_wants_addrv2, g_peer_wtxidrelay, g_sync_mp, ibd_txid_scratch, node_accept_handshake, node_drain, node_fetch_headers, node_handshake, node_ibd, node_ibd_blocks, node_ibd_blocks_s, node_ibd_blocks_x, node_ibd_headers, node_make_version, node_relay_flag, node_serve_block, node_serve_block_by_hash, node_services, node_sync, node_sync_multi, node_ua_buf, node_ua_len, sync_fail_code, sync_txid_scratch */
+ * Exports: drain_txid_scratch, g_accept_version_hook, g_block_ctx_hook, g_cmpct_hook_blocktxn, g_cmpct_hook_cmpct, g_cmpct_hook_type, g_peer_sendcmpct, g_peer_version_len, g_peer_version_payload, g_peer_wants_addrv2, g_peer_wtxidrelay, g_sync_mp, ibd_txid_scratch, node_accept_handshake, node_drain, node_fetch_headers, node_handshake, node_ibd, node_ibd_blocks, node_ibd_blocks_s, node_ibd_blocks_x, node_ibd_headers, node_make_version, node_relay_flag, node_serve_block, node_serve_block_by_hash, node_services, node_sync, node_sync_multi, node_ua_buf, node_ua_len, sync_fail_code, sync_txid_scratch */
 /* ============================================================================
  * bitcoind.S -- AArch64 (ARMv8-A) port of asm/bitcoind.asm
  * Node daemon orchestration: handshakes, headers-first sync/IBD, block serve,
@@ -579,7 +579,8 @@ _node_sync_multi:
 	   plen@32(dw), varint@36(dw), getdata_len@40(dw), loop_i@44(dw),
 	   loc_count@48(qw), hdr_retry@56(dw), blk_retry@60(dw),
 	   stop[32]@64, cmd[12]@96, blockhash[32]@128, getdata[40]@176,
-	   prehash[64*32]@224, getheaders[1061]@2304 */
+	   prehash[64*32]@224, getheaders[1061]@2304, cmpct flags@3376/3380,
+	   unrequested-block count@3384(dw), its hash[32]@3392 (P2P-1) */
 	mov  x19, x0                     /* fd */
 	mov  x20, x1                     /* st */
 	mov  x21, x2                     /* locator */
@@ -795,6 +796,7 @@ _node_sync_multi:
 	str  w0, [sp, #60]               /* blk_retry = 0 */
 	str  wzr, [sp, #3376]            /* this block not assembled from a compact block (yet) */
 	str  wzr, [sp, #3380]            /* no full-block fallback sent for it (yet) */
+	str  wzr, [sp, #3384]            /* P2P-1: `block` replies that were not the block requested */
 .LNSblk_drain:
 	mov  x0, x19
 	add  x1, sp, #96                 /* cmd */
@@ -851,7 +853,14 @@ _node_sync_multi:
 	ldr  x5, [sp, #8]                /* cap = buflen */
 	add  x6, sp, #128                /* the hash we asked for */
 	blr  x9
-	cmp  x0, #0
+	cmn  x0, #2                      /* P2P-3: CMPCT_INVALID, Core's READ_STATUS_INVALID */
+	b.ne 24f
+	mov  w1, #14                     /* bogus compact-block indexes: the peer is scored */
+	adrp x2, _sync_fail_code@PAGE
+	add  x2, x2, _sync_fail_code@PAGEOFF
+	str  w1, [x2]
+	b    .NSfail
+24:	cmp  x0, #0
 	b.le .LNSblk_drain
 	str  w0, [sp, #32]               /* plen = the assembled block */
 	mov  w1, #1
@@ -866,11 +875,12 @@ _node_sync_multi:
 	adrp x9, _g_cmpct_hook_blocktxn@PAGE
 	ldr  x9, [x9, _g_cmpct_hook_blocktxn@PAGEOFF]
 	cbz  x9, .LNSblk_drain
-	mov  x0, x19                     /* cmpct_recv_blocktxn(fd, pl, plen, out, cap) */
+	mov  x0, x19                     /* cmpct_recv_blocktxn(fd, pl, plen, out, cap, want) */
 	mov  x1, x22
 	ldr  w2, [sp, #32]
 	mov  x3, x22
 	ldr  x4, [sp, #8]
+	add  x5, sp, #128                /* P2P-1: the block this pass asked for */
 	blr  x9
 	cmp  x0, #0
 	b.le .LNSblk_drain
@@ -903,6 +913,59 @@ _node_sync_multi:
 	bl   _p2p_write
 	b    .LNSblk_drain
 .LNS_have_block:
+	/* ---- P2P-1 (audit 2026-10-23): is this the block we asked for? ----
+	 * blockhash@128 is the hash of the header the peer's own `headers`
+	 * reply named, and the block is filed under it below. Until this check
+	 * whatever `block` came back was stored under it (idxscan_append_locked
+	 * asks only that the body extend our tip; cons_verify checks PoW against
+	 * the body's OWN nBits), and the applier, which compares the two,
+	 * stopped at that height for good. A `block` that is not the one asked
+	 * for is passed over like any unrelated message; 16 of them end the
+	 * pass (where=11). Too short to hold a header: a bad block (where=8). */
+	ldr  w9, [sp, #32]
+	cmp  w9, #81
+	b.lo .LNS_fail8
+	add  x0, sp, #3392
+	mov  x1, x22
+	bl   _block_hash
+	add  x13, sp, #3392
+	ldp  x9, x10, [x13]
+	ldp  x11, x12, [sp, #128]
+	cmp  x9, x11
+	ccmp x10, x12, #0, eq
+	ldp  x9, x10, [x13, #16]
+	ldp  x11, x12, [sp, #144]
+	ccmp x9, x11, #0, eq
+	ccmp x10, x12, #0, eq
+	b.eq 25f
+	str  wzr, [sp, #3376]            /* whatever path assembled it, it is not ours */
+	ldr  w1, [sp, #3384]
+	add  w1, w1, #1
+	str  w1, [sp, #3384]
+	cmp  w1, #16
+	b.lo .LNSblk_drain
+	mov  w1, #11
+	adrp x2, _sync_fail_code@PAGE
+	add  x2, x2, _sync_fail_code@PAGEOFF
+	str  w1, [x2]
+	b    .NSfail
+25:	/* ---- P2P-1: Core's header acceptance before any of the body's work.
+	 * g_block_ctx_hook(st, hdr80) -> 1 accept, else the fail code: 12 a
+	 * header Core refuses as invalid (the peer is scored), 13 refused but
+	 * not the peer's fault (time-too-new). NULL (hermetic suites) skips. */
+	adrp x9, _g_block_ctx_hook@PAGE
+	ldr  x9, [x9, _g_block_ctx_hook@PAGEOFF]
+	cbz  x9, 26f
+	mov  x0, x20                     /* st */
+	mov  x1, x22                     /* the block's header */
+	blr  x9
+	cmp  w0, #1
+	b.eq 26f
+	adrp x2, _sync_fail_code@PAGE
+	add  x2, x2, _sync_fail_code@PAGEOFF
+	str  w0, [x2]
+	b    .NSfail
+26:
 	/* validate */
 	mov  x0, x22
 	ldr  w1, [sp, #32]               /* plen */
@@ -2146,6 +2209,9 @@ _g_cmpct_hook_fallback:
 	.quad 0
 	.globl _g_block_fetch_hook
 _g_block_fetch_hook:
+	.quad 0
+	.globl _g_block_ctx_hook
+_g_block_ctx_hook:		/* int (*)(void* st, const u8 hdr80[80]): 1 accept, else the fail code (P2P-1, 2026-10-23) */
 	.quad 0
 	.align 2
 	.globl _node_start_height

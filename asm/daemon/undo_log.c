@@ -44,6 +44,8 @@ typedef unsigned long long u64;
 static int  g_undo_fd = -1;          /* the current rev file, O_APPEND */
 static long g_undo_fd_height = -1;   /* the height whose run is being written */
 static unsigned g_undo_file = 0;     /* its file number */
+/* ST2-4: the rev files written since the last undo_sync (lo > hi: none) */
+static unsigned g_undo_dirty_lo = 1, g_undo_dirty_hi = 0;
 void undo_close_current(void){
     if (g_undo_fd >= 0) close(g_undo_fd);
     g_undo_fd = -1; g_undo_fd_height = -1;
@@ -77,15 +79,136 @@ static int undo_fd_for(long height){
     int fd = open(name, O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (fd < 0) return -1;
     g_undo_fd = fd; g_undo_fd_height = height; g_undo_file = file;
+    if (g_undo_dirty_lo > g_undo_dirty_hi){ g_undo_dirty_lo = g_undo_dirty_hi = file; }
+    else { if (file < g_undo_dirty_lo) g_undo_dirty_lo = file; if (file > g_undo_dirty_hi) g_undo_dirty_hi = file; }
     return fd;
 }
+
+/* ST2-4 (audit 2026-10-23): make the undo store durable. The checkpoint
+ * (utxo_live.c persist_applied_height) fsyncs the WAL and then records the
+ * applied height; the undo runs and their undo.idx slots were never synced
+ * at all, so a power loss could keep WAL ops (the spends) whose undo was
+ * lost -- and the ghost guard, which finds an unconfirmed block only through
+ * undo_exists(h), would then not see it, and a reorg could not disconnect a
+ * checkpointed block. Called by the checkpoint BEFORE its WAL fsync: every
+ * rev file written since the last call (one, or two across a rotation), then
+ * undo.idx. 0 ok (also: no undo store yet), -1 an fdatasync failed. */
+long undo_sync(void){
+    if (g_undo_dirty_lo <= g_undo_dirty_hi){
+        for (unsigned f = g_undo_dirty_lo; ; f++){
+            char name[32]; us_rev_name(name, f);
+            int fd = (f == g_undo_file && g_undo_fd >= 0) ? g_undo_fd : open(name, O_RDONLY | O_CLOEXEC);
+            if (fd >= 0){
+                int r = fdatasync(fd);
+                if (fd != g_undo_fd) close(fd);
+                if (r != 0) return -1;
+            }
+            if (f == g_undo_dirty_hi) break;
+        }
+    }
+    int ifd = open(UNDO_IDX_FILE, O_RDONLY | O_CLOEXEC);
+    if (ifd >= 0){
+        int r = fdatasync(ifd);
+        close(ifd);
+        if (r != 0) return -1;
+    }
+    /* the file still being appended to stays dirty for the next call */
+    if (g_undo_fd >= 0){ g_undo_dirty_lo = g_undo_dirty_hi = g_undo_file; }
+    else { g_undo_dirty_lo = 1; g_undo_dirty_hi = 0; }
+    return 0;
+}
 int undo_exists(long height){ return us_exists(height); }
+/* STO-A (formal/storage, 2026-10-23): register block `height`'s run (its
+ * undo.idx slot) BEFORE the block's first put or del. The slot used to be
+ * written at the first spend, after the coinbase's outputs were already in
+ * the WAL buffer, and for a block that spends nothing only at undo_commit:
+ * a drain in between could put outputs on disk that no slot accounts for,
+ * and recovery would never delete them. 1 ok, -1 failure. */
+long undo_begin(long height){ return undo_fd_for(height) >= 0 ? 1 : -1; }
+/* the rev files holding heights lo..hi join the next undo_sync's set (boot
+ * recovery: what a previous process wrote is in the page cache only) */
+void undo_mark_dirty_heights(long lo, long hi){
+    for (long h = lo; h <= hi; h++){
+        undo_slot_t s; if (us_slot_get(h, &s) != 1) continue;
+        if (g_undo_dirty_lo > g_undo_dirty_hi){ g_undo_dirty_lo = g_undo_dirty_hi = s.file; }
+        else { if (s.file < g_undo_dirty_lo) g_undo_dirty_lo = s.file; if (s.file > g_undo_dirty_hi) g_undo_dirty_hi = s.file; }
+    }
+}
 /* close block `height`'s run with the END marker (creating the run if the
  * block spent nothing). 1 ok, -1 write failure. */
 /* 2026-10-05 (bmc.benchlog): the split of undo_capture_and_del + undo_commit,
  * so the applier's `put` phase can be read as get / undo write / del / commit.
  * Four clock reads per spent input when on; off (the default) costs one load
  * and one branch per call. utxo_live.c turns it on with the benchlog. */
+/* ---- B16 (2026-10-11, bmc.dropappends): the undo stream out of the page cache
+ * A rev file is written once and read again only by a reorg or an index
+ * backfill. Left alone, its pages sit on the kernel's inactive list beside the
+ * blk files' -- 400 GB of appends in the first 650,000 blocks of run 49 --
+ * and that stream is what evicts the UTXO run pages the pread lookups
+ * (bmc.lsmreads=pread) rely on: at block 650,000 run 49's run files were 76%
+ * resident and the worker had re-read 212 GB of them from disk. The mapped
+ * path never saw it because mapped pages win the eviction (and count in the
+ * PSS, which is the row the pread path is there to take).
+ *
+ * The shape is the streaming-write recipe: every UNDO_DROP_STEP bytes, start
+ * writeback of the step just completed and, for the step before it (whose
+ * writeback was started a step ago, so the wait is normally nothing),
+ * wait for it and drop its pages. The last two steps of a file stay until
+ * the writer rolls to the next file, which drops the old file whole. A page
+ * that is still dirty is never freed by POSIX_FADV_DONTNEED, hence the
+ * sync_file_range before it; the syscalls are counted (undo_drop_count) so
+ * the test can see the path ran. */
+#define UNDO_DROP_STEP (16u << 20)
+#define SFR_WAIT_BEFORE 1
+#define SFR_WRITE       2
+#define SFR_WAIT_AFTER  4
+#ifdef __APPLE__
+/* bmc_osx: Darwin has neither sync_file_range nor posix_fadvise, and no call
+ * that frees one file's clean pages, so bmc.dropappends (off by default) does
+ * nothing on the Mac: no drops are made or counted. */
+#define UNDO_NO_DROP 1
+#else
+#include <sys/syscall.h>
+static int sfr(int fd, u64 off, u64 len, unsigned flags){ return (int)syscall(SYS_sync_file_range, fd, (off_t)off, (off_t)len, flags); }
+#endif
+static int      g_undo_drop = 0;
+static unsigned g_drop_file = ~0u;    /* the file g_drop_mark describes */
+static u64      g_drop_mark;          /* the next step boundary in g_drop_file */
+static u64      g_stat_drops;         /* steps (and whole files) dropped */
+void undo_set_drop_appends(int on){ g_undo_drop = on ? 1 : 0; }
+unsigned long long undo_drop_count(void){ return g_stat_drops; }
+#ifndef UNDO_NO_DROP
+static void undo_drop_whole(unsigned file){
+    char name[32]; us_rev_name(name, file);
+    int fd = open(name, O_RDONLY);
+    if (fd < 0) return;
+    sfr(fd, 0, 0, SFR_WAIT_BEFORE | SFR_WRITE | SFR_WAIT_AFTER);
+    posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+    close(fd); g_stat_drops++;
+}
+static void undo_drop_behind(int fd, unsigned file){
+    if (!g_undo_drop) return;
+    off_t end = lseek(fd, 0, SEEK_CUR);          /* O_APPEND: the offset is the end after a write */
+    if (end < 0) return;
+    if (file != g_drop_file){
+        if (g_drop_file != ~0u) undo_drop_whole(g_drop_file);
+        g_drop_file = file; g_drop_mark = UNDO_DROP_STEP;
+    }
+    while ((u64)end >= g_drop_mark){
+        u64 b = g_drop_mark - UNDO_DROP_STEP;     /* the step just completed: [b, mark) */
+        sfr(fd, b, UNDO_DROP_STEP, SFR_WRITE);
+        if (b >= UNDO_DROP_STEP){
+            u64 a = b - UNDO_DROP_STEP;           /* the step before it */
+            sfr(fd, a, UNDO_DROP_STEP, SFR_WAIT_BEFORE | SFR_WRITE | SFR_WAIT_AFTER);
+            posix_fadvise(fd, (off_t)a, (off_t)UNDO_DROP_STEP, POSIX_FADV_DONTNEED);
+            g_stat_drops++;
+        }
+        g_drop_mark += UNDO_DROP_STEP;
+    }
+}
+#else
+static void undo_drop_behind(int fd, unsigned file){ (void)fd; (void)file; (void)g_undo_drop; (void)g_drop_file; (void)g_drop_mark; }
+#endif
 static int g_undo_split_timing = 0;
 static u64 g_undo_split_ns[4];   /* 0 the prevout get, 1 the record write, 2 the del, 3 undo_commit */
 static u64 undo_clock_ns(void);
@@ -97,6 +220,7 @@ long undo_commit(long height){
     if (fd < 0) return -1;
     u8 end[UNDO_REC_HDR]; us_make_end(end, height);
     long w = write(fd, end, UNDO_REC_HDR);
+    if (w == UNDO_REC_HDR) undo_drop_behind(fd, g_undo_file);   /* B16: the stream behind this block out of the page cache */
     undo_close_current();
     if (g_undo_split_timing) g_undo_split_ns[3] += undo_clock_ns() - t0;
     return w == UNDO_REC_HDR ? 1 : -1;
@@ -220,15 +344,28 @@ long undo_replay_tolerant(long height, undo_replay_cb cb, void* ctx, int* torn){
     return undo_replay_impl(height, cb, ctx, 1, torn);
 }
 
-/* undo_discard(height) -> 1 removed / 0 nothing there.
+/* undo_discard(height) -> 1 removed / 0 nothing there / -1 the discard hook
+ * failed and the slot stays (STO-B, below).
  * Drops one height's undo file once it has been consumed by a disconnect --
  * that data describes a block that is no longer on our chain, so keeping it
  * around could only ever mislead a later disconnect at the same height (a
  * reconnected block at height H writes its OWN undo_<H>.dat, and
  * undo_append_record opens with O_APPEND, so a stale file left in place
  * would be silently PREPENDED to the new block's records). */
+/* STO-B (formal/storage, 2026-10-23): the slot is the only record that a
+ * block's effects are on disk, and every caller has just queued the
+ * reversal of those effects (restores, deletes) in the WAL's process
+ * buffer. Clearing the slot first left a window -- a SIGKILL, or a power
+ * loss before the WAL reached the disk -- in which the block's effects
+ * stayed while the record of them was gone; the next boot re-applied the
+ * block onto them and rejected it (BIP30). The hook (utxo_live.c) drains
+ * and fsyncs the WAL; when it fails the slot stays, -1, and the next
+ * recovery repeats the (idempotent) reversal. */
+static long (*g_undo_discard_hook)(void) = 0;
+void undo_set_discard_hook(long (*fn)(void)){ g_undo_discard_hook = fn; }
 long undo_discard(long height){
     if (g_undo_fd_height == height) undo_close_current();
+    if (g_undo_discard_hook && us_exists(height) && g_undo_discard_hook() != 0) return -1;
     return us_slot_clear(height) == 1 ? 1 : 0;
 }
 

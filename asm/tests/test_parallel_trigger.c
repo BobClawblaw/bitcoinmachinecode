@@ -43,6 +43,17 @@ int main(void){
      * honest peers claim the tip. The second-highest rule alone fires. */
     { long hs[4] = { 974088, 974088, 968553, 968554 };
       ok( dl_trigger_height(hs, 4) == 974088, "two agreeing false claims pass the second-highest rule (the #304 runs)"); }
+    printf("== 2026-10-07 (run 40, B10): a claim the chain could not have reached ==\n");
+    /* run 40's tail: two fresh legs claimed 975,945 on a 970,229 archive 4 s
+     * after the ranking's median said 970,265; the honest legs claimed the
+     * real tip. 62 s of parallel downloader for 37 blocks. */
+    { long hs[6] = { 975945, 975945, 970261, 970260, 970261, 970259 };
+      ok( dl_plausible_claim(975945, hs, 6, 0, 0, 1000) == 975945, "no ranking behind us: the second-highest rule stands (a fresh node must still sync)");
+      ok( dl_plausible_claim(975945, hs, 6, 970265, 1000, 1004) == 970261, "4 s after the pool's median said 970,265: 975,945 is not believed; the highest claim within reach (970,261) is");
+      ok( dl_plausible_claim(970300, hs, 6, 970265, 1000, 1004) == 970300, "a claim within the growth bound passes");
+      ok( dl_plausible_claim(975945, hs, 6, 970265, 1000, 1000 + 5700*60) == 975945, "...and the same claim once the chain could have grown that far (a block a minute allowed)");
+      long only[2] = { 975945, 975945 };
+      ok( dl_plausible_claim(975945, only, 2, 970265, 1000, 1004) == 970265, "every leg claims it: the pool's median is used"); }
     ok(!dl_claim_memo_active("203.0.113.7:8333", 1000), "an unknown host is believed");
     dl_claim_memo_note("203.0.113.7:8333", 974088, 1000);
     ok( dl_claim_memo_active("203.0.113.7:8333", 1001), "a host whose claim came to nothing is remembered");

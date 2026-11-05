@@ -30,10 +30,13 @@
  * its tx array plus the stride; block_witness never sees the rest. */
 typedef struct { const uint8_t* ptr; uint64_t len; } bw_txref_t;
 
-/* Returns 1 = block passes, 0 = reject (*reason = Core's reject string:
- * "bad-witness-nonce-size" | "bad-witness-merkle-match" |
- * "unexpected-witness"), -1 = internal error (malformed tx / scratch too
- * small; *reason set). `txs` is an array of `ntx` records of `stride` bytes
+/* Returns 1 = block passes, 0 = Core's BLOCK_MUTATED (*reason = Core's
+ * reject string: "bad-witness-nonce-size" | "bad-witness-merkle-match" |
+ * "unexpected-witness"), -1 = a transaction does not decode the way Core's
+ * deserializer requires (truncated, non-canonical CompactSize, superfluous
+ * witness record -- checked on EVERY transaction, CON-4) or the scratch is
+ * too small; *reason set. Neither 0 nor a decode -1 may mark the block
+ * invalid: the witness bytes are not committed to by the header (CON-1). `txs` is an array of `ntx` records of `stride` bytes
  * whose first 16 bytes are a bw_txref_t. `scratch` needs ntx*32 bytes. */
 long block_check_witness_commitment(const void* txs, uint64_t ntx, uint64_t stride,
                                     int segwit_active,

@@ -63,6 +63,7 @@ uint64_t mpj_capacity(void){ return g_mpj_cap; }
 int mpj_open(const char* path, uint64_t capacity){
     if (g_mpj) return 1;                       /* already open */
     if (!path || !*path || capacity == 0) return 0;
+    if (capacity > ((uint64_t)INT64_MAX - MPJ_HDR_BYTES) / MPJ_REC_BYTES) return 0;   /* ST2-6: the file size must be an off_t */
 
     uint64_t want = MPJ_FILE_BYTES(capacity);
     int fd = open(path, O_RDWR | O_CREAT, 0644);
@@ -85,7 +86,18 @@ int mpj_open(const char* path, uint64_t capacity){
             close(fd); return 0;               /* foreign or future file: refuse, never rewrite */
         }
         uint64_t filecap = ld64(hdr + MPJ_HOFF_CAPACITY);
-        if (filecap == 0 || (uint64_t)sb.st_size < MPJ_FILE_BYTES(filecap)){ close(fd); return 0; }
+        /* ST2-6 (audit 2026-10-23): bound the capacity by what the file holds
+         * BEFORE any multiply. MPJ_FILE_BYTES(filecap) wraps for a capacity
+         * near 2^64/152, so a small file could pass a size check made with
+         * it; the ring was then mapped at the small size and slot_at() walked
+         * past the mapping by the huge capacity. Division cannot wrap. */
+        if (filecap == 0 || filecap > ((uint64_t)sb.st_size - MPJ_HDR_BYTES) / MPJ_REC_BYTES){ close(fd); return 0; }
+        /* formal/parsers F5 (2026-10-23): next_seq is 1-based and only ever
+         * counts up from the 1 a new file is given, so 0 is a header no
+         * writer produced. Refuse it like the other impossible headers above
+         * (the node runs without the journal and says so) rather than adopt
+         * it: every reader computes next - 1. */
+        if (ld64(hdr + MPJ_HOFF_NEXTSEQ) == 0){ close(fd); return 0; }
         capacity = filecap;
         want = MPJ_FILE_BYTES(capacity);
     } else {
@@ -225,9 +237,15 @@ void mpj_stats(mpj_stats_t* st){
     if (!g_mpj) return;
     st->capacity = g_mpj_cap;
     uint64_t next = mpj_next_seq();
+    /* formal/parsers F5: next == 0 made `written` 2^64 - 1 and the walk below
+     * ran from seq 2^64 - 1 down to 1 (bmcgetmempooljournal never returned).
+     * mpj_recent and mpj_lookup already stop at next <= 1; so does this.
+     * mpj_open refuses a file whose header says 0, but the counter lives in a
+     * shared mapping a writer bumps -- one step past 2^64 - 1 reads 0 until
+     * mpj_append's second bump -- so the guard stays here as well. */
+    if (next <= 1) return;
     st->written  = next - 1;
     st->held     = (st->written < g_mpj_cap) ? st->written : g_mpj_cap;
-    if (st->written == 0) return;
     uint64_t oldest = oldest_seq(next);
     mpj_rec r;
     if (read_slot(oldest, &r))   st->oldest_departed = r.departed_at;

@@ -98,7 +98,7 @@ TAP_PREIMG_CAP equ 4*1024*1024
 ; see PERF_SCOPE.md section 14 for the profile that measured the cost.
 ; .tbss is demand-paged, so TAP_PREIMG_CAP is 4 MiB of address space per
 ; thread but only the touched pages are ever resident.
-section .tbss alloc noexec nowrite tls align=16
+section .tbss nobits alloc noexec write tls align=16
 global tagh_buf
 tagh_buf:   resb 32
 global tap_preimg

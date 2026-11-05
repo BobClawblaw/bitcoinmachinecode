@@ -25,11 +25,17 @@ void cmpct_recv_set_writer(cmpct_writer_t w);              /* test seam; default
  *   > 0  : the full block is in out (that many bytes) -- validate and store it
  *   0    : pending -- getblocktxn was sent, or (on any failure) a full
  *          MSG_WITNESS_BLOCK getdata was sent; keep reading
- *   -1   : not the block we wanted, or receive disabled -- ignore */
+ *   -1   : not the block we wanted, or receive disabled -- ignore
+ *   CMPCT_INVALID (-2): Core's READ_STATUS_INVALID (P2P-3) -- the peer sent
+ *          bogus indexes; nothing was sent, score the peer */
+#define CMPCT_INVALID (-2)
 long cmpct_recv_cmpctblock(int fd, void* mp, const unsigned char* pl, unsigned long plen,
                            unsigned char* out, unsigned long cap, const unsigned char want_hash[32]);
-/* A blocktxn payload: same contract (> 0 block ready, 0 fallback sent, -1 not ours) */
-long cmpct_recv_blocktxn(int fd, const unsigned char* pl, unsigned long plen, unsigned char* out, unsigned long cap);
+/* A blocktxn payload: same contract (> 0 block ready, 0 fallback sent, -1 not
+ * ours). want_hash (P2P-1): the block the caller is reconstructing; a pending
+ * reconstruction of any other block is not completed (-1). NULL: any. */
+long cmpct_recv_blocktxn(int fd, const unsigned char* pl, unsigned long plen, unsigned char* out, unsigned long cap,
+                         const unsigned char want_hash[32]);
 /* stats for the log */
 void cmpct_recv_stats(unsigned long* reconstructed, unsigned long* needed_txn, unsigned long* fell_back);
 /* The short-id table takes each pool entry's wtxid from the slot cache that

@@ -50,6 +50,11 @@ cons_verify:
     jz   .fail
 
     ; ---- read the tx-count CompactSize at block+80 (wire-required field) ----
+    ; CON-9 (audit 2026-10-23): CANONICAL only, as Core's ReadCompactSize
+    ; (serialize.h "non-canonical ReadCompactSize()"): fd 02 00 for 2 made a
+    ; block Core cannot deserialize; it was stored here, and apply_block_inner
+    ; (whose reader IS canonical) then failed it with no reason -- filed as a
+    ; store error, halting the applier and retrying it for ever.
     ; r8 = block, r9 = len, r10 = cursor (caller-saved; no nested calls here).
     mov  r8, [rbp-0x10]
     mov  r9, [rbp-0x18]
@@ -68,6 +73,9 @@ cons_verify:
     cmp  rdx, rax
     ja   .fail
     mov  rcx, [r10+1]
+    mov  rax, 0xffffffff
+    cmp  rcx, rax
+    jbe  .fail                ; CON-9: non-canonical (fits the 5-byte form)
     add  r10, 9
     jmp  .havecount
 .count4:
@@ -77,6 +85,8 @@ cons_verify:
     ja   .fail
     mov  ecx, [r10+1]
     mov  ecx, ecx             ; zero-extend 32->64 (count is unsigned 32-bit)
+    cmp  ecx, 0xffff
+    jbe  .fail                ; CON-9: non-canonical (fits the 3-byte form)
     add  r10, 5
     jmp  .havecount
 .count2:
@@ -85,6 +95,8 @@ cons_verify:
     cmp  rdx, rax
     ja   .fail
     movzx ecx, word [r10+1]
+    cmp  ecx, 0xfd
+    jb   .fail                ; CON-9: non-canonical (fits one byte)
     add  r10, 3
     jmp  .havecount
 .count1:

@@ -28,7 +28,9 @@
  *     fails the block on an absent coin (store inconsistency) instead of
  *     skipping the spend. Before that fix this build reported
  *     "walk=65000 expected=64989 resurrected_spent=11 of 31904": +10 at the
- *     first flush, +1 at the second, exactly the production shape. */
+ *     first flush, +1 at the second, exactly the production shape. Since
+ *     2026-10-06 (plan B3) this arm runs the inline flush explicitly: see
+ *     the note in main(). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,6 +38,7 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include "test_tmpdir.h"
+#include "../daemon/node_config.h"
 
 typedef unsigned char u8;
 typedef unsigned int u32;
@@ -183,6 +186,23 @@ int main(void){
     tt_isolate();
     memset(store_buf,0,sizeof store_buf);
     if (store_init(store_buf)!=1){ printf("FAIL store_init\n"); return 1; }
+#ifdef EXPECT_INCIDENT
+    /* 2026-10-06 (plan B3): the incident is the INLINE flush's shape -- the
+     * flush lands in the middle of a block and the spends after it in that
+     * same block look their coins up in the run it just wrote. Under the
+     * async flush (bmc.asyncflush=1, the default) a threshold crossing
+     * freezes the generation into a private copy that answers every lookup
+     * until the forked writer's run is adopted at a block boundary, so a
+     * lying run first meets the verify pass of a later block (a missing
+     * input: the block is rejected, never a skipped spend). Measured with
+     * this object under the async flush: 701 blocks, 0 rejects, walk exact,
+     * and the lie only in point lookups of the adopted runs (114 of 31,904
+     * spent coins read back as live until a compaction rewrote the offsets).
+     * The inline path is still shipped (bmc.asyncflush=0, build_utxo, the
+     * tools), so this arm pins it there. The shipped-object arm keeps the
+     * default and pins exactness under the async flush. */
+    g_cfg.async_flush = 0;
+#endif
     if (utxo_live_init(".")!=1){ printf("FAIL utxo_live_init\n"); return 1; }
     /* undo capture stays ON: production's replay ran with g_undo_enabled=1 (its default; main.c
      * never clears it), so every spend went through undo_capture_and_del = utxo_lsm_get THEN del */

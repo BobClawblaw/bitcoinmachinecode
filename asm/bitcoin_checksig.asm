@@ -57,7 +57,7 @@ extern ecdsa_verify                   ; asm
 %define SCF_CAP     20000
 %define PRE_CAP     65536
 
-section .tbss alloc noexec nowrite tls align=8
+section .tbss nobits alloc noexec write tls align=8
 global cks_needle
 cks_needle: resq 1                    ; __thread u8* needle[600]
 global cks_scf

@@ -4,6 +4,64 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-11-04 — merged main through #450 (243 commits, 7eb763ab..e4e54e3f) and ported its x86 changes
+
+Merge (not rebase) of `origin/main` at e4e54e3f into `bmc_osx`. Backup tag `pre-merge-450` = d48a7c2e.
+
+**Conflicts (9), resolved:**
+- `asm/Makefile`: main's test list, plus the Mac's `tests/test_mempool_lock_fair` after `test_mempool_lock_log`.
+- `asm/bitcoin_mempool_policy.c`: main's persistent children index (`g_cx`, `mpol_cx_get`), with the Mac's `mpool_policy_set_cluster_walk_scan` knob kept in front of it (`have_cx = !g_mpol_cluster_walk_scan && mpol_cx_get(st)`); `test_mempool_policy` uses the knob for its differential check.
+- `asm/rpc_chain.c`: both sides fixed the read lane's per-thread leak independently (main on 10-07 with a pthread key, the Mac on 10-09 with `bmc_tls_keep`). The Mac's version is kept and main's key removed; `test_rpc_chain` keeps both tests (the six exiting threads and main's 64 `getblock_once` threads, counting fds with the Mac's `open_fds`).
+- `asm/daemon/main.c` (idle branch), `daemon/coinstats_index.c` (the Mac's acquire-fence comments), `tests/test_dlc_header_probe.c` (main's served-count reset and 5-argument `start_peer`, the Mac's `stop_peers` on failure), `docs/FEATURE_GAPS.md` and `docs/devlog/LOG.md` (both sides).
+
+**Shared C that did not build on Darwin, now guarded:**
+- `SYS_close_range` under `#ifdef SYS_close_range` (`coinstats_index.c`, `index_repair.c`, `index_trail.c`, as `notify.c` already did); `benchlog.h`'s `PR_SET_VMA` naming under `#ifdef SYS_prctl`.
+- `rpc_signer.c`: the keeper was a `clone()` child. On Darwin it is a `fork()` child that writes the shell's wait status down a second CLOEXEC pipe (`pipe` + `fcntl`: no `pipe2`); `signer_wait` reads it, then reaps, tolerating ECHILD. `test_rpc_signer` lists fds with `ls /dev/fd`.
+- `undo_log.c`: `undo_drop_behind` is a no-op (`UNDO_NO_DROP`: no `sync_file_range`/`posix_fadvise` page drop).
+- `utxo_live.c`: the cache drops are under `#ifndef __APPLE__`, `MADV_HUGEPAGE` under its ifdef. **Fork trim (plan M2) is off on the Mac** (`g_fork_trim = 0`): Darwin has no `MADV_DONTFORK`, and `minherit` cannot restore the MAP_SHARED header page. The merge child and the flush writer are forked whole, so pages the parent writes while a child lives are copied. The WAL retire punches with `F_PUNCHHOLE`, rounded inward to the filesystem block (`fz_punch`); `g_fz_bytes_retired` still counts the whole range.
+- `torcontrol.c`: `getrandom` via `getentropy`.
+
+**Assembly ports (`port/osx/*.S`):**
+- `bitcoin_utxo_lsm.S`, plan B3 (the async flush): `utxo_lsm_freeze`, `utxo_lsm_build_run` (the run writer split out of the flush; the flush calls it), `utxo_lsm_set_freeze_hook` (called in place of the flush at put/del's threshold), `utxo_lsm_fz_enable`, and the frozen generation in `utxo_lsm_get` (between the live generation and the runs). The flush empties `utxo.idx` before the WAL reset. ST2-1: the run's and the manifest's fsync results are checked; STO-W: a directory fsync between the run's create and the manifest rename; STO-D: the directory fsync's open and result are checked (`Lfsync_dir` returns a status), in the flush and the compaction. F7: a manifest entry with gen or run_no 2^64-1 fails the reload; the reload's tombstone scan starts at `ckpt_log_off`. Runs may carry a bloom up to 256 MiB (`RUN_BLOOM_MAX_BYTES`, its own mapping past the 4 MiB scratch area). The Mac's file-path lookup preads its three bloom bytes, so it tests a large bloom where main's fallback skips it. The tombstone set uses `utxo_hash`'s multiply mix (`Ltomb_probe_raw`).
+- `bitcoin_utxo.S`: the memtable home slot is the new multiply mix (the C `outpoint_hash` in `utxo_live.c` agrees).
+- `bitcoin_utxo_store.S`: the WAL buffer is 32 MiB, with the pre-drain hook (STO-A), `utxo_store_forget_buffer`, and the STO-E heal of a log shorter than its checkpoint.
+- `bitcoind.S` (P2P-1): a `block` reply whose hash is not the one asked for is passed over; 16 of them end the pass (where=11). It also adds `g_block_ctx_hook`, and a compact-block hook result of -2 fails the pass (where=14).
+- `bitcoin_serve.S`: main's getblocks rewrite (hashStop, the internal-order hashes, the continuation inv at 500), the locator limits (`serve_locator_from`'s size check; no-locator getheaders), low-work getheaders, the tip watch, `serve_cmpct_as_full`, and MPL-1 (the reject filter is keyed by wtxid, so a MSG_WTX announcement is checked against it too).
+- Smaller ones: CON-9 canonical CompactSize tx count (`bitcoin_cons.S`), the addr count's canonical and MAX_SIZE checks (`bitcoin_addrmgr.S`), `k == n` refused (`bitcoin_keys.S`, and `bitcoin_bip32.S`'s master key now uses that check), `fd_write_all` failing at once on a negative fd (`bitcoin_net.S`), `node_log_open` returning -1 (`node_log.S`), the store's fd set to -1 after a failed open (`bitcoin_store.S`).
+- `utxo_lsm_mm.c`: main's version (pread record reads, `lsm_mm_set_reads`, the ST2-8 sparse_off check, cached bloom hashes) with the Mac's default-off patch reapplied.
+
+**Mac gaps that main had already closed, found while porting `bitcoin_serve.S`:**
+- 3.1: peers were told the stored tip rather than the connected one; announcements and getheaders now use `serve_public_tip`.
+- CC-1: the serve loop never announced mempool transactions to inbound peers (`txann_wait`).
+- BIP144: a plain MSG_BLOCK request (no witness bit) was sent with witnesses; `block_strip_witness` now strips them.
+- A bug of the port's own: `.gh_build` stored the header count through the tip value as if it were an address (`str x10, [x11]`). It now stores to `s_cnt`.
+- Another, introduced by this port and caught by `test_serve_txrejects`: the tx-announcement path reloaded the item pointer from a stack slot that nothing on its way had written, so a connection's first tx announcement read address 0 and killed the serve child. It keeps the pointer from the inv loop now.
+
+**A Mac bug that predates the merge:** `p2p_read`'s v1 path returned -1 on a clean close or short header read; x86 returns 0 (`.eof_or_err`). It now returns -1 only on a read error. `test_getblocks`'s disconnect checks caught it.
+
+**Tests:**
+- `run_tests.py` emulates `-Wl,--wrap` (ld64 has none). Each object's undefined references to SYM are pointed at `__wrap_SYM` in its Mach-O symbol table, and a `__real_SYM: b SYM` trampoline is linked in. Eight Makefile rules use it; three of them predate this merge.
+- `test_support/bitcoin_utxo_lsm_badsparse_twin` is now the Mac assembly with `LSM_REPRO_BAD_SPARSE`, as on x86. The C twin it used lacked the async-flush entry points, so the runner had quietly linked the good LSM, and both `_bad` negative controls stopped reproducing the incident.
+- Shared tests made to run on Darwin:
+  - `test_secret_wipe` reads `sp` on AArch64.
+  - `test_coinstats_hist_build` and `test_rpc_signer` list `/dev/fd`.
+  - `test_utxo_reap_at_tip` reads the zombie state with `sysctl(KERN_PROC_PID)`.
+  - `test_utxo_memtable_anon` reads VM regions with `mach_vm_region`/`proc_regionfilename` and uses the page size (16 KiB here) for the header page; Darwin does not name anonymous regions.
+  - `test_lsm_fsync_fail` interposes `fsync` in place of the seccomp trap. It confirms that the Mac LSM's flush and compaction each make exactly four fsyncs and that each one's failure fails the operation.
+  - `tests/durable_image.h` (the power-loss recorder of `test_sto_crash` and `test_sto1_crash`) and `test_undo_ckpt_sync` define `fsync`, `fdatasync` and `open` in place of the seccomp trap (the Mac code calls them through libc); a file is named with `F_GETPATH`, identified by `st_ino` + `st_birthtimespec`. Every STO scenario and its control heals, the EIO and EMFILE injections included.
+  - `test_index_runs` and `test_addr_hist` make the merger's unlinks fail with `chflags(UF_IMMUTABLE)` on the inputs (EPERM, the seccomp filter's answer).
+  - `test_index_repair` and `test_index_trail` list `/dev/fd`; `test_benchlog`'s mem section checks only that the line stays bounded (no `/proc/self/status`); `test_bip324_transport` reads `sp`.
+  - `test_rpc_server` and `test_rpc_esplora_listener` measure the heap with `malloc_zone_statistics`. RPC-21's bound allows 12 KiB per thread on the Mac (4 elsewhere): libmalloc's per-thread magazines took +20,736 KiB for 16 threads.
+  - `test_utxo_recover_gate` reads VM regions as `memtable_anon` does (an unlinked run is a mapped path that no longer exists); it and `test_lsm_mm_sparse_off` turn the mapping cache on (`BMC_LSM_MMAP=1`), which the Mac leaves off by default.
+  - `test_tx_relay_rejects` gives its socketpairs 1 MiB buffers (Darwin's 8 KiB default blocked its 5,000-entry inv).
+  - `test_rpc_intake` dials from 127.0.0.2 and .3 and is alias-gated (`loopback_alias.h`).
+  - `build_tools.sh` lets `bmc_rpcd` leave `serve_conn_perms` and `serve_reorg_check` undefined (the daemon supplies them).
+- N/A: `test_utxo_fork_trim` (`MADV_DONTFORK`) and `test_drop_appends` (the page-cache drop is a no-op on the Mac).
+  - `test_block_481827_pool_stack` drops its macOS `#define` stand-in for `--wrap`: with the runner's emulation as well, its `__real_store_get_at` was redirected back to the wrapper and recursed forever.
+- **Full suite (2026-11-04, 480 commands):** 452 PASS, 12 SKIP, 16 N/A, 0 FAIL. Of those, 451 passed in the full run; `test_block_481827_pool_stack` timed out there and passed alone after the fix above. The N/A list is the 14 x86 asm differentials plus `fork_trim` and `drop_appends`; SKIP is the alias-gated and fixture-gated tests.
+
+**Not deployed.** The mainnet node (`~/bmc_osx_deploy`, `com.bmc.mainnet`) is stopped and disabled since 2026-10-12. A deploy restarts it on the async flush and the new store code.
+
 ## 2026-10-10 (2) — an outbound slot with no free candidate draws a fresh pool from the book (shared C)
 
 The empty slots found in (1). Every pool a slot redials from was sampled once, when the worker started: 64 addresses of the book's 3,401 dialable. As they entered dial backoff or were held by other legs, slots found no free candidate, and the node ran on 6–8 of its 10–11 outbound legs, logging "no dial candidate is free" (15,517 lines; one per slot per minute) from an hour or two after each restart.

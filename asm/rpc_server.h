@@ -67,7 +67,10 @@ typedef struct {
 
 /* -rpcwhitelist=<user>:<m1>,<m2>,... (repeatable; entries for one user are
  * intersected) and -rpcwhitelistdefault. Core: once any whitelist exists,
- * users without one may call nothing unless rpcwhitelistdefault=0. */
+ * users without one may call nothing unless rpcwhitelistdefault=0; a bare
+ * "<user>" is an empty list. rpc_whitelist_add fails only on allocation
+ * failure (no length or count limits, CFG-2), and the daemon treats that as
+ * fatal. */
 int  rpc_whitelist_add(const char* spec);
 void rpc_whitelist_set_default(int deny_unlisted);   /* -1 = Core's rule */
 void rpc_whitelist_clear(void);

@@ -23,6 +23,7 @@ long mempool_resolve_confirmed_utxo(void* u, const unsigned char t[32],
 extern long blk_submit_evaluate(const unsigned char*, unsigned long,
                                 const unsigned char*, long, char*, unsigned long);
 extern void sha256d(unsigned char out[32], const void* data, unsigned long len);
+extern long merkle_root(unsigned char out[32], unsigned char* hashes, unsigned long long n);   /* in place */
 
 static int fails=0;
 static void ck(const char* l, int c){ printf("%s %s\n", c?"ok  :":"FAIL:", l); if(!c) fails++; }
@@ -61,6 +62,50 @@ int main(void){
     /* short buffer */
     ck("80 bytes -> Block decode failed",
        blk_submit_evaluate(blk, 80, zero32, -1, r, sizeof r) == 0 && !strcmp(r,"Block decode failed"));
+
+    /* CON-14 (audit 2026-10-23): a block of 16,500 minimal (60-byte)
+     * transactions is 990 KB stripped, inside Core's bad-blk-length bound;
+     * submitblock refused anything over 16,384 transactions as
+     * bad-blk-length. 16,666 is the first count Core's rule refuses. */
+    {
+        static unsigned char big[80 + 3 + 16700 * 60];
+        static unsigned char ids[16700 * 32];
+        for (int pass = 0; pass < 2; pass++){
+            unsigned nt = pass == 0 ? 16500 : 16666;
+            unsigned char* q = big + 80;
+            *q++ = 0xfd; *q++ = (unsigned char)(nt & 0xff); *q++ = (unsigned char)(nt >> 8);
+            for (unsigned t = 0; t < nt; t++){
+                unsigned char* tx = q;
+                *q++ = 1; *q++ = 0; *q++ = 0; *q++ = 0; *q++ = 1;          /* version 1, one input */
+                if (t == 0){ memset(q, 0, 32); q += 32; memset(q, 0xff, 4); q += 4; }   /* coinbase */
+                else { memset(q, 0x5c, 32); q[0] = (unsigned char)t; q[1] = (unsigned char)(t >> 8); q += 32; memset(q, 0, 4); q += 4; }
+                *q++ = 0; memset(q, 0xff, 4); q += 4;                       /* empty scriptSig, sequence */
+                *q++ = 1; memset(q, 0, 8); q += 8; *q++ = 0;                /* one 0-value output, empty script */
+                memset(q, 0, 4); q += 4;                                    /* locktime */
+                sha256d(ids + (size_t)t * 32, tx, (unsigned long)(q - tx));
+            }
+            if (pass == 0) ck("CON-14 fixture: a minimal transaction is 60 bytes", (q - (big + 83)) == 60L * nt);
+            unsigned long blen = (unsigned long)(q - big);
+            memset(big, 0, 80); big[0] = 1;
+            unsigned char root[32]; merkle_root(root, ids, nt);
+            memcpy(big + 36, root, 32);
+            big[72] = 0xff; big[73] = 0xff; big[74] = 0x7f; big[75] = 0x20;   /* 0x207fffff */
+            unsigned nonce = 0;
+            for (;;){ unsigned char hh[32], be[32]; sha256d(hh, big, 80);
+                      for (int i = 0; i < 32; i++) be[i] = hh[31-i];
+                      if (be[0] < 0x7f) break;
+                      nonce++; memcpy(big + 76, &nonce, 4); }
+            long rv = blk_submit_evaluate(big, blen, zero32, -1, r, sizeof r);
+            if (pass == 0){
+                ck("CON-14 a 16,500-transaction block passes the size rules (would-accept)", rv == 1);
+                if (rv != 1) printf("      (reason: %s)\n", r);
+            } else {
+                ck("CON-14 a 16,666-transaction block is bad-blk-length (stripped > 1,000,000)",
+                   rv == 0 && !strcmp(r, "bad-blk-length"));
+                if (strcmp(r, "bad-blk-length")) printf("      (reason: %s)\n", r);
+            }
+        }
+    }
 
     printf("\n%s (%d failures)\n", fails?"TESTS FAILED":"ALL TESTS PASSED", fails);
     return fails?1:0;

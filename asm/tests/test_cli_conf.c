@@ -107,6 +107,35 @@ int main(void){
         unlink_datadir_conf();
     }
 
+    printf("== CFG-1 (audit 2026-10-23): sections, comments, precedence as bitcoin-cli ==\n");
+    wr("bitcoin.conf", "rpcuser=alice   # the operator\nrpcpassword=pw\n[regtest]\nrpcuser=mallory\nrpcpassword=evil\nrpcport=18999\n");
+    ok(cli_conf_resolve(DIR, 0, &c, &err) == 1 && !strcmp(c.user, "alice") && !strcmp(c.pass, "pw") && c.port == 8332,
+       "CFG-1: on mainnet the [regtest] credentials and port are inert; the inline comment is stripped");
+    wr("bitcoin.conf", "[regtest]\nrpcuser=u\nrpcpassword=p\n");
+    ok(cli_conf_resolve(DIR, 0, &c, &err) == 1 && c.from_cookie,
+       "CFG-1: credentials only under [regtest] are not used on mainnet (the cookie is)");
+    wr("bitcoin.conf", "chain=regtest\nrpcport=1111\nrpcuser=base\nrpcpassword=basepw\n[regtest]\nrpcport=18446\nrpcpassword=sec\nrpcpassword=later\n");
+    ok(cli_conf_resolve(DIR, 0, &c, &err) == 1 && c.port == 18446 && !strcmp(c.user, "base") && !strcmp(c.pass, "sec"),
+       "CFG-1: on regtest the section beats the base and the first value wins");
+    wr("bitcoin.conf", "chain=regtest\nrpcport=1111\nrpcuser=u\nrpcpassword=p\n");
+    ok(cli_conf_resolve(DIR, 0, &c, &err) == 1 && c.port == 18443,
+       "CFG-1: a base-section rpcport is ignored off mainnet (NETWORK_ONLY)");
+    wr("bitcoin.conf", "rpcport=70000\nrpcuser=u\nrpcpassword=p\n");
+    ok(cli_conf_resolve(DIR, 0, &c, &err) == 0 && err && strstr(err, "rpcport"),
+       "CFG-1: rpcport=70000 is refused, not wrapped");
+    wr("bitcoin.conf", "[regtest\nrpcpassword=p\n");
+    ok(cli_conf_resolve(DIR, 0, &c, &err) == 0 && err && strstr(err, "parse error"),
+       "CFG-1: an unclosed [section is a parse error, as in bitcoin-cli");
+    wr("bitcoin.conf", "rpcuser=u\nrpcpassword=a#b\n");
+    ok(cli_conf_resolve(DIR, 0, &c, &err) == 0 && err && strstr(err, "rpcpassword"),
+       "CFG-1: a '#' on an rpcpassword line is refused, as in bitcoin-cli");
+    wr("bitcoin.conf", "chain=mainnet\n");
+    ok(cli_conf_resolve(DIR, 0, &c, &err) == 0 && err && strstr(err, "chain"),
+       "CFG-6: chain=mainnet is an unknown chain (Core's name is main)");
+    wr("bitcoin.conf", "chain=main\nregtest=1\n");
+    ok(cli_conf_resolve(DIR, 0, &c, &err) == 0 && err && strstr(err, "Invalid combination"),
+       "CFG-6: chain= with regtest=1 is Core's invalid combination");
+
     printf("== failures say what to do, rather than sending bitcoin/bitcoin ==\n");
     ok(cli_conf_resolve(0, 0, &c, &err) == 0 && err && strstr(err, "-datadir"),
        "no datadir: refuses and names the flag to pass");

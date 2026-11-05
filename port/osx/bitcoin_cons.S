@@ -342,6 +342,8 @@ _cons_verify:
     cmp   x20, #83                        /* 0xfd: block[81..82] inside */
     b.lo  Lcv_no
     ldurh w23, [x19, #81]
+    cmp   w23, #0xfd                      /* CON-9 (audit 2026-10-23): canonical only, as */
+    b.lo  Lcv_no                          /* Core's ReadCompactSize -- fits one byte */
     mov   x24, #83
     b     4f
 2:  cmp   w9, #0xfe
@@ -349,11 +351,17 @@ _cons_verify:
     cmp   x20, #85
     b.lo  Lcv_no
     ldur  w23, [x19, #81]
+    mov   w10, #0xffff
+    cmp   w23, w10
+    b.ls  Lcv_no                          /* CON-9: fits the 3-byte form */
     mov   x24, #85
     b     4f
 3:  cmp   x20, #89
     b.lo  Lcv_no
     ldur  x23, [x19, #81]
+    mov   x10, #0xffffffff
+    cmp   x23, x10
+    b.ls  Lcv_no                          /* CON-9: fits the 5-byte form */
     mov   x24, #89
 4:  cbz   x23, Lcv_no                     /* >= 1 tx (the coinbase) */
     mov   w25, #0

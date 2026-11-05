@@ -48,10 +48,12 @@ for t in $TOOLS; do
     # daemon_out minus main.o and minus the objects of this tool's own sources
     excl='/main\.o$'; for s in $srcs; do excl="$excl|/$(basename "${s%.c}")\.o$"; done
     rm -f "$W/lib.a"; ar rcs "$W/lib.a" $(ls $OUT/*.o | grep -v -E "$excl")
-    # tx_relay.c's WEAK hooks, defined only in the daemon's main.c and checked
-    # with `if (fn)` before any call: ELF leaves an undefined weak reference
-    # NULL; ld64 still refuses it unless told the symbol may stay undefined.
+    # tx_relay.c's and serve_invbounds.c's WEAK hooks, defined only in the
+    # daemon's main.c and checked with `if (fn)` before any call: ELF leaves
+    # an undefined weak reference NULL; ld64 still refuses it unless told the
+    # symbol may stay undefined.
     WEAK="-Wl,-U,_rpc_note_msg_recv -Wl,-U,_txr_report_violation_fd -Wl,-U,_txr_source_group_fd"
+    WEAK="$WEAK -Wl,-U,_serve_conn_perms -Wl,-U,_serve_reorg_check"
     if $CC -o "$PREFIX/$t" $srcs "$W/lib.a" "$OUT/addrbook.a" -lpthread $WEAK 2>"$W/$t.err"; then
         echo "  ok   $t"; ok=$((ok+1))
     else

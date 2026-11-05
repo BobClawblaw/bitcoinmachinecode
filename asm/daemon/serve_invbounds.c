@@ -22,6 +22,10 @@
  */
 #include <stddef.h>
 #include <sys/stat.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include "netperm.h"
 
 #define INV_ENTRY   36                 /* type u32 LE + 32-byte hash */
 #define INV_MAX_SZ  50000              /* Core's MAX_INV_SZ */
@@ -83,22 +87,84 @@ int serve_inv_bounds(const unsigned char* pl, long plen,
  *
  * Core's FindForkInGlobalIndex walks every locator entry and serves from the
  * first one on the active chain, falling back to genesis only when none
- * matches, and honours hashStop.
+ * matches -- so an unknown locator is served from height 1, the block after
+ * genesis, not from genesis itself -- and honours hashStop.
  *
  * Payload: version(4) | CompactSize(count) | count*32 locator | 32 stop.
  *
- * Returns 1 with *out_from set to the height to serve FROM, and *out_stop set
- * to the stop hash's height or -1 when the stop hash is zero/unknown.
- * Returns 0 when the message is malformed, which the caller drops. In C for
+ * Returns 1 with *out_from set to the height to serve FROM, or 2 with the same
+ * outputs when the locator is EMPTY (Core's getheaders answers that with the
+ * hashStop header alone; getblocks treats it as 1), and *out_stop set
+ * to the stop hash's height or -1 when the stop hash is zero/unknown. When
+ * out_stop_hash is not NULL the stop hash itself is copied there (getblocks
+ * compares it against each block it walks, as Core does; zeroed on a
+ * malformed message).
+ * Returns 0 when the message is malformed, which the caller drops, and -1
+ * when it is well formed but carries more than MAX_LOCATOR_SZ (101) entries,
+ * for which Core disconnects the peer. In C for
  * the same reason the inv bounds are: a second hand-written varint walk in
  * assembly is how the first one went wrong.
  */
 extern int idx_get(void* idx, const unsigned char hash[32], long* height);
 
+/* A hash-index hit names a height; the block at that height is the one the
+ * peer means only if index.dat still holds that hash there. A serve child's
+ * index is its own copy: after a reorg it keeps the losing branch's hashes
+ * until serve_reorg_check rebuilds it, which the getheaders path reached only
+ * AFTER the locator walk (through serve_public_tip), and the worker can
+ * truncate and rewrite index.dat at any moment of the walk. A stale hit
+ * mis-placed the fork point: the peer was served the new branch from the
+ * height of a block it has and we no longer do. Core walks the locator
+ * against its active chain (FindForkInGlobalIndex: chain.Contains), so a
+ * hash off it is skipped, and a stop hash off it never matches. Checking the
+ * record closes the window whatever its timing. node_serve_loop registers
+ * its store (index.dat is st+8); with none registered nothing is checked. */
+static const void* g_loc_store = 0;
+void serve_set_locator_store(const void* st){ g_loc_store = st; }
+static int loc_on_chain(long h, const unsigned char hash[32]){
+    if (!g_loc_store) return 1;
+    int fd = (int)*(const long*)((const char*)g_loc_store + 8);
+    if (fd < 0) return 1;
+    unsigned char rec[48];
+    if (h < 0 || pread(fd, rec, sizeof rec, (off_t)h * 48) != (ssize_t)sizeof rec) return 0;
+    return memcmp(rec, hash, 32) == 0;    /* the record holds the hash in wire order */
+}
+
+/* ---- getheaders below the minimum chain work ----
+ * Core (GETHEADERS, net_processing.cpp 4410-4422) serves no headers from an
+ * active chain whose work is below -minimumchainwork, unless the peer has the
+ * download permission: it answers with an EMPTY headers message, "to tell
+ * the peer to go away but not treat us as unresponsive", so a peer never
+ * starts a low-work headers sync from it. bmc served whatever it had. The
+ * floor is minchainwork.c's (set in main before the serve processes fork);
+ * the work is chainwork.dat's cumulative record at `tip` (16 bytes LE, one
+ * per height), read here because only the download worker opens the
+ * chainwork store. A record not written yet falls back to the last one:
+ * work only grows with height, so the last record clearing the floor means
+ * the tip does. No floor, no minchainwork.o linked (the harnesses), or a
+ * download-permission peer: served as before. 1 = answer empty. */
+extern int reorg_min_chain_work_set(void) __attribute__((weak));
+extern int reorg_work_meets_minimum(const unsigned char work[16]) __attribute__((weak));
+extern unsigned serve_conn_perms(void) __attribute__((weak));   /* daemon/main.c */
+static int g_cw_fd = -2;                    /* -2 = not opened yet */
+int serve_getheaders_low_work(long tip){
+    if (!reorg_min_chain_work_set || !reorg_work_meets_minimum || !reorg_min_chain_work_set()) return 0;
+    if (serve_conn_perms && (serve_conn_perms() & NP_DOWNLOAD)) return 0;
+    unsigned char w[16]; memset(w, 0, sizeof w);   /* no record: no work */
+    if (g_cw_fd == -2) g_cw_fd = open("chainwork.dat", O_RDONLY | O_CLOEXEC);
+    if (g_cw_fd >= 0 && tip >= 0 && pread(g_cw_fd, w, 16, (off_t)tip * 16) != 16){
+        struct stat sb; long n = fstat(g_cw_fd, &sb) == 0 ? (long)(sb.st_size / 16) : 0;
+        memset(w, 0, sizeof w);
+        if (n > 0 && pread(g_cw_fd, w, 16, (off_t)(n - 1) * 16) != 16) memset(w, 0, sizeof w);
+    }
+    return !reorg_work_meets_minimum(w);
+}
+
 int serve_locator_from(const unsigned char* pl, unsigned long plen, void* htidx,
-                       long* out_from, long* out_stop){
+                       long* out_from, long* out_stop, unsigned char* out_stop_hash){
     *out_from = 0;
     *out_stop = -1;
+    if (out_stop_hash) for (int i = 0; i < 32; i++) out_stop_hash[i] = 0;
     if (!pl || !htidx) return 0;
     if (plen < 4 + 1) return 0;
 
@@ -116,24 +182,48 @@ int serve_locator_from(const unsigned char* pl, unsigned long plen, void* htidx,
                          n = 0; for (int i=0;i<8;i++) n |= (unsigned long long)pl[p+1+i] << (8*i);
                          p += 9; }
 
-    /* Core's MAX_LOCATOR_SZ is 101; anything larger is a malformed request.
-     * The bound also stops an absurd count from making the walk expensive. */
-    if (n > 101) return 0;
+    /* CANONICAL COUNT (formal/parsers F1, 2026-10-23). Core reads the locator
+     * with ReadCompactSize, which throws "non-canonical ReadCompactSize()"
+     * for a value spelled in more bytes than it needs (fd 0100 for 1); the
+     * exception is caught in ProcessMessages and the message is dropped,
+     * unscored. This accepted the long spelling and served from it -- a
+     * fingerprint, and the one parser here that still took one (the inv
+     * bounds above refuse it). Drop it the same way: return 0. */
+    if ((p == 4 + 3 && n < 0xfd) || (p == 4 + 5 && n <= 0xffff) ||
+        (p == 4 + 9 && n <= 0xffffffffULL)) return 0;
+
+    /* Core reads the whole CBlockLocator and the stop hash before it looks
+     * at the count, so the order of these three matters (2026-10-23):
+     *  - above MAX_SIZE (serialize.h 32), ReadCompactSize throws "size too
+     *    large": dropped, like any parse failure;
+     *  - fewer bytes than count*32 + 32: the vector read throws at the end
+     *    of the message: dropped;
+     *  - a complete locator of more than MAX_LOCATOR_SZ (101) entries:
+     *    GETBLOCKS and GETHEADERS both set fDisconnect (net_processing.cpp
+     *    4272, 4399). This returned 0 for it, so the peer was only ignored.
+     * The 101 bound also keeps the walk below cheap. */
+    if (n > 0x02000000ULL) return 0;
     if (plen < p + n * 32u + 32u) return 0;    /* locator + the stop hash */
+    if (n > 101) return -1;
 
     /* first locator entry we know wins, in the order the peer sent them --
-     * they run newest-first, so this is the most recent common block */
+     * they run newest-first, so this is the most recent common block. None
+     * known: FindForkInGlobalIndex returns genesis (validation.cpp 127-143)
+     * and both handlers serve from its successor, height 1. This said 0 and
+     * sent genesis, which no peer lacks (2026-10-23). */
+    *out_from = 1;
     for (unsigned long long i = 0; i < n; i++){
         long h = 0;
-        if (idx_get(htidx, pl + p + i * 32u, &h) == 1){ *out_from = h + 1; break; }
+        if (idx_get(htidx, pl + p + i * 32u, &h) == 1 && loc_on_chain(h, pl + p + i * 32u)){ *out_from = h + 1; break; }
     }
 
     /* hashStop: all-zero means "as many as you have" */
     { const unsigned char* stop = pl + p + n * 32u;
+      if (out_stop_hash) for (int i = 0; i < 32; i++) out_stop_hash[i] = stop[i];
       int zero = 1;
       for (int i = 0; i < 32; i++) if (stop[i]){ zero = 0; break; }
-      if (!zero){ long sh = 0; if (idx_get(htidx, stop, &sh) == 1) *out_stop = sh; } }
-    return 1;
+      if (!zero){ long sh = 0; if (idx_get(htidx, stop, &sh) == 1 && loc_on_chain(sh, stop)) *out_stop = sh; } }
+    return n == 0 ? 2 : 1;
 }
 
 /* ---- 3.1 (UTXO_INLINE_CONNECT_SCOPE, 2026-09-06): the tip bitcoin_serve.asm
@@ -207,4 +297,33 @@ long serve_public_tip(const void* st){
     long long cap = *g_connected_tip;
     if (cap == -2LL /* NODE_TIP_UNTRACKED */) return stored;
     return cap < (long long)stored ? (long)cap : stored;
+}
+
+/* ---- the tip-watch's memory (2026-10-25) ----
+ * The serve loop announced a new tip when the public tip's HEIGHT passed the
+ * one it last announced, so a reorg that ends at the same height (one block
+ * replaced by another) reached an idle peer only with the next block. It
+ * remembers the announced block's hash as well now: index.dat's record at
+ * that height (wire order), which a reorg rewrites in place. A tip that ends
+ * LOWER after a reorg waits for the chain to grow past the announced height,
+ * as before. 1 = announce the public tip. */
+static unsigned char g_tw_hash[32];
+static long g_tw_h = -1;
+static int tw_hash_at(long h, unsigned char out[32]){
+    if (!g_loc_store || h < 0) return 0;
+    int fd = (int)*(const long*)((const char*)g_loc_store + 8);
+    unsigned char rec[48];
+    if (fd < 0 || pread(fd, rec, sizeof rec, (off_t)h * 48) != (ssize_t)sizeof rec) return 0;
+    memcpy(out, rec, 32);
+    return 1;
+}
+void serve_tipwatch_note(long h){
+    g_tw_h = tw_hash_at(h, g_tw_hash) ? h : -1;
+}
+int serve_tipwatch_changed(const void* st, long announced){
+    long tip = serve_public_tip(st);
+    if (tip > announced) return 1;
+    if (tip != announced || g_tw_h != announced) return 0;
+    unsigned char now[32];
+    return tw_hash_at(tip, now) && memcmp(now, g_tw_hash, 32) != 0;
 }

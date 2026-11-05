@@ -98,7 +98,7 @@ extern tap_txctx_export               ; C seam: version/locktime/sequence
 %define S_SEQUENCE  108
 %define S_VERSION   112
 
-section .tbss alloc noexec nowrite tls align=8
+section .tbss nobits alloc noexec write tls align=8
 global tv_main_e
 tv_main_e: resq 1
 global tv_alt_e

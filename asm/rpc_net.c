@@ -134,17 +134,25 @@ long rpc_http_post(int port, const char* user, const char* pass,
     base64_encode(cred, ul + pl + 1, b64);
     free(cred);
 
-    char head[512];
-    int hl = snprintf(head, sizeof head,
+    /* RPC-25: the head is sized to the credentials. A fixed 512-byte head
+     * was written with snprintf's unclamped return, so a long rpcuser /
+     * rpcpassword (Core sets no limit on either) sent stack bytes from past
+     * the array and cut the Authorization line. */
+    static const char HEAD_FMT[] =
         "POST / HTTP/1.1\r\n"
         "Host: 127.0.0.1:%d\r\n"
         "Authorization: Basic %s\r\n"
         "Content-Type: application/json\r\n"
         "Content-Length: %ld\r\n"
         "Connection: close\r\n"
-        "\r\n", port, b64, bodylen);
+        "\r\n";
+    int need = snprintf(NULL, 0, HEAD_FMT, port, b64, bodylen);
+    char* head = need > 0 ? malloc((size_t)need + 1) : NULL;
+    if (!head) { free(b64); close(fd); return -1; }
+    int hl = snprintf(head, (size_t)need + 1, HEAD_FMT, port, b64, bodylen);
     free(b64);
-    if (write(fd, head, (size_t)hl) != hl) { close(fd); return -1; }
+    if (hl != need || write(fd, head, (size_t)hl) != hl) { free(head); close(fd); return -1; }
+    free(head);
     if (write(fd, body, (size_t)bodylen) != bodylen) { close(fd); return -1; }
 
     char* resp = malloc(outcap + 1);
@@ -212,6 +220,13 @@ int http_request_parse(const char* buf, size_t len,
     if (!sp1) return 0;
     const char* sp2 = memchr(sp1 + 1, ' ', (size_t)(line_end - (sp1 + 1)));
     if (!sp2) return 0;
+    /* RPC-26: no control bytes anywhere in the request line. The line is cut
+     * at the first CR only, so a bare LF (or a NUL, an ESC) could sit in the
+     * request target; HTTP allows none of them there (RFC 9112 3.2), and the
+     * target is echoed into the exec-lock log lines. Refused as malformed
+     * (the callers answer 400). */
+    for (const char* q = buf; q < line_end; q++)
+        if ((unsigned char)*q < 0x20 || (unsigned char)*q == 0x7f) return 0;
     if (method) *method = buf;
     if (method_len) *method_len = (size_t)(sp1 - buf);
     if (path) *path = sp1 + 1;

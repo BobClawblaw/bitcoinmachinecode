@@ -45,7 +45,12 @@ static inline long dlc_announced_height(const long* hs, int n){
  * 1; a second peer is only tried after the first times out), so
  * bmc.dlshape=core keeps the single pick, in the shuffled pool's order.
  * Stated divergence in the default mode: Core's header sync is as fast as
- * its one draw; this node's is as fast as the best of four. */
+ * its one draw; this node's is as fast as the best of four. And (B12,
+ * 2026-10-07) as fast as the best of them over the whole download: a leader
+ * whose last pages fall under half the next candidate's probed rate is
+ * switched, and the next continues from where it stopped (the stored pages
+ * kept, the low-work hold carried) -- Core moves to a second peer only on a
+ * timeout. */
 /* does a header chain ending at chain_tip fall short of what the pool announces? */
 static inline int dlc_chain_falls_short(long chain_tip, long announced){
     return announced > 0 && chain_tip + DLC_HDR_BEHIND_MAX < announced;

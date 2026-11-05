@@ -79,6 +79,27 @@ static void wenc_path(char* out, long cap){
     else snprintf(out, (size_t)cap, "%s", WENC_FILE);
 }
 
+/* ---------------------------------------------------------------- CRY-8
+ * (audit 2026-10-23) fsync the directory that holds `path`, so a rename()
+ * into it (or an unlink() from it) is on disk. wenc_encrypt renamed the
+ * sealed container into place and then unlinked the plaintext bmcwallet.dat
+ * with no directory fsync between them: on a filesystem that may reorder
+ * the two directory updates (xfs, btrfs, ext4 without auto_da_alloc), a
+ * crash can persist the unlink but not the rename, leaving neither the
+ * plaintext store nor the container -- no wallet at all. Returns 1 on
+ * success. */
+static int wenc_fsync_dir(const char* path){
+    char dir[640]; snprintf(dir, sizeof dir, "%s", path);
+    char* slash = strrchr(dir, '/');
+    if (slash){ if (slash == dir) slash[1] = 0; else *slash = 0; }
+    else { dir[0] = '.'; dir[1] = 0; }
+    int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0) return 0;
+    int ok = fsync(dfd) == 0;
+    close(dfd);
+    return ok;
+}
+
 /* Boot: if an encrypted container exists in `dir`, adopt it (locked). The
  * daemon calls this INSTEAD of loading a plaintext seed when it finds one. */
 int wenc_boot(const char* dir){
@@ -123,14 +144,22 @@ int wenc_encrypt(const char* mn, const char* mn_pass, const char* wallet_pass, l
     static char payload_check[WENC_MNMAX*2];
     memcpy(payload_check, payload, (size_t)(pl < (long)sizeof payload_check ? pl : (long)sizeof payload_check));
     secure_zero(payload, sizeof payload);
-    if (n < 0) return 0;
+    if (n < 0){ secure_zero(payload_check, sizeof payload_check); return 0; }
     char p[600]; wenc_path(p, sizeof p);
     char tmp[640]; snprintf(tmp, sizeof tmp, "%s.tmp", p);
-    int fd = open(tmp, O_WRONLY|O_CREAT|O_TRUNC, 0600);
-    if (fd < 0) return 0;
-    if (write(fd, seal, n) != n || fsync(fd) != 0){ close(fd); return 0; }
+    int fd = open(tmp, O_WRONLY|O_CREAT|O_TRUNC|O_NOFOLLOW|O_CLOEXEC, 0600);
+    if (fd < 0){ secure_zero(payload_check, sizeof payload_check); return 0; }
+    if (write(fd, seal, n) != n || fsync(fd) != 0){ close(fd); secure_zero(payload_check, sizeof payload_check); return 0; }
     close(fd);
-    if (rename(tmp, p) != 0) return 0;
+    if (rename(tmp, p) != 0){ secure_zero(payload_check, sizeof payload_check); return 0; }
+    /* CRY-8: the rename must be durable before the plaintext is unlinked
+     * below; if the directory cannot be synced, keep the plaintext. */
+    if (!wenc_fsync_dir(p)){
+        fprintf(stderr, "[wallet] encryptwallet: could not fsync the directory of %s -- the plaintext store is kept\n", p);
+        unlink(p);
+        secure_zero(payload_check, sizeof payload_check);
+        return 0;
+    }
 
     /* VERIFY BEFORE DESTROYING (audit follow-up 2026-08-29).
      *
@@ -167,7 +196,8 @@ int wenc_encrypt(const char* mn, const char* mn_pass, const char* wallet_pass, l
 
     /* verified -- now the plaintext store can go (both candidate locations) */
     { char d1[600]; snprintf(d1, sizeof d1, "%s/bmcwallet.dat", g_enc_dir[0]?g_enc_dir:"."); unlink(d1);
-      unlink("bmcwallet.dat"); }
+      unlink("bmcwallet.dat");
+      (void)wenc_fsync_dir(d1); (void)wenc_fsync_dir("bmcwallet.dat"); }   /* the deletions, durable too */
     secure_zero(payload_check, sizeof payload_check);
     memcpy(g_blob, seal, n); g_bloblen = n;
     g_encrypted = 1; g_unlocked = 0;
@@ -245,11 +275,12 @@ int wenc_change(const char* oldp, long ol, const char* newp, long nl){
     if (n <= 0) return 0;
     char p[600]; wenc_path(p, sizeof p);
     char tmp[640]; snprintf(tmp, sizeof tmp, "%s.tmp", p);
-    int fd = open(tmp, O_WRONLY|O_CREAT|O_TRUNC, 0600);
+    int fd = open(tmp, O_WRONLY|O_CREAT|O_TRUNC|O_NOFOLLOW|O_CLOEXEC, 0600);
     if (fd < 0) return 0;
     if (write(fd, nb, n) != n || fsync(fd) != 0){ close(fd); return 0; }
     close(fd);
     if (rename(tmp, p) != 0) return 0;
+    (void)wenc_fsync_dir(p);            /* CRY-8: the new wrap survives a crash */
     memcpy(g_blob, nb, n); g_bloblen = n;
     return 1;
 }

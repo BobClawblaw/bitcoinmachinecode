@@ -390,6 +390,16 @@ p2p_addr_v2:
 ; p2p_addr_count(pl, plen) -> # v1 addr entries or -1
 ;   Parses the leading CompactSize; returns -1 if the payload is too small to
 ;   hold that many 30-byte records.
+;
+;   formal/parsers F2a (2026-10-23): the count is read as Core's
+;   ReadCompactSize reads it. The 0xff form used to load 4 of its 8 bytes
+;   (`mov eax, [rbx+1]`), so ff 01000000 01000000 (2^32 + 1) counted as 1;
+;   no form was checked for a canonical spelling (fd 0100 for 1); and the
+;   fit check was count*30 + width in 32 bits against the low 32 bits of
+;   plen, which wraps. Now: all 8 bytes, -1 for a non-canonical spelling or
+;   a count above MAX_SIZE (0x02000000, "size too large"), and the fit check
+;   divides in 64 bits: (plen - width) / 30 >= count. Each of those is a
+;   payload Core throws on while deserializing, so the message is dropped.
 global p2p_addr_count
 p2p_addr_count:
     push rbp
@@ -413,29 +423,40 @@ p2p_addr_count:
 .fd:
     cmp  r12, 3
     jl   .err
-    mov  ax, [rbx+1]
+    movzx eax, word [rbx+1]
     mov  ecx, 3
+    cmp  eax, 0xfd           ; canonical: 0xfd..0xffff only
+    jb   .err
     jmp  .have
 .fe:
     cmp  r12, 5
     jl   .err
-    mov  eax, [rbx+1]
+    mov  eax, [rbx+1]        ; zero-extends into rax
     mov  ecx, 5
+    cmp  eax, 0x10000        ; canonical: 0x10000..0xffffffff only
+    jb   .err
     jmp  .have
 .ff:
     cmp  r12, 9
     jl   .err
-    mov  eax, [rbx+1]
+    mov  rax, [rbx+1]        ; all 8 count bytes
     mov  ecx, 9
+    mov  rdx, rax
+    shr  rdx, 32             ; canonical: >= 2^32 only
+    jz   .err
 .have:
-    ; sanity: records fit?
-    mov  edx, eax            ; count
-    ; needed = count*30 + varin_bytes
-    imul eax, 30
-    add  eax, ecx
-    cmp  eax, r12d
+    cmp  rax, 0x02000000     ; Core's MAX_SIZE
     ja   .err
-    mov  rax, rdx
+    ; sanity: records fit? (plen - width) / 30 >= count, in 64 bits
+    mov  r8, rax             ; count
+    mov  rax, r12
+    sub  rax, rcx            ; plen - width (>= 0: each form checked plen above)
+    xor  edx, edx
+    mov  r9d, 30
+    div  r9                  ; rax = whole records the payload holds
+    cmp  rax, r8
+    jb   .err
+    mov  rax, r8
     jmp  .ret
 .err:
     mov  rax, -1

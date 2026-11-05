@@ -294,6 +294,8 @@ _p2p_addr_count:
     b.lt  9f
     ldurh w9, [x0, #1]
     mov   x10, #3
+    cmp   w9, #0xfd                       /* canonical: 0xfd..0xffff only */
+    b.lo  9f
     b     5f
 2:  cmp   w9, #0xfe
     b.ne  3f
@@ -301,12 +303,19 @@ _p2p_addr_count:
     b.lt  9f
     ldur  w9, [x0, #1]
     mov   x10, #5
+    cmp   w9, #0x10, lsl #12              /* canonical: 0x10000..0xffffffff only */
+    b.lo  9f
     b     5f
 3:  cmp   x1, #9
     b.lt  9f
     ldur  x9, [x0, #1]
     mov   x10, #9
-5:  mov   x11, #30                        /* count * 30 + len <= plen, in u64 */
+    lsr   x11, x9, #32                    /* canonical: >= 2^32 only */
+    cbz   x11, 9f
+5:  mov   x11, #0x02000000                /* Core's MAX_SIZE ("size too large"); */
+    cmp   x9, x11                         /* it also keeps the product below from wrapping */
+    b.hi  9f
+    mov   x11, #30                        /* count * 30 + len <= plen, in u64 */
     madd  x11, x9, x11, x10
     cmp   x11, x1
     b.hi  9f

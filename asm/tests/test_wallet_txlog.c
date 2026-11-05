@@ -21,6 +21,8 @@ extern int txlog_append_sent(const char* wallet_path, const unsigned char txid[3
                              const unsigned char dest_h160[20],
                              unsigned long inputs_used, long rawlen);
 extern int txlog_list(const char* path, char* out, int cap);
+extern int book_set(const char* path, const char* label, const char* addr, int overwrite);
+extern int lbl_set(const char* path, const char* addr, const char* label);
 
 static int failures = 0;
 static void ck(const char* lbl, int got, int exp){
@@ -98,6 +100,40 @@ int main(void){
          * "900" at 1788849001 and failed a gate. The corrupt record's own
          * timestamp cannot appear in any genuine record. */
         ck_contains("torn-write: corrupt record rejected", o, "1786923023", 0);
+    }
+
+    /* ---- HST-7 (audit 2026-10-23): the wallet's own files are created
+     * 0600 and never follow a symlink.
+     *
+     * The journal, the address book and the labels file were created with
+     * fopen (0666 & ~umask) and chmod'ed afterwards -- the labels file never
+     * -- and fopen follows a symlink at the name. Run under umask 0, the
+     * worst case a service manager can hand a process. */
+    {
+        char tmpl[] = "/tmp/hst7.XXXXXX"; char* d = mkdtemp(tmpl);
+        ck("HST-7 tmpdir", d != NULL, 1);
+        mode_t old_umask = umask(0);
+        char lp[512], bp[512], wp[512], vp[512], tp[600]; struct stat sb;
+        snprintf(lp, sizeof lp, "%s/labels.dat", d); snprintf(bp, sizeof bp, "%s/book.abk", d);
+        snprintf(wp, sizeof wp, "%s/w", d); snprintf(vp, sizeof vp, "%s/victim", d);
+
+        ck("HST-7 labels: lbl_set succeeds", lbl_set(lp, "bc1qexample", "rent"), 0);
+        ck("HST-7 labels: the file is 0600 under umask 0", stat(lp, &sb) == 0 && (sb.st_mode & 0777) == 0600, 1);
+        ck("HST-7 book: book_set succeeds", book_set(bp, "alice", "bc1qalice", 0), 0);
+        ck("HST-7 book: the file is 0600 under umask 0", stat(bp, &sb) == 0 && (sb.st_mode & 0777) == 0600, 1);
+
+        /* a symlink at each write's name: refused, and its target untouched */
+        FILE* vf = fopen(vp, "w"); fputs("victim\n", vf); fclose(vf);
+        snprintf(tp, sizeof tp, "%s.tmp", bp); ck("HST-7 (setup) book tmp symlink", symlink(vp, tp), 0);
+        ck("HST-7 book: a symlink at the tmp name is refused", book_set(bp, "bob", "bc1qbob", 0), -1);
+        snprintf(tp, sizeof tp, "%s.tmp", lp); ck("HST-7 (setup) labels tmp symlink", symlink(vp, tp), 0);
+        ck("HST-7 labels: a symlink at the tmp name is refused", lbl_set(lp, "bc1qother", "food"), -1);
+        char jp3[600]; snprintf(jp3, sizeof jp3, "%s.txlog", wp); ck("HST-7 (setup) journal symlink", symlink(vp, jp3), 0);
+        ck("HST-7 txlog: a symlink at the journal name is refused", txlog_append_sent(wp, txid, 1, 1, dest, 1, 100), -1);
+        char vb[256] = {0}; vf = fopen(vp, "r"); size_t vn = fread(vb, 1, sizeof vb - 1, vf); fclose(vf); vb[vn] = 0;
+        ck("HST-7 the symlinks' target was not written", strcmp(vb, "victim\n") == 0, 1);
+        ck("HST-7 ...and keeps its own mode", stat(vp, &sb) == 0 && (sb.st_mode & 0777) == 0666, 1);
+        umask(old_umask);
     }
 
     printf("\n%s (%d failures)\n", failures?"TESTS FAILED":"ALL TESTS PASSED", failures);

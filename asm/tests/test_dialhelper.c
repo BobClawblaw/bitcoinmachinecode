@@ -354,6 +354,22 @@ int main(void){
       double early = dlc_effective_floor(5.6 * 1024.0);
       ok(!dlc_dead_weight(9.0 * 1024.0, 12, early), "the run-7 case: 9 KB/s and 12 blocks at height 50k is HEALTHY, not dead weight");
       ok(dlc_dead_weight(300.0, 1, early), "0.3 KB/s and one block at the same floor: genuinely dead, still killed"); }
+      /* 2026-10-08 (run 42): judged on the time the worker was free to
+       * fetch. A worker waiting at the full window moves nothing; run 42's
+       * applier held the window for 90 minutes and a peer that had served
+       * 9,600 blocks read 2.8 KB/s over the tick and was dropped -- 57
+       * dead-weight drops in the stall, the run's bans rising with them. Watched to fail with
+       * dlc_dead_weight_judged ignoring waited_s. */
+      { double F = (double)g_cfg.dead_weight_bps;
+      ok(!dlc_dead_weight_judged(2800.0, 0, F, 10.0, 9.8), "run 42's case: 2.8 KB/s over a tick spent 9.8 s at the full window is not judged");
+      ok(dlc_dead_weight_judged(2800.0, 0, F, 10.0, 0.0), "...the same rate with no wait: dead weight, as before");
+      ok(!dlc_dead_weight_judged(24000.0, 6, F, 10.0, 4.0), "24 KB/s and 6 blocks over 6 s of fetching is 40 KB/s and 10 blocks: not dead");
+      ok(dlc_dead_weight(24000.0, 6, F), "...which the whole-tick rule called dead");
+      ok(dlc_dead_weight_judged(300.0, 0, F, 10.0, 4.0), "0.3 KB/s over 6 s of fetching: genuinely dead, still killed");
+      ok(dlc_dead_weight_judged(2800.0, 0, F, 10.0, 5.0), "half the tick free to fetch is enough to judge");
+      ok(!dlc_dead_weight_judged(2800.0, 0, F, 10.0, 5.1), "...less than half is not");
+      ok(!dlc_dead_weight_judged(-1.0, 0, F, 10.0, 0.0), "no rate sample yet: not judged");
+      ok(dlc_dead_weight_judged(2800.0, 0, F, 10.0, -3.0), "a negative wait reads as none"); }
       /* 2026-09-07: boundary rotation. With the flat chunk budget gone (PR
        * #68) nothing removed a delivering-but-slow peer: the floor is 32 KB/s
        * at the tail, so a 250 KB/s peer against an 800 KB/s median held its
@@ -744,14 +760,30 @@ int main(void){
             ok(c[DLC_CTL_N_STALL] == 1 && WIFEXITED(st7) && WEXITSTATUS(st7) == 7 && sst[0].kill_reason == 1,
                "2 s at a full window: the holder is dropped (SIGUSR1, reason 'stalling the window'), the eviction counted");
             ok(g_dlc_stall_timeout_s == 4, "...and the timeout doubled to 4 s");
-            ok(tbanned[0] == 1,
-               "...and the staller is BANNED for the run (run 20, 2026-09-10: the eviction was memoryless and one address was handed the same chunk 14 times)");
+            ok(tbanned[0] == 0,
+               "...and a FIRST stall is not banned (B13, 2026-10-07: Core only disconnects; run 41 banned 26 fresh peers for one slow first chunk each)");
             kids[0] = 0;                                                    /* the worker is gone */
             c[DLC_CTL_FIRST_HOLE] = 140;                                     /* the tail moved on */
             dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 124000, tlive, TNLIVE, tbanned);
             ok(g_dlc_stall_timeout_s == 3, "the tail moved: the timeout eases 15% (4 s -> 3 s)");
             dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 200000, tlive, TNLIVE, tbanned);
             ok(c[DLC_CTL_N_STALL] == 1, "nobody holds the new tail (it is the retry ring's): no eviction");
+            /* B13: the same address stalls a second time (redrawn for the new
+             * tail) -- now it is banned for the run, so run 20's address, handed
+             * the same chunk 14 times, still goes on its second */
+            { sigset_t um1; sigemptyset(&um1); sigaddset(&um1, SIGUSR1); sigprocmask(SIG_BLOCK, &um1, 0);
+              pid_t hp1 = fork();
+              if (hp1 == 0){ for (;;){ sigset_t m; sigemptyset(&m); int s = 0; sigaddset(&m, SIGUSR1); sigwait(&m, &s); if (s == SIGUSR1) _exit(7); } }
+              sigprocmask(SIG_UNBLOCK, &um1, 0);
+              kids[0] = opid[0] = hp1;
+              sst[0].cur_lo = 140; sst[0].cur_hi = 179; sst[0].held_idx = 0; sst[0].kill_reason = 0;
+              c[DLC_CTL_CLAIM] = 140 + 4097;
+              dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 250000, tlive, TNLIVE, tbanned);
+              dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 250000 + g_dlc_stall_timeout_s * 1000, tlive, TNLIVE, tbanned);
+              int st1 = 0; waitpid(hp1, &st1, 0);
+              ok(c[DLC_CTL_N_STALL] == 2 && WIFEXITED(st1) && WEXITSTATUS(st1) == 7 && tbanned[0] == 1,
+                 "the SAME address stalling a second time is BANNED for the run (run 20, 2026-09-10: one address was handed the same chunk 14 times)");
+              kids[0] = 0; }
             /* the floor guard: the same rule that stops the dead-weight
              * eviction emptying the pool applies here -- a slow peer beats no
              * peer, so at the floor the staller is dropped but stays selectable */
@@ -764,6 +796,7 @@ int main(void){
               c[DLC_CTL_FIRST_HOLE] = 140; c[DLC_CTL_CLAIM] = 140 + 4097;
               g_dlc_stall_timeout_s = 2;
               int save_floor = g_cfg.min_usable_peers; g_cfg.min_usable_peers = TNLIVE;   /* every peer is needed */
+              (void)dlc_stall_strike(tlive[1]);                                           /* its first stall was earlier: this one would ban */
               dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 300000, tlive, TNLIVE, tbanned);
               dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 303000, tlive, TNLIVE, tbanned);
               int st8 = 0; waitpid(hp2, &st8, 0);

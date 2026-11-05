@@ -177,6 +177,26 @@ int main(void){
     { u64 n = 0; long r = try_reload(512, &n);
       ck("the real manifest with a large enough cap still loads", r >= 0 && n == good_n); }
 
+    printf("== formal/parsers F7: an entry of gen 2^64-1 FAILS the reload ==\n");
+    /* The boot reader sets next_gen to 1 + the largest gen in the manifest;
+     * for 2^64-1 that wrapped to 0, so the next flush wrote a run no newer
+     * than an existing one. The store's own manifest, with the first entry's
+     * gen rewritten: 2^64-1 must fail the reload like any unreadable
+     * manifest, 2^64-2 must still load (its successor exists). The run
+     * number is not the one varied: a run file is named by it, so a changed
+     * run number fails the reload on the missing file either way. */
+    { unsigned magic = 0; memcpy(&magic, good, 4);
+      long eoff = magic == MAGIC2 ? 20 : 12;               /* first entry: gen at +0, run at +8 */
+      u64 gens[2] = { ~0ULL - 1, ~0ULL };
+      for (int k = 0; k < 2; k++){
+          restore_good(good, goodlen);
+          int fd = open(MANIFEST, O_WRONLY); (void)!pwrite(fd, &gens[k], 8, eoff); close(fd);
+          u64 n = 0; long r = try_reload(512, &n);
+          if (k == 0) ck("F7 (control) first entry gen 2^64-2 -> reload succeeds", r >= 0 && n == good_n);
+          else        ck("F7 first entry gen 2^64-1 -> reload returns -1 (halts the boot, UTX-6)", r == -1);
+      } }
+    restore_good(good, goodlen);
+
     printf("== UTX-6: an open() failure that is not ENOENT FAILS ==\n");
     unlink(MANIFEST);
     /* A symlink to itself: open() gives ELOOP for every uid, so this behaves

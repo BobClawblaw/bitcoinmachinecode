@@ -393,6 +393,35 @@ int main(void){
         ck("the real block at 151 connects (1 applied)", utxo_live_catchup(store_buf), 1);
         ck("applied height 151", utxo_live_applied_height(), 151);
         ck("no mutation reported for that call", utxo_live_call_mutated_height(), -1);
+
+        /* ---- Phase 6 (P2P-1, 2026-10-23): a body filed under another
+         * block's hash is dropped after UTXO_ARCH_STUCK_PASSES passes, not
+         * retried forever ---- */
+        printf("\n-- phase 6: the index names one block, the body is another: dropped after 3 passes, then the real block connects\n");
+        {
+            extern unsigned long long utxo_live_archive_mismatch_drops(void);
+            u8 prev151[32];
+            { static u8 blk[1<<16]; extern long store_read_at(void*, unsigned long, void*, long);
+              long l = store_read_at(store_buf, 151, blk, sizeof blk); ck("read block 151 back", l >= 80, 1);
+              block_hash(prev151, blk); }
+            u8 rawA[256], hashA[32], rawB[256], hashB[32];
+            long lenA = mk_and_mine(rawA, hashA, prev151, 0x73000000u, 1800400100u);
+            (void)mk_and_mine(rawB, hashB, prev151, 0x74000000u, 1800400101u);
+            append_and_mirror(152, rawA, lenA, hashB);                  /* A's body under B's hash */
+            int drops0 = g_drop_calls;
+            long a1 = utxo_live_catchup(store_buf), a2 = utxo_live_catchup(store_buf);
+            ck("passes 1 and 2: nothing applied, nothing dropped (the stale-reader retry)", a1 == 0 && a2 == 0 && g_drop_calls == drops0, 1);
+            ck("...the archive still holds 152", (long)*(int*)(store_buf+24), 152);
+            long a3 = utxo_live_catchup(store_buf);
+            ck("pass 3: the call does not fail", a3 >= 0, 1);
+            ck("pass 3: the drop hook ran once", g_drop_calls, drops0 + 1);
+            ck("pass 3: the archive is back at 151", (long)*(int*)(store_buf+24), 151);
+            ck("pass 3: one mismatch drop counted", (long)utxo_live_archive_mismatch_drops(), 1);
+            ck("applied height stays 151", utxo_live_applied_height(), 151);
+            append_and_mirror(152, rawA, lenA, hashA);
+            ck("the block under its own hash connects (1 applied)", utxo_live_catchup(store_buf), 1);
+            ck("applied height 152", utxo_live_applied_height(), 152);
+        }
         utxo_live_set_mutated_fn(NULL);
     }
 

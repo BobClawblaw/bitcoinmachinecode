@@ -114,6 +114,8 @@ extern int  p2wsh_verify_checksig(const u8* tx, int64_t txlen, int64_t n_in,
                                   const u8* vchPub, uint64_t publen);
 extern int  sv_classify_segwit(const u8* spk, u32 spl, const u8* ss, u32 ssl,
                                u32* version, const u8** prog, u32* proglen, int* wrapped);
+extern int  sv_witness_program_true(const u8* prog, u32 n);   /* CON-2: Core's EVAL_FALSE on the program push */
+#define TXV_WPROG_FALSE_MSG "witness program evaluates false (EVAL_FALSE)"
 extern int  sv_verify_witness_v0(const u8* prog, u32 proglen,
                                  const u8* const* wit, const u32* witlen, u32 nwit,
                                  u64 amount, unsigned long long flags, unsigned long nIn,
@@ -129,6 +131,11 @@ extern int  sv_verify_witness_v0(const u8* prog, u32 proglen,
  * ignore the computed flags entirely and apply taproot rules unconditionally,
  * so the replay rejected that block: a FALSE REJECT. See LOG.md incident #22. */
 #define TXV_FLAG_TAPROOT (1ULL<<17)
+/* SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM, Core bit 12: policy
+ * only (STANDARD_SCRIPT_VERIFY_FLAGS), never in a block's set. Core's
+ * VerifyWitnessProgram fails an unknown witness version with it set and
+ * succeeds without. Read at the TXV_SHAPE_WPASS classification (CON-2). */
+#define TXV_FLAG_DISCOURAGE_UPGRADABLE_WP (1ULL<<12)
 extern int  p2wsh_verify_multisig(const u8* tx, int64_t txlen, int64_t n_in,
                                   uint64_t amount, const u8* witness_script,
                                   uint64_t wslen,
@@ -917,6 +924,7 @@ static int txv_connect_body(const u8* tx, u64 txlen, long height, unsigned long 
         if (is_p2tr(spk, (u32)spklen) && (flags & TXV_FLAG_TAPROOT)) {
             has_taproot = 1;
             g_txv_in[i].shape = TXV_SHAPE_P2TR;
+            if (!sv_witness_program_true(spk + 2, 32)) TXV_SHAPE_FAIL(SCRIPT_ERR_EVAL_FALSE, TXV_WPROG_FALSE_MSG);
             if (g_txv_in[i].scriptSiglen != 0) TXV_SHAPE_FAIL(SCRIPT_ERR_WITNESS_MALLEATED, "p2tr scriptSig must be empty");
             if (g_txv_in[i].nwit == 0) TXV_SHAPE_FAIL(SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY, "p2tr empty witness");
             continue;
@@ -932,13 +940,18 @@ static int txv_connect_body(const u8* tx, u64 txlen, long height, unsigned long 
                                          &wver, &wprog, &wplen, &wrapped);
             if (cls < 0) TXV_SHAPE_FAIL(SCRIPT_ERR_WITNESS_MALLEATED_P2SH, "p2sh-wrapped witness program: scriptSig must be exactly one push of the redeemScript");
             if (cls > 0) {
+                if (!sv_witness_program_true(wprog, wplen)) TXV_SHAPE_FAIL(SCRIPT_ERR_EVAL_FALSE, TXV_WPROG_FALSE_MSG);
                 if (!wrapped && g_txv_in[i].scriptSiglen != 0) TXV_SHAPE_FAIL(SCRIPT_ERR_WITNESS_MALLEATED, "witness program scriptSig must be empty");
                 if (wver == 0) {
                     g_txv_in[i].shape = TXV_SHAPE_WV0; g_txv_in[i].wprog = wprog; g_txv_in[i].wproglen = wplen; g_txv_in[i].wrapped = (u8)wrapped;
                     if (wplen == 20 && g_txv_in[i].nwit != 2) TXV_SHAPE_FAIL(SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH, "p2wpkh needs exactly 2 witness items");
                     if (wplen == 32 && g_txv_in[i].nwit < 1) TXV_SHAPE_FAIL(SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY, "p2wsh needs a witnessScript");
                 } else {
-                    g_txv_in[i].shape = TXV_SHAPE_WPASS;   /* unknown version: valid under consensus flags (no DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM) */
+                    /* unknown version: valid under consensus flags, refused
+                     * under the mempool's standard set (CON-2) */
+                    if (flags & TXV_FLAG_DISCOURAGE_UPGRADABLE_WP)
+                        TXV_SHAPE_FAIL(SCRIPT_ERR_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM, "Witness version reserved for soft-fork upgrades");
+                    g_txv_in[i].shape = TXV_SHAPE_WPASS;
                 }
                 continue;
             }
@@ -1036,6 +1049,10 @@ int tx_verify_block_connect(const u8* tx, u64 txlen, long height, const u8 block
  *   DISCOURAGE_OP_SUCCESS (19) bitcoin_interp.asm:457, and the prescan in
  *                              bitcoin_taproot_sighash.c that returns before
  *                              it (IR-9: flags now reach the tapscript leaf)
+ *   DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM (12) this file's TXV_SHAPE_WPASS
+ *                              classification in txv_connect_body (CON-2,
+ *                              audit 2026-10-23; until then it was absent and
+ *                              unknown-version spends were accepted and relayed)
  *
  * DELIBERATELY ABSENT:
  *
@@ -1044,11 +1061,10 @@ int tx_verify_block_connect(const u8* tx, u64 txlen, long height, const u8 block
  *     mined mainnet transactions use OP_NOP1 in consensus-valid scripts, and
  *     treating the range as bad opcodes rejects them. The interpreter is
  *     shared with the block path, so there is no arm to switch on here.
- *   DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM (12), WITNESS_PUBKEYTYPE (15),
- *   DISCOURAGE_UPGRADABLE_TAPROOT_VERSION (18),
+ *   WITNESS_PUBKEYTYPE (15), DISCOURAGE_UPGRADABLE_TAPROOT_VERSION (18),
  *   DISCOURAGE_UPGRADABLE_PUBKEYTYPE (20) -- no interpreter arm exists. These
- *     are the "unknown witness versions" and "uncompressed keys in segwit"
- *     cases SCR-9 names, and they stay open; see docs/FEATURE_GAPS.md.
+ *     are the "uncompressed keys in segwit" and upgradable-taproot cases
+ *     SCR-9 names, and they stay open; see docs/FEATURE_GAPS.md.
  *
  * CLEANSTACK is safe to set unconditionally here because Core's own note
  * ("should never be used without P2SH or WITNESS") is satisfied: P2SH has
@@ -1062,6 +1078,7 @@ int tx_verify_block_connect(const u8* tx, u64 txlen, long height, const u8 block
                                  | (1ULL<<13) /* MINIMALIF        */ \
                                  | (1ULL<<14) /* NULLFAIL         */ \
                                  | (1ULL<<16) /* CONST_SCRIPTCODE */ \
+                                 | TXV_FLAG_DISCOURAGE_UPGRADABLE_WP  /* 12, CON-2 */ \
                                  | (1ULL<<19) /* DISCOURAGE_OP_SUCCESS */ )
 
 /* Core's -acceptnonstdtxn drops back to the consensus set (its require_standard
@@ -1857,6 +1874,7 @@ int txvb_classify(txvb_in_t* in, long height, unsigned long long flags,
 
     if (is_p2tr(spk, (u32)spklen) && (flags & TXV_FLAG_TAPROOT)) {
         *has_taproot = 1; in->shape = TXV_SHAPE_P2TR;
+        if (!sv_witness_program_true(spk + 2, 32)) { *reason = TXV_WPROG_FALSE_MSG; return 0; }
         if (in->scriptSiglen != 0) { *reason = "p2tr scriptSig must be empty"; return 0; }
         /* Exact shape (key-path vs script-path, annex or not) isn't
          * decidable from nwit alone -- taproot_verify_input classifies
@@ -1872,6 +1890,7 @@ int txvb_classify(txvb_in_t* in, long height, unsigned long long flags,
                                      &wver, &wprog, &wplen, &wrapped);
         if (cls < 0) { *reason = "p2sh-wrapped witness program: scriptSig must be exactly one push of the redeemScript"; return 0; }
         if (cls > 0) {
+            if (!sv_witness_program_true(wprog, wplen)) { *reason = TXV_WPROG_FALSE_MSG; return 0; }
             if (!wrapped && in->scriptSiglen != 0) { *reason = "witness program scriptSig must be empty"; return 0; }
             if (wver == 0) {
                 in->shape = TXV_SHAPE_WV0; in->wproglen = wplen; in->wrapped = (u8)wrapped;

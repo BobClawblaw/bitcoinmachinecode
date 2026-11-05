@@ -11,6 +11,17 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stddef.h>
+#include <dirent.h>
+#ifndef __APPLE__
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <linux/audit.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
+#endif
 #include "test_tmpdir.h"
 
 static int fails = 0;
@@ -53,6 +64,66 @@ static long gen(rec_t* out, long from, long to){
     return n;
 }
 
+static int cp_file(const char* from, const char* to){
+    FILE* a = fopen(from, "rb"); FILE* b = fopen(to, "wb"); int ok = a && b, c;
+    while (ok && (c = fgetc(a)) != EOF) if (fputc(c, b) == EOF) ok = 0;
+    if (a) fclose(a);
+    if (b && fclose(b)) ok = 0;
+    return ok;
+}
+#ifdef __APPLE__
+/* bmc_osx: no seccomp. The txindex files present before the merge are marked
+ * user-immutable, so the merger's unlink of each input fails with EPERM, the
+ * filter's answer; its new output is not marked. Cleared after it exits. */
+static void flag_txindex_files(unsigned flags){
+    DIR* d = opendir("."); struct dirent* e;
+    while (d && (e = readdir(d))) if (!strncmp(e->d_name, "txindex", 7)) chflags(e->d_name, flags);
+    if (d) closedir(d);
+}
+static int run_merger(int fail_unlink){
+    if (fail_unlink) flag_txindex_files(UF_IMMUTABLE);
+    pid_t p = fork();
+    if (p == 0){ execl(tt_src("daemon/bmc_merge_index_runs"), "bmc_merge_index_runs", ".", "txindex", (char*)0); _exit(127); }
+    int st = 0; waitpid(p, &st, 0);
+    if (fail_unlink) flag_txindex_files(0);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 255;
+}
+#else
+/* run the merger; fail_unlink: under a seccomp filter that answers unlink and
+ * unlinkat with EPERM (inherited across the exec) */
+static int run_merger(int fail_unlink){
+    pid_t p = fork();
+    if (p == 0){
+        if (fail_unlink){
+            struct sock_filter f[] = {
+                BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
+                BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0),
+                BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+                BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+                BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_unlink, 1, 0),
+                BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_unlinkat, 0, 1),
+                BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+                BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            };
+            struct sock_fprog pr = { (unsigned short)(sizeof f / sizeof f[0]), f };
+            if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) || prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &pr)) _exit(126);
+        }
+        execl(tt_src("daemon/bmc_merge_index_runs"), "bmc_merge_index_runs", ".", "txindex", (char*)0); _exit(127);
+    }
+    int st = 0; waitpid(p, &st, 0);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 255;
+}
+#endif
+static int count_txindex_files(void){
+    DIR* d = opendir("."); int n = 0; struct dirent* e;
+    while (d && (e = readdir(d))){
+        size_t l = strlen(e->d_name);
+        if (!strncmp(e->d_name, "txindex", 7) && l > 4 && !strcmp(e->d_name + l - 4, ".dat")) n++;   /* not the .tmp the test left */
+    }
+    if (d) closedir(d);
+    return n;
+}
+
 int main(void){
     tt_isolate();
     irunset_t s; irs_init(&s, "txindex", "BMCTXIDX", 20, 16);
@@ -81,8 +152,38 @@ int main(void){
     write_run(n2, c, nc, 2000, 2499, 0); irs_dirty(&s); irs_refresh(&s);
     ck("...and found again when it is back", s.n == 3);
 
+    /* formal/parsers F4: the header checks must not wrap. irs_open_run
+     * compared so + ns*16 with the size and 48 + n*20 with so in 64 bits:
+     * nsparse 2^60 (16 * 2^60 == 0 mod 2^64) and n = 1 + 2^62 (20n == 20
+     * mod 2^64) both passed on a 68-byte file, and a lookup then searched
+     * 2^60 sparse samples or 2^62 records of it. Exactly the confirmation
+     * driver's input, then the honest 68- and 84-byte runs that must still
+     * open. Files named outside the run pattern, so the set never sees them. */
+    { struct { const char* what; unsigned long long n, so, ns; long size; int want; } cs[] = {
+        { "nsparse 2^60 on a 68-byte run (16*2^60 wraps to 0)",  1, 68, 1ULL << 60, 68, 0 },
+        { "n = 1 + 2^62 on a 68-byte run (20n wraps to 20)",     1 + (1ULL << 62), 68, 0, 68, 0 },
+        { "sparse_off past the end of the file",                 1, 68 + 20, 0, 68, 0 },
+        { "sparse_off inside the header",                        0, 40, 0, 68, 0 },
+        { "(control) one record, no samples: 68 bytes",          1, 68, 0, 68, 1 },
+        { "(control) one record, one sample: 84 bytes",          1, 68, 1, 84, 1 } };
+      for (unsigned k = 0; k < sizeof cs / sizeof cs[0]; k++){
+          unsigned char f[84]; memset(f, 0, sizeof f);
+          memcpy(f, "BMCTXIDX", 8); put64(f + 8, cs[k].n); put64(f + 16, cs[k].so); put64(f + 24, cs[k].ns);
+          put32(f + 32, 10); put32(f + 36, 10);
+          FILE* o = fopen("f4run.bin", "wb"); fwrite(f, 1, (size_t)cs[k].size, o); fclose(o);
+          irun_t r; memset(&r, 0, sizeof r); snprintf(r.path, sizeof r.path, "%s", "f4run.bin");
+          int ok = irs_open_run(&s, &r);
+          char l[200]; snprintf(l, sizeof l, "F4 %s: %s", cs[k].what, cs[k].want ? "opens" : "refused");
+          ck(l, ok == cs[k].want);
+          if (ok) irs_close_run(&r);
+      }
+      unlink("f4run.bin"); }
+
     /* the merger: one file, the union range, every record, builder order */
     unlink("txindex.r000003000-000003999.dat");
+    /* ST2-2: keep copies of the inputs, to put back after the merge as a
+     * crash between the merger's rename and its unlinks would leave them */
+    ck("saved copies of the merge inputs", cp_file("txindex.dat", "saved.base") && cp_file(n1, "saved.n1") && cp_file(n2, "saved.n2"));
     irs_close_all(&s);
     pid_t p = fork();
     if (p == 0){ execl(tt_src("daemon/bmc_merge_index_runs"), "bmc_merge_index_runs", ".", "txindex", (char*)0); _exit(127); }
@@ -110,6 +211,35 @@ int main(void){
     ck("merging a single run is a no-op, exit 0", WIFEXITED(st) && WEXITSTATUS(st) == 0);
     irs_dirty(&s); irs_refresh(&s);
     ck("...and the run is still there", s.n == 1 && (long)s.r[0].n == nall);
+
+    /* ---- ST2-2 (audit 2026-10-23): the inputs come back beside the merged
+     * run, as a crash between the rename and the unlinks leaves them. Every
+     * one lies inside the merged run's range: the set must read the merged
+     * run alone, not 2x the records. */
+    ck("the inputs restored beside the merged run", rename("saved.base", "txindex.dat") == 0 && rename("saved.n1", n1) == 0 && rename("saved.n2", n2) == 0);
+    irs_dirty(&s); irs_refresh(&s);
+    ck("leftover inputs inside the merged range are not runs: one run", s.n == 1 && s.r[0].from == 0 && s.r[0].to == 2499);
+    ck("...with each record once", s.n == 1 && (long)s.r[0].n == nall);
+    { long nr = 0; for (int i = 0; i < s.n; i++) nr += (long)s.r[i].n;
+      ck("the set's record total is the union's, not twice it", nr == nall); }
+    irs_close_all(&s);
+    ck("the merger cleans the leftovers up and exits 0", run_merger(0) == 0);
+    ck("...only the merged run is left", count_txindex_files() == 1);
+
+    /* ---- ST2-2: an input that cannot be unlinked fails the merge's exit
+     * status (it was printed and exit 0). Two new runs above the merged one,
+     * merged with unlink refused. */
+    static rec_t d4[4096], e4[4096];
+    long nd = gen(d4, 2500, 2999), ne = gen(e4, 3000, 3499);
+    char n3[300], n4[300]; irs_run_name("txindex", 2500, 2999, n3, sizeof n3); irs_run_name("txindex", 3000, 3499, n4, sizeof n4);
+    write_run(n3, d4, nd, 2500, 2999, 0); write_run(n4, e4, ne, 3000, 3499, 0);
+    ck("a merge whose unlinks fail exits non-zero", run_merger(1) != 0);
+    struct stat sm;
+    ck("...its output is in place", stat("txindex.r000000000-000003499.dat", &sm) == 0);
+    irs_dirty(&s); irs_refresh(&s);
+    ck("...and the reader sees the merged run alone over the leftovers", s.n == 1 && s.r[0].from == 0 && s.r[0].to == 3499 && (long)s.r[0].n == nall + nd + ne);
+    irs_close_all(&s);
+    ck("a later merge removes the leftovers, exit 0", run_merger(0) == 0 && count_txindex_files() == 1);
 
     printf(fails ? "\nFAILURES: %d\n" : "\nall good\n", fails);
     return fails ? 1 : 0;

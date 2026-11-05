@@ -19,15 +19,20 @@
 #include <stdint.h>
 
 /* Header pages we are willing to accumulate for one candidate chain. 2048 is
- * ~1 getheaders page plus margin, and far beyond any reorg depth this node
- * will ever act on (see REORG_MAX_DEPTH). */
+ * ~1 getheaders page plus margin. */
 #define REORG_MAX_HEADERS   2048
-/* Hard cap on how many blocks we will ever disconnect automatically. Undo
- * data is kept for every block since 2026-09-08 (daemon/undo_store.h), so
- * this is policy, not a physical limit: a candidate that forks deeper than
- * this is refused outright and logged -- that situation is a human's
- * decision, not a daemon's. */
-#define REORG_MAX_DEPTH     100
+/* CON-10 (audit 2026-10-23): there is no reorg DEPTH cap any more. Core has
+ * none; this one (100) refused a heavier valid chain, and an operator's
+ * invalidateblock, more than 100 blocks below the tip. Undo data is kept for
+ * every block since 2026-09-08 (daemon/undo_store.h), and reorg_execute's
+ * non-destructive pre-flight proves every height to be disconnected is
+ * readable and has complete undo before anything is touched -- a pruned or
+ * pre-undo height is refused there, as Core refuses a reorg past its pruned
+ * blocks. What remains is only a SEARCH bound: how far back from the tip
+ * reorg_analyze scans for a candidate whose first header attaches to no
+ * locator entry (an unsolicited announcement). The locator itself reaches
+ * genesis, so a deep fork still attaches through it. */
+#define REORG_SCAN_BACK     100
 /* Matches daemon/locator_build.c's own LOCATOR_MAX. */
 #define REORG_LOCATOR_MAX   32
 
@@ -80,7 +85,7 @@ long reorg_headers_ingest(reorg_cand_t* c, const unsigned char* payload, long pl
  *   1  genuine fork but NOT heavier      -> ignore (or fetch more headers)
  *   0  no fork (candidate extends us, duplicates us, or is behind us)
  *  -1  candidate REJECTED as invalid/unusable (bad PoW, broken prevhash
- *      linkage, unknown base, or forks deeper than REORG_MAX_DEPTH)
+ *      linkage, or an unknown base)
  * On 1/2 it fills fork_height, first_new, our_work and cand_work. */
 long reorg_analyze(void* st, reorg_cand_t* c);
 

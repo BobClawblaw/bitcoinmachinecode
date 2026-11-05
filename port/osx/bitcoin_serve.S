@@ -20,6 +20,14 @@
 	.extern _p2p_write
 	.extern _serve_inv_bounds
 	.extern _serve_locator_from
+	.extern _serve_set_locator_store   /* daemon/serve_invbounds.c (main 2026-10-23) */
+	.extern _serve_getheaders_low_work /* daemon/serve_invbounds.c (main 2026-10-24) */
+	.extern _serve_public_tip          /* 3.1: the CONNECTED tip (daemon/serve_invbounds.c) */
+	.extern _serve_tipwatch_note       /* the announced tip's hash (main 2026-10-25) */
+	.extern _serve_tipwatch_changed
+	.extern _serve_cmpct_as_full       /* daemon/serve_hdrctx.c (main 2026-10-23) */
+	.extern _txann_wait                /* CC-1: announce accepted txs while waiting to read */
+	.extern _block_strip_witness       /* BIP144: MSG_BLOCK without the witness bit */
 	.extern _serve_getaddr
 	.extern _g_peer_wants_addrv2
 	.extern amr_init
@@ -106,6 +114,10 @@ s_plen:      .zero 8
 s_fh:        .zero 8
 s_ghstop:    .zero 8                    /* NET-8: hashStop height for getheaders,
                                          * -1 = absent/unknown (prologue-inited) */
+s_ghret:     .zero 8                    /* _serve_locator_from's result, kept across the low-work gate */
+s_gbstop:    .zero 32                   /* getblocks: the hashStop hash itself (wire order) */
+s_gbcont:    .zero 32                   /* getblocks: Core's m_continuation_block (wire order) */
+s_gbcont_set: .zero 8                   /* 1 while s_gbcont holds one (per connection) */
 s_cmd:       .zero 16
 s_cnt:       .zero 8
 s_ptr:       .zero 8
@@ -153,6 +165,8 @@ viol_mempool:  .ascii "mempool request with bloom filters disabled\0"
 viol_txparse:  .ascii "malformed tx payload (parse failure)\0"
 viol_blkshort: .ascii "malformed block payload (shorter than a header)\0"
 viol_gbtidx:   .ascii "getblocktxn with malformed or out-of-bounds tx indices\0"  /* Core: Misbehaving(100) */
+viol_ghlocsz:  .ascii "getheaders locator size > MAX_LOCATOR_SZ (101)\0"       /* Core: fDisconnect */
+viol_gblocsz:  .ascii "getblocks locator size > MAX_LOCATOR_SZ (101)\0"        /* Core: fDisconnect */
 cn_getbtxn:.ascii "getblocktxn\0"
 cn_btxn:   .ascii "blocktxn\0"
 cn_cmpct:  .ascii "cmpctblock\0"
@@ -297,6 +311,10 @@ _node_serve_loop:
 	mov  x20, x1                      /* lfd */
 	mov  x21, x2                      /* st */
 	mov  x22, x3                      /* ht_idx */
+	/* the locator walk checks each hash-index hit against index.dat
+	 * (_serve_locator_from): a child's index can be a reorg behind */
+	mov  x0, x21
+	bl   _serve_set_locator_store
 
 	/* mempool lazy init (static fallback vs C-provided -maxmempool region) */
 	LOADADDR x9, mp_initdone
@@ -362,9 +380,16 @@ _node_serve_loop:
 	strb wzr, [x9]
 	LOADADDR x9, s_addrsent
 	strb wzr, [x9]        /* getaddr answered once per conn (Core: m_getaddr_recvd) */
-	ldr  w9, [x21, #24]               /* tip height = st[24] */
+	LOADADDR x9, s_gbcont_set
+	str  xzr, [x9]                    /* no getblocks continuation yet */
+	/* 3.1: the PUBLIC tip = the connected tip (_serve_public_tip caps
+	 * st[24] by the worker's published connected height), and its hash
+	 * (_serve_tipwatch_note, main 2026-10-25) */
+	mov  x0, x21
+	bl   _serve_public_tip
 	LOADADDR x10, s_lasttip
-	str  x9, [x10]
+	str  x0, [x10]
+	bl   _serve_tipwatch_note
 	/* feefilter_send: int64 LE min-relay-feerate -- gated (x86 2026-09-01):
 	 * -blocksonly / forcerelay peers get no feefilter from us (Core) */
 	LOADADDR x9, _g_serve_send_feefilter
@@ -386,6 +411,23 @@ _node_serve_loop:
 .LAH_ff_skip:
 
 .outer:
+	/* CC-1 (x86 2026-09-06): before blocking in _p2p_read, the C side polls
+	 * the socket in sub-second slices and, between slices, announces what the
+	 * node accepted since this peer last heard from us. 1 = readable (read as
+	 * before), 0 = the NET-3 idle bound expired (.done), 2 = the public tip
+	 * passed s_lasttip or a reorg replaced the block there: the tip-watch at
+	 * .next announces it now (main 2026-10-24/25).
+	 * _txann_wait(fd, peer_feefilter, st, announced_tip) */
+	mov  x0, x19
+	LOADADDR x9, s_peerfee
+	ldr  x1, [x9]
+	mov  x2, x21
+	LOADADDR x9, s_lasttip
+	ldr  x3, [x9]
+	bl   _txann_wait
+	cbz  x0, .done
+	cmp  x0, #2
+	b.eq .next
 	LOADADDR x9, s_plen
 	str  xzr, [x9]
 	mov  x0, x19
@@ -623,7 +665,10 @@ _node_serve_loop:
 	LOADADDR x10, _node_relay_flag
 	ldrb w10, [x10]
 	cbz  w10, .LSV_inv_next
-	ldr  x9, [sp, #0]
+	/* (x9 is the item pointer from .LSV_inv_loop. This reloaded it from
+	 * [sp, #0], which nothing on the way here had written: the first tx
+	 * announcement of a connection read its type from address 0 and the
+	 * serve child died -- test_serve_txrejects, 2026-11-04) */
 	/* no validation this connection: nothing to accept it into */
 	LOADADDR x10, tx_dv_ok
 	ldrb w10, [x10]
@@ -631,7 +676,7 @@ _node_serve_loop:
 	b.ne .LSV_inv_next
 	ldr  w13, [x9]                    /* type u32 */
 	cmp  w13, #1
-	b.ne .LSV_inv_txann_req           /* a wtxid cannot be looked up by txid: just ask */
+	b.ne .LSV_inv_txann_rej           /* a wtxid cannot be looked up in the pool by txid -- but it IS what the reject filter holds */
 	/* already in the pool? _mpool_get(mp_cur, hash, &s_fh) */
 	str  x9, [sp, #0]
 	LOADADDR x0, mp_cur
@@ -653,7 +698,13 @@ _node_serve_loop:
 	 *
 	 * The filter holds FINAL verdicts only: a fee-only failure stays
 	 * re-announceable, because a CPFP child can overturn it. It is shared
-	 * across serve children, so one child's refusal spares all of them. */
+	 * across serve children, so one child's refusal spares all of them.
+	 *
+	 * MPL-1 (audit 2026-10-23): refusals are filed by WTXID (Core's
+	 * MempoolRejectedTx), so a MSG_WTX announcement is checked here too; a
+	 * MSG_TX one matches only a transaction without a witness, whose txid IS
+	 * its wtxid -- the same answer Core's AlreadyHaveTx gives. */
+.LSV_inv_txann_rej:
 	str  x9, [sp, #0]
 	add  x0, x9, #4
 	bl   _serve_reject_has
@@ -999,6 +1050,42 @@ _node_serve_loop:
 	b.le .gd_miss
 	LOADADDR x10, s_blen_spill
 	str  x0, [x10]
+	/* ---- STO-10, as .gd_block does it (main 2026-10-23): the block read
+	 * must hash to the one requested. A child's index can be a reorg behind;
+	 * this path served whatever block sat at the stale height. */
+	str  x9, [sp, #0]
+	LOADADDR x0, s_gdbh
+	LOADADDR x1, sb_buf
+	bl   _block_hash
+	ldr  x9, [sp, #0]
+	LOADADDR x10, s_gdbh
+	ldp  x11, x12, [x10]
+	ldr  x13, [x9, #4]
+	ldr  x14, [x9, #12]
+	cmp  x11, x13
+	ccmp x12, x14, #0, eq
+	b.ne .gd_miss
+	ldp  x11, x12, [x10, #16]
+	ldr  x13, [x9, #20]
+	ldr  x14, [x9, #28]
+	cmp  x11, x13
+	ccmp x12, x14, #0, eq
+	b.ne .gd_miss
+	/* Core: compact only for a block at most 5 below a fresh tip, else the
+	 * full block with witness (_serve_cmpct_as_full, daemon/serve_hdrctx.c) */
+	mov  x0, x21
+	bl   _serve_public_tip
+	mov  x2, x0
+	mov  x0, x21
+	LOADADDR x9, s_fh
+	ldr  x1, [x9]
+	bl   _serve_cmpct_as_full
+	ldr  x9, [sp, #0]
+	cbz  w0, .gc_compact
+	LOADADDR x10, s_blen_spill
+	ldr  x0, [x10]
+	b    .gdb_send_full
+.gc_compact:
 	/* ---- NET-14 (audit 2026-09-03): a FRESH nonce per block ----
 	 * This was the constant 0x0123456789abcdef, drawn once and then cached in
 	 * s_cmpct_nonce for the life of the connection -- so every compact block
@@ -1057,7 +1144,7 @@ _node_serve_loop:
 	ldr  x11, [x10]
 	add  x11, x11, #1
 	str  x11, [x10]
-	b    .gd_next
+	b    .gd_cont
 
 .gd_block:
 	str  x9, [sp, #0]
@@ -1119,6 +1206,34 @@ _node_serve_loop:
 	ldr  x12, [x9, #28]
 	cmp  x11, x12
 	b.ne .gd_miss
+	/* BIP144: a bare MSG_BLOCK (witness flag 0x40000000 CLEAR) from a strict
+	 * pre-segwit peer wants the STRIPPED serialization. Witness bit set
+	 * (MSG_WITNESS_BLOCK): send sb_buf as is; else strip into bt_buf (free in
+	 * this arm) and send that. A strip failure serves nothing. */
+	ldr  w10, [x9]
+	tbnz w10, #30, .gdb_send_full
+	str  x9, [sp, #0]
+	mov  x1, x0                        /* len */
+	LOADADDR x0, sb_buf
+	LOADADDR x2, bt_buf
+	mov  x3, #(8<<20)
+	bl   _block_strip_witness
+	ldr  x9, [sp, #0]
+	cmp  x0, #0
+	b.le .gd_miss
+	mov  x4, x0
+	mov  x0, x19
+	LOADADDR x1, cn_block
+	mov  x2, #5
+	LOADADDR x3, bt_buf
+	bl   _p2p_write
+	ldr  x9, [sp, #0]
+	LOADADDR x10, s_served
+	ldr  x11, [x10]
+	add  x11, x11, #1
+	str  x11, [x10]
+	b    .gd_cont
+.gdb_send_full:
 	mov  x4, x0                        /* block len */
 	str  x9, [sp, #0]
 	mov  x0, x19
@@ -1131,6 +1246,43 @@ _node_serve_loop:
 	ldr  x11, [x10]
 	add  x11, x11, #1
 	str  x11, [x10]
+.gd_cont:
+	/* ---- the getblocks continuation (Core ProcessGetBlockData,
+	 * net_processing.cpp 2480-2492; main 2026-10-23): a block was just sent;
+	 * if it is the one the last 500-entry getblocks stopped at, send
+	 * inv(MSG_BLOCK, connected tip) right after it, "even if redundant",
+	 * then forget it. Every served block form reaches here. The entry is
+	 * reloaded from s_ptr: the compact arm's getrandom clobbers x9. */
+	LOADADDR x9, s_ptr
+	ldr  x9, [x9]
+	LOADADDR x10, s_gbcont_set
+	ldr  x11, [x10]
+	cbz  x11, .gd_next
+	LOADADDR x10, s_gbcont
+	ldp  x11, x12, [x10]
+	ldr  x13, [x9, #4]
+	ldr  x14, [x9, #12]
+	cmp  x11, x13
+	ccmp x12, x14, #0, eq
+	b.ne .gd_next
+	ldp  x11, x12, [x10, #16]
+	ldr  x13, [x9, #20]
+	ldr  x14, [x9, #28]
+	cmp  x11, x13
+	ccmp x12, x14, #0, eq
+	b.ne .gd_next
+	LOADADDR x10, s_gbcont_set
+	str  xzr, [x10]
+	/* _node_announce_tip(fd, st, ht_idx, use_headers=0): the inv form
+	 * whatever sendheaders said, as Core's is. It reloads sb_buf/hp_buf,
+	 * both free here. */
+	str  x9, [sp, #0]
+	mov  x0, x19
+	mov  x1, x21
+	mov  x2, x22
+	mov  x3, #0
+	bl   _node_announce_tip
+	ldr  x9, [sp, #0]
 	b    .gd_next
 
 .gd_wtx:
@@ -1325,31 +1477,56 @@ _node_serve_loop:
 	 * _serve_locator_from does the CompactSize, the bounds and the walk
 	 * (Core's FindForkInGlobalIndex), in C for the same reason
 	 * _serve_inv_bounds is: hand-writing a second varint walk in assembly is
-	 * how the first one went wrong.   x0 = 1 ok / 0 malformed. */
+	 * how the first one went wrong.
+	 * w0 = 1 ok / 2 ok, empty locator / 0 malformed (dropped) /
+	 *     -1 more than MAX_LOCATOR_SZ entries (disconnected). */
 	LOADADDR x0, pl_buf
 	LOADADDR x9, s_plen
 	ldr  x1, [x9]
 	mov  x2, x22                      /* htidx */
 	LOADADDR x3, s_fh		/* out_from */
 	LOADADDR x4, s_ghstop		/* out_stop (-1 = none/unknown) */
+	mov  x5, #0			/* out_stop_hash: not needed here */
 	bl   _serve_locator_from
-	cbz  x0, .next			/* malformed: drop, as the inv path does */
+	cmn  w0, #1
+	b.eq .gh_locsz			/* > MAX_LOCATOR_SZ: Core disconnects */
+	cbz  w0, .next			/* malformed: drop, as the inv path does */
+	sxtw x0, w0
+	LOADADDR x9, s_ghret
+	str  x0, [x9]
+	/* Core (net_processing.cpp 4410-4422): no headers from a chain below
+	 * -minimumchainwork, unless the peer has the download permission -- an
+	 * empty headers message instead, after the locator checks and before
+	 * either walk. _serve_getheaders_low_work: 1 = answer empty. */
+	mov  x0, x21
+	bl   _serve_public_tip
+	bl   _serve_getheaders_low_work
+	cbnz w0, .gh_empty
+	LOADADDR x9, s_ghret
+	ldr  x9, [x9]
+	cmp  x9, #2
+	b.eq .gh_nolocator		/* empty locator: the hashStop header alone */
 .gh_build:
-	ldr  w9, [x21, #24]               /* tip = st[24] */
+	/* tip = the CONNECTED tip (3.1), not st[24]: a peer is never told about
+	 * a block this node has stored but not validated */
+	mov  x0, x21
+	bl   _serve_public_tip
 	LOADADDR x10, s_cnt
-	str  x9, [x10]
+	str  x0, [x10]
 	/* NET-8: hashStop, when it names a height we hold, caps the range Core
 	 * would send. Only ever LOWERS the bound -- a stop above our tip is not
-	 * a request to invent headers. */
+	 * a request to invent headers. (This stored through the tip's VALUE as
+	 * an address -- `str x10, [x11]` after x11 was reloaded with s_cnt's
+	 * contents -- found in the 2026-11 merge.) */
 	LOADADDR x9, s_ghstop
 	ldr  x10, [x9]
 	cmp  x10, #0
 	b.lt .gh_nostop
-	LOADADDR x11, s_cnt
-	ldr  x11, [x11]
+	LOADADDR x12, s_cnt
+	ldr  x11, [x12]
 	cmp  x10, x11
 	b.hs .gh_nostop
-	str  x10, [x11]
+	str  x10, [x12]
 .gh_nostop:
 	LOADADDR x9, s_fh
 	ldr  x9, [x9]
@@ -1495,6 +1672,34 @@ _node_serve_loop:
 	bl   _p2p_write
 	b    .next
 
+.gh_nolocator:
+	/* An EMPTY locator (Core GETHEADERS, net_processing.cpp 4426-4436) asks
+	 * for the hashStop header alone: unknown (or all-zero) -> no reply at
+	 * all; otherwise exactly that one header. A stop above the CONNECTED tip
+	 * is not served (Core's BlockRequestAllowed). This used to serve from
+	 * genesis, up to 2000 headers (main 2026-10-23). */
+	mov  x0, x21
+	bl   _serve_public_tip
+	LOADADDR x9, s_ghstop
+	ldr  x10, [x9]
+	tbnz x10, #63, .next		/* stop unknown: nothing is sent */
+	cmp  x10, x0
+	b.gt .next			/* above the connected tip: not served */
+	LOADADDR x9, s_fh
+	str  x10, [x9]			/* from = to = the stop's height */
+	LOADADDR x9, s_cnt
+	str  x10, [x9]
+	b    .gh_nostop
+.gh_locsz:
+	/* A complete locator of more than MAX_LOCATOR_SZ (101) entries: Core
+	 * sets fDisconnect, unscored (net_processing.cpp 4399 getheaders, 4272
+	 * getblocks). Both used to be dropped and the connection kept. */
+	LOADADDR x0, viol_ghlocsz
+	b    .viol_disconnect
+.gb_locsz:
+	LOADADDR x0, viol_gblocsz
+	b    .viol_disconnect
+
 .maybe_getb:
 	LOADADDR x9, s_cmd
 	ldr  w9, [x9, #8]
@@ -1508,34 +1713,37 @@ _node_serve_loop:
 	movk w10, #0x6b63, lsl #16        /* "lock" at cmd[4] (0x6b636f6c LE) */
 	cmp  w9, w10
 	b.ne .next
+	/* payload: version(4) | CompactSize count | count*32 locator | 32 stop,
+	 * the same CBlockLocator body getheaders carries. formal/parsers F1
+	 * (main 2026-10-23): this read the first hash at pl+5 whatever the count
+	 * said -- a non-canonical count, a short message or a multi-byte count
+	 * was served from a misread hash or from genesis, where Core's
+	 * ReadCompactSize throws and the message is dropped. _serve_locator_from
+	 * parses it as getheaders does and walks the whole locator
+	 * (FindForkInGlobalIndex). w0 = 1 or 2 ok (2 = empty locator, served
+	 * like any unknown one) / 0 malformed (dropped) / -1 more than
+	 * MAX_LOCATOR_SZ entries (disconnected); s_fh = the height to serve from,
+	 * s_gbstop = the stop hash. */
+	LOADADDR x0, pl_buf
 	LOADADDR x9, s_plen
-	ldr  x9, [x9]
-	cmp  x9, #37
-	b.lo .gb_from0
-	mov  x0, x22
-	LOADADDR x1, pl_buf
-	add  x1, x1, #5
-	LOADADDR x2, s_fh
-	bl   _idx_get
-	cbz  x0, .gb_from0
+	ldr  x1, [x9]
+	mov  x2, x22
+	LOADADDR x3, s_fh		/* out_from */
+	LOADADDR x4, s_ghstop		/* out_stop height (unused: the walk compares hashes) */
+	LOADADDR x5, s_gbstop		/* out_stop_hash */
+	bl   _serve_locator_from
+	cmn  w0, #1
+	b.eq .gb_locsz			/* > MAX_LOCATOR_SZ: Core disconnects */
+	cbz  w0, .next			/* malformed: drop, as getheaders does */
+	/* tip = the CONNECTED tip (3.1) */
+	mov  x0, x21
+	bl   _serve_public_tip
+	LOADADDR x10, s_cnt
+	str  x0, [x10]
 	LOADADDR x9, s_fh
 	ldr  x9, [x9]
-	add  x9, x9, #1
-	b    .gb_havefrom
-.gb_from0:
-	mov  x9, #0
-.gb_havefrom:
-	LOADADDR x10, s_fh
-	str  x9, [x10]
-	ldr  w9, [x21, #24]               /* tip */
-	LOADADDR x10, s_cnt
-	str  x9, [x10]
-	LOADADDR x9, s_fh
-	ldr  x9, [x9]
-	LOADADDR x10, s_cnt
-	ldr  x10, [x10]
-	cmp  x9, x10
-	b.hi .gb_empty
+	cmp  x9, x0
+	b.gt .next			/* nothing past the fork point: no inv (see .gb_done) */
 	LOADADDR x9, s_p
 	mov  x10, #3
 	str  x10, [x9]
@@ -1565,43 +1773,78 @@ _node_serve_loop:
 	add  x0, x0, #0x200000
 	LOADADDR x1, sb_buf
 	bl   _block_hash
-	/* type=2 at hp_buf[p] (u32), reversed hash at hp_buf[p+4..p+35] */
-	LOADADDR x9, s_p
-	ldr  x9, [x9]
-	LOADADDR x10, hp_buf
-	add  x10, x10, x9
-	mov  w11, #2
-	str  w11, [x10]                   /* type u32 (will be at p..p+3) */
-	add  x9, x10, #4                  /* dst base p+4 */
+	/* hashStop. Core (GETBLOCKS) walks the active chain from the fork
+	 * point's successor and breaks BEFORE queueing the block whose hash is
+	 * hashStop. A stop at or below the start, off this chain, unknown or
+	 * all-zero is never met. Compared by hash, over the blocks actually
+	 * served, so a stale index entry cannot stop it early (main 2026-10-23;
+	 * this handler ignored hashStop). */
 	LOADADDR x10, sb_buf
 	add  x10, x10, #0x200000
-	add  x10, x10, #31                /* src last byte */
-	mov  x11, #0
-.LSV_gbl_rev:
-	cmp  x11, #32
-	b.hs .LSV_gbl_rev_done
-	sub  x12, x10, x11
-	ldrb w13, [x12]
-	strb w13, [x9, x11]
-	add  x11, x11, #1
-	b    .LSV_gbl_rev
-.LSV_gbl_rev_done:
+	LOADADDR x13, s_gbstop
+	ldp  x11, x12, [x10]
+	ldp  x14, x15, [x13]
+	cmp  x11, x14
+	ccmp x12, x15, #0, eq
+	ldp  x11, x12, [x10, #16]
+	ldp  x14, x15, [x13, #16]
+	ccmp x11, x14, #0, eq
+	ccmp x12, x15, #0, eq
+	b.eq .gb_done			/* this block is hashStop: stop before it */
+	/* entry at hp_buf+p: type u32 = 2 (MSG_BLOCK), then the hash in
+	 * INTERNAL order -- _block_hash's output as-is, the bytes a getdata
+	 * carries back and the order _idx_get is keyed on. (main 2026-10-23:
+	 * this copied the hash byte-reversed, so every getblocks reply named 500
+	 * blocks nobody has.) */
 	LOADADDR x9, s_p
-	ldr  x10, [x9]
-	add  x10, x10, #36
-	str  x10, [x9]
+	ldr  x9, [x9]
+	LOADADDR x13, hp_buf
+	add  x13, x13, x9
+	mov  w11, #2
+	str  w11, [x13]
+	ldp  x11, x12, [x10]
+	stur x11, [x13, #4]
+	stur x12, [x13, #12]
+	ldp  x11, x12, [x10, #16]
+	stur x11, [x13, #20]
+	stur x12, [x13, #28]
+	LOADADDR x9, s_p
+	ldr  x11, [x9]
+	add  x11, x11, #36
+	str  x11, [x9]
 	LOADADDR x9, s_n
-	ldr  x10, [x9]
-	add  x10, x10, #1
-	str  x10, [x9]
-	LOADADDR x9, s_fh
+	ldr  x11, [x9]
+	add  x11, x11, #1
+	str  x11, [x9]
+	/* The 500th entry: Core (GETBLOCKS, `if (--nLimit <= 0)`) remembers it
+	 * as the peer's m_continuation_block and stops; when the peer asks for
+	 * that block, .gd_cont sends inv(tip) right after it, which is what makes
+	 * an old-style getblocks sync ask for the next batch. Set only at the
+	 * limit; a shorter reply leaves an earlier continuation in place. */
+	cmp  x11, #500
+	b.lo 12f
+	LOADADDR x13, s_gbcont
+	ldp  x11, x12, [x10]
+	stp  x11, x12, [x13]
+	ldp  x11, x12, [x10, #16]
+	stp  x11, x12, [x13, #16]
+	LOADADDR x9, s_gbcont_set
+	mov  x11, #1
+	str  x11, [x9]
+	b    .gb_done
+12:	LOADADDR x9, s_fh
 	ldr  x10, [x9]
 	add  x10, x10, #1
 	str  x10, [x9]
 	b    .LSV_gbl_loop
 .gb_done:
+	/* Nothing to announce (the peer is at our tip, or hashStop is the first
+	 * block): Core pushes no inv for an empty m_blocks_for_inv_relay, so
+	 * there is no reply at all. This sent an empty inv (count 0) until
+	 * main 2026-10-23. */
 	LOADADDR x9, s_n
 	ldr  x9, [x9]
+	cbz  x9, .next
 	cmp  x9, #253
 	b.hs .gb_varint16
 	mov  x10, x9
@@ -1657,16 +1900,6 @@ _node_serve_loop:
 	ldr  x11, [x11]
 	add  x10, x10, x11
 	str  x10, [x9]
-	b    .next
-.gb_empty:
-	LOADADDR x9, hp_buf
-	strb wzr, [x9]
-	mov  x0, x19
-	LOADADDR x1, cn_inv
-	mov  x2, #3
-	LOADADDR x3, hp_buf
-	mov  x4, #1
-	bl   _p2p_write
 	b    .next
 
 .maybe_sendcmpct:
@@ -1919,14 +2152,19 @@ _node_serve_loop:
 	b    .viol_report_next
 
 .next:
-	/* tip-watch: announce a newly-advanced tip exactly once */
-	ldr  w9, [x21, #24]               /* tip */
+	/* tip-watch: announce a newly-advanced tip exactly once. 3.1: the
+	 * CONNECTED tip, not st[24]. A reorg that replaces the block at the
+	 * announced height is a new tip too: _serve_tipwatch_changed compares
+	 * the hash there (main 2026-10-25). */
+	mov  x0, x21
+	LOADADDR x9, s_lasttip
+	ldr  x1, [x9]
+	bl   _serve_tipwatch_changed
+	cbz  w0, .tw_done                 /* no advance, same block -> nothing to announce */
+	mov  x0, x21
+	bl   _serve_public_tip
 	LOADADDR x10, s_cnt
-	str  x9, [x10]
-	LOADADDR x10, s_lasttip
-	ldr  x11, [x10]
-	cmp  x11, x9
-	b.ge .tw_done
+	str  x0, [x10]
 	/* _node_announce_tip(fd, st, ht_idx, use_headers) */
 	mov  x0, x19
 	mov  x1, x21
@@ -1936,8 +2174,9 @@ _node_serve_loop:
 	bl   _node_announce_tip
 	LOADADDR x10, s_lasttip
 	LOADADDR x11, s_cnt
-	ldr  x11, [x11]
-	str  x11, [x10]
+	ldr  x0, [x11]
+	str  x0, [x10]
+	bl   _serve_tipwatch_note
 .tw_done:
 	b    .outer
 /* A -3 from _p2p_read means the peer announced a message above P2P_MAX_MSG --
@@ -1977,10 +2216,12 @@ _node_announce_tip:
 	mov  x19, x0                     /* fd */
 	mov  x20, x1                     /* st */
 	str  x3, [sp, #0]                /* use_headers */
-	/* tip = *(int*)(st+24) */
-	ldr  w21, [x20, #24]
-	cmp  w21, #0
-	b.lt .at_fail
+	/* tip = the CONNECTED tip (3.1): _serve_public_tip(st) caps st[24] by
+	 * the worker's published connected height */
+	mov  x0, x20
+	bl   _serve_public_tip
+	tbnz x0, #63, .at_fail            /* no tip */
+	mov  x21, x0
 	/* _node_serve_block(st, tip, sb_buf, cap) */
 	mov  x0, x20
 	mov  x1, x21

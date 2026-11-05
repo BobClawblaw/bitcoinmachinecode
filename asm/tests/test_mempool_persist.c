@@ -132,6 +132,33 @@ int main(void){
       long r = mempool_dump_read("empty.dat", sink, &c, err, sizeof err);
       ck("an empty mempool round-trips", w0 == 0 && r == 0 && c.n == 0); }
 
+    /* formal/parsers F6: the delta-map count. The fit check was pos + nd*40
+     * > size in wrapping arithmetic: a v1 dump of 0 transactions and a map
+     * count of 0x0666666666666667 (*40 is 24 mod 2^64) in a 49-byte file
+     * read as valid. Core's ReadCompactSize throws "size too large" for any
+     * count above MAX_SIZE (and "non-canonical" for a long spelling), and
+     * LoadMempool reports failure. Beside them, the honest maps that must
+     * still load: empty, and one entry of 40 bytes. */
+    { struct { const char* what; u8 cs[9]; int csl; unsigned tail; int ok; } cs[] = {
+        { "count 0x0666666666666667 (*40 wraps to 24) behind 24 bytes", { 0xff, 0x67,0x66,0x66,0x66,0x66,0x66,0x66,0x06 }, 9, 24, 0 },
+        { "count 0x02000001 (above MAX_SIZE)",                          { 0xfe, 0x01,0x00,0x00,0x02 },                      5, 0,  0 },
+        { "count 1 spelt fd 0100 (non-canonical) with its 40 bytes",    { 0xfd, 0x01,0x00 },                                3, 40, 0 },
+        { "count 2 with one entry's 40 bytes",                          { 0x02 },                                           1, 40, 0 },
+        { "(control) an empty map",                                     { 0x00 },                                           1, 0,  1 },
+        { "(control) one entry, 40 bytes",                              { 0x01 },                                           1, 40, 1 } };
+      for (unsigned k = 0; k < sizeof cs / sizeof cs[0]; k++){
+          u8 f6[16 + 9 + 40]; memset(f6, 0, sizeof f6);
+          f6[0] = 1;                                              /* version 1; count (u64) 0 */
+          memcpy(f6 + 16, cs[k].cs, (size_t)cs[k].csl);
+          FILE* f = fopen("f6.dat", "wb"); (void)!fwrite(f6, 1, 16 + (size_t)cs[k].csl + cs[k].tail, f); fclose(f);
+          char err[128]; err[0] = 0;
+          long r = mempool_dump_read("f6.dat", sink, NULL, err, sizeof err);
+          char l[200]; snprintf(l, sizeof l, "F6 delta map, %s: %s (r=%ld%s%s)", cs[k].what,
+                                cs[k].ok ? "loads" : "refused", r, err[0] ? ", " : "", err);
+          ck(l, cs[k].ok ? r == 0 : r == -1);
+      }
+      unlink("f6.dat"); }
+
     if(failures) printf("\nFAILURES: %d\n", failures);
     else printf("\nALL TESTS PASSED (0 failures)\n");
     return failures ? 1 : 0;

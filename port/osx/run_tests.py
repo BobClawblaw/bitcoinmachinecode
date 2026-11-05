@@ -32,6 +32,11 @@ hard way on 2026-09-25/26, see port/OSX_STATE.md):
     bench_abi_guard.S, ...) are replaced by their Mac stand-ins in
     port/osx/test_support/<name>_twin.{c,S}; a tests/<name>.o with a
     tests/<name>.c beside it is compiled from that;
+  * -Wl,--wrap=SYM (GNU ld; ld64 has no such option) is emulated: every
+    object of the link is a copy whose UNDEFINED references to SYM name
+    __wrap_SYM instead (the Mach-O symbol table, see macho_redirect), and a
+    one-instruction __real_SYM -> SYM trampoline is linked in. As in GNU ld,
+    an object's references to a SYM it defines itself are not redirected;
   * the link is tried strict first (unresolved = code only x86 has, reported
     as MISSING), then with -undefined dynamic_lookup;
   * only if every combination fails with a duplicate symbol -- a symbol the
@@ -65,6 +70,16 @@ X86_ONLY = {
 }
 # x86 code the Mac has not ported yet, with the reason the report shows
 NOT_PORTED = {
+    # main 2026-10-08 (plan M2): the children are forked without the
+    # memtable / frozen copy by MADV_DONTFORK, which Darwin lacks (minherit
+    # cannot restore a MAP_SHARED header page); the test reads the children's
+    # /proc/self/maps. The Mac forks them whole (daemon/utxo_live.c).
+    "test_utxo_fork_trim": "Linux MADV_DONTFORK + /proc maps; the Mac forks the writers without the trim",
+    # main 2026-10-11 (plan B16): the undo/blk append streams are dropped
+    # from the page cache with sync_file_range + POSIX_FADV_DONTNEED. Darwin
+    # has neither and no per-file cache drop, so undo_drop_behind is a no-op
+    # there (daemon/undo_log.c, UNDO_NO_DROP) and nothing is dropped.
+    "test_drop_appends": "Linux page-cache drop (fadvise DONTNEED); a no-op on the Mac",
 }
 FINAL_OK = {"PASS", "SKIP", "N/A"}
 
@@ -117,6 +132,43 @@ def strong_over_weak(objs):
     return sorted(out - {"main.o"})
 
 
+def macho_redirect(src, dst, renames):
+    """copy the 64-bit Mach-O object src to dst with each UNDEFINED external
+    symbol named in `renames` pointed at its new name (the string is appended
+    to the string table, which a compiler's .o keeps last). True when
+    something was renamed; dst is written either way."""
+    import struct
+    b = bytearray(open(src, "rb").read())
+    if len(b) < 32 or struct.unpack_from("<I", b, 0)[0] != 0xFEEDFACF:
+        open(dst, "wb").write(b); return False
+    ncmds = struct.unpack_from("<I", b, 16)[0]
+    off, lc = 32, None
+    for _ in range(ncmds):
+        cmd, size = struct.unpack_from("<II", b, off)
+        if cmd == 0x2: lc = off; break                   # LC_SYMTAB
+        off += size
+    changed = False
+    if lc is not None:
+        symoff, nsyms, stroff, strsize = struct.unpack_from("<IIII", b, lc + 8)
+        if stroff + strsize != len(b):
+            raise RuntimeError(f"{src}: the string table is not the end of the file")
+        for i in range(nsyms):
+            e = symoff + 16 * i
+            strx, ntype = struct.unpack_from("<IB", b, e)
+            if ntype & 0xE0 or (ntype & 0x0E) != 0 or not (ntype & 0x01): continue   # stab / defined / local
+            end = b.index(0, stroff + strx)
+            name = b[stroff + strx:end].decode("latin-1")
+            if name in renames:
+                struct.pack_into("<I", b, e, len(b) - stroff)
+                b += renames[name].encode() + b"\0"
+                changed = True
+        if changed:
+            while (len(b) - stroff) % 8: b += b"\0"
+            struct.pack_into("<I", b, lc + 20, len(b) - stroff)
+    open(dst, "wb").write(b)
+    return changed
+
+
 class Builder:
     def __init__(self, workdir):
         self.work = workdir
@@ -161,18 +213,50 @@ class Builder:
                     if os.path.exists(tw): extra.append(tw); break
 
         tail = [os.path.join(DOUT, "addrbook.a"), "-lpthread"]
+        strong = [os.path.join(DOUT, o) for o in self.strong if o not in inc]
+
+        # -Wl,--wrap=SYM: compile the test and its extra sources to objects,
+        # redirect every object's undefined SYM to __wrap_SYM, add __real_SYM
+        wraps = sorted(set(re.findall(r"--wrap=([A-Za-z_][A-Za-z0-9_]*)", rule)))
+        main_in = [src]
+        if wraps:
+            wd = os.path.join(self.work, f"wrap_{name}")
+            os.makedirs(wd, exist_ok=True)
+            ren = {"_" + w: "___wrap_" + w for w in wraps}
+            def redirect(o):
+                d = os.path.join(wd, os.path.basename(o))
+                macho_redirect(o, d, ren)
+                return d
+            def compile_one(s_, keep=False):
+                o = os.path.join(wd, "c_" + os.path.basename(s_).rsplit(".", 1)[0] + ".o")
+                r_ = sh(CC + defs + ["-c", "-o", o, s_])
+                if r_.returncode != 0:
+                    raise RuntimeError(next((l for l in r_.stderr.splitlines() if "error" in l), r_.stderr[:200]))
+                return o if keep else redirect(o)
+            tramp = os.path.join(wd, "wrap_real.S")
+            with open(tramp, "w") as f:
+                f.write("    .text\n")
+                for w in wraps:
+                    f.write(f"    .p2align 2\n    .globl ___real_{w}\n___real_{w}:\n    b     _{w}\n")
+            try:
+                main_in = [compile_one(src), compile_one(tramp, keep=True)]   # (its SYM is the real one)
+                extra = [compile_one(x) for x in extra]
+            except RuntimeError as e:
+                self.cache[name] = ("BUILD-FAIL", str(e)[:200]); return self.cache[name]
+            use[:] = [redirect(o) for o in use]
+            strong = [redirect(o) for o in strong]
+            archive()
 
         def link(direct, ex):
-            strict = sh(CC + defs + ["-o", binp, src] + ex + direct + [arc] + tail)
+            strict = sh(CC + defs + ["-o", binp] + main_in + ex + direct + [arc] + tail)
             if strict.returncode == 0: return ("OK", "")
             missing = sorted(set(re.findall(r'^\s+"(_[A-Za-z0-9_]+)"', strict.stderr, re.M)))
-            loose = sh(CC + defs + ["-o", binp, src] + ex + direct + [arc] + tail + ["-Wl,-undefined,dynamic_lookup"])
+            loose = sh(CC + defs + ["-o", binp] + main_in + ex + direct + [arc] + tail + ["-Wl,-undefined,dynamic_lookup"])
             if loose.returncode != 0:
                 err = next((l for l in loose.stderr.splitlines() if "error" in l), loose.stderr[:200])
                 return ("BUILD-FAIL", err[:200])
             return ("MISSING", " ".join(m[1:] for m in missing[:8]) + (" ..." if len(missing) > 8 else ""))
 
-        strong = [os.path.join(DOUT, o) for o in self.strong if o not in inc]
         combos = ((strong, extra), (strong, []), ([], extra), ([], []))
         r = ("BUILD-FAIL", "")
         for d, ex in combos:                              # pass 1: nothing dropped
@@ -181,7 +265,7 @@ class Builder:
         if r[0] == "BUILD-FAIL":                          # pass 2: drop clashing members (last resort)
             for d, ex in combos:
                 for _ in range(4):
-                    probe = sh(CC + defs + ["-o", binp, src] + ex + d + [arc] + tail + ["-Wl,-undefined,dynamic_lookup"]).stderr
+                    probe = sh(CC + defs + ["-o", binp] + main_in + ex + d + [arc] + tail + ["-Wl,-undefined,dynamic_lookup"]).stderr
                     clash = set(re.findall(r"\.a\[\d+\]\(([A-Za-z0-9_]+\.o)\)", probe)) if "duplicate symbol" in probe else set()
                     clash -= {os.path.basename(x) for x in d}
                     if not clash: break

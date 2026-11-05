@@ -31,7 +31,10 @@ static void ck(const char* l, int c){ if (c) printf("  ok  %s\n", l); else { pri
 static void txid_of(unsigned char* t, unsigned i){ memset(t, 0x33, 32); memcpy(t, &i, 4); }
 static long fsize(void){ struct stat st; return stat("utxo.dat", &st) == 0 ? (long)st.st_size : -1; }
 enum { SLOTS = 1 << 17, N = 30000 };
-static void* mk_table(void){ void* u = malloc(utxo_struct_size(SLOTS)); utxo_init(u, SLOTS, malloc(32u << 20), 32u << 20); return u; }
+extern const unsigned long long utxo_store_walbuf_cap;
+#define BIG_SCRIPT 60000
+static unsigned long blob_bytes(void){ return (32ul << 20) + 2 * (unsigned long)utxo_store_walbuf_cap; }
+static void* mk_table(void){ void* u = malloc(utxo_struct_size(SLOTS)); utxo_init(u, SLOTS, malloc(blob_bytes()), blob_bytes()); return u; }
 int main(void){
     tt_isolate();
     struct US st; memset(&st, 0, sizeof st);
@@ -76,19 +79,21 @@ int main(void){
       ck("...and everything before it is intact", rep >= 0 && utxo_store_count(&st3, u3) == N + 501);
       st3.log_fd = -1; st3.idx_fd = -1; }
     /* oversize record: straight through, in order */
-    { static unsigned char big[65000]; memset(big, 0x6a, sizeof big);
+    { static unsigned char big[BIG_SCRIPT]; memset(big, 0x6a, sizeof big);
+      /* enough big records to overflow the buffer whatever its size (32 MB since STO-A) */
+      unsigned nbig = (unsigned)(utxo_store_walbuf_cap / (59 + BIG_SCRIPT)) + 2;
       unsigned char a[32], b[32]; txid_of(a, 700001); txid_of(b, 700002);
       utxo_store_put(&st, u, a, 1, 11, 9, 0, script, 40);          /* buffered */
       /* a script is capped well below the buffer, so the "larger than the buffer" path is exercised by
          filling the buffer to within a few bytes of the cap and appending: the append drains first. */
-      for (unsigned i = 0; fsize() + 0 >= 0 && i < 12000; i++){ unsigned char t[32]; txid_of(t, 800000 + i); utxo_store_put(&st, u, t, 0, 1, 1, 0, big, 60); }
+      for (unsigned i = 0; i < nbig; i++){ unsigned char t[32]; txid_of(t, 800000 + i); utxo_store_put(&st, u, t, 0, 1, 1, 0, big, BIG_SCRIPT); }
       utxo_store_put(&st, u, b, 2, 22, 9, 0, script, 40);
-      ck("the buffer drained itself while filling past 1 MB", fsize() > before);
+      ck("the buffer drained itself while filling past its capacity", fsize() > before);
       ck("utxo_store_wal_drain -> 0", utxo_store_wal_drain(&st) == 0);
       struct US st4; memset(&st4, 0, sizeof st4); void* u4 = mk_table(); utxo_store_init(&st4);
       long rep = utxo_store_reload(&st4, u4);
       unsigned long long v = 0; unsigned long h = 0, cb = 0, sl = 0; const unsigned char* sp = 0;
-      ck("records written across a self-drain are all there and in order", rep >= 0 && utxo_store_count(&st4, u4) == N + 501 + 2 + 12000
+      ck("records written across a self-drain are all there and in order", rep >= 0 && utxo_store_count(&st4, u4) == N + 501 + 2 + (long)nbig
          && utxo_store_get(&st4, u4, a, 1, &v, &h, &cb, &sp, &sl) == 1 && v == 11 && utxo_store_get(&st4, u4, b, 2, &v, &h, &cb, &sp, &sl) == 1 && v == 22);
       printf("  (count=%ld)\n", utxo_store_count(&st4, u4));
       st4.log_fd = -1; st4.idx_fd = -1; }

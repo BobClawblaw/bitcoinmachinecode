@@ -151,6 +151,47 @@ static __thread lsm_run_t g_cache[LSM_MM_SLOTS];
 static __thread u64       g_tick;
 static __thread u8        g_script[SCRIPT_MAX_BYTES];
 
+/* RECORDS BY pread (2026-10-11, the memory row of the release report)
+ * ------------------------------------------------------------------
+ * A mapped page that a lookup touches is counted in the process's PSS for
+ * as long as it stays resident, and the random lookups of a sync touch
+ * every records page of every run: run 46's worker held ~49 GB of run
+ * files mapped and counted the minute before a full compaction (56.3 GB
+ * PSS against Core's 34.3; Core reads its chainstate through LevelDB's
+ * pread and its page cache is outside its PSS). With bmc.lsmreads=pread
+ * the header, the Bloom filter and the sparse index are still read from
+ * the mapping (a few MB per run, touched on every lookup anyway) and the
+ * RECORDS are read with pread() into a per-thread window: one syscall per
+ * run a lookup reaches, no page-table entry for the records, so the run
+ * files leave the PSS and stay what they are on Core's side -- page cache.
+ * The mapping is also marked MADV_RANDOM so a Bloom or sparse touch does
+ * not fault neighbouring records pages in around it.
+ *
+ * The window: the sparse index samples every 64th record, so a scan from
+ * the sampled position covers at most 64 records; LSM_WIN_FIRST bytes are
+ * read first and the window is re-read at the current position, larger,
+ * whenever a record (or its script, up to SCRIPT_MAX_BYTES) runs past its
+ * end. rec_at() is the one accessor; in mmap mode it is the mapping. */
+#define LSM_WIN_FIRST  4096
+#define LSM_WIN_BYTES  (LSM_WIN_FIRST + 37 + 15 + SCRIPT_MAX_BYTES)
+static __thread u8   g_win[LSM_WIN_BYTES];
+static __thread u64  g_win_pos, g_win_len;      /* file offset and length of what g_win holds */
+static __thread int  g_win_fd = -1;             /* the fd it was read from (a slot's) */
+static int g_reads_cfg = -1;                    /* lsm_mm_set_reads: -1 unset (env), 0 mmap, 1 pread */
+static __thread int g_reads_env = -1;
+static __thread u64 g_stat_pread;
+static int reads_pread(void){
+    if (g_reads_cfg >= 0) return g_reads_cfg;
+    if (g_reads_env < 0){ const char *e = getenv("BMC_LSM_READS"); g_reads_env = (e && !strcmp(e, "pread")) ? 1 : 0; }
+    return g_reads_env;
+}
+/* Process-wide switch (the daemon: bmc.lsmreads; tests). Takes effect on
+ * the next lookup of every thread; the mapping cache is unchanged either
+ * way (both modes map the file; pread mode only reads the records elsewhere). */
+void lsm_mm_set_reads(int pread_mode){ g_reads_cfg = pread_mode ? 1 : 0; }
+int  lsm_mm_reads_pread(void){ return reads_pread(); }
+unsigned long long lsm_mm_pread_count(void){ return g_stat_pread; }
+
 static void slot_release(lsm_run_t *s);
 
 /* Opt-out, for differential testing: BMC_LSM_MMAP=0 forces the asm path.
@@ -239,6 +280,13 @@ static int parse_header(lsm_run_t *s){
     /* Bounds: every region we will touch must lie inside the mapping.
      * A malformed/truncated run falls back rather than reading OOB. */
     if (s->records_start > s->len) return -1;
+    /* ST2-8 (audit 2026-10-23): sparse_off is also the END of the records
+     * (lsm_run_lookup_mm's rec_end), so it is checked whatever sparse_n says.
+     * The flush and the compaction write it even with no samples (it is then
+     * the file length); 0 means "no trailer" (URUN, rec_end = len). Unchecked
+     * with sparse_n == 0, a sparse_off past the file let the scan run off the
+     * mapping (SIGBUS) and one inside the header ended it before it began. */
+    if (s->sparse_off && (s->sparse_off < s->records_start || s->sparse_off > s->len)) return -1;
     if (s->sparse_n) {
         u64 end;
         if (__builtin_mul_overflow(s->sparse_n, (u64)SPARSE_ENT_SIZE, &end)) return -1;
@@ -301,6 +349,9 @@ static lsm_run_t *slot_get(u64 run_no, u64 gen){
     s->fd   = fd;
     s->base = (const u8*)m;
     s->len  = (size_t)st.st_size;
+    /* pread mode: the records are never read through this mapping, and a
+     * Bloom or sparse touch must not fault the records around it in */
+    if (reads_pread()) (void)madvise(m, (size_t)st.st_size, MADV_RANDOM);
 
     if (parse_header(s) != 0) { slot_release(s); return NULL; }
 
@@ -324,9 +375,28 @@ static u32 bloom_h(const u8 *key, u32 seed){
     return h;
 }
 
-static int bloom_test(const u8 *bloom, u32 bits_mask, const u8 *key, u32 seed){
-    u32 bit = bloom_h(key, seed) & bits_mask;
+static int bloom_bit(const u8 *bloom, u32 bits_mask, u32 h){
+    u32 bit = h & bits_mask;
     return (bloom[bit >> 3] >> (bit & 7)) & 1;
+}
+
+/* 2026-10-09: the three hashes of the key a get() is walking the runs with.
+ * Every run uses the same three seeds and only its mask differs, so one
+ * get() needs them once -- not once per run (3 x 36-byte FNV, ~50 ns, times
+ * 26 runs in run 45's mid-chain). utxo_lsm_get asks each run in turn with
+ * the same key; per thread, as the mapping cache is. */
+static __thread u8  t_hkey[KEY_SIZE];
+static __thread u32 t_h[3];
+static __thread int t_hset;
+static const u32 *key_hashes(const u8 *key){
+    if (!t_hset || memcmp(key, t_hkey, KEY_SIZE) != 0) {
+        memcpy(t_hkey, key, KEY_SIZE);
+        t_h[0] = bloom_h(key, 0x811c9dc5u);
+        t_h[1] = bloom_h(key, 0xa1b2c3d4u);
+        t_h[2] = bloom_h(key, 0x5bd1e995u);
+        t_hset = 1;
+    }
+    return t_h;
 }
 
 /* mac_cmp_key semantics: the 36-byte key compared big-endian-wise, which is
@@ -339,6 +409,29 @@ static int cmp_key(const u8 *a, const u8 *b){ return memcmp(a, b, KEY_SIZE); }
  * Signature deliberately mirrors mac_run_lookup's, with `gen` added so the
  * cache can be validated (see the staleness note at the top).
  */
+/* The records accessor: bytes [pos, pos+need) of the run, need <= the window.
+ * mmap mode: the mapping (the caller has bounded pos+need by rec_end).
+ * pread mode: inside the current window, or the window is re-read at pos --
+ * LSM_WIN_FIRST bytes, or `need` when a record runs past that, never past
+ * rec_end. NULL = the read came up short (a truncated run): fall back. */
+static const u8 *rec_at(lsm_run_t *s, u64 pos, u64 need, u64 rec_end, int pr){
+    if (!pr) return s->base + pos;
+    if (g_win_fd == s->fd && g_win_len && pos >= g_win_pos && pos + need <= g_win_pos + g_win_len)
+        return g_win + (pos - g_win_pos);
+    u64 want = need > LSM_WIN_FIRST ? need : LSM_WIN_FIRST;
+    if (want > LSM_WIN_BYTES) return NULL;
+    if (pos + want > rec_end) want = rec_end - pos;
+    if (want < need) return NULL;
+    ssize_t got = pread(s->fd, g_win, (size_t)want, (off_t)pos);
+    g_stat_pread++;
+    if (got < 0 || (u64)got < need) { g_win_len = 0; return NULL; }
+    g_win_fd = s->fd; g_win_pos = pos; g_win_len = (u64)got;
+    return g_win;
+}
+
+static long lookup_body(u64 run_no, u64 gen, const u8 *txid, u32 index,
+                        u64 *out_value, u64 *out_height, u64 *out_is_coinbase,
+                        const u8 **out_script, u32 *out_slen);
 long lsm_run_lookup_mm(void *lst, u64 run_no, u64 gen,
                        const u8 *txid, u32 index,
                        u64 *out_value, u64 *out_height, u64 *out_is_coinbase,
@@ -346,9 +439,16 @@ long lsm_run_lookup_mm(void *lst, u64 run_no, u64 gen,
 {
     (void)lst;
     if (!mm_enabled()) { g_stat_fallback++; return LSM_MM_FALLBACK; }
-
+    long r = lookup_body(run_no, gen, txid, index, out_value, out_height, out_is_coinbase, out_script, out_slen);
+    if (r == LSM_MM_FALLBACK) g_stat_fallback++;   /* every hand-off to the asm is counted (2026-10-11; the scan's were not) */
+    return r;
+}
+static long lookup_body(u64 run_no, u64 gen, const u8 *txid, u32 index,
+                        u64 *out_value, u64 *out_height, u64 *out_is_coinbase,
+                        const u8 **out_script, u32 *out_slen)
+{
     lsm_run_t *s = slot_get(run_no, gen);
-    if (!s) { g_stat_fallback++; return LSM_MM_FALLBACK; }
+    if (!s) return LSM_MM_FALLBACK;
 
     u8 key[KEY_SIZE];
     memcpy(key, txid, 32);
@@ -357,9 +457,10 @@ long lsm_run_lookup_mm(void *lst, u64 run_no, u64 gen,
     /* ---- bloom: 3 seeds, all must hit ---- */
     const u8 *bloom = s->base + s->header_size;
     if (s->bloom_bytes) {
-        if (!bloom_test(bloom, (u32)s->bits_mask, key, 0x811c9dc5u)) return LSM_MM_ABSENT;
-        if (!bloom_test(bloom, (u32)s->bits_mask, key, 0xa1b2c3d4u)) return LSM_MM_ABSENT;
-        if (!bloom_test(bloom, (u32)s->bits_mask, key, 0x5bd1e995u)) return LSM_MM_ABSENT;
+        const u32 *h = key_hashes(key);
+        if (!bloom_bit(bloom, (u32)s->bits_mask, h[0])) return LSM_MM_ABSENT;
+        if (!bloom_bit(bloom, (u32)s->bits_mask, h[1])) return LSM_MM_ABSENT;
+        if (!bloom_bit(bloom, (u32)s->bits_mask, h[2])) return LSM_MM_ABSENT;
     }
 
     /* ---- sparse index: largest sampled key <= target ---- */
@@ -380,8 +481,9 @@ long lsm_run_lookup_mm(void *lst, u64 run_no, u64 gen,
      *
      * UTX-9 (audit 2026-09-03): the bound was s->len, the whole MAPPING, not
      * the records region. For a target greater than every key in the run --
-     * reached whenever the bloom passes, and a saturated 4 MiB filter on a
-     * 30M-record bulk run passes almost always -- the scan ran off the end of
+     * reached whenever the bloom passes, and a saturated 4 MiB filter (the
+     * cap until 2026-10-09's RUN_BLOOM_MAX_BYTES) on a 30M-record bulk run
+     * passes almost always -- the scan ran off the end of
      * the records and into the SPARSE-INDEX TRAILER, parsing 44-byte index
      * entries as records and skipping by whatever their bytes happened to say
      * `slen` was. It stayed inside the mapping, so nothing was ever read out
@@ -392,9 +494,12 @@ long lsm_run_lookup_mm(void *lst, u64 run_no, u64 gen,
      * The records end where the sparse index begins; a run written without a
      * sparse index has no trailer, so the mapping end is correct there. */
     const u64 rec_end = s->sparse_off ? s->sparse_off : s->len;
+    const int pr = reads_pread();
+    if (pr) g_win_len = 0;                     /* a fresh window per lookup */
     for (;;) {
         if (pos + 37 > rec_end) return LSM_MM_ABSENT;
-        const u8 *rec  = s->base + pos;
+        const u8 *rec = rec_at(s, pos, 37, rec_end, pr);
+        if (!rec) return LSM_MM_FALLBACK;
         int c    = cmp_key(rec, key);
         u8  kind = rec[36];
 
@@ -404,10 +509,14 @@ long lsm_run_lookup_mm(void *lst, u64 run_no, u64 gen,
             u64 vp = pos + 37;
             u64 vlen = s->rec_v2 ? 15 : 10;
             if (vp + vlen > rec_end) return LSM_MM_FALLBACK;   /* UTX-9 */
-            const u8 *v = s->base + vp;
+            const u8 *v = rec_at(s, vp, vlen, rec_end, pr);
+            if (!v) return LSM_MM_FALLBACK;
             u32 slen = (u32)(v[8] | (v[9] << 8));
             if (slen > SCRIPT_MAX_BYTES) return LSM_MM_FALLBACK;
             if (vp + vlen + slen > rec_end) return LSM_MM_FALLBACK;   /* UTX-9 */
+            /* the script too: a window re-read may move v */
+            v = rec_at(s, vp, vlen + slen, rec_end, pr);
+            if (!v) return LSM_MM_FALLBACK;
 
             *out_value = rd64(v);
             if (s->rec_v2) {
@@ -417,7 +526,7 @@ long lsm_run_lookup_mm(void *lst, u64 run_no, u64 gen,
                 *out_height = 0;
                 *out_is_coinbase = 0;
             }
-            if (slen) memcpy(g_script, s->base + vp + vlen, slen);
+            if (slen) memcpy(g_script, v + vlen, slen);
             *out_script = g_script;
             *out_slen   = slen;
             return LSM_MM_FOUND;
@@ -429,7 +538,8 @@ long lsm_run_lookup_mm(void *lst, u64 run_no, u64 gen,
         u64 vp = pos + 37;
         u64 vlen = s->rec_v2 ? 15 : 10;
         if (vp + vlen > rec_end) return LSM_MM_ABSENT;   /* UTX-9 */
-        const u8 *v = s->base + vp;
+        const u8 *v = rec_at(s, vp, vlen, rec_end, pr);
+        if (!v) return LSM_MM_FALLBACK;
         u32 slen = (u32)(v[8] | (v[9] << 8));
         pos = vp + vlen + slen;
     }

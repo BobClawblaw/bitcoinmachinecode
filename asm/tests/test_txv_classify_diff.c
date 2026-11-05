@@ -61,6 +61,8 @@ extern long txvb_classify_asm(txvb_in_t* in, long height, u64 flags,
                               const u8* spk, u64 spklen,
                               bytepool_t* spk_pool, int* has_taproot, const char** reason);
 
+extern void hash160(u8 out[20], const void* in, long long len);
+
 /* linked sources want this resolver; classification never reaches it */
 long mempool_resolve_confirmed_utxo(void* u, const u8 txid[32], unsigned long index,
                                     unsigned long long* value, const u8** spk,
@@ -128,6 +130,13 @@ int main(void){
     p2tr[0]=0x51; p2tr[1]=0x20;   for (int i=0;i<32;i++) p2tr[2+i]=(u8)(i+7);
     v2prog[0]=0x52; v2prog[1]=0x20; for (int i=0;i<32;i++) v2prog[2+i]=(u8)(i+3);
     memset(big, 0x51, sizeof big);
+    /* CON-2 (audit 2026-10-23): witness programs whose push is FALSE --
+     * Core's VerifyScript fails EVAL_FALSE before the witness branch. */
+    static u8 v2false[4] = {0x52,0x02,0x00,0x00};
+    static u8 v2negz[4]  = {0x52,0x02,0x00,0x80};
+    static u8 p2tr0[34];  p2tr0[0]=0x51; p2tr0[1]=0x20;     /* OP_1 <32 zero bytes> */
+    static u8 p2sh_v2f[23]; static u8 ss_wrap_v2f[5] = {0x04,0x52,0x02,0x00,0x00};
+    p2sh_v2f[0]=0xa9; p2sh_v2f[1]=0x14; hash160(p2sh_v2f+2, v2false, 4); p2sh_v2f[22]=0x87;
 
     /* scriptSigs: empty; a P2SH-wrapped P2WPKH redeem push (0x16 22-byte
      * push of 0x00 0x14 <20>); the same but with a trailing extra byte
@@ -150,6 +159,10 @@ int main(void){
         { p2tr, 34, ss_empty, 0, "p2tr" },
         { p2tr, 34, ss_junk, 3, "p2tr+ss" },
         { v2prog, 34, ss_empty, 0, "v2" },
+        { v2false, 4, ss_empty, 0, "v2-false" },
+        { v2negz, 4, ss_empty, 0, "v2-negzero" },
+        { p2tr0, 34, ss_empty, 0, "p2tr-zero" },
+        { p2sh_v2f, 23, ss_wrap_v2f, 5, "p2sh-v2-false" },
         { garbage, 7, ss_empty, 0, "opreturn" },
         { garbage, 7, ss_junk, 3, "opreturn+ss" },
         { p2pkh, 0, ss_empty, 0, "empty-spk" },
@@ -179,6 +192,26 @@ int main(void){
         for (unsigned s = 0; s < sizeof shapes/sizeof shapes[0]; s++)
             diff_one(shapes[s].spk, shapes[s].sl, shapes[s].ss, shapes[s].ssl,
                      2, mat[m].h, mat[m].uh, mat[m].cb, FLAG_WITNESS|FLAG_TAPROOT, ++tag);
+
+    /* CON-2: the C oracle itself must refuse every false program, under
+     * any flag set that classifies witness programs (the asm twin is held
+     * to the same answer by the matrix above). */
+    {
+        const u8* fs[4] = { v2false, v2negz, p2tr0, p2sh_v2f };
+        u64 fl[4] = { 4, 4, 34, 23 };
+        const u8* fss[4] = { ss_empty, ss_empty, ss_empty, ss_wrap_v2f };
+        u32 fssl[4] = { 0, 0, 0, 5 };
+        for (int k = 0; k < 4; k++) for (int f = 1; f < 3; f++){
+            txvb_in_t in; memset(&in, 0, sizeof in);
+            in.scriptSig = fss[k]; in.scriptSiglen = fssl[k]; in.nwit = 0;
+            pc.used = 0; int ht = 0; const char* r = "";
+            int c = txvb_classify(&in, 800000, flagsets[f], 5000, 700000, 0, fs[k], fl[k], &pc, &ht, &r);
+            compared++;
+            if (c != 0 || strcmp(r, "witness program evaluates false (EVAL_FALSE)")){
+                printf("FAIL CON-2 false program %d flags %d: rc=%d reason=[%s]\n", k, f, c, r); fails++;
+            }
+        }
+    }
 
     printf("compared %ld classify cases; %ld mismatch(es)\n", compared, fails);
     printf("%s (%ld failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);

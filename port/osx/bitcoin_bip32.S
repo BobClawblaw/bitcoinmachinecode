@@ -3,6 +3,7 @@
  * (Mach-O AArch64).  Functional twin of asm/bitcoin_bip32.asm (x86-64).
  *
  *   int  bip32_master(u8 k[32], u8 c[32], const u8* seed, i64 seedlen);
+ *        -> 1, or 0 if the master key is 0 or >= n (BIP32)
  *   int  bip32_ckd_priv(u8 k[32], u8 c[32], const u8 k_par[32],
  *                       const u8 c_par[32], u32 index);
  *   int  bip32_derive_path(u8 k[32], u8 c[32], const u8* seed, i64 seedlen,
@@ -75,19 +76,10 @@ _bip32_master:
     add     x9, x9, #1
     b       .m_ccp
 .m_ccp_done:
-    // return k != 0
-    mov     w9, #0
-    mov     w10, #0
-.m_zk:
-    cmp     w10, #32
-    b.hs    .m_zk_done
-    ldrb    w11, [x19, x10]
-    orr     w9, w9, w11
-    add     w10, w10, #1
-    b       .m_zk
-.m_zk_done:
-    cmp     w9, #0
-    cset    w0, ne
+    // return 1 if 0 < k < n (audit 2026-10-23: this tested k != 0 only; BIP32
+    // also rejects k >= n, and ckd_priv already used scalar_small_nonzero)
+    mov     x0, x19
+    bl      _scalar_small_nonzero
     add     sp, sp, #64
     ldp     x21, x22, [sp, #32]
     ldp     x19, x20, [sp, #16]

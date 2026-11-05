@@ -18,7 +18,8 @@
  * the union range. Both key comparisons are the ones the builders use.
  *
  * Usage: merge_index_runs <chaindir> <name>      exit 0 = merged (or nothing
- * to merge), 1 = failed, nothing replaced. */
+ * to merge), 1 = failed, nothing replaced -- or merged, but an input (or a
+ * leftover run inside the merged range) could not be unlinked. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,6 +48,23 @@ static int rec_cmp(const fmt_t* f, const u8* a, const u8* b){
     u32 oa = rd32(a + ho + 4), ob = rd32(b + ho + 4); return oa < ob ? -1 : oa > ob ? 1 : 0;
 }
 
+/* ST2-2 (audit 2026-10-23): the output's name must be durable before an input
+ * is unlinked (a crash could otherwise lose both), and an input that cannot
+ * be unlinked is a failure: it stays beside the merged run covering it. The
+ * readers now ignore a run whose range lies inside another's, but the exit
+ * status is how the trail and an operator learn the directory is not clean. */
+static int fsync_dir(void){
+    int d = open(".", O_RDONLY | O_DIRECTORY);
+    if (d < 0) return -1;
+    int r = fsync(d); close(d);
+    return r;
+}
+static int unlink_input(const char* who, const char* path){
+    if (unlink(path) == 0) return 0;
+    fprintf(stderr, "[%s] merge: cannot unlink %s -- the merged run covers it, the readers skip it\n", who, path);
+    return 1;
+}
+
 /* ---- addr_hist: variable-length GROUPS, merged by key ---------------------
  * Same idea, different shape (addr_hist_fmt.h): each run is a sequence of
  * [group header][n events] sorted by key with a sparse index every 256th
@@ -71,13 +89,38 @@ static int merge_addr_hist(void){
         int fd = open(f, O_RDONLY); if (fd < 0) continue;
         void* m = mmap(0, (size_t)sb.st_size, PROT_READ, MAP_SHARED, fd, 0); close(fd); if (m == MAP_FAILED) continue;
         ah_header h; memcpy(&h, m, sizeof h);
-        if (h.magic != AH_MAGIC || h.version != AH_VERSION || h.body_off + h.body_len > (u64)sb.st_size){ munmap(m, (size_t)sb.st_size); continue; }
+        u64 hend;                                   /* ST2-7: no wrapping sum */
+        if (h.magic != AH_MAGIC || h.version != AH_VERSION || h.body_off < AH_HDR_BYTES
+            || __builtin_add_overflow(h.body_off, h.body_len, &hend) || hend > (u64)sb.st_size){ munmap(m, (size_t)sb.st_size); continue; }
         snprintf(r[n].path, sizeof r[n].path, "%s", f); r[n].map = m; r[n].len = (size_t)sb.st_size; r[n].hdr = h;
         r[n].from = (long)h.pad; r[n].to = (long)h.to_height; r[n].p = r[n].map + h.body_off; r[n].end = r[n].p + h.body_len; n++;
     }
     closedir(d);
-    if (n < 2){ fprintf(stderr, "[addr_hist] merge: %d run(s), nothing to merge\n", n); return 0; }
     qsort(r, (size_t)n, sizeof r[0], ahr_cmp);
+    /* ST2-2: a run inside another run's range is an earlier merge's input
+     * left behind by a crash; merging it again would bake its events in
+     * twice. It is not an input -- only unlinked once a merged run covers it.
+     * Same rule as the reader (daemon/addr_hist.c): the widest is kept; of
+     * equal ranges, the later in name order. */
+    static ahr_t sup[64]; int nsup = 0, keep = 0;
+    for (int i = 0; i < n; i++){
+        int inside = 0;
+        for (int j = 0; j < n && !inside; j++){
+            if (j == i || r[j].from > r[i].from || r[j].to < r[i].to) continue;
+            if (r[j].from == r[i].from && r[j].to == r[i].to && strcmp(r[j].path, r[i].path) < 0) continue;
+            inside = 1;
+        }
+        if (inside){ munmap((void*)r[i].map, r[i].len); sup[nsup++] = r[i]; continue; }
+        r[keep++] = r[i];
+    }
+    n = keep;
+    if (n < 2){
+        int bad = 0;
+        for (int i = 0; i < nsup; i++){ fprintf(stderr, "[addr_hist] merge: %s lies inside another run -- removing it\n", sup[i].path); bad |= unlink_input("addr_hist", sup[i].path); }
+        fprintf(stderr, "[addr_hist] merge: %d run(s), nothing to merge\n", n);
+        for (int i = 0; i < n; i++) munmap((void*)r[i].map, r[i].len);
+        return bad;
+    }
     long from = r[0].from, to = r[0].to; u64 total_ev = 0;
     for (int i = 0; i < n; i++){ if (r[i].from < from) from = r[i].from; if (r[i].to > to) to = r[i].to; total_ev += r[i].hdr.n_events; }
     char out_name[320], tmp_name[340];
@@ -93,8 +136,13 @@ static int merge_addr_hist(void){
         /* the smallest key at the head of any run */
         int best = -1; ah_group_hdr bg;
         for (int i = 0; i < n; i++){
-            if (r[i].p + AH_GROUP_HDR > r[i].end) continue;
+            if ((size_t)(r[i].end - r[i].p) < AH_GROUP_HDR) continue;
             ah_group_hdr g; memcpy(&g, r[i].p, AH_GROUP_HDR);
+            /* ST2-7: a group longer than what is left of its body is corrupt */
+            if ((u64)g.n > (u64)(r[i].end - r[i].p - AH_GROUP_HDR) / AH_EVENT_BYTES){
+                fprintf(stderr, "[addr_hist] merge: %s: a group of %u events overruns the body -- not merging\n", r[i].path, g.n);
+                fclose(out); unlink(tmp_name); return 1;
+            }
             if (best < 0 || ah_key_cmp(g.type, g.hash, bg.type, bg.hash) < 0){ best = i; bg = g; }
         }
         if (best < 0) break;
@@ -127,7 +175,11 @@ static int merge_addr_hist(void){
     if (fflush(out) || fsync(fileno(out)) || fseek(out, 0, SEEK_SET) || fwrite(&hd, 1, sizeof hd, out) != sizeof hd || fflush(out) || fsync(fileno(out)) || fclose(out)){ perror("write"); unlink(tmp_name); return 1; }
     if (events != total_ev){ fprintf(stderr, "[addr_hist] merge: wrote %llu of %llu events -- not replacing anything\n", (unsigned long long)events, (unsigned long long)total_ev); unlink(tmp_name); return 1; }
     if (rename(tmp_name, out_name)){ perror("rename"); unlink(tmp_name); return 1; }
-    for (int i = 0; i < n; i++){ munmap((void*)r[i].map, r[i].len); if (unlink(r[i].path) != 0) fprintf(stderr, "[addr_hist] merge: cannot unlink %s\n", r[i].path); }
+    if (fsync_dir()){ perror("fsync directory"); return 1; }   /* the inputs stay: the rename may not be durable */
+    int bad = 0;
+    for (int i = 0; i < n; i++){ munmap((void*)r[i].map, r[i].len); bad |= unlink_input("addr_hist", r[i].path); }
+    for (int i = 0; i < nsup; i++) bad |= unlink_input("addr_hist", sup[i].path);
+    if (bad) return 1;
     fprintf(stderr, "[addr_hist] merge DONE: %llu keys, %llu events, %.2f GB, %llds\n", (unsigned long long)groups, (unsigned long long)events, (double)(hd.sparse_off + sp_n * AH_SPARSE_BYTES) / 1e9, (long long)(time(NULL) - t0));
     return 0;
 }
@@ -141,7 +193,14 @@ int main(int argc, char** argv){
     if (chdir(argv[1])){ perror("chdir"); return 1; }
     static irunset_t s; irs_init(&s, f->name, f->magic, f->rec, f->sparse);
     irs_dirty(&s); irs_refresh(&s);
-    if (s.n < 2){ fprintf(stderr, "[%s] merge: %d run(s), nothing to merge\n", f->name, s.n); return 0; }
+    /* s.r holds only the widest runs; s.sup the ones inside them (ST2-2):
+     * not inputs, only unlinked */
+    if (s.n < 2){
+        int bad = 0;
+        for (int i = 0; i < s.nsup; i++){ fprintf(stderr, "[%s] merge: %s lies inside another run -- removing it\n", f->name, s.sup[i].path); bad |= unlink_input(f->name, s.sup[i].path); }
+        fprintf(stderr, "[%s] merge: %d run(s), nothing to merge\n", f->name, s.n);
+        return bad;
+    }
     long from = s.r[0].from, to = s.r[0].to; u64 total = 0;
     for (int i = 0; i < s.n; i++){ if (s.r[i].from < from) from = s.r[i].from; if (s.r[i].to > to) to = s.r[i].to; total += s.r[i].n; }
     char out_name[320], tmp_name[340];
@@ -187,8 +246,12 @@ int main(int argc, char** argv){
     if (fseek(out, 0, SEEK_SET) || fwrite(hdr, 1, IRS_HDR, out) != IRS_HDR || fflush(out) || fsync(fileno(out)) || fclose(out)){ perror("header"); return 1; }
     if (written != total){ fprintf(stderr, "[%s] merge: wrote %llu of %llu records -- not replacing anything\n", f->name, (unsigned long long)written, (unsigned long long)total); unlink(tmp_name); return 1; }
     if (rename(tmp_name, out_name)){ perror("rename"); unlink(tmp_name); return 1; }
-    /* the output is durable and visible: now the inputs may go */
-    for (int i = 0; i < s.n; i++){ irs_close_run(&s.r[i]); if (unlink(s.r[i].path) != 0) fprintf(stderr, "[%s] merge: cannot unlink %s\n", f->name, s.r[i].path); }
+    /* the output's name made durable, then the inputs may go */
+    if (fsync_dir()){ perror("fsync directory"); return 1; }
+    int bad = 0;
+    for (int i = 0; i < s.n; i++){ irs_close_run(&s.r[i]); bad |= unlink_input(f->name, s.r[i].path); }
+    for (int i = 0; i < s.nsup; i++) bad |= unlink_input(f->name, s.sup[i].path);
+    if (bad) return 1;
     fprintf(stderr, "[%s] merge DONE: %llu records, %llu sparse, %.2f GB, %llds\n", f->name, (unsigned long long)written, (unsigned long long)nsparse,
             (double)(sparse_off + nsparse * (u64)f->sparse) / 1e9, (long long)(time(NULL) - t0));
     return 0;

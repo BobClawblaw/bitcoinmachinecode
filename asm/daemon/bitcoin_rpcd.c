@@ -262,10 +262,11 @@ int main(int argc, char** argv) {
       if ((e = getenv("TEST_RPC_WORKQUEUE")) && *e) cfg.workqueue = atoi(e);
       if ((e = getenv("TEST_RPC_TIMEOUT")) && *e)   cfg.timeout_s = atoi(e);
       if ((e = getenv("TEST_RPC_WHITELIST")) && *e){          /* "user:m1,m2;user2:m3" */
-          char buf[1024]; snprintf(buf, sizeof buf, "%s", e);
+          char* buf = strdup(e);
           char* save = NULL;
-          for (char* t = strtok_r(buf, ";", &save); t; t = strtok_r(NULL, ";", &save))
-              if (!rpc_whitelist_add(t)) fprintf(stderr, "bmc_rpcd: bad TEST_RPC_WHITELIST entry %s\n", t);
+          for (char* t = buf ? strtok_r(buf, ";", &save) : NULL; t; t = strtok_r(NULL, ";", &save))
+              if (!rpc_whitelist_add(t)){ fprintf(stderr, "bmc_rpcd: bad TEST_RPC_WHITELIST entry %s\n", t); return 1; }
+          free(buf);
       }
       if ((e = getenv("TEST_RPC_WHITELIST_DEFAULT")) && *e) rpc_whitelist_set_default(atoi(e)); }
 

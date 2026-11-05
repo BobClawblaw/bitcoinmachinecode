@@ -373,6 +373,34 @@ static rj_val* esplora_decode_raw(const rpc_wallet* w, const unsigned char* raw,
     return call(w, "decoderawtransaction", a, 0, 0);
 }
 long g_esplora_batch_pool_takes_saved;   /* test seam: per-tx lookups the batch replaced */
+/* RPC-23 (audit 2026-10-23): the facade is unauthenticated, so a request's
+ * work is bounded here. mempool.space's backend asks for its
+ * ESPLORA.BATCH_QUERY_BASE_SIZE per batch (1,000 upstream, 200 on the
+ * reference box) and pages the mempool until an empty page, so a cap well
+ * above that changes nothing for it: the batch POSTs refuse a longer list
+ * (400) and max_txs is clamped. */
+#define ESP_BATCH_MAX 10000
+/* The parents of a batch, by txid: an open-addressed index into pid[] (a
+ * linear scan per input was O(inputs x parents), twice). */
+typedef struct { size_t* slot; size_t cap; } esp_pidx;      /* slot = index + 1, 0 = empty */
+static size_t esp_hx_hash(const char* h){ size_t v = 1469598103934665603ULL; for (int i = 0; i < 64; i++){ v ^= (unsigned char)h[i]; v *= 1099511628211ULL; } return v; }
+/* the slot for txid h: the one holding it, or the empty one where it goes */
+static size_t* esp_pidx_at(const esp_pidx* x, char (*pid)[65], const char* h){
+    size_t i = esp_hx_hash(h) & (x->cap - 1);
+    while (x->slot[i] && memcmp(pid[x->slot[i] - 1], h, 64)) i = (i + 1) & (x->cap - 1);
+    return &x->slot[i];
+}
+static int esp_pidx_grow(esp_pidx* x, char (*pid)[65], size_t n){
+    size_t ncap = x->cap ? x->cap * 2 : 256;
+    esp_pidx y = { calloc(ncap, sizeof(size_t)), ncap };
+    if (!y.slot) return 0;
+    for (size_t q = 0; q < n; q++) *esp_pidx_at(&y, pid, pid[q]) = q + 1;
+    free(x->slot); *x = y; return 1;
+}
+static long esp_pidx_find(const esp_pidx* x, char (*pid)[65], const char* h){
+    if (!x->cap) return -1;
+    size_t v = *esp_pidx_at(x, pid, h); return v ? (long)v - 1 : -1;
+}
 static rj_val* mempool_txs_batch(const rpc_wallet* w, const rj_val* ids){
     rj_val* arr = rj_arr();
     size_t n = (ids && ids->typ == RJ_ARR) ? ids->nitems : 0;
@@ -398,7 +426,9 @@ static rj_val* mempool_txs_batch(const rpc_wallet* w, const rj_val* ids){
     }
     /* 2. decode, outside the lock; gather the parents of every input */
     size_t pcap = 64, pn = 0; char (*pid)[65] = malloc(pcap * 65);
-    for (long i = 0; i < m; i++){
+    esp_pidx px = { 0, 0 };
+    if (!pid || !esp_pidx_grow(&px, pid, 0)){ free(pid); pid = 0; }
+    for (long i = 0; pid && i < m; i++){
         if (!it[i].present) continue;
         dec[i] = esplora_decode_raw(w, it[i].raw, it[i].len);
         free(it[i].raw); it[i].raw = 0;
@@ -406,10 +436,11 @@ static rj_val* mempool_txs_batch(const rpc_wallet* w, const rj_val* ids){
         for (size_t k = 0; vin && vin->typ == RJ_ARR && k < vin->nitems; k++){
             const char* ptx = S(vin->items[k], "txid");
             if (!ptx || S(vin->items[k], "coinbase") || strlen(ptx) != 64) continue;
-            int dup = 0; for (size_t q = 0; q < pn; q++) if (!memcmp(pid[q], ptx, 64)){ dup = 1; break; }
-            if (dup) continue;
-            if (pn == pcap){ void* g = realloc(pid, (pcap *= 2) * 65); if (!g) break; pid = g; }
-            memcpy(pid[pn], ptx, 64); pid[pn][64] = 0; pn++;
+            if (esp_pidx_find(&px, pid, ptx) >= 0) continue;
+            if (pn == pcap){ void* g = realloc(pid, pcap * 2 * 65); if (!g) break; pid = g; pcap *= 2; }
+            if (2 * (pn + 1) > px.cap && !esp_pidx_grow(&px, pid, pn)) break;      /* load <= 1/2 */
+            memcpy(pid[pn], ptx, 64); pid[pn][64] = 0;
+            *esp_pidx_at(&px, pid, ptx) = pn + 1; pn++;
         }
     }
     /* 3. the parents in the pool, one hold per slice; 4. the rest from the index */
@@ -468,11 +499,10 @@ static rj_val* mempool_txs_batch(const rpc_wallet* w, const rj_val* ids){
             rj_val* ci = vin->items[k];
             if (S(ci, "coinbase") || G(ci, "prevout") || !S(ci, "txid")) continue;
             const char* ptx = S(ci, "txid"); long vo = N(ci, "vout");
-            for (size_t q = 0; q < pn; q++){
-                if (memcmp(pid[q], ptx, 64)) continue;
+            long q = strlen(ptx) == 64 ? esp_pidx_find(&px, pid, ptx) : -1;
+            if (q >= 0){
                 rj_val* pv = (pdec && pdec[q]) ? G(pdec[q], "vout") : 0;
                 if (pv && pv->typ == RJ_ARR && vo >= 0 && (size_t)vo < pv->nitems) rj_obj_set(ci, "prevout", rj_clone(pv->items[vo]));
-                break;
             }
         }
         rj_arr_push(arr, tx_to_esplora(t, -1, 0, 0, w));
@@ -482,7 +512,7 @@ static rj_val* mempool_txs_batch(const rpc_wallet* w, const rj_val* ids){
     for (size_t q = 0; pdec && q < pn; q++) if (pdec[q]) rj_free(pdec[q]);
     if (pit) for (size_t q = 0; q < pn; q++) free(pit[q].raw);
     for (long i = 0; i < m; i++) free(it[i].raw);
-    free(pw); free(pit); free(pdec); free(pid);
+    free(pw); free(pit); free(pdec); free(pid); free(px.slot);
     free(wire); free(idv); free(it); free(dec);
     return arr;
 }
@@ -912,6 +942,8 @@ static int esp_dep_push(void* c, const mpj_rec* d){
     return 1;
 }
 #define IS(k, s) (!strcmp(seg[k], s))
+#define ESP_UTXO_FUND_MAX 20000     /* RPC-23: funding events the utxo route resolves */
+#define ESP_UTXO_BLOCKS_MAX 2000    /* RPC-23: distinct blocks it reads for their txids */
 static void esplora_address(resp_t* r, const rpc_wallet* w, char seg[][80], int ns, int get){
     int type; unsigned char key[32];
     if (!get){ reply_text(r, 405, "method not allowed"); return; }
@@ -964,6 +996,18 @@ static void esplora_address(resp_t* r, const rpc_wallet* w, char seg[][80], int 
          * utxos_limit (500): every funding event would need its txid, one
          * getblock per block. Same rule here. */
         if (h.funded_n - h.spent_n > 500){ free(h.refs); reply_text(r, 400, "too many unspent transaction outputs"); return; }
+        /* RPC-23: the rule above bounds the ANSWER, not the work. Every
+         * funding event, spent or not, needs its txid -- one block read per
+         * distinct height -- before the spender index can say it is spent,
+         * so an address with a long, fully spent history passed the rule and
+         * cost a block read per height on an unauthenticated route. Refused
+         * past ESP_UTXO_FUND_MAX funding events or ESP_UTXO_BLOCKS_MAX blocks
+         * to read, as electrs refuses a history over its limit. */
+        { long nb = 0, lh = -1; const ah_event* ev0 = 0; long n0 = ah_lookup((uint8_t)type, key, &ev0);
+          for (long i = 0; i < n0 && nb <= ESP_UTXO_BLOCKS_MAX; i++){
+              ah_event e; memcpy(&e, (const unsigned char*)ev0 + i * AH_EVENT_BYTES, sizeof e);
+              if (e.kind == AH_FUND && (long)e.height != lh){ nb++; lh = e.height; } }
+          if (h.funded_n > ESP_UTXO_FUND_MAX || nb > ESP_UTXO_BLOCKS_MAX){ free(h.refs); reply_text(r, 400, "Too many history entries"); return; } }
         /* every funding event of the address (base, then the tail's ADDs),
          * minus the ones the txospender index knows a spender for -- one
          * gettxspendingprevout per 500 outpoints. The tail's DELs cover
@@ -1145,13 +1189,14 @@ int esplora_handle(const char* method, size_t mlen, const char* path, size_t ple
         /* mempool.space's electrs additions: batch loads */
         if (post && ((ns == 2 && IS(1, "txs")) || (ns == 3 && IS(1, "mempool") && IS(2, "txs")))){
             rj_val* ids = rj_parse(body, blen);
+            if (ids && ids->typ == RJ_ARR && ids->nitems > ESP_BATCH_MAX){ rj_free(ids); reply_text(&r, 400, "too many txids requested"); return 1; }
             rj_val* arr = mempool_txs_batch(w, ids);       /* one pool-lock hold per slice (2026-10-01) */
             if (ids) rj_free(ids);
             reply_json(&r, arr); return 1;
         }
         if (get && ns >= 3 && IS(1, "mempool") && IS(2, "txs")){
             /* recent mempool txs, newest first, `max_txs` after `lastSeen` */
-            long maxn = qparam(path, plen, "max_txs"); if (maxn <= 0) maxn = 25; const char* last = ns >= 4 ? seg[3] : 0;
+            long maxn = qparam(path, plen, "max_txs"); if (maxn <= 0) maxn = 25; if (maxn > ESP_BATCH_MAX) maxn = ESP_BATCH_MAX; const char* last = ns >= 4 ? seg[3] : 0;
             rj_val* m = call(w, "getrawmempool", (rj_val*)({ rj_val* a = rj_arr(); rj_arr_push(a, rj_bool(0)); a; }), &ec, &em); if (!m){ reply_rpc_error(&r, ec, em); return 1; }
             rj_val* arr = rj_arr(); long taken = 0; int after = last ? 0 : 1;
             for (size_t i = m->nitems; i > 0 && taken < maxn; i--){ const char* id = m->items[i-1]->str; if (!after){ if (last && id && !strcmp(id, last)) after = 1; continue; }
@@ -1159,7 +1204,9 @@ int esplora_handle(const char* method, size_t mlen, const char* path, size_t ple
             rj_free(m); reply_json(&r, arr); return 1;
         }
         if (post && ns == 4 && IS(1, "txs") && IS(2, "outspends") && IS(3, "by-txid")){
-            rj_val* ids = rj_parse(body, blen); rj_val* arr = rj_arr();
+            rj_val* ids = rj_parse(body, blen);
+            if (ids && ids->typ == RJ_ARR && ids->nitems > ESP_BATCH_MAX){ rj_free(ids); reply_text(&r, 400, "too many txids requested"); return 1; }
+            rj_val* arr = rj_arr();
             for (size_t i = 0; ids && ids->typ == RJ_ARR && i < ids->nitems; i++){ const char* id = ids->items[i]->str; rj_val* o = (id && is_hex64(id, strlen(id))) ? outspends_of(w, id, 0, 0) : 0; rj_arr_push(arr, o ? o : rj_arr()); }
             if (ids) rj_free(ids);
             reply_json(&r, arr); return 1;

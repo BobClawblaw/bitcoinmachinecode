@@ -78,7 +78,7 @@ extern sv_checksig_witness_v0_export  ; C seam: alias of the static hook
 %define CTX_VERSION   48
 %define CTX_AMOUNT    56
 
-section .tbss alloc noexec nowrite tls align=8
+section .tbss nobits alloc noexec write tls align=8
 global wv0_main_e
 wv0_main_e:  resq 1                   ; __thread u8* main stack arena (lazy)
 global wv0_p2wpkh

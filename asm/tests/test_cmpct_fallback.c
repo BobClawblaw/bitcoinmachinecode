@@ -36,7 +36,7 @@ extern long g_peer_sendcmpct; extern void* g_sync_mp;
 extern void* g_cmpct_hook_type; extern void* g_cmpct_hook_cmpct; extern void* g_cmpct_hook_blocktxn; extern void* g_cmpct_hook_fallback;
 extern unsigned cmpct_getdata_type(int);
 extern long cmpct_recv_cmpctblock(int, void*, const unsigned char*, unsigned long, unsigned char*, unsigned long, const unsigned char*);
-extern long cmpct_recv_blocktxn(int, const unsigned char*, unsigned long, unsigned char*, unsigned long);
+extern long cmpct_recv_blocktxn(int, const unsigned char*, unsigned long, unsigned char*, unsigned long, const unsigned char*);
 extern void cmpct_recv_note_fallback(void);
 extern void cmpct_recv_stats(unsigned long* r, unsigned long* n, unsigned long* f);
 static int failures=0;

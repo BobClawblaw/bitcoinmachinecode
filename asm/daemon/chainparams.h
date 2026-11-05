@@ -84,6 +84,14 @@ typedef struct {
     const unsigned char* signet_challenge;
     long                 signet_challenge_len;
     const char*  assumevalid;     /* Core defaultAssumeValid (display hex) or NULL; assumevalid=0 turns it off */
+    /* B12 (2026-10-08): block hashes at known heights, ascending, where the
+     * header download may start a parallel range. A starting point only:
+     * every header of a range is checked again in order (linkage, PoW, the
+     * contextual rules, -minimumchainwork) before it is stored, so a wrong
+     * hash costs time and is never accepted. Core has no such table (its
+     * checkpoints are gone); NULL/0 = the header phase is one sequence. */
+    const struct hdr_anchor { long height; const char* hash; }* hdr_anchors;   /* hash: display hex */
+    int          n_hdr_anchors;
 } chainparams_t;
 
 /* The selected chain. Statically CHAIN_MAIN. */

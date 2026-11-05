@@ -15,10 +15,16 @@
 #   rss_mb=<sum of VmRSS> pss_mb=<sum of Pss from smaps_rollup: shared pages
 #   counted once across the set, the honest figure for a multi-process node>
 #   rss_peak_mb=<largest rss_mb seen> pss_peak_mb=<largest pss_mb seen>
-#   anon_mb=<sum of Anonymous from smaps_rollup: the memory the node
+#   anon_mb=<sum of Pss_Anon from smaps_rollup: the memory the node
 #   allocated, as opposed to file pages it has mapped (the archive, the
-#   runs); run 35's main process held 31 GB resident of which 8.5 GB was
-#   anonymous> anon_peak_mb=<largest anon_mb seen>
+#   runs), each page split between the processes holding it; run 35's
+#   main process held 31 GB resident of which 8.5 GB was anonymous.
+#   Until 2026-10-06 this summed "Anonymous", which counts a forked
+#   child's inherited copy-on-write pages once PER CHILD: run 39's 13
+#   children each reported 1.4 GB of the worker's pages, so the tree read
+#   27.9 GB where its proportional share was ~10 GB; anon figures in
+#   reports before run 40 carry that inflation> anon_peak_mb=<largest
+#   anon_mb seen>
 # A process that exits between samples keeps its last CPU reading in
 # cpu_total_s, so the total is a lower bound on what the run consumed; a
 # spike shorter than the interval can be missed, which is why the default
@@ -43,7 +49,12 @@ while :; do
         rest=${st##*) }; set -- $rest          # fields 14/15 after ')' = utime/stime, ticks
         t=$(( ${12} + ${13} ))
         r=$(awk '/^VmRSS:/{print $2}' "$p/status" 2>/dev/null); r=${r:-0}
-        sr=$(awk '/^Pss:/{s=$2} /^Anonymous:/{a=$2} END{print s+0, a+0}' "$p/smaps_rollup" 2>/dev/null); set -- ${sr:-0 0}
+        # Pss_Anon, not Anonymous: a forked child's inherited copy-on-write
+        # pages are "Anonymous" in every child (run 39: 13 children x 1.4 GB
+        # of the worker's pages, so the tree's "anon" read 27.9 GB when its
+        # proportional share was ~10 GB). Pss_Anon splits a shared page
+        # between its holders, as the pss column already does.
+        sr=$(awk '/^Pss:/{s=$2} /^Pss_Anon:/{a=$2} END{print s+0, a+0}' "$p/smaps_rollup" 2>/dev/null); set -- ${sr:-0 0}
         s=$1; a=$2; [ "$s" -gt 0 ] || s=$r
         n=$((n+1)); cpu=$((cpu+t)); rss=$((rss+r)); pss=$((pss+s)); anon=$((anon+a)); seen[$pid]=$t; last_cpu[$pid]=$t
     done

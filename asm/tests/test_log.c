@@ -2,6 +2,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
+#include <fcntl.h>
 #include "test_tmpdir.h"
 
 extern int  node_log_open(const char* path);
@@ -28,6 +30,23 @@ int main(void){
     int n=0;
     if(f){ while(fgets(line,sizeof line,f)){ line[strcspn(line,"\n")]=0; printf("  |%s|\n", line); n++; } fclose(f); }
     cki("6 lines logged", n, 6);
+
+    /* A failed open must not hand back fd 0: the writers would then send
+     * every line to whatever fd 0 is (stdin, or a socket that reused it).
+     * fd 0 is a pipe here; nothing may arrive on it. */
+    int pp[2];
+    if (pipe(pp) == 0 && dup2(pp[1], 0) == 0){
+        close(pp[1]);
+        int bad = node_log_open("no-such-dir/test_log.txt");
+        cki("failed open returns a negative fd", bad < 0, 1);
+        node_log_str(bad, 6, "must not reach fd 0", 19);
+        node_log_event(bad, 1, 1, 2, 3);
+        close(0);
+        fcntl(pp[0], F_SETFL, O_NONBLOCK);
+        char b[64]; long got = read(pp[0], b, sizeof b);
+        cki("nothing written to fd 0", got > 0 ? got : 0, 0);
+        close(pp[0]);
+    } else { printf("FAIL pipe/dup2 setup\n"); failures++; }
     printf("\n%s (%d failures)\n", failures?"TESTS FAILED":"ALL TESTS PASSED", failures);
     remove(path);
     return failures?1:0;

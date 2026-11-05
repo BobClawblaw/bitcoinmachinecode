@@ -8,4 +8,8 @@
 #define INBOUND_EVICT_H
 #include "../rpc_node.h"
 int inbound_select_victim(const node_status_t* st, long long now, int first_slot, int last_slot);
+/* P2P-4: the netgroup key (Core's keyed netgroup, drawn from /dev/urandom on
+ * first use); tests set it to make the netgroup round predictable */
+void inbound_evict_set_key(unsigned long long k0, unsigned long long k1);
+unsigned long long inbound_evict_keyed_group(unsigned grp);
 #endif

@@ -37,16 +37,28 @@ int irs_open_run(const irunset_t* s, irun_t* r){
     if (memcmp(b, s->magic, 8)){ munmap(m, (size_t)sb.st_size); return 0; }
     unsigned long long n = rd64(b + 8), so = rd64(b + 16), ns = rd64(b + 24);
     long from = (long)rd32(b + 32), to = (long)rd32(b + 36);
-    /* a header that describes more than the file holds is a torn build */
-    if (so + ns * (unsigned long long)s->sparse > (unsigned long long)sb.st_size
-        || IRS_HDR + n * (unsigned long long)s->rec != so || to < from){
+    /* a header that describes more than the file holds is a torn build.
+     * formal/parsers F4 (2026-10-23): this was `so + ns*sparse > size ||
+     * IRS_HDR + n*rec != so` in 64-bit arithmetic, which wraps -- a 68-byte
+     * run with nsparse 2^60 (16 * 2^60 == 0 mod 2^64) was accepted, and the
+     * reader's binary search (rpc_chain.c txi_lookup_locked) then read 2^63
+     * bytes past the mapping; n + 2^62 passed the record equation the same
+     * way. Each term is now bounded by what is left of the file before it is
+     * scaled, by division, which cannot wrap. */
+    unsigned long long size = (unsigned long long)sb.st_size;
+    unsigned long long rec = (unsigned long long)s->rec, sp = (unsigned long long)s->sparse;
+    if (s->rec <= 0 || s->sparse <= 0
+        || so < IRS_HDR || so > size
+        || (so - IRS_HDR) % rec != 0 || (so - IRS_HDR) / rec != n    /* records exactly [48, so) */
+        || ns > (size - so) / sp                                     /* sparse table inside the file */
+        || to < from){
         munmap(m, (size_t)sb.st_size); return 0; }
     r->map = b; r->len = (size_t)sb.st_size; r->ino = sb.st_ino;
     r->n = n; r->sparse_off = so; r->nsparse = ns; r->from = from; r->to = to;
     return 1;
 }
 void irs_close_run(irun_t* r){ if (r->map) munmap((void*)r->map, r->len); r->map = 0; r->len = 0; }
-void irs_close_all(irunset_t* s){ for (int i = 0; i < s->n; i++) irs_close_run(&s->r[i]); s->n = 0; irs_dirty(s); }
+void irs_close_all(irunset_t* s){ for (int i = 0; i < s->n; i++) irs_close_run(&s->r[i]); s->n = 0; s->nsup = 0; irs_dirty(s); }
 
 static int is_run_name(const irunset_t* s, const char* f){
     size_t nl = strlen(s->name), fl = strlen(f);
@@ -87,6 +99,11 @@ int irs_refresh(irunset_t* s){
             if (s->r[i].ino == sb.st_ino && s->r[i].len == (size_t)sb.st_size && !strcmp(s->r[i].path, e->d_name)){
                 found[nf++] = s->r[i]; s->r[i].map = 0; kept = 1; break; }
         }
+        /* superseded last time and unchanged: carried unmapped (ST2-2) */
+        for (int i = 0; !kept && i < s->nsup; i++){
+            if (s->sup[i].ino == sb.st_ino && s->sup[i].len == (size_t)sb.st_size && !strcmp(s->sup[i].path, e->d_name)){
+                found[nf++] = s->sup[i]; kept = 1; }
+        }
         if (kept) continue;
         irun_t r; memset(&r, 0, sizeof r); snprintf(r.path, sizeof r.path, "%s", e->d_name);
         if (!irs_open_run(s, &r)) continue;                      /* a torn or foreign file is not a run */
@@ -97,7 +114,38 @@ int irs_refresh(irunset_t* s){
     /* whatever is still mapped in s was not found this time: it vanished */
     for (int i = 0; i < s->n; i++) if (s->r[i].map){ irs_close_run(&s->r[i]); changed = 1; }
     qsort(found, (size_t)nf, sizeof found[0], cmp_run);
-    memcpy(s->r, found, (size_t)nf * sizeof found[0]); s->n = nf;
+    /* ST2-2 (audit 2026-10-23): a run whose range lies inside another run's
+     * is a merge input left behind -- the merger renames its output into
+     * place and only then unlinks the inputs, so a crash in between leaves
+     * both, and every lookup (and the next merge) took their records twice.
+     * Keep the widest; of two with the same range, the later in cmp_run
+     * order (a merged <name>.r* sorts after the legacy <name>.dat). The
+     * superseded ones are unmapped and listed in sup[] for the merger. */
+    int keep = 0, nsup = 0;
+    for (int i = 0; i < nf; i++){
+        int sup = 0;
+        for (int j = 0; j < nf && !sup; j++){
+            if (j == i || found[j].from > found[i].from || found[j].to < found[i].to) continue;
+            if (found[j].from == found[i].from && found[j].to == found[i].to && j < i) continue;
+            sup = 1;
+        }
+        if (sup){
+            if (found[i].map){
+                fprintf(stderr, "[%s] run %s: heights [%ld,%ld] lie inside another run -- a merge input left behind, not read\n",
+                        s->name, found[i].path, found[i].from, found[i].to);
+                size_t len = found[i].len;                       /* kept: the rescan matches on it */
+                irs_close_run(&found[i]); found[i].len = len; changed = 1;
+            }
+            s->sup[nsup++] = found[i];
+            continue;
+        }
+        if (!found[i].map){                                      /* superseded until now: its container went away */
+            if (!irs_open_run(s, &found[i])) continue;
+            changed = 1;
+        }
+        found[keep++] = found[i];
+    }
+    memcpy(s->r, found, (size_t)keep * sizeof found[0]); s->n = keep; s->nsup = nsup;
     return changed;
 }
 long irs_covered_to(irunset_t* s){
