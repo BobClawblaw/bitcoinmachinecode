@@ -2210,3 +2210,47 @@ were still on disk. Nothing in them is new measurement.
 - **Rollback:** relink to `deploy-20261025a` AND restore
   `bmc_build_addr_hist.pre-20261025b`. Going by the diff, no on-disk format
   changed: with the two knobs off the stores are read and written as before.
+
+## 2026-11-05 00:20Z — `deploy-20261105a`: Lightning backend support (PR #451)
+
+- **What:** `main` at `695fbb8f` (PR #451).
+  - `echo`, `echojson`, `echoipc`, byte-identical to Core v31.1
+    (`validation/echo_core_diff.py`). Core Lightning's bcli calls `echo`
+    first.
+  - `getnetworkinfo`: `version` 310100 and `subversion`
+    `/Satoshi:31.1.0(BitcoinMachineCode:0.0.1)/`. RPC only; the P2P user
+    agent and `bmcgetcapabilities` still say `/BitcoinMachineCode:0.0.1/`.
+  - `getblockheader` answers for a block a reorg or `invalidateblock`
+    removed, with `confirmations: -1` (`validation/stale_header_core_diff.py`,
+    18 of 18 identical to v31.1). The fork tree's file is now
+    `headers_forks2.dat`, version 2, with the full header.
+  - `validation/lightning_regtest_e2e.py` (LND v0.21.6-beta and CLN v26.06.9
+    on regtest, bmc their only backend) passes every phase, a reorg included.
+
+  Built from clean (`make -B`) in a worktree at the merge commit, with no
+  compiler warnings; the binary reports `bmc_build_commit` 695fbb8f, not
+  dirty.
+- **Helpers:** all five exec'd helpers were byte-identical to the live ones;
+  none was replaced.
+- **Wallet** files were copied before the deploy. The wallet code did not
+  change.
+- **Started:** 00:20:49Z, at tip 974,602 (= the oracle). RPC came up at
+  00:21:38Z.
+- **Verified live:**
+  - New block 974,603 applied at 00:30:50Z in 0.15 s, hash-identical to the
+    Core v31.1 oracle's
+    (`000000000000000000004a21955eeae61fc9dda557c155fac9de6b47804cb8b1`);
+    the heartbeat reads `tip=974603` at 00:31:49Z.
+  - `NRestarts=0` and `active` at 10 minutes; no `[crash]` line; 60 fds.
+  - RPC and Esplora facade clients back (363 TIME-WAIT sockets on 8331/3005
+    at 11 minutes).
+  - `getnetworkinfo` answers `version` 310100 and the new `subversion`;
+    `echo` answers.
+- **Found before the deploy, not caused by it:** the previous process was
+  OOM-killed on 2026-11-03 at 19:53Z at the 64 GiB cgroup limit (33 GB of
+  it page tables), after a ~70 h stall from 2026-10-30 22:48Z in which it
+  applied almost nothing and logged nothing. Under investigation; a read-only
+  memory sampler runs beside production.
+- **Rollback:** relink to `deploy-20261025b`. The only on-disk change is the
+  new `headers_forks2.dat`, which the older build does not read; production
+  had no `headers_forks.dat`, so there is nothing to restore.

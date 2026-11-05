@@ -49,7 +49,7 @@ CSRC=(
   # merge_index_runs.c is a standalone TOOL (its own main -- bmc_merge_index_runs),
   # not a daemon object; the daemon only execs it by path
   daemon/asmap.c daemon/dialer.c daemon/dial_memory.c daemon/inflight.c
-  daemon/index_repair.c daemon/hdr_tree.c
+  daemon/index_repair.c daemon/hdr_tree.c daemon/hdr_tree_read.c
   daemon/socks5.c daemon/torcontrol.c daemon/serve_hdrctx.c bitcoin_sha3.c daemon/i2psam.c daemon/net6.c
 
   daemon/ctl_dial.c

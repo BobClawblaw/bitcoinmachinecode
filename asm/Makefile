@@ -264,7 +264,7 @@ WALLETPRIMS := secp256k1_fe.o secp256k1_point.o secp256k1_glv_c.o secp256k1_poin
 # links DAEMONSRCS or DIALSRCS also links DAEMON_RPCOBJS -- listing it in
 # both bundles puts the object on the command line twice (multiple
 # definition of pow_retarget_bits/pow_expected_bits/pow_check_bits).
-DAEMON_RPCOBJS := rpc_server.o rpc_esplora.o rest.o daemon/addr_hist.o daemon/rpc_acl.c daemon/benchlog.c daemon/dlc_benchlog.c crypto_hkdf.o rpc_commands.o rpc_chain.o bitcoin_pow_rules.o block_filter.o utxo_snapshot.o rpc_signer.o bip32_ckdpub.o descriptor.o psbt_update.o miniscript.o miniscript_sign.o bip340_sign.o musig2.o rpc_json.o rpc_net.o rpc_node.o mempool_cluster.a daemon/mempool_persist.c \
+DAEMON_RPCOBJS := rpc_server.o rpc_esplora.o rest.o daemon/hdr_tree_read.c daemon/addr_hist.o daemon/rpc_acl.c daemon/benchlog.c daemon/dlc_benchlog.c crypto_hkdf.o rpc_commands.o rpc_chain.o bitcoin_pow_rules.o block_filter.o utxo_snapshot.o rpc_signer.o bip32_ckdpub.o descriptor.o psbt_update.o miniscript.o miniscript_sign.o bip340_sign.o musig2.o rpc_json.o rpc_net.o rpc_node.o mempool_cluster.a daemon/mempool_persist.c \
     rpc_wallet_ops.o wallet_labels.o wallet_scan.o wallet_scan_hash.o wallet_txlog.c \
     daemon/wallet_enc_state.c daemon/wallet_crypter.c bitcoin_aes.c wallet_bnb.c wallet_coinsel.c \
     bitcoin_keys.o bitcoin_bip39.o sha512.o bitcoin_hmac.o bitcoin_bip32.o bech32.o
@@ -618,7 +618,7 @@ tests/test_undo_asm_diff: tests/test_undo_asm_diff.c tests/undo_log_ref.o bitcoi
 # the big ones. It is added individually to the few lists that lacked it.
 SIGNETSRCS := daemon/signet.c daemon/signet_verify.c daemon/signet_block.c
 
-REORGSRCS := tests/test_reorg.c daemon/reorg.c daemon/hdr_tree.c daemon/invalid_set.c daemon/minchainwork.c daemon/notify.c daemon/archive_verify.c daemon/utxo_live.c daemon/lsm_manifest.c daemon/block_witness.c $(SIGNETSRCS) daemon/chainparams.c daemon/undo_log.c \
+REORGSRCS := tests/test_reorg.c daemon/reorg.c daemon/hdr_tree.c daemon/hdr_tree_read.c daemon/invalid_set.c daemon/minchainwork.c daemon/notify.c daemon/archive_verify.c daemon/utxo_live.c daemon/lsm_manifest.c daemon/block_witness.c $(SIGNETSRCS) daemon/chainparams.c daemon/undo_log.c \
     daemon/locator_build.c daemon/node_config.c daemon/netperm.c daemon/subnet.c daemon/mempool_cfg.c daemon/mempool_journal.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c \
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c bitcoin_pow_rules.o
@@ -3049,7 +3049,7 @@ RPCOBJS := rpc_json.o rpc_net.o rpc_commands.o
 # archive): bitcoin_store.o + bitcoin_store_fast.o (index.dat / blk*.dat read
 # path), bitcoin_idx.o (hash->height), bitcoin_tx.o (tx_txid), bitcoin_chainwork.o
 # (block_work/chainwork_add fallback when chainwork.dat is absent).
-RPCCHAIN := rpc_chain.o bitcoin_pow_rules.o block_filter.o bip32_ckdpub.o descriptor.o psbt_update.o miniscript.o miniscript_sign.o bip340_sign.o musig2.o bitcoin_store.o bitcoin_store_fast.o bitcoin_idx.o bitcoin_tx.o bitcoin_chainwork.o
+RPCCHAIN := rpc_chain.o daemon/hdr_tree_read.c bitcoin_pow_rules.o block_filter.o bip32_ckdpub.o descriptor.o psbt_update.o miniscript.o miniscript_sign.o bip340_sign.o musig2.o bitcoin_store.o bitcoin_store_fast.o bitcoin_idx.o bitcoin_tx.o bitcoin_chainwork.o
 RPCLIBS := daemon/index_runs.c daemon/addr_hist.o daemon/mempool_journal.c daemon/wallet_pass.c wallet_core.c wallet_msgsign.c wallet_store.c wallet_bnb.c wallet_coinsel.c $(WALLETPRIMS) bitcoin_script.o bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o rpc_node.o mempool_cluster.a daemon/mempool_persist.c rpc_wallet_ops.o wallet_txlog.c wallet_labels.o wallet_scan.o wallet_scan_hash.o rpc_signer.o daemon/bfilter_index.c daemon/index_repair.c daemon/addr_index_tail.c daemon/wallet_enc_state.c daemon/wallet_crypter.c bitcoin_aes.c $(RPCCHAIN) addrbook.a
 
 # rpc_wallet_ops.o -- the rest of Core's Wallet category (labels, wallet
@@ -3143,7 +3143,7 @@ rest.o: rest.c rest.h rpc_json.h rpc_commands.h
 rpc_esplora.o: rpc_esplora.c rpc_esplora.h rpc_json.h rpc_node.h rpc_commands.h daemon/addr_hist_fmt.h
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -c -o $@ rpc_esplora.c
 
-rpc_chain.o: rpc_chain.c rpc_chain.h bitcoin_pow_rules.h rpc_json.h rpc_commands.h version_gen.h descriptor.h miniscript.h musig2.h daemon/undo_store.h \
+rpc_chain.o: rpc_chain.c rpc_chain.h bitcoin_pow_rules.h rpc_json.h rpc_commands.h version_gen.h descriptor.h miniscript.h musig2.h daemon/undo_store.h daemon/hdr_tree.h \
     rpc_node.h script_flags_consts.h block_filter.h mempool_slot.h
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -c -o $@ rpc_chain.c
 mempool_cluster.o: mempool_cluster.c mempool_cluster.h
@@ -3587,8 +3587,8 @@ tests/test_leg_close_labels: tests/test_leg_close_labels.c
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_leg_close_labels.c
 # test_hdr_tree -- the fork tree: headers off the best chain retained with
 # their work, the heaviest tip, pruning, the file, eviction of the lightest tip
-tests/test_hdr_tree: tests/test_hdr_tree.c daemon/hdr_tree.c daemon/hdr_tree.h bitcoin_hash.o sha256.o bitcoin_chainwork.o $(TEST_TMPDIR_H)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_hdr_tree.c daemon/hdr_tree.c bitcoin_hash.o sha256.o bitcoin_chainwork.o
+tests/test_hdr_tree: tests/test_hdr_tree.c daemon/hdr_tree.c daemon/hdr_tree_read.c daemon/hdr_tree.h bitcoin_hash.o sha256.o bitcoin_chainwork.o $(TEST_TMPDIR_H)
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_hdr_tree.c daemon/hdr_tree.c daemon/hdr_tree_read.c bitcoin_hash.o sha256.o bitcoin_chainwork.o
 # test_ctl_dial -- the runtime addnode queue: add is dialed and re-dialed with
 # backoff while listed, onetry once, remove stops it, a live leg is skipped
 tests/test_ctl_dial: tests/test_ctl_dial.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/ctl_dial.h

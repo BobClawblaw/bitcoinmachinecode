@@ -158,6 +158,47 @@ int main(void){
       }
       ck("every unsupported Control method errors with the reason named", all); }
 
+    /* ---- echo / echojson / echoipc (2026-11-04) --------------------------
+     * Core Lightning's bcli runs `echo` at startup. Expected values are
+     * v31.1's answers (validation/echo_core_diff.py diffs the live replies). */
+    { static const struct { const char* m; const char* p; const char* want; long ec; const char* em; } E[] = {
+          {"echo", NULL, "[]", 0, NULL},
+          {"echo", "null", "[]", 0, NULL},
+          {"echo", "{}", "[]", 0, NULL},
+          {"echo", "[\"a\",1,{\"x\":[1,2.50]},null,true]", "[\"a\",1,{\"x\":[1,2.50]},null,true]", 0, NULL},
+          {"echojson", "[1e3,-0]", "[1e3,-0]", 0, NULL},
+          {"echo", "[0,1,2,3,4,5,6,7,8,9]", "[0,1,2,3,4,5,6,7,8,9]", 0, NULL},
+          {"echo", "{\"arg2\":\"c\",\"arg0\":\"a\"}", "[\"a\",null,\"c\"]", 0, NULL},
+          {"echo", "{\"arg3\":null}", "[null,null,null,null]", 0, NULL},
+          {"echo", "{\"args\":[\"a\"],\"arg2\":\"x\"}", "[\"a\",null,\"x\"]", 0, NULL},
+          {"echo", "{\"args\":\"a\"}", "[]", 0, NULL},
+          {"echo", "{\"arg10\":1}", NULL, -8, "Unknown named parameter arg10"},
+          {"echo", "{\"arg0\":1,\"arg0\":2}", NULL, -8, "Parameter arg0 specified multiple times"},
+          {"echo", "{\"args\":[1,2],\"arg1\":3}", NULL, -8, "Parameter arg1 specified twice both as positional and named argument"},
+          {"echo", "\"str\"", NULL, -32600, "Params must be an array or object"},
+          {"echoipc", "[\"x\"]", "\"x\"", 0, NULL},
+          {"echoipc", "{\"arg\":\"z\"}", "\"z\"", 0, NULL},
+          {"echoipc", "[5]", NULL, -3, "Wrong type passed:\n{\n    \"Position 1 (arg)\": \"JSON value of type number is not of expected type string\"\n}"},
+      };
+      int all = 1;
+      for (unsigned i = 0; i < sizeof E / sizeof *E; i++){
+          rj_val* r = call(E[i].m, E[i].p, &ec, &em);
+          char* got = r ? rj_write_alloc(r, 0, NULL) : NULL;
+          int good = E[i].want ? (got && !strcmp(got, E[i].want) && ec == 0)
+                               : (!r && ec == E[i].ec && em && !strcmp(em, E[i].em));
+          if (!good){ printf("      (%s %s: got %s ec=%ld em=%s)\n", E[i].m, E[i].p ? E[i].p : "(none)", got ? got : "-", ec, em ? em : "-"); all = 0; }
+          free(got); rj_free(r);
+      }
+      ck("echo/echojson/echoipc answer as v31.1 does", all);
+      rj_val* r = call("echo", "[0,1,2,3,4,5,6,7,8,9,10]", &ec, &em);
+      ck("echo with eleven arguments: -1 and the usage text",
+         !r && ec == -1 && em && !strncmp(em, "echo ( \"arg0\"", 13) && ends_with(em, "10. arg9    (string, optional)\n"));
+      r = call("echojson", "[0,1,2,3,4,5,6,7,8,9,10]", &ec, &em);
+      ck("...and echojson's usage text names echojson", !r && ec == -1 && em && !strncmp(em, "echojson ( ", 11));
+      r = call("echoipc", "[]", &ec, &em);
+      ck("echoipc with no argument: -1 and the usage text", !r && ec == -1 && em && !strncmp(em, "echoipc \"arg\"\n", 14));
+    }
+
     /* ================================================================
      * The invariant: everything help advertises actually dispatches.
      * ================================================================ */

@@ -4882,6 +4882,8 @@ static const char* const WALLET_METHODS[] = {
     /* Control, plus the three singletons Core files elsewhere */
     "help","logging","getrpcinfo","getmemoryinfo","getopenrpcinfo","rpc.discover",
     "exportasmap","enumeratesigners",
+    /* Core's hidden test category: served, though Core's help omits it */
+    "echo","echojson","echoipc",
         /* createrawtransaction / signraw / sendraw are wired by the server card
          * which owns the tx-store lookup; the pure-wallet subset is dispatched
          * here. */
@@ -5080,6 +5082,126 @@ static int cmd_getmemoryinfo(const rj_val* params, long* ec, const char** em, rj
     return 0;
 }
 
+/* ==== Core's hidden test category: echo, echojson, echoipc (2026-11-04) ====
+ * Core Lightning's bcli plugin calls `echo` at startup to learn that the node
+ * answers; until this node served it, CLN could not start against it.
+ *
+ * Measured against v31.1 on regtest (validation/echo_core_diff.py):
+ *   - the result is the request's params array, verbatim (number text kept);
+ *     absent, null or {} params give [];
+ *   - more than ten arguments: -1 with the method's usage text;
+ *   - named arguments arg0..arg9 land at their index, holes filled with null,
+ *     trailing holes not added; a key named "args" holding an array supplies
+ *     the leading positional values (any other "args" is ignored); an unknown
+ *     name is -8 "Unknown named parameter X", a name given twice -8
+ *     "Parameter X specified multiple times", a name also covered by "args" -8
+ *     "Parameter X specified twice both as positional and named argument".
+ *     This node has no general named-argument layer (every other method reads
+ *     positional arrays only), so the transform lives here, for these methods.
+ * echojson differs from echo only in bitcoin-cli's argument conversion; on
+ * the server they are the same method.
+ * One divergence, deliberate: Core's arg9 == "trigger_internal_bug" fires its
+ * own CHECK_NONFATAL and returns an "Internal bug detected" report naming
+ * Core's source file. That hook tests Core's bug reporting; here the string
+ * is echoed like any other. */
+static const char ECHO_USAGE_TAIL[] =
+    " ( \"arg0\" \"arg1\" \"arg2\" \"arg3\" \"arg4\" \"arg5\" \"arg6\" \"arg7\" \"arg8\" \"arg9\" )\n\n"
+    "Simply echo back the input arguments. This command is for testing.\n\n"
+    "It will return an internal bug report when arg9='trigger_internal_bug' is passed.\n\n"
+    "The difference between echo and echojson is that echojson has argument conversion "
+    "enabled in the client-side table in bitcoin-cli and the GUI. There is no server-side difference.\n\n"
+    "Arguments:\n"
+    "1. arg0     (string, optional)\n"
+    "2. arg1     (string, optional)\n"
+    "3. arg2     (string, optional)\n"
+    "4. arg3     (string, optional)\n"
+    "5. arg4     (string, optional)\n"
+    "6. arg5     (string, optional)\n"
+    "7. arg6     (string, optional)\n"
+    "8. arg7     (string, optional)\n"
+    "9. arg8     (string, optional)\n"
+    "10. arg9    (string, optional)\n";
+static const char ECHOIPC_USAGE[] =
+    "echoipc \"arg\"\n\n"
+    "Echo back the input argument, passing it through a spawned process in a multiprocess build.\n"
+    "This command is for testing.\n\n"
+    "Arguments:\n"
+    "1. arg    (string, required) The string to echo\n\n"
+    "Result:\n"
+    "\"str\"    (string) The echoed string.\n\n"
+    "Examples:\n"
+    "> bitcoin-cli echo \"Hello world\"\n"
+    "> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", "
+    "\"method\": \"echo\", \"params\": [\"Hello world\"]}' -H 'content-type: application/json' "
+    "http://127.0.0.1:8332/\n";
+
+/* Core's transformNamedArguments for a method whose arguments are names[0..n).
+ * params is absent, null, an array (returned as a clone) or an object. Returns
+ * a new array, or NULL with *ec and *em set. */
+static rj_val* echo_positional(const rj_val* params, const char* const* names, int n,
+                               long* ec, const char** em){
+    static __thread char msg[160];
+    if (!params || params->typ == RJ_NULL) return rj_arr();
+    if (params->typ == RJ_ARR) return rj_clone(params);
+    if (params->typ != RJ_OBJ){ *ec = -32600; *em = "Params must be an array or object"; return NULL; }
+    const rj_val* pos = NULL;           /* "args": the leading positional values */
+    for (size_t i = 0; i < params->nmembers; i++){
+        const rj_member* m = &params->members[i];
+        int known = !strcmp(m->key, "args");
+        for (int k = 0; k < n && !known; k++) known = !strcmp(m->key, names[k]);
+        if (!known){ snprintf(msg, sizeof msg, "Unknown named parameter %s", m->key); *ec = -8; *em = msg; return NULL; }
+        for (size_t j = 0; j < i; j++)
+            if (!strcmp(params->members[j].key, m->key)){
+                snprintf(msg, sizeof msg, "Parameter %s specified multiple times", m->key);
+                *ec = -8; *em = msg; return NULL;
+            }
+        if (!strcmp(m->key, "args") && m->val->typ == RJ_ARR) pos = m->val;
+    }
+    rj_val* out = pos ? rj_clone(pos) : rj_arr();
+    int holes = 0;
+    for (int k = 0; k < n; k++){
+        const rj_val* v = rj_obj_get(params, names[k]);
+        if (!v){ if ((size_t)k >= out->nitems) holes++; continue; }
+        if ((size_t)k < out->nitems){
+            snprintf(msg, sizeof msg, "Parameter %s specified twice both as positional and named argument", names[k]);
+            *ec = -8; *em = msg; rj_free(out); return NULL;
+        }
+        for (; holes > 0; holes--) rj_arr_push(out, rj_null());
+        rj_arr_push(out, rj_clone(v));
+    }
+    return out;
+}
+
+static int cmd_echo(const char* method, const rj_val* params, long* ec, const char** em, rj_val** result){
+    static const char* const names[10] = {"arg0","arg1","arg2","arg3","arg4","arg5","arg6","arg7","arg8","arg9"};
+    static __thread char usage[sizeof ECHO_USAGE_TAIL + 16];
+    rj_val* a = echo_positional(params, names, 10, ec, em);
+    if (!a) return 0;
+    if (a->nitems > 10){
+        rj_free(a);
+        snprintf(usage, sizeof usage, "%s%s", method, ECHO_USAGE_TAIL);
+        *ec = -1; *em = usage; return 0;
+    }
+    *result = a;
+    return 1;
+}
+
+static int cmd_echoipc(const rj_val* params, long* ec, const char** em, rj_val** result){
+    static const char* const names[1] = {"arg"};
+    rj_val* a = echo_positional(params, names, 1, ec, em);
+    if (!a) return 0;
+    if (a->nitems != 1){ rj_free(a); *ec = -1; *em = ECHOIPC_USAGE; return 0; }
+    if (a->items[0]->typ != RJ_STR){
+        rj_typeerrs te; rj_typeerr_init(&te);
+        rj_typeerr_add(&te, 1, "arg", a->items[0], "string");
+        rj_typeerr_fail(&te, ec, em);
+        rj_free(a); return 0;
+    }
+    *result = rj_clone(a->items[0]);
+    rj_free(a);
+    return 1;
+}
+
 static int ctl_unsupported(const char* msg, long* ec, const char** em){
     *ec = -1; *em = msg; return 0;
 }
@@ -5174,6 +5296,10 @@ int rpc_dispatch(const char* method, const rj_val* params,
         return cmd_logging(params, err_code, err_msg, result);
     if (!strcmp(method, "getmemoryinfo"))
         return cmd_getmemoryinfo(params, err_code, err_msg, result);
+    if (!strcmp(method, "echo") || !strcmp(method, "echojson"))
+        return cmd_echo(method, params, err_code, err_msg, result);
+    if (!strcmp(method, "echoipc"))
+        return cmd_echoipc(params, err_code, err_msg, result);
     if (!strcmp(method, "getopenrpcinfo") || !strcmp(method, "rpc.discover"))
         return ctl_unsupported(
             "this node publishes no OpenRPC service description: that document "

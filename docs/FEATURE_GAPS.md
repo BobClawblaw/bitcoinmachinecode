@@ -2207,12 +2207,14 @@ needs to prove.
   declared stopping point, unchanged since 2026-08-30.
 - UPnP/NAT-PMP, `blockreconstructionextratxn`, `rpc.discover` (REST: implemented 2026-09-08)
   — all absent by explicit design, consistently described as such.
-- **Inbound-accepted transactions are not re-announced to this node's other
-  peer connections** (`asm/daemon/tx_relay.c`'s `txrelay_poll_leg` is only
-  ever called with outbound mux legs, `asm/daemon/main.c`). Distinct from
-  the 2026-09-03 own-transaction announcement work earlier today, which
-  fixed how WE originate an announcement, not how we relay one someone
-  else handed us onward past our outbound legs.
+- ~~**Inbound-accepted transactions are not re-announced to this node's other
+  peer connections**~~ **CLOSED 2026-09-06 (CC-1, `5537fab7`); this line was
+  left standing until 2026-11-04.** `daemon/txann.c`: a shared announce ring
+  that every serve child drains to its inbound peer (Poisson 5 s, feefilter
+  honoured, never back to the sender), and that the worker drains into the
+  outbound announcer for inbound-origin transactions. `docs/CORE_BEHAVIORAL_COMPAT.md`
+  rows "Transaction announcement to inbound peers" and "Re-announcement of
+  transactions received from inbound peers" carry it.
 
 ### Confirmed CLOSED, contradicting older passages elsewhere in this file
 
@@ -2923,3 +2925,121 @@ test, and the bug was in the measurement.
   and five legs lost their third strike within 33 s of it. A design call:
   no strike for N s after a silence ends.
 
+## Update 2026-11-04 — Lightning on bmc: `echo`, the version number, and blocks reorged off
+
+- **`echo`, `echojson` and `echoipc` are served** (`asm/rpc_commands.c`).
+  Core Lightning's bcli plugin runs `bitcoin-cli echo` before anything else,
+  so until now CLN could not start against this node. Measured against
+  v31.1 on regtest by `validation/echo_core_diff.py`: 33 raw request bodies
+  (params absent, null, `{}`, arrays of every JSON type, eleven arguments,
+  named arguments with holes, `args`, unknown and repeated names, a
+  non-container, JSON-RPC 2.0, a notification, a batch, and `echoipc`'s
+  arity and type errors) give the same HTTP status and the same reply bytes,
+  and Core's own bitcoin-cli (`echo`, `echojson`, `-named`, too many
+  arguments) prints the same output with the same exit code against both. The
+  same script against the previous build fails on every `echo` case. The
+  methods are FAST (no execution lock), so the probe does not queue behind a
+  slow call. One deliberate difference: Core's `arg9="trigger_internal_bug"`
+  test hook (an "Internal bug detected" report naming Core's source file) is
+  echoed here like any other string. Unlike Core, `help` lists the three:
+  this node's `help` is generated from the dispatch tables and says so.
+- **Named arguments (JSON-RPC `params` as an object, `bitcoin-cli -named`)
+  are not supported by any other method.** Every handler reads a positional
+  array; an object reaches it unconverted, and the handler sees no arguments
+  or the wrong ones. Core converts names to positions for every method
+  (`transformNamedArguments`) and answers -8 for an unknown name. The echo
+  methods carry that transform themselves (`echo_positional`); a general
+  layer needs each method's argument names, which this node has nowhere in
+  one table. Not yet built.
+- **`getnetworkinfo` `version` is 310100, not 1.** It reported this node's
+  own 0.0.1 encoded Core's way, and clients read the field as a capability
+  level: Core Lightning's bcli refused to start ("Unsupported bitcoind
+  version 1, at least 220000 required"). It now names the Core release whose
+  RPC surface this node is measured against (v31.1); `subversion`
+  (/BitcoinMachineCode:0.0.1/) and `bmc_build_commit` still say which
+  software answered (`asm/rpc_node.c` NODE_RPC_COMPAT_VERSION, pinned by
+  `test_rpc_node`).
+- **Lightning: LND and Core Lightning run on this node** (across a reorg
+  since the fork-tree fix below). `validation/lightning_regtest_e2e.py` points LND v0.21.6-beta
+  (bitcoind backend: RPC + rawblock/rawtx ZMQ) and CLN v26.06.9 (bcli,
+  through Core's bitcoin-cli) at bmc alone, with Core v31.1 only mining and
+  bmc following it over P2P, so every Lightning transaction reaches the miner
+  through bmc's relay. Measured 2026-11-04, every check passing: both start
+  and sync, both wallets see their funds, a channel opened from each side
+  goes active, payments both ways settle, a cooperative close confirms, and a
+  force close confirms and LND sweeps its CSV-delayed output (199,766 of
+  200,000 sat back on chain); `estimatesmartfee` answers as Core's does.
+- ~~**OPEN, and it blocks LND on mainnet: a block this node reorged off
+  cannot be looked up.**~~ **CLOSED 2026-11-04.** `getblockheader` resolved
+  hashes through the active chain only, so a replaced block answered -5
+  "Block not found" where Core answers with `confirmations: -1`. LND's wallet
+  (btcwallet) processes a reorg by fetching the header of the block it last
+  saw and walking its prev links to the fork; on bmc it logged "Unable to
+  process chain reorg: unable to get block header ... -5" on every block and
+  never followed the chain again. CLN, which asks by height, was unaffected.
+  Two causes, both fixed: the fork tree kept no 80-byte header (hash, prev,
+  height, bits and work only), and the ordinary staged reorg and
+  invalidateblock never put the branch they disconnect into it (only the
+  large-reorg handoff and the best-header gate did). Now:
+  - `daemon/hdr_tree.c`: version-2 records carry the header and the block's
+    transaction count (`headers_forks2.dat`; a version-1 file is read once,
+    rewritten and kept aside as `headers_forks.dat.v1`, its entries without
+    a header to serve). An eviction now leaves the file as well as the table:
+    it was appended to and never rewritten, so a reload brought evicted tips
+    back.
+  - `daemon/reorg.c` `reorg_execute`: every disconnect retains the branch it
+    leaves, except the mutated-block drop (that hash is the real chain's).
+  - `rpc_chain.c`: a `getblockheader` miss on the active chain reads the fork
+    tree file (`daemon/hdr_tree_read.c`; the tree is owned by the download
+    worker, the RPC answers in the parent) and answers in Core's shape:
+    `confirmations: -1`, no `nextblockhash`, `mediantime` along the block's
+    own branch. A block back on the active chain answers as active.
+  - `getblock` for such a block answers -1 "Block not available (pruned
+    data)": the body left with the archive truncation. **Divergence:** Core
+    keeps stale bodies and returns the block.
+  - Evidence: `validation/stale_header_core_diff.py` against v31.1, 18 of 18
+    identical (a two-block reorg: both replaced blocks verbose and raw, the
+    fork point, the walk from the replaced tip to the fork; then a reorg back
+    onto the original branch: its blocks answer as active, the replacement's
+    as replaced); against the commit before this one 10 of them differ (every
+    replaced-block lookup, the walk and the getblock answer). The Lightning
+    e2e passes every phase, its reorg phase included: LND follows the reorg,
+    the channel funded across it opens at the new height and a payment crosses
+    it. `test_reorg` checks the fork tree after each staged reorg (depths 1,
+    3, 12, 101 and a shorter-but-heavier branch; all five fail against the old
+    `reorg.c`), `test_hdr_tree` the file format.
+- **Found while testing the above, OPEN:** `invalidateblock` finds its block
+  by scanning `headers.dat` (`daemon/main.c` txoq_mark_block), and a node
+  that follows its peers block by block through the keep-up path never
+  writes `headers.dat` (0 bytes on the regtest node), so there it answers -5
+  "Block not found" for every block, its own tip included. A node that synced
+  headers-first is unaffected.
+- **Observed, not yet measured further:** right after a reorg,
+  `getbestblockhash` names the new tip about 0.3 s before the hash index can
+  resolve it (`[idx] fold` lands after `[reorg] complete`); a
+  `getblockheader` of the new tip in that window answers -5.
+- ~~**OPEN: LND runs against this node in its pre-0.19 compatibility
+  mode.**~~ **CLOSED 2026-11-04 (decided with the operator).** LND's RPC
+  client (btcd `rpcclient/backend_version.go`) does not read `version`; it
+  strips `/Satoshi:` from `subversion` and string-compares the rest with
+  "0.19.0", "22.0.0", "24.0.0" and "25.0.0". `/BitcoinMachineCode:0.0.1/`
+  sorted below all of them, so LND treated `testmempoolaccept`,
+  `gettxspendingprevout` and `submitpackage` as unsupported and logged
+  "TestMempoolAccept not supported by backend" at each publish.
+  `getnetworkinfo` `subversion` is now Core's shape with this node's agent as
+  the first comment: `/Satoshi:31.1.0(BitcoinMachineCode:0.0.1)/`, and with
+  `-uacomment=x` `/Satoshi:31.1.0(BitcoinMachineCode:0.0.1; x)/`
+  (`asm/rpc_node.c` rpc_subversion, pinned by `test_rpc_node`). **RPC only,
+  a deliberate divergence:** in Core `subversion` equals the P2P user agent;
+  here the agent other nodes see stays `/BitcoinMachineCode:0.0.1/` (checked
+  on the wire by `validation/config_surface_core_diff.sh`, 18 of 18 ok), and
+  `bmcgetcapabilities` still reports it. The Lightning e2e passes every phase
+  with it, and its LND logs the warning 0 times (it logged it at every
+  publish before).
+- **Found 2026-11-04, OPEN (a P2P identity question, not decided):** three
+  secondary kinds of outbound connection already introduce themselves as
+  Core, not as this node: block-relay-only legs and feeler probes
+  (`daemon/net_policy.c` net_handshake_relay, `/Satoshi:25.0.0/`) and
+  `seednode` address gathering (`daemon/addr_ingest.c` addr_gather_from,
+  `/Satoshi:0.18.0/`). The full-relay outbound and inbound connections send
+  `/BitcoinMachineCode:0.0.1/`.

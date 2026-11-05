@@ -99,7 +99,9 @@ echo "  both at height $TIP"
 C_IBD=$(core getblockchaininfo | jget "d['initialblockdownload']"); B_IBD=$(bmc getblockchaininfo | jget "d['result']['initialblockdownload']")
 [ "$C_IBD" = "$B_IBD" ] && ok "maxtipage default: initialblockdownload core=$C_IBD bmc=$B_IBD" || fail "initialblockdownload core=$C_IBD bmc=$B_IBD"
 C_UA=$(core getnetworkinfo | jget "d['subversion']"); B_UA=$(bmc getnetworkinfo | jget "d['result']['subversion']")
-case "$B_UA" in *"("*) fail "bmc subversion carries a comment without uacomment: $B_UA";; *) ok "no uacomment: core=$C_UA bmc=$B_UA";; esac
+# 2026-11-04: bmc's RPC subversion is Core's shape with its own agent as the
+# one comment (rpc_node.c rpc_subversion); the P2P agent is checked on the wire
+[ "$B_UA" = "/Satoshi:31.1.0(BitcoinMachineCode:0.0.1)/" ] && ok "no uacomment: core=$C_UA bmc=$B_UA" || fail "no uacomment: bmc subversion is '$B_UA'"
 # a 1 sat/vB transaction relayed to both mempools
 TXID=$(core -rpcwallet=e2ecore -named sendtoaddress address="$(core -rpcwallet=e2ecore getnewaddress)" amount=0.1 fee_rate=1)
 for i in $(seq 45); do [ "$(bmc getmempoolinfo | jget "d['result']['size']")" = 1 ] && break; sleep 1; done
@@ -142,7 +144,7 @@ C_IBD=$(core getblockchaininfo | jget "d['initialblockdownload']"); B_IBD=$(bmc 
 # is recent; it never re-evaluates. Against v31.1 both nodes report False here.
 [ "$C_IBD" = "$B_IBD" ] && ok "maxtipage=1: initialblockdownload core=$C_IBD bmc=$B_IBD" || fail "maxtipage=1: initialblockdownload core=$C_IBD bmc=$B_IBD"
 C_UA=$(core getnetworkinfo | jget "d['subversion']"); B_UA=$(bmc getnetworkinfo | jget "d['result']['subversion']")
-case "$C_UA" in *"(cfgdiff)/") C_OK=1;; *) C_OK=0;; esac; case "$B_UA" in *"(cfgdiff)/") B_OK=1;; *) B_OK=0;; esac
+case "$C_UA" in *"(cfgdiff)/") C_OK=1;; *) C_OK=0;; esac; case "$B_UA" in *"(BitcoinMachineCode:0.0.1; cfgdiff)/") B_OK=1;; *) B_OK=0;; esac
 [ $C_OK = 1 ] && [ $B_OK = 1 ] && ok "uacomment: core=$C_UA bmc=$B_UA" || fail "uacomment: core=$C_UA bmc=$B_UA"
 # the UA on the wire, as the peer saw it: Core's getpeerinfo shows our subver
 for i in $(seq 60); do [ "$(core getpeerinfo | python3 -c "import sys,json;print(len(json.load(sys.stdin)))")" -ge 1 ] && break; sleep 1; done

@@ -52,6 +52,7 @@
  *     block-relaying node; stop's reply names this project, not Core.
  */
 #include "daemon/undo_store.h"
+#include "daemon/hdr_tree.h"   /* 2026-11-04: blocks reorged off, from the fork tree file */
 #include "rpc_chain.h"
 #include <sys/mman.h>
 #include <sys/wait.h>
@@ -1136,36 +1137,81 @@ static rj_val* tx_to_json(const u8* tx, const txw_t* w, long long in_total){
 }
 
 /* ---- blockheaderToJSON ---- */
+/* Core's getblockheader object, in Core's field order, for the active chain
+ * and for a block reorged off alike. cw and next may be NULL (omitted). */
+static rj_val* render_header(const u8 hash_wire[32], const u8 hdr[80], long h, long confirmations,
+                             long mtp, const u8* cw, u64 ntx, const u8* next_wire){
+    char hx[65];
+    rj_val* o = rj_obj();
+    hex_rev(hx, hash_wire, 32); rj_obj_set(o, "hash", rj_str(hx));
+    rj_obj_set(o, "confirmations", rj_numf("%ld", confirmations));
+    rj_obj_set(o, "height", rj_numf("%ld", h));
+    u32 ver = rd32(hdr);
+    rj_obj_set(o, "version", rj_numf("%d", (int)ver));
+    rj_obj_set(o, "versionHex", rj_strf("%08x", ver));
+    hex_rev(hx, hdr + 36, 32); rj_obj_set(o, "merkleroot", rj_str(hx));
+    rj_obj_set(o, "time", rj_numf("%u", rd32(hdr + 68)));
+    rj_obj_set(o, "mediantime", rj_numf("%ld", mtp));
+    rj_obj_set(o, "nonce", rj_numf("%u", rd32(hdr + 76)));
+    u32 bits = rd32(hdr + 72);
+    rj_obj_set(o, "bits", rj_strf("%08x", bits));
+    target_hex(bits, hx); rj_obj_set(o, "target", rj_str(hx));
+    rj_obj_set(o, "difficulty", rj_double(difficulty_of(bits)));
+    if (cw){ chainwork_hex(cw, hx); rj_obj_set(o, "chainwork", rj_str(hx)); }
+    rj_obj_set(o, "nTx", rj_numf("%llu", ntx));
+    if (h > 0){ hex_rev(hx, hdr + 4, 32); rj_obj_set(o, "previousblockhash", rj_str(hx)); }
+    if (next_wire){ hex_rev(hx, next_wire, 32); rj_obj_set(o, "nextblockhash", rj_str(hx)); }
+    return o;
+}
 static int header_json(long h, long tip, rj_val** out, long* ec, const char** em){
     u8 pre[89 + 9];
     int r = read_block_prefix(h, pre, sizeof pre);
     if (r != 1){ *ec = -1; *em = "Block not available"; return 0; }
     u8 rec[48]; if (!read_idx_rec(h, rec)){ *ec = -1; *em = "Block not available"; return 0; }
-    char hx[65];
-    rj_val* o = rj_obj();
-    hex_rev(hx, rec, 32); rj_obj_set(o, "hash", rj_str(hx));
+    u8 cw[16]; int have_cw = chainwork_at(h, cw);
+    u64 c; u64 ntx = read_varint(pre + 80, pre + sizeof pre, &c);
+    u8 nrec[48]; int have_next = h < tip && read_idx_rec(h + 1, nrec) && rec_present(nrec);
     /* Core: a block that is stored but not in the active chain (here: above
      * the connected tip) reports confirmations -1, never 0 or negative. */
-    rj_obj_set(o, "confirmations", rj_numf("%ld", h > tip ? -1L : tip - h + 1));
-    rj_obj_set(o, "height", rj_numf("%ld", h));
-    u32 ver = rd32(pre);
-    rj_obj_set(o, "version", rj_numf("%d", (int)ver));
-    rj_obj_set(o, "versionHex", rj_strf("%08x", ver));
-    hex_rev(hx, pre + 36, 32); rj_obj_set(o, "merkleroot", rj_str(hx));
-    rj_obj_set(o, "time", rj_numf("%u", rd32(pre + 68)));
-    rj_obj_set(o, "mediantime", rj_numf("%ld", median_time_past(h)));
-    rj_obj_set(o, "nonce", rj_numf("%u", rd32(pre + 76)));
-    u32 bits = rd32(pre + 72);
-    rj_obj_set(o, "bits", rj_strf("%08x", bits));
-    target_hex(bits, hx); rj_obj_set(o, "target", rj_str(hx));
-    rj_obj_set(o, "difficulty", rj_double(difficulty_of(bits)));
-    u8 cw[16]; if (chainwork_at(h, cw)){ chainwork_hex(cw, hx); rj_obj_set(o, "chainwork", rj_str(hx)); }
-    u64 c; u64 ntx = read_varint(pre + 80, pre + sizeof pre, &c);
-    rj_obj_set(o, "nTx", rj_numf("%llu", ntx));
-    if (h > 0){ hex_rev(hx, pre + 4, 32); rj_obj_set(o, "previousblockhash", rj_str(hx)); }
-    if (h < tip){ u8 nrec[48]; if (read_idx_rec(h + 1, nrec) && rec_present(nrec)){ hex_rev(hx, nrec, 32); rj_obj_set(o, "nextblockhash", rj_str(hx)); } }
-    *out = o;
+    *out = render_header(rec, pre, h, h > tip ? -1L : tip - h + 1, median_time_past(h),
+                         have_cw ? cw : NULL, ntx, have_next ? nrec : NULL);
     return 1;
+}
+
+/* ---- blocks reorged off (2026-11-04) ----
+ * The archive keeps the active chain only; a block a reorg disconnected (or
+ * invalidateblock removed) is kept in the fork tree with its header, work and
+ * transaction count (daemon/hdr_tree.h). Core answers getblockheader for such
+ * a block with confirmations -1, and LND's wallet relies on it: it processes
+ * a reorg by fetching the header of the block it last saw and walking its
+ * prev links back to the fork. */
+static int stale_lookup(const u8 wire[32], u8 hdr[80], long* h, u8 work[16], unsigned* ntx){
+    return hdrtree_file_lookup(wire, hdr, h, work, ntx);
+}
+/* Median time past along the block's OWN branch: the block and up to ten
+ * ancestors, through the fork tree until the branch rejoins the active chain. */
+static long stale_median_time_past(const u8 hdr[80]){
+    u32 t[11]; int n = 0;
+    u8 cur[80]; memcpy(cur, hdr, 80);
+    t[n++] = rd32(cur + 68);
+    while (n < 11){
+        u8 disp[32]; for (int i = 0; i < 32; i++) disp[i] = cur[4 + 31 - i];
+        long ah;
+        if (height_by_hash(disp, &ah)){
+            for (long i = ah; i >= 0 && n < 11; i--){
+                u8 ph[80];
+                if (read_block_prefix(i, ph, 80) != 1) break;
+                t[n++] = rd32(ph + 68);
+            }
+            break;
+        }
+        u8 ph[80];
+        if (!stale_lookup(cur + 4, ph, NULL, NULL, NULL)) break;
+        t[n++] = rd32(ph + 68);
+        memcpy(cur, ph, 80);
+    }
+    qsort(t, (size_t)n, sizeof t[0], cmp_u32);
+    return (long)t[n/2];
 }
 
 /* ---- param helpers ---- */
@@ -1839,7 +1885,17 @@ static int cmd_getblockheader(const rj_val* params, rj_val** res, long* ec, cons
         rj_typeerr_add(&te, 2, "verbose", params->items[1], "bool");
     if (rj_typeerr_fail(&te, ec, em)) return 0;
     int verbose = param_present(params, 1) ? params->items[1]->str[0] == '1' : 1;
-    if (!lookup_block_param(params, 0, 1, &h, ec, em)) return 0;
+    if (!lookup_block_param(params, 0, 1, &h, ec, em)){
+        /* not in the active chain: a block reorged off still has its header */
+        u8 disp[32], wire[32], hdr[80], cw[16]; unsigned ntx = 0; long sh;
+        if (*ec != -5 || !parse_hash_param(params->items[0]->str, 1, disp, ec, em)) return 0;
+        for (int i = 0; i < 32; i++) wire[i] = disp[31 - i];
+        if (!stale_lookup(wire, hdr, &sh, cw, &ntx)) return 0;          /* the error still says -5 "Block not found" */
+        *ec = 0; *em = NULL;
+        if (!verbose){ char hx[161]; hex_of(hx, hdr, 80); *res = rj_str(hx); return 1; }
+        *res = render_header(wire, hdr, sh, -1, stale_median_time_past(hdr), cw, ntx, NULL);
+        return 1;
+    }
     if (!verbose){
         u8 hdr[80];
         if (read_block_prefix(h, hdr, 80) != 1){ *ec = -1; *em = "Block not available"; return 0; }
@@ -1849,7 +1905,19 @@ static int cmd_getblockheader(const rj_val* params, rj_val** res, long* ec, cons
 }
 static int cmd_getblock(const rj_val* params, rj_val** res, long* ec, const char** em){
     long tip = refresh(); long h;
-    if (!lookup_block_param(params, 0, 1, &h, ec, em)) return 0;
+    if (!lookup_block_param(params, 0, 1, &h, ec, em)){
+        /* a block reorged off is known (getblockheader answers for it) but its
+         * body left with the archive truncation: Core's answer for a known
+         * block whose data is gone. Core itself keeps stale bodies and would
+         * return the block; this node does not (docs/FEATURE_GAPS.md). */
+        u8 disp[32], wire[32];
+        if (*ec == -5 && params->items[0]->typ == RJ_STR && parse_hash_param(params->items[0]->str, 1, disp, ec, em)){
+            for (int i = 0; i < 32; i++) wire[i] = disp[31 - i];
+            if (stale_lookup(wire, NULL, NULL, NULL, NULL)){ *ec = -1; *em = "Block not available (pruned data)"; return 0; }
+            *ec = -5; *em = "Block not found";
+        }
+        return 0;
+    }
     int verbosity = param_verbosity(params, 1, 1, ec, em);
     if (verbosity == -999) return 0;
     long len = read_block(h);
@@ -6205,7 +6273,7 @@ int rpc_chain_method_lane_p(const char* m, const rj_val* params){
 int rpc_chain_method_lane(const char* m){
     if (!strcmp(m, "uptime") || !strcmp(m, "getblockcount") || !strcmp(m, "getbestblockhash")
      || !strcmp(m, "getblockchaininfo") || !strcmp(m, "getdifficulty") || !strcmp(m, "getindexinfo")
-     || !strcmp(m, "getblockhash") || !strcmp(m, "getblockheader"))   /* 2026-09-30: the pollers' block lookups; a few preads on the lane handle, the hash index under g_idx_mu, stack buffers */
+     || !strcmp(m, "getblockhash") || !strcmp(m, "getblockheader"))   /* 2026-09-30: the pollers' block lookups; a few preads on the lane handle, the hash index under g_idx_mu, stack buffers. 2026-11-04: a getblockheader MISS also reads the fork tree file (at most HDRTREE_MAX records, ~1.5 MB, its own fd), up to 11 times for a replaced block's median time */
         return 1;
     if (!strcmp(m, "getchaintxstats") || !strcmp(m, "waitfornewblock")
      || !strcmp(m, "waitforblockheight") || !strcmp(m, "waitforblock")
