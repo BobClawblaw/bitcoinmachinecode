@@ -2319,3 +2319,53 @@ were still on disk. Nothing in them is new measurement.
     15 of 15 peers. `MALLOC_ARENA_MAX=4` is in the process environment.
 - **Rollback:** relink to `deploy-20261105b` and restore the four
   `.pre-20261105c` helpers. No on-disk format changed.
+
+## 2026-11-05 09:03Z — `deploy-20261105d`: mempool admission's verify pool ends the arena-heap growth (PR #461)
+
+- **What:** `main` at `f9e8f2df`. #461 gives `txv_verify_all` (mempool
+  admission's parallel input check) a persistent worker pool instead of
+  creating and joining threads for every transaction with 8 or more inputs.
+- **Why without the cap:** `MALLOC_ARENA_MAX=4` has contained the download
+  worker's malloc arena-heap growth since 02:38Z, but the source of that
+  growth is unknown. A scratch harness that verified 811 real mainnet
+  transactions (5,000 calls, arenas uncapped) did not reproduce it with the
+  old per-call threads either, so this deploy tests the question on the live
+  node. The drop-in was set aside as
+  `/etc/systemd/system/bmcbitcoind.service.d/60-malloc-arena.conf.off` from
+  09:03 to 11:04Z; the processes carried no `MALLOC_ARENA_MAX`.
+- **Checked before the merge:** `make test` passes on x86 (gate-log-check:
+  all 480 gated tests ran); the Mac's full suite gives 448 PASS, 16 SKIP,
+  16 N/A, 0 FAIL.
+- Built from clean (`make -B daemon/bmcbitcoind` and the helpers by name) in
+  a clean worktree at the merge commit. All five exec'd helpers were
+  byte-identical; none was replaced. Wallet files were copied first.
+- **Started:** 09:03:38Z at tip 974,650; RPC answered at 974,650 (= the
+  oracle) by 09:05Z.
+- **Verified live:**
+  - New block 974,651 applied with the Core v31.1 oracle's hash
+    (`00000000000000000001433bcbb639a213e779962c8bb0c73d49dc0756dedfe1`);
+    the heartbeat reads `tip=974651` at 09:17:39Z.
+  - `NRestarts=0` and `active` at 14 minutes; no `[crash]` line; 66 fds.
+- **Arena heaps, uncapped (per-minute log of the worker's 64 MB-aligned
+  heaps; every new worker thread logged by 5 ms polling):**
+  - 28 heaps with 18 threads from 09:04 to 09:15. At 09:16 the pool started
+    its 16 workers (34 threads) and the count went to 57: each persistent
+    worker holds its own arena.
+  - 57 heaps from 09:16 to 11:04 (1 h 48 min). VmSize went from 360.445 to
+    360.458 GB and VmPTE from 33.26 to 33.49 MB. No thread was created after
+    the pool's 16.
+  - For comparison, the uncapped `deploy-20261105a` worker went from 208 to
+    863 heap tails in its first 1.5 h, VmSize growing ~29 GB/h.
+- **Result:** on the live node the per-call verify threads were the source
+  of the growth, and the pool ends it. Why they grew heaps in production but
+  not in the harness is still unexplained.
+- **Cap restored:** the drop-in went back at 11:04:16Z (`daemon-reload`,
+  restart). The processes carry `MALLOC_ARENA_MAX=4` again; it now caps the
+  pool's per-worker arenas (57 heaps uncapped; 13 capped at 11:12Z with the
+  pool running) rather than holding back the growth. RPC answered at
+  974,659 (= the oracle) at 11:04:50Z; new block 974,660 applied with the
+  oracle's hash
+  (`000000000000000000019a03139e7df014be6f0f36809953b41e592c18bf8629`) by
+  11:08:26Z. `NRestarts=0` and `active` at 11 minutes; no `[crash]` line;
+  65 fds.
+- **Rollback:** relink to `deploy-20261105c`. No on-disk format changed.
