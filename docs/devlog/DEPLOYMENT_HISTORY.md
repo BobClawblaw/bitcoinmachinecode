@@ -2369,3 +2369,41 @@ were still on disk. Nothing in them is new measurement.
   11:08:26Z. `NRestarts=0` and `active` at 11 minutes; no `[crash]` line;
   65 fds.
 - **Rollback:** relink to `deploy-20261105c`. No on-disk format changed.
+
+## 2026-11-05 23:48Z — `deploy-20261105e`: the header mirror is seeded from the archive and no longer leaks descriptors (PR #464)
+
+- **What:** `main` at `7e36dad5`. #464 fixes two defects in the worker's
+  `headers.dat` (the best-header mirror):
+  - An empty mirror was never seeded on a node that follows its peers
+    block by block, so `invalidateblock`, which finds its block in that
+    file, answered -5 "Block not found" there. The top-up now seeds an
+    empty mirror from the archive when block 0 is the chain's genesis.
+    Production's mainnet mirror was already current and takes the
+    unchanged path.
+  - `hst_init` opened `headers.dat` without closing the descriptor
+    already held, and the top-up re-inits once per stored block. The
+    `deploy-20261105d` worker held 65 descriptors on `headers.dat` after
+    65 blocks (soft limit 1024: about a week). The leak dates from
+    2026-09-01; earlier processes were restarted before reaching the
+    limit.
+- **Checked before the merge:** `make test` passes on x86 (gate-log-check:
+  all 480 gated tests ran). On regtest against Core v31.1, 40 blocks mined
+  one at a time: 46 records and 0 leaked descriptors, against 0 and 41 on
+  the previous `main`; `invalidateblock` works.
+  `validation/zmq_sequence_core_diff.py`: 51 passed, 0 failed.
+- Built from clean (`make -B daemon/bmcbitcoind` and the helpers by name) in
+  a clean worktree at the merge commit. All five exec'd helpers were
+  byte-identical; none was replaced. Wallet files were copied first.
+  `MALLOC_ARENA_MAX=4` stays in place.
+- **Started:** 23:48:26Z at tip 974,730 (= the oracle); RPC answered at
+  974,730 by 23:49:16Z.
+- **Verified live:**
+  - New block 974,731 applied with the Core v31.1 oracle's hash
+    (`00000000000000000001084cb696acb26ece868dfa0746ce617f3f6732016349`)
+    at 23:50:33Z, and 974,732 at 23:51:51Z. Each logged
+    `[dl] header mirror +1 from the archive`.
+  - `NRestarts=0` and `active` at 11 minutes; no `[crash]` line.
+  - No process holds a descriptor on `headers.dat` after two new blocks
+    (the previous build kept one per block).
+- **Rollback:** relink to `deploy-20261105d`. No on-disk format changed;
+  that build leaks one descriptor per block again.
