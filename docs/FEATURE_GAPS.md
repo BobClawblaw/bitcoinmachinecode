@@ -2902,15 +2902,28 @@ test, and the bug was in the measurement.
   `getbestblockhash` names the new tip about 0.3 s before the hash index can
   resolve it (`[idx] fold` lands after `[reorg] complete`); a
   `getblockheader` of the new tip in that window answers -5.
-- **OPEN: LND runs against this node in its pre-0.19 compatibility mode.**
-  LND's RPC client (btcd `rpcclient/backend_version.go`) does not read
-  `version`; it strips `/Satoshi:` from `subversion` and compares the rest
-  as a string against "0.19.0", "22.0.0", "24.0.0" and "25.0.0".
-  `/BitcoinMachineCode:0.0.1/` sorts below all of them, so LND classifies the
-  node as bitcoind < 0.19 and treats `testmempoolaccept`,
-  `gettxspendingprevout` and `submitpackage` as unsupported, though this node
-  serves all three (the e2e's LND logged "TestMempoolAccept not supported by
-  backend, consider upgrading bitcoind" at each of its publishes). Every e2e phase above passed in that mode. Closing
-  it means changing what `subversion` says, a decision about this node's
-  identity, not yet taken.
-
+- ~~**OPEN: LND runs against this node in its pre-0.19 compatibility
+  mode.**~~ **CLOSED 2026-11-04 (decided with the operator).** LND's RPC
+  client (btcd `rpcclient/backend_version.go`) does not read `version`; it
+  strips `/Satoshi:` from `subversion` and string-compares the rest with
+  "0.19.0", "22.0.0", "24.0.0" and "25.0.0". `/BitcoinMachineCode:0.0.1/`
+  sorted below all of them, so LND treated `testmempoolaccept`,
+  `gettxspendingprevout` and `submitpackage` as unsupported and logged
+  "TestMempoolAccept not supported by backend" at each publish.
+  `getnetworkinfo` `subversion` is now Core's shape with this node's agent as
+  the first comment: `/Satoshi:31.1.0(BitcoinMachineCode:0.0.1)/`, and with
+  `-uacomment=x` `/Satoshi:31.1.0(BitcoinMachineCode:0.0.1; x)/`
+  (`asm/rpc_node.c` rpc_subversion, pinned by `test_rpc_node`). **RPC only,
+  a deliberate divergence:** in Core `subversion` equals the P2P user agent;
+  here the agent other nodes see stays `/BitcoinMachineCode:0.0.1/` (checked
+  on the wire by `validation/config_surface_core_diff.sh`, 18 of 18 ok), and
+  `bmcgetcapabilities` still reports it. The Lightning e2e passes every phase
+  with it, and its LND logs the warning 0 times (it logged it at every
+  publish before).
+- **Found 2026-11-04, OPEN (a P2P identity question, not decided):** three
+  secondary kinds of outbound connection already introduce themselves as
+  Core, not as this node: block-relay-only legs and feeler probes
+  (`daemon/net_policy.c` net_handshake_relay, `/Satoshi:25.0.0/`) and
+  `seednode` address gathering (`daemon/addr_ingest.c` addr_gather_from,
+  `/Satoshi:0.18.0/`). The full-relay outbound and inbound connections send
+  `/BitcoinMachineCode:0.0.1/`.
