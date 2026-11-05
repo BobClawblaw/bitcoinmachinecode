@@ -19,7 +19,7 @@
 # the identity check always runs.
 
 WANT_NAME="BobClawblaw"
-WANT_EMAIL="BobClawblaw@users.noreply.github.com"
+WANT_EMAIL="288991054+BobClawblaw@users.noreply.github.com"   # the id-prefixed noreply since 2026-10-29
 
 name=$(git var GIT_AUTHOR_IDENT | sed 's/ <.*//')
 email=$(git var GIT_AUTHOR_IDENT | sed 's/.*<//; s/>.*//')

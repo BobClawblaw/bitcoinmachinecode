@@ -176,13 +176,15 @@ void reorg_set_mirror_hash_at(int (*cb)(long, unsigned char*)){ g_mirror_hash_at
 static long g_last_handoff_fork = -1;
 long reorg_last_handoff_fork(void){ return g_last_handoff_fork; }
 static int read_stored_header(void* st, long h, unsigned char out[80]);
+static unsigned read_stored_ntx(void* st, long h);
 static unsigned hdr_bits(const unsigned char hdr[80]);
-/* retain OUR blocks [from..to] in the fork tree with their recorded work */
+/* retain OUR blocks [from..to] in the fork tree with their recorded work and
+ * transaction count (getblockheader's nTx for a block reorged off) */
 static long retain_branch(void* st, long from, long to){
     long n = 0; unsigned char hdr[80], w[16];
     for (long h = from; h <= to; h++){
         if (!read_stored_header(st, h, hdr) || store_chainwork_get_at(st, h, w) != 1) break;
-        if (hdrtree_add(hdr, h, w) == 1) n++;
+        if (hdrtree_add_ntx(hdr, h, w, read_stored_ntx(st, h)) == 1) n++;
     }
     return n;
 }
@@ -358,6 +360,21 @@ static int read_stored_header(void* st, long h, unsigned char out[80]){
     int fd = hdr_fd_for((unsigned)meta[2]);
     if (fd < 0) return 0;
     return pread(fd, out, 80, (off_t)meta[0] + 8) == 80 ? 1 : 0;
+}
+
+/* The block's transaction count (the varint after its header), 0 when the
+ * block cannot be read. */
+static unsigned read_stored_ntx(void* st, long h){
+    uint64_t meta[3];
+    if (store_get_at(st, (uint64_t)h, meta) != 1 || meta[1] < 81) return 0;
+    int fd = hdr_fd_for((unsigned)meta[2]);
+    if (fd < 0) return 0;
+    unsigned char p[9]; size_t want = meta[1] - 80 < 9 ? (size_t)(meta[1] - 80) : 9;
+    if (pread(fd, p, want, (off_t)meta[0] + 8 + 80) != (ssize_t)want) return 0;
+    if (p[0] < 0xfd) return p[0];
+    if (p[0] == 0xfd && want >= 3) return (unsigned)p[1] | (unsigned)p[2] << 8;
+    if (p[0] == 0xfe && want >= 5) return (unsigned)p[1] | (unsigned)p[2] << 8 | (unsigned)p[3] << 16 | (unsigned)p[4] << 24;
+    return 0;
 }
 
 /* Full block body, same framing skip. -> length or -1. */
@@ -653,6 +670,7 @@ static int rg_mtp_at(void* vctx, long h, unsigned long* out){
 }
 
 static int g_pure_disconnect = 0;                 /* CC-10: reorg_disconnect_to() */
+static int g_no_retain = 0;                       /* chain_drop_mutated_block: the branch is not left */
 static int (*g_invalid_fn)(const unsigned char[32]) = 0;
 void reorg_set_invalid_fn(int (*fn)(const unsigned char hash[32])){ g_invalid_fn = fn; }
 long reorg_analyze(void* st, reorg_cand_t* c){
@@ -937,6 +955,18 @@ long reorg_execute(void* st, long fork_height, long nblocks,
                             "the disconnected branch's transactions will not be re-offered\n",
                     REORG_DISC_MAX_BYTES);
         }
+    }
+
+    /* The branch about to be disconnected stays known (Core keeps every
+     * header it has seen): getblockheader answers for its blocks with
+     * confirmations -1, which LND's wallet needs to walk back to the fork.
+     * 2026-11-04: only the large-reorg handoff and the best-header gate
+     * retained it before (they still do; a second add is a no-op); the
+     * staged reorg and invalidateblock dropped it. Not for a mutated block:
+     * its hash is the real chain's, fetched again next. */
+    if (!g_no_retain){
+        long kept = retain_branch(st, fork_height + 1, tip);
+        if (kept > 0) fprintf(stderr, "[reorg] %ld header(s) of the branch being disconnected retained in the fork tree\n", kept);
     }
 
     /* ------------------------ point of no return ------------------------ */
@@ -1764,7 +1794,9 @@ long chain_drop_mutated_block(void* st, long h){
     long applied = utxo_live_applied_height();
     fprintf(stderr, "[chain] mutated block at height %ld (tip %ld, connected %ld) -- dropping the archive back to %ld, no mark\n",
             h, tip, applied, h - 1);
+    g_no_retain = 1;
     long r = reorg_disconnect_to(st, h - 1);
+    g_no_retain = 0;
     if (r != 1){
         fprintf(stderr, "[chain] mutated: disconnect %s\n", r == 0 ? "refused (see the reorg log)" : "FAILED PART WAY -- see the reorg log");
         return r == 0 ? 0 : -1;

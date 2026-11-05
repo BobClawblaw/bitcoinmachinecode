@@ -128,9 +128,38 @@ static int srt_hex1(char c){
  * blocks (see bitcoind.asm's version msg, kept in sync with this) */
 #define NODE_LOCAL_SERVICES 0x0000000000000009ULL
 
-/* Core encodes CLIENT_VERSION as 10000*major + 100*minor + patch. */
-static long node_client_version(void){
-    return 10000L*NODE_VERSION_MAJOR + 100L*NODE_VERSION_MINOR + NODE_VERSION_PATCH;
+/* getnetworkinfo "version" (2026-11-04): the Core release whose RPC surface
+ * this node is measured against (v31.1, 10000*major + 100*minor + patch), not
+ * this node's own 0.0.1. Clients read the number as a capability level, not
+ * as a name: Core Lightning's bcli refuses anything below 220000 and would not
+ * start against this node ("Unsupported bitcoind version 1, at least 220000
+ * required"). Which software answered is still told by "subversion"
+ * (/BitcoinMachineCode:x.y.z/) and bmc_build_commit. Raise this only when the
+ * parity oracle moves to a newer Core. */
+#define NODE_RPC_COMPAT_VERSION 310100L
+
+/* getnetworkinfo "subversion" (2026-11-04): Core's shape for the same
+ * release, with this node's own user agent as the first comment:
+ *   P2P user agent /BitcoinMachineCode:0.0.1/          -> /Satoshi:31.1.0(BitcoinMachineCode:0.0.1)/
+ *   with -uacomment /BitcoinMachineCode:0.0.1(a; b)/   -> /Satoshi:31.1.0(BitcoinMachineCode:0.0.1; a; b)/
+ * LND's RPC client (btcd rpcclient/backend_version.go) does not read
+ * "version": it strips "/Satoshi:" from subversion and string-compares the
+ * rest against "0.19.0", "22.0.0", "24.0.0", "25.0.0". Our own agent sorted
+ * below all four, so LND classed the node as bitcoind < 0.19 and never used
+ * testmempoolaccept, gettxspendingprevout or submitpackage, all served here.
+ * RPC only: the P2P user agent is unchanged, and bmcgetcapabilities still
+ * reports it as "subversion" for a consumer that must know the node. */
+static void rpc_subversion(char* out, size_t cap){
+    const char* in = g_user_agent[0] ? g_user_agent : NODE_UA_STRING;
+    size_t len = strlen(in);
+    if (len >= 2 && in[0] == '/' && in[len - 1] == '/'){ in++; len -= 2; }      /* "Name:ver(c1; c2)" */
+    const char* lp = memchr(in, '(', len);
+    long v = NODE_RPC_COMPAT_VERSION;
+    if (lp && len >= 2 && in[len - 1] == ')')
+        snprintf(out, cap, "/Satoshi:%ld.%ld.%ld(%.*s; %.*s)/", v / 10000, v / 100 % 100, v % 100,
+                 (int)(lp - in), in, (int)(len - (size_t)(lp - in) - 2), lp + 1);
+    else
+        snprintf(out, cap, "/Satoshi:%ld.%ld.%ld(%.*s)/", v / 10000, v / 100 % 100, v % 100, (int)len, in);
 }
 
 /* ---- one definition of "a live connection" (2026-09-16) -------------------
@@ -255,8 +284,8 @@ static int cmd_getnetworkinfo(rj_val** res){
     rpc_conn_counts(&n_in, &n_out);
 
     rj_val* o = rj_obj();
-    rj_obj_set(o, "version", rj_numf("%ld", node_client_version()));
-    rj_obj_set(o, "subversion", rj_str(g_user_agent[0] ? g_user_agent : NODE_UA_STRING));
+    rj_obj_set(o, "version", rj_numf("%ld", NODE_RPC_COMPAT_VERSION));
+    { char sv[320]; rpc_subversion(sv, sizeof sv); rj_obj_set(o, "subversion", rj_str(sv)); }
     rj_obj_set(o, "protocolversion", rj_numf("%d", NODE_PROTOCOL_VER));
     { char h[17]; snprintf(h, sizeof h, "%016llx", (unsigned long long)NODE_LOCAL_SERVICES);
       rj_obj_set(o, "localservices", rj_str(h)); }
