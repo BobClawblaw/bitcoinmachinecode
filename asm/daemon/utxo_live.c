@@ -401,7 +401,7 @@ extern void lsm_mm_invalidate_all(void);
 static pid_t   g_cmp_pid = 0;
 static struct timespec g_cmp_t0;
 static char g_cmp_desc[160];   /* what the running compaction is, for its completion line (2026-09-08) */
-static u64     g_cmp_inputs[64]; static int g_cmp_nin = 0;
+static uint64_t g_cmp_inputs[64]; static int g_cmp_nin = 0;   /* uint64_t: lsm_manifest.h's type (u64 is unsigned long, uint64_t is unsigned long long on Darwin) */
 static u64     g_cmp_n_before = 0;
 static long    g_cmp_height = 0;
 static int     g_cmp_fallbacks = 0;
@@ -529,7 +529,7 @@ static void compact_adopt(int st){
     struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
     double secs = (t1.tv_sec - g_cmp_t0.tv_sec) + (t1.tv_nsec - g_cmp_t0.tv_nsec) / 1e9;
     if (WIFEXITED(st) && WEXITSTATUS(st) == 0){
-        u64 nbase = ~0ULL;
+        uint64_t nbase = ~0ULL;
         int ar = lsm_manifest_adopt_child(&g_utxo_lst, g_cmp_inputs, g_cmp_nin, g_cmp_is_full, g_cmp_old_base, &nbase);
         if (ar < 0){
             /* keep the old manifest: its runs are all still on disk (unlink
@@ -626,7 +626,7 @@ static long compact_pick_now(long* lo, int* over_budget){
     *over_budget = 0;
     long n = (long)g_utxo_lst.manifest_n;
     if (n < 2) return 0;
-    static u64 sizes[256];
+    static uint64_t sizes[256];
     if (n > 256) n = 256;
     const unsigned char* e = (const unsigned char*)g_utxo_lst.manifest_buf;
     for (long i = 0; i < n; i++){

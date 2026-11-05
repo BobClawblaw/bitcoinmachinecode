@@ -8,7 +8,9 @@ set -u
 cd "$(dirname "$0")/../../asm"     # asm/
 OUT=../port/osx/daemon_out
 mkdir -p "$OUT"
-CC="cc -O2 -arch arm64 -I. -Idaemon -Itests -I../port/osx/compat -D_DARWIN_C_SOURCE -Dst_mtim=st_mtimespec -Dst_atim=st_atimespec -Dst_ctim=st_ctimespec"
+# -Wall -Werror (2026-11-05): the same bar as the x86 Makefile; a warning
+# fails the build instead of scrolling past in compile_errors.log
+CC="cc -O2 -Wall -Werror -arch arm64 -I. -Idaemon -Itests -I../port/osx/compat -D_DARWIN_C_SOURCE -Dst_mtim=st_mtimespec -Dst_atim=st_atimespec -Dst_ctim=st_ctimespec"
 ERRLOG="$OUT/compile_errors.log"
 : > "$ERRLOG"
 
@@ -79,6 +81,7 @@ for f in "${CSRC[@]}"; do
   if stale "$f" "$obj"; then
     if ! $CC -c -o "$obj" "$f" 2>>"$ERRLOG"; then
       echo "COMPILE FAIL: $f" | tee -a "$ERRLOG"
+      rm -f "$obj"                       # never link an object from an earlier build
       fail=1
     fi
   fi
@@ -91,7 +94,7 @@ for f in ../port/osx/*.c ../port/osx/*.S; do
   case "$f" in *bitcoin_hmac_c.c) continue;; esac
   base=$(basename "$f"); obj="$OUT/px_${base%.*}.o"
   if stale "$f" "$obj"; then
-    if ! $CC -c -o "$obj" "$f" 2>>"$ERRLOG"; then echo "PORTOBJ FAIL: $f" >> "$ERRLOG"; fi
+    if ! $CC -c -o "$obj" "$f" 2>>"$ERRLOG"; then echo "PORTOBJ FAIL: $f" | tee -a "$ERRLOG"; rm -f "$obj"; fail=1; fi
   fi
 done
 # drop px_ objects whose source is gone: when a C twin becomes assembly (fe_twin.c
@@ -109,6 +112,11 @@ done
 
 # ---- addrbook archive from the osx-compiled object ----
 ar rcs "$OUT/addrbook.a" "$OUT/addrbook.o" 2>>"$ERRLOG" || { echo "ar fail"; exit 1; }
+
+if [ $fail -ne 0 ]; then
+  echo "--- compile failed (see $ERRLOG); not linking"
+  exit 1
+fi
 
 # ---- port/osx objects (asm + twins) ----
 OSXOBJS=$(ls ../port/osx/*.o 2>/dev/null | grep -v daemon_out)

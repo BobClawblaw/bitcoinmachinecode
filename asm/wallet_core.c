@@ -1212,7 +1212,6 @@ long wallet_signrawtx_withkeys(unsigned char* out_tx, long cap,
     if (!work || !next) { free(work); free(next); return -1; }
     memcpy(work, tx, (size_t)txlen);
     long wlen = (long)txlen;
-    unsigned long payload_msk = 0;
 
     for (unsigned long i = 0; i < n_in; i++) {
         /* locate input i scriptSig len offset in `work` */
@@ -1281,7 +1280,6 @@ long wallet_signrawtx_withkeys(unsigned char* out_tx, long cap,
         unsigned char* t = work; work = next; next = t;
         wlen = nn;
         if (signed_mask_out) signed_mask_out[i] = 1;
-        payload_msk |= (1UL << i);
     }
 
     if (wlen > cap) { free(work); free(next); return -1; }

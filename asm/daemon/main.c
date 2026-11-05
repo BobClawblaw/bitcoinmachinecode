@@ -7011,7 +7011,11 @@ static void dlc_wire_adopt(int fd){
     for(int i = 0; i < RPC_MSG_N; i++){ g_dlc_me->sent_pm[i] = g_dlc_pend_spm[i]; g_dlc_me->recv_pm[i] = g_dlc_pend_rpm[i]; }
     g_dlc_conn_fd = fd;
 }
-static long long dlc_now_ms(void); static long dlc_proc_rchar(pid_t pid);   /* fwd decls: the worker judges its own chunk before these are defined */
+/* fwd decls: the worker judges its own chunk before these are defined */
+static long long dlc_now_ms(void);
+#ifndef __APPLE__
+static long dlc_proc_rchar(pid_t pid);
+#endif
 static void dlc_fmt_rate(char* buf, size_t cap, double bytes_per_sec); /* fwd decls, defined below */
 static void dlc_fmt_bytes(char* buf, size_t cap, double bytes);
 
@@ -7573,6 +7577,7 @@ static int dlc_probe_round(char pool[][DL_POOL_SLOT], int from, int ntry,
     return got;
 }
 
+#ifndef __APPLE__   /* /proc/<pid>/io is Linux's; Darwin's counterparts follow */
 /* read one named field out of /proc/<pid>/io ("rchar:", "write_bytes:", ...).
  * Returns -1 if unavailable (process already gone, field not found, or a
  * non-Linux host without /proc). */
@@ -7602,6 +7607,7 @@ static long dlc_proc_rchar(pid_t pid){ return dlc_proc_iofield(pid,"rchar:"); }
  * status log can show network-received and disk-written rates separately
  * instead of one figure trying to represent both. */
 static long dlc_proc_wbytes(pid_t pid){ return dlc_proc_iofield(pid,"write_bytes:"); }
+#endif
 #ifdef __APPLE__
 /* Darwin (osx port, 2026-09-23): no /proc/<pid>/io. The DISK side has a
  * kernel equivalent -- proc_pid_rusage's ri_diskio_byteswritten, the same

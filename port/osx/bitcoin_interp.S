@@ -283,7 +283,7 @@ _interp_memeq:
 	.equ SL_HND,0xb0		/* IR-6: _hnd_begin() returned 1 (this call owns the */
 					/* handle table) and must pair it with _hnd_end(). */
 					/* 0xb0/0xb8 were the two spare slots of the 0xC0 */
-					/* frame; x86 took [rbp-0x110] out of the same
+					/* frame; x86 took [rbp-0x110] out of the same */
 					/* reservation growth (0x108 -> 0x118). */
 
 	/* macros */

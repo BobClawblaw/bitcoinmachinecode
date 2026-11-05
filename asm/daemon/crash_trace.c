@@ -30,7 +30,9 @@
 #endif
 #ifdef __APPLE__
 #define _XOPEN_SOURCE 700       /* Darwin hides ucontext_t without it */
+#ifndef _DARWIN_C_SOURCE        /* the Mac build passes it on the command line */
 #define _DARWIN_C_SOURCE        /* ...and SA_ONSTACK/sigaltstack/syscall with it alone */
+#endif
 #endif
 #include <signal.h>
 #include <string.h>
