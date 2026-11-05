@@ -1773,6 +1773,7 @@ long chain_invalidate_block(void* st, long h, const unsigned char hash[32]){
               if (truncate("headers.dat", (off_t)h * 112) != 0)
                   fprintf(stderr, "[chain] invalidate: could not roll headers.dat back to %ld record(s): %s\n", h, strerror(errno));
           }
+          close((int)*(long*)hb);                   /* hst_init opened it: one-shot, so close (main.c hst_close) */
       } }
     fprintf(stderr, "[chain] invalidate: marked height %ld (%s); archive at %ld; headers rolled back to %ld; the chain stays below it until a heavier chain avoids the mark\n",
             h, added ? "new mark" : "already marked", store_tip(st), h);

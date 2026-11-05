@@ -454,6 +454,13 @@ extern long node_ibd_blocks_s(int fd, void* st, void* hst, long lo_real, long nl
                               void* buf, unsigned long buflen, void* scratch, unsigned cap);
 extern int  hst_reload(void* hst);
 extern int  hst_append(void* hst, const unsigned char hdr[80], const unsigned char hash[32]);
+/* hst_init OPENS headers.dat and stores the fd at +0 without closing the one
+ * already there, so every re-init of a long-lived hst kept a descriptor: the
+ * worker's mirror top-up re-inits once per stored block, and production's
+ * worker held 65 on headers.dat after 65 blocks (2026-11-05, soft limit
+ * 1024 -- about a week of blocks). Close before every re-init, and after a
+ * one-shot use. A zeroed static has fd 0, which is never ours: skipped. */
+static void hst_close(void* hst){ long fd = *(long*)hst; if(fd > 0) close((int)fd); *(long*)hst = -1; }
 
 #define L_HDRS   2
 #define L_BLOCK  3
@@ -5994,7 +6001,7 @@ static int g_dl_parallel_now = 0;
 static unsigned char g_mirror_hst[4096]; static off_t g_mirror_size = -1;
 static int dl_mirror_load(void){
     struct stat s; if(stat("headers.dat", &s) != 0) return 0;
-    if(s.st_size != g_mirror_size){ hst_init(g_mirror_hst); hst_reload(g_mirror_hst); g_mirror_size = s.st_size; }
+    if(s.st_size != g_mirror_size){ hst_close(g_mirror_hst); hst_init(g_mirror_hst); hst_reload(g_mirror_hst); g_mirror_size = s.st_size; }
     return 1;
 }
 static int dl_mirror_hash_at(long height, unsigned char out[32]){
@@ -6037,6 +6044,7 @@ static void dl_headers_truncate_to(long keep){
 static void dlc_headers_rollback(unsigned char* hst, long have){
     if(truncate("headers.dat", (off_t)have * 112) != 0)
         fprintf(stderr,"[dlc] could not roll headers.dat back to %ld record(s): %s\n", have, strerror(errno));
+    hst_close(hst);
     hst_init(hst);
     hst_reload(hst);
 }
@@ -6430,21 +6438,40 @@ static long dlc_headers_try(const char* cand, void* hst, unsigned char loc[32],
  * stored blocks without touching the mirror, so every boot used to ask peers
  * from a stale point (12 blocks stale on 2026-09-01), and a peer that did not
  * know that block answered from genesis. Stops at the first hole; the peer
- * sync takes over from there. Returns headers appended. */
+ * sync takes over from there. Returns headers appended.
+ *
+ * An EMPTY mirror is seeded from the archive too, from height 0, when the
+ * archive's block 0 is this chain's genesis (2026-11-05). This used to
+ * return at once and leave the seed to dlc_headers -- the boot catch-up's
+ * header phase -- which a node following its peers by announcements never
+ * runs: a fresh regtest node kept a 0-byte headers.dat through 200 blocks,
+ * and invalidateblock, which finds the block in this file, answered -5
+ * "Block not found" for every block (validation/zmq_sequence_core_diff.py's
+ * invalidate phase). */
 static long dl_header_mirror_topup(unsigned char* store){
-    static unsigned char hst[4096]; hst_init(hst);
+    static unsigned char hst[4096]; hst_close(hst); hst_init(hst);
     struct stat hs;
     if(stat("headers.dat",&hs)==0 && hs.st_size>=112) hst_reload(hst);
     long have = hst_count(hst); long tip = *(int*)(store + 24); long n = 0;   /* store tip lives at +24 (store_get_tip takes (st, out_meta[3]), not one arg) */
-    if(have <= 0 || tip < 0) return 0;               /* an empty mirror is seeded with genesis by dlc_headers */
+    static unsigned char hb[4u<<20];   /* store_read_at returns the WHOLE block (a 128-byte stack buffer SEGV-looped the q boot) */
+    if(have < 0 || tip < 0){ hst_close(hst); return 0; }
+    if(have == 0){
+        unsigned char gh[32], ah[32]; block_hash(gh, g_chainp->genesis);
+        if(store_read_at(store, 0, hb, sizeof hb) < 80){ hst_close(hst); return 0; }
+        block_hash(ah, hb);
+        if(memcmp(ah, gh, 32) != 0){
+            fprintf(stderr,"[dl] header mirror is empty and the archive's block 0 is not this chain's genesis: not seeding it\n");
+            hst_close(hst); return 0;
+        }
+    }
     for(long h = have; h <= tip; h++){
-        static unsigned char hb[4u<<20];   /* store_read_at returns the WHOLE block (a 128-byte stack buffer SEGV-looped the q boot) */
         if(store_read_at(store, (unsigned long)h, hb, sizeof hb) < 80) break;
         unsigned char bh[32]; block_hash(bh, hb);
         if(hst_append(hst, hb, bh) < 0) break;
         n++;
     }
     if(n) fprintf(stderr,"[dl] header mirror +%ld from the archive (now %ld, archive tip %ld)\n", n, hst_count(hst), tip);
+    hst_close(hst);
     return n;
 }
 
@@ -6748,7 +6775,7 @@ static void dlc_hr_release(void){                /* after the replay: the hold k
     g_hr_buf = 0; g_hr_blen = 0; g_hr_base = g_hr_hi = -1;
 }
 static long dlc_headers(char live[][DL_POOL_SLOT], int nlive){
-    static unsigned char hst[4096]; hst_init(hst);
+    static unsigned char hst[4096]; hst_close(hst); hst_init(hst);
     struct stat hs;
     dl_header_mirror_topup(store_buf);
     if(stat("headers.dat",&hs)==0 && hs.st_size>=112) hst_reload(hst);
@@ -11132,7 +11159,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                                  * (readers self-heal via header sync anyway) */
                                 { static unsigned char hstate[128];
                                   if (hst_init(hstate) == 1 && hst_reload(hstate) >= 0)
-                                      hst_append(hstate, sblk, bh); }
+                                      hst_append(hstate, sblk, bh);
+                                  hst_close(hstate); }
                                 /* announce to the outbound legs (inv MSG_BLOCK) */
                                 { unsigned char inv[37]; inv[0]=1;
                                   inv[1]=2; inv[2]=0; inv[3]=0; inv[4]=0;   /* MSG_BLOCK */

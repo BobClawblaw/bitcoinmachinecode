@@ -3008,12 +3008,24 @@ test, and the bug was in the measurement.
     it. `test_reorg` checks the fork tree after each staged reorg (depths 1,
     3, 12, 101 and a shorter-but-heavier branch; all five fail against the old
     `reorg.c`), `test_hdr_tree` the file format.
-- **Found while testing the above, OPEN:** `invalidateblock` finds its block
-  by scanning `headers.dat` (`daemon/main.c` txoq_mark_block), and a node
-  that follows its peers block by block through the keep-up path never
-  writes `headers.dat` (0 bytes on the regtest node), so there it answers -5
-  "Block not found" for every block, its own tip included. A node that synced
-  headers-first is unaffected.
+- ~~**Found while testing the above, OPEN:** `invalidateblock` answers -5
+  "Block not found" on a node with an empty `headers.dat`.~~ **CLOSED
+  2026-11-05.** `invalidateblock` finds its block by scanning `headers.dat`
+  (`daemon/main.c` txoq_mark_block). The worker derives that file from the
+  archive after every stored block (`dl_header_mirror_topup`), but returned
+  at once on an EMPTY mirror and left the genesis seed to the boot
+  catch-up's header phase, which a node following its peers block by block
+  never runs: the file stayed 0 bytes for good. The top-up now seeds an
+  empty mirror from the archive, from height 0, when the archive's block 0
+  is the chain's genesis. Found beside it: `hst_init` opens `headers.dat`
+  without closing the descriptor already held, and the top-up re-inits once
+  per stored block, so the worker kept one descriptor per block
+  (production: 65 after 65 blocks, soft limit 1024). Every re-init in the
+  daemon now closes first. Evidence: regtest, 40 blocks mined one at a time
+  -- before: 0 records, 41 descriptors on `headers.dat`, -5; after: 46
+  records, 0, the block invalidated. `validation/zmq_sequence_core_diff.py`
+  against v31.1: 51 passed, 0 failed (before: aborted at its invalidate
+  phase on -5).
 - **Observed, not yet measured further:** right after a reorg,
   `getbestblockhash` names the new tip about 0.3 s before the hash index can
   resolve it (`[idx] fold` lands after `[reorg] complete`); a
