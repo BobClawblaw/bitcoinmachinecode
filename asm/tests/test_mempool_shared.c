@@ -29,6 +29,10 @@ extern int  mempool_configure(void);
 extern void mp_lock(void);
 extern void mp_unlock(void);
 extern long mempool_time_of(const unsigned char* txid);
+extern long mempool_height_of(const unsigned char* txid);
+extern void mempool_set_height_fn(long (*fn)(void));
+static long g_test_tip = 777;
+static long test_tip(void){ return g_test_tip; }
 extern void mempool_note_accept(const unsigned char* txid);
 extern const unsigned char* mpool_wtxid_at_slot(const void*, unsigned long);
 extern long mpool_del(void*, const unsigned char*);
@@ -88,6 +92,10 @@ int main(void){
     memset(txid1, 0x11, 32); memset(tx1, 0xAA, sizeof tx1);
     memset(txid2, 0x22, 32); memset(tx2, 0xBB, sizeof tx2);
 
+    /* getmempoolentry's "height" (2026-11-06): the tip at entry, written
+     * beside the arrival time by the accepting process */
+    mempool_set_height_fn(test_tip);
+
     /* ---- the point of the slice: child writes, parent sees ---- */
     pid_t pid = fork();
     if (pid == 0){
@@ -110,6 +118,8 @@ int main(void){
     ck("parent reads tx2 bytes back", p2 && l2==sizeof tx2 && p2[0]==0xBB);
     ck("arrival time visible cross-process", mempool_time_of(txid1) > 0);
     ck("no arrival record for un-stamped tx", mempool_time_of(txid2) == 0);
+    ck("entry height visible cross-process: the tip the child accepted at", mempool_height_of(txid1) == 777);
+    ck("no entry height for an un-stamped tx", mempool_height_of(txid2) == 0);
 
     /* ---- a second process must ADOPT, never re-init (serve.asm contract):
      * with mp_ext_inited set, the pool it inherits still holds both txs. ---- */

@@ -1674,7 +1674,7 @@ typedef struct { unsigned char id[32]; unsigned long vs, w; long inf; unsigned c
                  /* 2026-10-06, the snapshot path (see cmd_getrawmempool): what
                   * mpe_entry_obj used to read from the pool and its hooks,
                   * copied under the pool lock so the build can run after it */
-                 unsigned char wtxid[32]; long tm; long long pri; unsigned long ord; } mpe_vs_t;
+                 unsigned char wtxid[32]; long tm; long long pri; unsigned long ord; long ht; } mpe_vs_t;
 static mpe_vs_t* g_mpe_vs; static unsigned long g_mpe_vs_n;
 /* 1 while verbose getrawmempool builds its entries AFTER releasing the pool
  * lock: every per-entry input then comes from g_mpe_vs / g_mpe_g, and
@@ -1938,6 +1938,7 @@ static int cmd_getrawmempool(const rj_val* params, rj_val** res, long* ec, const
                     if (g_mph.sha256d) memcpy(v->wtxid, e2.wtxid, 32);
                     else memcpy(v->wtxid, e2.txid, 32);
                     v->tm = g_mph.time_of ? g_mph.time_of(e2.txid) : 0;
+                    v->ht = g_mph.height_of ? g_mph.height_of(e2.txid) : 0;
                     v->pri = pri_delta_of(e2.txid);
                     v->ord = g_mpe_vs_n;           /* the pool's order, the reply's */
                     g_mpe_vs_n++;
@@ -2218,7 +2219,11 @@ static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx,
     rj_obj_set(o, "weight", rj_numf("%lu", w));
     rj_obj_set(o, "time", rj_numf("%ld", g_mpe_snap ? g_mpe_vs[sk].tm
                                           : (g_mph.time_of ? g_mph.time_of(txid) : 0)));
-    rj_obj_set(o, "height", rj_numf("%d", 0));   /* documented gap: entry height untracked */
+    /* Core: the chain height when the tx entered the pool (CTxMemPoolEntry
+     * entryHeight; a mempool.dat reload enters at the height then). It was
+     * the constant 0 until 2026-11-06 ("entry height untracked"). */
+    rj_obj_set(o, "height", rj_numf("%ld", g_mpe_snap ? g_mpe_vs[sk].ht
+                                            : (g_mph.height_of ? g_mph.height_of(txid) : 0)));
 
     /* ancestor/descendant sums of the same entry size, over set members
      * STILL IN THE POOL; bip125-replaceable over the same ancestor set */
@@ -2419,6 +2424,7 @@ static int mpe_snapshot_component(const unsigned char seed[32]){
         v->inf = -1;
         if (g_mph.sha256d) g_mph.sha256d(v->wtxid, tx, len); else memcpy(v->wtxid, id, 32);
         v->tm = g_mph.time_of ? g_mph.time_of(id) : 0;
+        v->ht = g_mph.height_of ? g_mph.height_of(id) : 0;
         v->pri = pri_delta_of(id);
         v->ord = nv;
         nv++;
