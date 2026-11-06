@@ -2481,3 +2481,35 @@ were still on disk. Nothing in them is new measurement.
   - `NRestarts=0` and `active` at 33 minutes; no `[crash]` line.
   - Feelers: 8 alive and 8 dead since the restart.
 - **Rollback:** relink to `deploy-20261106a`. No on-disk format changed.
+
+## 2026-11-06 04:49Z — `deploy-20261106c`: mempool entries report the height they entered at (PR #472)
+
+- **What:** `main` at `67ab5366`. #472: `getmempoolentry`'s `height`, and
+  the same field in verbose `getrawmempool` and the verbose ancestor and
+  descendant calls, was the constant 0. It is now the chain height when the
+  transaction entered the pool, as Core's; a `mempool.dat` reload enters at
+  the height then. The accept path records the connected tip beside the
+  arrival time in the table every accepting process shares.
+- **Checked before the merge:** `make test` passes on x86 (gate-log-check:
+  all 480 gated tests ran); on the Mac `test_mempool_shared`,
+  `test_mempool_persist` and `test_rpc_node` pass. On regtest against Core
+  v31.1 the heights agree at entry, across an empty block and after each
+  node's own reload; the previous build reported 0 throughout.
+- Built from clean (`make -B daemon/bmcbitcoind` and the helpers by name) in
+  a clean worktree at the merge commit. All five exec'd helpers were
+  byte-identical; none was replaced. Wallet files were copied first.
+  `MALLOC_ARENA_MAX=4` stays in place.
+- **Started:** 04:49:25Z at tip 974,761 (= the oracle); RPC answered at
+  974,761 by 04:50:15Z. Before the restart a sampled entry read
+  `height=0`; the entries reloaded from `mempool.dat` read 974,761, the
+  tip at the reload.
+- **Verified live:**
+  - New block 974,762 applied with the Core v31.1 oracle's hash
+    (`000000000000000000018c9441a61c9c2b0724683c2c2e7aedf14ff75cbb0cf3`)
+    by 04:53:02Z.
+  - `NRestarts=0` and `active` at 12 minutes; no `[crash]` line.
+  - Entry heights against the oracle's mempool: of the 2,116 transactions
+    in both pools that the oracle entered at 974,762, bmc reports 974,762
+    for 2,113. The other 3 read 974,761 on bmc: accepted in the moment
+    before bmc connected the block the oracle had already connected.
+- **Rollback:** relink to `deploy-20261106b`. No on-disk format changed.
