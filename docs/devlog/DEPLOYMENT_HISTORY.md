@@ -2653,3 +2653,49 @@ were still on disk. Nothing in them is new measurement.
     descriptors in the main process. Peers: 5 at 10 minutes, 7 at 18
     (10 at 18 minutes after the 14:57Z start).
 - **Rollback:** relink to `deploy-20261106e`. No on-disk format changed.
+
+## 2026-11-06 18:06Z — `deploy-20261106g`: systemd's watchdog, fed while the download worker progresses (PR #481)
+
+- **What:** `main` at `a440e37a`. #481: a dead worker already restarted
+  the unit; a worker alive but stuck never did (2026-10-19, 42 minutes in
+  one ZMQ loop; 2026-10-30 to 11-02, about 3.6 days under memory
+  throttling, the unit "active" throughout). With `WatchdogSec=` set, the
+  serve parent now sends systemd `WATCHDOG=1` only while the worker's
+  progress stamp moves (each rotation of its loop, each block of a
+  catch-up pass, each status tick of the parallel downloader). On a timeout
+  systemd sends `SIGABRT` to every process in the unit, each logs its
+  `[crash]` stack, and `Restart=on-failure` restarts it.
+- **Checked before the merge:** `tests/test_sd_watchdog` (new, 26 checks;
+  14 on the Mac, where it stays off). `validation/watchdog_regtest_e2e.py`
+  (new) under a real systemd user unit with `WatchdogSec=20s`: a healthy
+  node stayed active for 5 timeouts while following new blocks, and with
+  only the worker frozen systemd fired 23.7 s later with `Result=watchdog`.
+  The previous build is killed while healthy under the same unit (it never
+  pings); a mutation that pings regardless of the stamp fails both checks.
+  `make test` passes on x86 (gate-log-check: all 481 gated tests ran). A
+  first gate run failed `test_dlc_interleave`'s timed idle-tick check once
+  (572 of 599); it passed 29 runs on the branch and 29 on `main`, and the
+  rerun gate. The Mac daemon builds.
+- Built from clean (`make -B daemon/bmcbitcoind` and the helpers by name) in
+  a clean worktree at the merge commit, with no warnings. All five exec'd
+  helpers were byte-identical; none was replaced. Wallet files were copied
+  first. `MALLOC_ARENA_MAX=4` stays in place.
+- **Unit:** new drop-in `bmcbitcoind.service.d/70-watchdog.conf` with
+  `WatchdogSec=10min`, installed with `daemon-reload` in the same step as
+  the relink and restart (an older binary never pings, so the drop-in must
+  never precede the build). systemd reports `WatchdogUSec=10min`,
+  `NotifyAccess=main`.
+- **Started:** 18:06:15Z at tip 974,833 (= the oracle). The log's
+  `[watchdog] systemd watchdog 600s` line came at 18:07:04Z, with the
+  worker's fork; RPC answered at 974,833 by 18:07:07Z.
+- **Verified live:**
+  - `NRestarts=0` and `active` at 11 minutes, past one full watchdog
+    period, with systemd's `WatchdogTimestamp` advancing (18:17:04Z, then
+    18:24:35Z); no `[crash]` line; 51 open descriptors in the main process;
+    13 peers.
+  - New block 974,834 applied with the Core v31.1 oracle's hash
+    (`00000000000000000001d8c20c7e8a71baaaab7baaf2c1088aba074c62b18c8b`)
+    at 18:24:43Z.
+- **Rollback:** remove `70-watchdog.conf` and `daemon-reload` FIRST, then
+  relink to `deploy-20261106f` and restart. Relinking with the drop-in in
+  place gets the older build killed ten minutes after it starts.
