@@ -2613,3 +2613,43 @@ were still on disk. Nothing in them is new measurement.
   `docs/FEATURE_GAPS.md`.
 - **Rollback:** relink to `deploy-20261106d`. It reads `mempool.dat` as
   before and skips the unbroadcast section; it writes the section empty.
+
+## 2026-11-06 16:31Z — `deploy-20261106f`: a `mempool.dat` load announces nothing, as Core's does (PR #479)
+
+- **What:** `main` at `f8fb869f`. #479: the startup load and
+  `importmempool` re-submitted every `mempool.dat` entry through the
+  `sendrawtransaction` channel, whose accept queued an announcement on every
+  outbound leg and put the accept on the ring every inbound peer reads (the
+  09:04Z boot queued 37,200). An entry already in the pool was announced
+  again and counted as admitted. Core's `LoadMempool` admits through
+  `AcceptToMemoryPool` and never calls `RelayTransaction`. The loader now
+  stages with `tx_submit_norelay`; the worker admits those entries through
+  `txsub_accept_quiet`, which queues nothing for the legs and keeps the
+  accept off the announce ring. An entry already in the pool stays -27 and
+  is counted as already there, which `importmempool`'s log line now prints.
+- **Checked before the merge:** `validation/reload_announce_core_diff.py`
+  (new) runs bmc and a second Core v31.1 with a Core peer on their outbound
+  leg and a Core observer on their inbound side, both logging every `inv`:
+  32 of 32 checks equal to Core, including a control in which each
+  subject's own `sendrawtransaction` reaches both peers; `deploy-20261106e`
+  fails 3 (60 invs to each peer after an `importmempool`, 60 again to the
+  outbound peer after a second one). `make test` passes on x86
+  (gate-log-check: all 480 gated tests ran); `test_tx_submit`'s new checks
+  fail with either half of the fix reverted. On the Mac `test_tx_submit`,
+  `test_tx_relay`, `test_mempool_persist` and `test_rpc_node` pass.
+- Built from clean (`make -B daemon/bmcbitcoind` and the helpers by name) in
+  a clean worktree at the merge commit, with no warnings. All five exec'd
+  helpers were byte-identical; none was replaced. Wallet files were copied
+  first. `MALLOC_ARENA_MAX=4` stays in place.
+- **Started:** 16:31:54Z at tip 974,824 (= the oracle); RPC up at
+  16:32:45Z. The pool reload finished at 16:33:55Z: 59,761 of 59,761
+  transactions, and no "queued for announcement" line (the 14:57Z boot
+  logged one during its reload).
+- **Verified live:**
+  - New block 974,825 applied with the Core v31.1 oracle's hash
+    (`000000000000000000007df6a841e4115f926510966dbf7864cb9cabcfd9c060`)
+    at 16:35:24Z.
+  - `NRestarts=0` and `active` at 10.5 minutes; no `[crash]` line; 62 open
+    descriptors in the main process. Peers: 5 at 10 minutes, 7 at 18
+    (10 at 18 minutes after the 14:57Z start).
+- **Rollback:** relink to `deploy-20261106e`. No on-disk format changed.
