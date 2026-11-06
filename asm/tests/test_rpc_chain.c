@@ -217,7 +217,17 @@ static void fx_write_sorted(const char* path, fx_rec_t* recs, int n, long from, 
         while (j >= 0 && memcmp(recs[j].pre, k.pre, 8) > 0){ recs[j+1] = recs[j]; j--; }
         recs[j+1] = k;
     }
-    FILE* f = fopen(path, "wb");
+    /* Written to <path>.tmp and renamed into place, as build_tx_index and
+     * the merger write runs (2026-11-05). Written in place, the file existed
+     * with a zeroed header while it was filled: a lane's rescan in that
+     * window skipped it as torn, nothing changed the directory again, and
+     * irs_refresh rescans at most once a second otherwise -- so the race
+     * test's lookup right after the rewrites could miss the index ("...and
+     * the index still answers after the rewrites": one x86 gate run). With
+     * that window widened to 5 ms the in-place fixture failed 10 of 10, this
+     * one 0 of 10. */
+    char tmp[320]; snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    FILE* f = fopen(tmp, "wb");
     unsigned char hdr[48]; memset(hdr, 0, sizeof hdr);
     fwrite(hdr, 1, 48, f);
     for (int i = 0; i < n; i++){
@@ -241,6 +251,7 @@ static void fx_write_sorted(const char* path, fx_rec_t* recs, int n, long from, 
     for (int b = 0; b < 4; b++) hdr[36+b] = (unsigned char)((unsigned int)to >> (8*b));
     fseek(f, 0, SEEK_SET); fwrite(hdr, 1, 48, f);
     fclose(f);
+    if (rename(tmp, path) != 0){ printf("FAIL rename %s\n", tmp); exit(1); }
 }
 /* 2026-09-16: heights (base_to, run_to] go into a RUN file
  * (txindex.r<from>-<to>.dat, daemon/index_runs.h) so every by-txid assertion
