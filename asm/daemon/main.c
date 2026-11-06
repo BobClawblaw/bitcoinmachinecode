@@ -92,6 +92,7 @@ static void mempool_refresh_seqlocks(void* store_buf, long now_tip);
 #include "chainparams.h" /* runtime chain selection (main / regtest)   */
 #include "benchlog.h"    /* 2026-10-04: the [bench] index line and the [ready] finish line */
 #include "dlc_benchlog.h" /* 2026-10-04: the [bench] per-chunk download line (bmc.benchlog) */
+#include "sd_watchdog.h"  /* 2026-11-06: systemd's watchdog, fed while the worker progresses */
 
 /* The node log path, chain-tagged so an aggregated view can never confuse
  * chains: logs/bitcoind.log on mainnet, logs/bitcoind.<chain>.log otherwise
@@ -2415,10 +2416,18 @@ static long txoq_mark_block(void* store_buf, const unsigned char hash[32], int o
 static void* g_txoq_store = NULL;                 /* CC-10: set by the worker before its rotation */
 static void txoq_service(void);
 static void txoq_service_mode(int allow_marks);
-/* The catch-up loop's between-block hook: publish the connected tip (3.1) so
- * the parent's RPCs and the serve children follow a long catch-up call block
- * by block, then answer pending gettxout queries (a no-op without the IPC). */
-static void dl_apply_hook(void){ dl_publish_connected_tip(); txoq_service(); }
+/* the worker's progress stamp for the systemd watchdog (daemon/sd_watchdog.c):
+ * the serve parent pings systemd only while this moves */
+static void wd_beat(void){
+    if(!g_node_status) return;
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    g_node_status->wd_worker_ms = t.tv_sec*1000LL + t.tv_nsec/1000000;
+}
+/* The catch-up loop's between-block hook: stamp the worker's progress (the
+ * watchdog), publish the connected tip (3.1) so the parent's RPCs and the
+ * serve children follow a long catch-up call block by block, then answer
+ * pending gettxout queries (a no-op without the IPC). */
+static void dl_apply_hook(void){ wd_beat(); dl_publish_connected_tip(); txoq_service(); }
 static void txoq_service(void){ txoq_service_mode(1); }
 /* 2026-09-26: the worker's idle rest (all legs quiet: 200 ms before the next
  * rotation) was a blind usleep, and on a quiet node it was where gettxout
@@ -8697,6 +8706,7 @@ static long dl_catchup_run(const char* dir, int min_workers){
     int dlc_table_this_tick = 1;
     while(alive>0){
         long done = 0;
+        wd_beat();   /* the parallel downloader's status tick: the worker is alive in here for hours during IBD */
         if(next_claim[DLC_CTL_WANT_ANCHOR]) dlc_publish_anchor(next_claim, start_h);   /* before a connect call that may run for seconds */
         dlc_stall_tick(next_claim, stats, kids, opid, nw, start_h, end_h, dlc_now_ms(), live, nlive, banned);   /* Core's rule, every pass (2026-09-10) */
         legs_sweep_except(-1);                                                            /* row 3: the legs stay served through a handoff */
@@ -10110,6 +10120,7 @@ static void dlc_crash_handler(int sig, siginfo_t* si, void* uctx){
 #endif
 
 static void serve_download_worker(const char* dir, const char* peers[], int pool_len, int out_port){
+    wd_beat();
     signal(SIGPIPE, SIG_IGN);
     signal(SIGCHLD, SIG_IGN);
 #ifdef __APPLE__
@@ -10768,6 +10779,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     int apply_first_prev = 0;
     long long dl_parallel_last_s = 0;
     for(;;){
+        wd_beat();   /* one rotation: the systemd watchdog's progress stamp */
         dl_publish_peer_table(store_buf, 1);   /* the peer table the RPC reads (2026-09-16: shared with dl_catchup) */
         /* peer control: one command per ack, executed HERE because this is the
          * process that holds the legs. Every branch reports what it actually
@@ -12899,6 +12911,9 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
             if(g_cfg.pidfile[0]) unlink(g_cfg.pidfile);
             _exit(0);
         }
+        /* systemd's watchdog: ping only while the worker's stamp moves (no-op
+         * without WatchdogSec=; daemon/sd_watchdog.c) */
+        if(g_node_status) sdw_tick(mono_now_ms(), g_node_status->wd_worker_ms);
         int pr=poll(pfds, nfds, 300);
         if(pr<0){ if(errno==EINTR) continue; break; }
         /* -mempoolexpiry sweep. Bounded scan of a fixed table, so running it
@@ -14367,6 +14382,13 @@ int main(int argc, char** argv){
           }
           else fprintf(stderr,"[serve] gettxout IPC unavailable (socketpair: %s) -- gettxout will refuse\n", strerror(errno)); }
 
+        /* systemd's watchdog (WatchdogSec= on the unit): read and cleared
+         * here, in the main PID, before any child inherits it */
+        { long long wdms = sdw_init();
+          if(wdms > 0){
+              if(g_node_status) g_node_status->wd_worker_ms = mono_now_ms();
+              fprintf(stderr,"[watchdog] systemd watchdog %llds: this process pings while the download worker's progress stamp moves\n", wdms/1000);
+          } }
         pid_t dl = fork();
         if(dl==0){
             { extern void mp_fork_child_reset(void) __attribute__((weak));

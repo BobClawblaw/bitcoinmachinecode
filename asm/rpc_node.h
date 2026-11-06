@@ -572,6 +572,12 @@ typedef struct {
      * reattempt (2026-11-06). Every stager writes it; the worker reads and
      * clears it before it branches. Appended: every offset above is unchanged. */
     volatile int              tx_submit_norelay;
+    /* The download worker's progress stamp (CLOCK_MONOTONIC ms), written at
+     * each rotation of its loop, between blocks of a catch-up pass and at each
+     * parallel-downloader status tick. The serve parent feeds systemd's
+     * watchdog only while it moves (daemon/sd_watchdog.c, 2026-11-06).
+     * Appended: every offset above is unchanged. */
+    volatile long long        wd_worker_ms;
 } node_status_t;
 #define NODE_TIP_UNTRACKED (-2LL)
 
