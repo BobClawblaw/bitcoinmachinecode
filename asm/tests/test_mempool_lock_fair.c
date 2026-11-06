@@ -15,9 +15,10 @@
  * lock, so the woken waiter gets it. Watched to fail first: without the
  * deferral, the longest wait is 2.8-3.7 s.
  *
- * The deferral is in the Mac's lock (mp_rlock_lock). Linux takes a
- * process-shared pthread_mutex, which may barge the same way; until it
- * gets the same treatment the check is N/A there (x86 note, item 30). */
+ * The deferral is in the Mac's lock (mp_rlock_lock) and, since 2026-11-06,
+ * in front of Linux's process-shared pthread_mutex (mp_defer_newcomer),
+ * which barged the same way: on x86 the longest wait was 4.7-8.0 s before
+ * it (x86 note item 30). */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -42,10 +43,6 @@ static double now_ms(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &
 static int cmp_d(const void* a, const void* b){ double x = *(const double*)a, y = *(const double*)b; return (x > y) - (x < y); }
 
 int main(void){
-#ifndef __APPLE__
-    printf("N/A   lock fairness (the deferral is in the Mac's lock; x86 note item 30)\n");
-    return 0;
-#endif
     g_cfg.maxmempool_mb = 8;
     ck("mempool_configure(8MB)", mempool_configure() == 1 && mp_ext_area != NULL);
     mp_lock_set_log_ms(0);

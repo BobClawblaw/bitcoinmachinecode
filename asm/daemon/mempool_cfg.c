@@ -117,6 +117,10 @@ typedef struct {
     uint64_t takes;                  /* every take, under the lock */
     long     conv_max_ms;            /* the longest hold released while someone waited */
     char     conv_max_site[96];
+    /* Linux's newcomer deferral (2026-11-06, mp_defer_newcomer): a 32-bit
+     * take count to sleep on with a futex, and how many are sleeping */
+    uint32_t take_seq;
+    uint32_t deferring;
 } mp_lockpage_t;
 static mp_lockpage_t*   g_mp_page  = 0;
 static pthread_mutex_t* g_mp_mutex = 0;   /* &g_mp_page->lk.mu */
@@ -255,6 +259,37 @@ static void mp_rlock_unlock(mp_rlock_t* l){
     if (__atomic_load_n(&l->waiters, __ATOMIC_SEQ_CST))
         os_sync_wake_by_address_any(&l->word, sizeof l->word, OS_SYNC_WAKE_BY_ADDRESS_SHARED);
 }
+#else
+/* 2026-11-06: the same deferral on Linux (x86 note item 30). The lock is a
+ * process-shared robust pthread_mutex, and glibc's lets the unlocking thread
+ * take it straight back ahead of the waiter it just woke: behind a client
+ * that takes, holds 3 ms and takes again at once, test_mempool_lock_fair's
+ * waiter got in after 4.7-8.0 s (five runs; the poller stops at 8 s) --
+ * the starvation the Mac's lock had. So, as there: a thread that arrives
+ * while others are already waiting first sleeps until somebody else takes
+ * the lock -- take_seq moving -- or 1 ms, whichever is first, and only then
+ * calls pthread_mutex_lock. The sleep is a futex on the shared page (not
+ * FUTEX_PRIVATE: the waiters are in other processes); each take wakes the
+ * deferrers. Bounded at 1 ms it is not a queue and cannot wedge, and the
+ * mutex keeps its robustness (EOWNERDEAD) untouched. */
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <limits.h>
+static void mp_defer_newcomer(mp_lockpage_t* pg){
+    if (!__atomic_load_n(&pg->waiting, __ATOMIC_SEQ_CST)) return;        /* nobody to let in first */
+    uint32_t t = __atomic_load_n(&pg->take_seq, __ATOMIC_SEQ_CST);
+    __atomic_add_fetch(&pg->deferring, 1, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&pg->waiting, __ATOMIC_SEQ_CST)){
+        struct timespec ts = { 0, 1000 * 1000 };
+        syscall(SYS_futex, &pg->take_seq, FUTEX_WAIT, t, &ts, NULL, 0);   /* returns at once if a take already moved it */
+    }
+    __atomic_sub_fetch(&pg->deferring, 1, __ATOMIC_SEQ_CST);
+}
+static void mp_wake_deferrers(mp_lockpage_t* pg){
+    __atomic_add_fetch(&pg->take_seq, 1, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&pg->deferring, __ATOMIC_SEQ_CST))
+        syscall(SYS_futex, &pg->take_seq, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
+}
 #endif
 static volatile int g_mp_inflight = 0;      /* this process's threads entering or inside */
 static volatile int g_mp_closed   = 0;      /* mp_quiesce ran: park, do not enter */
@@ -345,12 +380,16 @@ void mp_lock_at(const char* site){
         site = sitebuf[0] ? sitebuf : "(unnamed)";
     }
     struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+#ifndef __APPLE__
+    mp_defer_newcomer(g_mp_page);                     /* before counting ourselves as waiting */
+#endif
     uint64_t takes0 = __atomic_load_n(&g_mp_page->takes, __ATOMIC_SEQ_CST);
     __atomic_add_fetch(&g_mp_page->waiting, 1, __ATOMIC_SEQ_CST);
 #ifdef __APPLE__
     int r = mp_rlock_lock(MP_RL);
 #else
     int r = pthread_mutex_lock(g_mp_mutex);
+    mp_wake_deferrers(g_mp_page);
 #endif
     __atomic_sub_fetch(&g_mp_page->waiting, 1, __ATOMIC_SEQ_CST);
     clock_gettime(CLOCK_MONOTONIC, &g_ml_took);
