@@ -50,15 +50,13 @@ static long ms_in(const char* line, const char* key){
     return atol(p + strlen(key));
 }
 
-#ifdef __APPLE__
-/* E: six convoy threads -- take, hold 3 ms, release, take again at once */
+/* E: convoy threads -- take, hold 3 ms, release, take again at once */
 static volatile int g_convoy_stop;
 static void* convoy_thread(void* a){
     (void)a;
     while (!g_convoy_stop){ mp_lock_at("convoy_site"); usleep(3000); mp_unlock(); }
     return NULL;
 }
-#endif
 /* A: the holder -- three named steps, ~120 ms each */
 static void* holder_thread(void* a){
     int wfd = *(int*)a;
@@ -180,14 +178,11 @@ int main(void){
      * convoy is still the thing pinned, at a smaller scale: twelve holders
      * and a 20 ms threshold -- a 20 ms wait made of 3 ms holds is a convoy
      * that no single hold explains.
-     * Mac only (2026-11-05): E needs that fair handoff. Linux takes a
-     * process-shared pthread_mutex that lets a releaser barge, so twelve
-     * convoy threads starve the waiter outright -- on x86 the waiter had not
-     * got in after four minutes and the gate hung. N/A there until the
-     * deferral is ported, as for test_mempool_lock_fair (x86 note item 30). */
-#ifndef __APPLE__
-    printf("N/A   E: convoy wait line (needs the Mac's fair handoff; x86 note item 30)\n");
-#else
+     * It needs that fair handoff: on Linux, before the same deferral went in
+     * front of the process-shared pthread_mutex (2026-11-06), twelve convoy
+     * threads starved the waiter outright -- the waiter had not got in after
+     * four minutes and the x86 gate hung, so E was Mac-only from 2026-11-05
+     * to 2026-11-06 (x86 note item 30). */
     mp_lock_set_log_ms(20);
     { const char* cl = NULL; long waited = -1;
       for (int attempt = 0; attempt < 8 && !cl; attempt++){   /* a fair handoff can let the waiter in early; under a loaded suite that happened 3 times running once */
@@ -222,7 +217,6 @@ int main(void){
           ck("E: no hold line was written by anyone (no hold reached the threshold)", strstr(log, "convoy_site (pid ") == NULL || strstr(strstr(log, "convoy_site (pid "), ") held ") == NULL);
       }
     }
-#endif
     mp_lock_set_log_ms(100);
     /* the convoy's reset: with nobody waiting, the next quiet take reports no convoy */
     mp_lock_at("quiet_after"); mp_unlock();
