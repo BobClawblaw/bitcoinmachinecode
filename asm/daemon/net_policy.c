@@ -3,6 +3,7 @@
  *
  *   full-relay        (8)  tx + block relay, addr gossip   [we already had this]
  *   block-relay-only  (2)  headers/blocks ONLY -- relay=0, never gossiped
+ *                          (dialled by the dial helpers, main.c CC-4)
  *   feeler            (1)  short-lived, ~every 2 min, tests one book entry
  *
  * WHY BLOCK-RELAY-ONLY. Core 0.19 added these as an anti-eclipse measure. They
@@ -28,6 +29,7 @@
  * can contribute.
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -42,9 +44,52 @@ extern long p2p_write(int,const char*,unsigned,const void*,unsigned);
 extern int  p2p_read(int,char[12],void*,unsigned,unsigned*);
 extern void fd_close(int);
 
-static void np_u32(unsigned char*p,unsigned v){p[0]=v;p[1]=v>>8;p[2]=v>>16;p[3]=v>>24;}
-static void np_u64(unsigned char*p,unsigned long long v){for(int i=0;i<8;i++){p[i]=v&0xff;v>>=8;}}
-static void np_u16(unsigned char*p,unsigned v){p[0]=v>>8;p[1]=v&0xff;}
+/* The version message every secondary connection sends (2026-11-06): the
+ * feeler here and seednode address gathering (addr_ingest.c). Each used to
+ * hand-build its own -- /Satoshi:25.0.0/ or /Satoshi:0.18.0/, services=1,
+ * the constant nonce 0x11223344, start height 0 or 789000, port 8333 --
+ * copies of the asm handshake from before its 2026-09-09 fixes, which they
+ * never received. The full-relay and block-relay-only legs send
+ * node_make_version's (bitcoind.asm: our user agent and -uacomment, our
+ * service bits, a random nonce, our tip and listen port), and Core sends
+ * the same version on every kind of connection. main.c registers that
+ * builder and the chain's default port at boot; without a builder these
+ * connections are not made. */
+static long (*g_np_version)(unsigned char* out);
+static unsigned short g_np_default_port = 8333;
+void net_policy_set_version(long (*build)(unsigned char* out), unsigned short default_port){
+    g_np_version = build;
+    if(default_port) g_np_default_port = default_port;
+}
+/* The version payload into v (512 bytes: 81 + a 255-byte agent + 5). relay
+ * 0/1 sets the fRelay byte, the payload's last; -1 keeps the builder's,
+ * which is 0 under -blocksonly. Returns the length, or -1. */
+long net_version_payload(unsigned char* v, int relay){
+    if(!g_np_version) return -1;
+    long n = g_np_version(v);
+    if(n < 86 || n > 512) return -1;
+    if(relay >= 0) v[n - 1] = (unsigned char)(relay ? 1 : 0);
+    return n;
+}
+/* "a.b.c.d" or "a.b.c.d:port", the candidate pool's form; a bare address
+ * takes the chain's default port. 1 / 0. The feeler used to hand the pool
+ * entry straight to inet_pton, which refuses "a.b.c.d:port": every feeler
+ * failed before dialing (production, 2026-09-27..11-05: 23,687 probes, 0
+ * alive). */
+int net_parse_v4(const char* s, unsigned* ip, unsigned short* port){
+    char host[64]; const char* colon = strrchr(s, ':');
+    size_t hl = colon ? (size_t)(colon - s) : strlen(s);
+    if(hl == 0 || hl >= sizeof host) return 0;
+    memcpy(host, s, hl); host[hl] = 0;
+    if(inet_pton(AF_INET, host, ip) != 1) return 0;
+    *port = g_np_default_port;
+    if(colon){
+        char* end; long p = strtol(colon + 1, &end, 10);
+        if(end == colon + 1 || *end || p <= 0 || p > 65535) return 0;
+        *port = (unsigned short)p;
+    }
+    return 1;
+}
 
 /* IPv4 netgroup == the /16, matching Core's grouping for IPv4. `ip` is in the
  * host-order-of-network-bytes form used throughout this daemon (see
@@ -53,16 +98,16 @@ unsigned net_netgroup_v4(unsigned ip){
     return ip & 0x0000FFFFu;      /* first two octets */
 }
 
-/* Version/verack handshake with an explicit relay flag.
- *   relay=1 -> ordinary full-relay peer
- *   relay=0 -> block-relay-only: peer must not send us transactions
- * Returns a live post-verack fd, or -1. The asm node_handshake hardcodes
- * relay=1 (bitcoind.asm), so block-relay-only needs its own path; this also
- * keeps the flag visible at the call site instead of buried in the wire
- * layout. */
+/* Version/verack handshake with an explicit relay flag, to "a.b.c.d[:port]".
+ *   relay=1 -> the peer may send us transactions
+ *   relay=0 -> it must not (Core: block-relay-only and feeler connections)
+ * Returns a live post-verack fd, or -1. The feeler's path; the legs go
+ * through the dial helpers' node_handshake. */
 int net_handshake_relay(const char* ip_str, int relay, int rcv_secs){
-    unsigned ip;
-    if(inet_pton(AF_INET, ip_str, &ip)!=1) return -1;
+    unsigned ip; unsigned short port;
+    if(!net_parse_v4(ip_str, &ip, &port)) return -1;
+    unsigned char v[512]; long vl = net_version_payload(v, relay);
+    if(vl < 0) return -1;
 
     /* NON-BLOCKING connect with a bounded wait. tcp_connect_ip() is a plain
      * blocking connect() with NO connect-phase timeout (SO_RCVTIMEO only
@@ -76,7 +121,7 @@ int net_handshake_relay(const char* ip_str, int relay, int rcv_secs){
     if(fd < 0) return -1;
     int fl = fcntl(fd,F_GETFL,0); fcntl(fd,F_SETFL,fl|O_NONBLOCK);
     struct sockaddr_in sa; memset(&sa,0,sizeof sa);
-    sa.sin_family=AF_INET; sa.sin_addr.s_addr=ip; sa.sin_port=(unsigned short)htons(8333);
+    sa.sin_family=AF_INET; sa.sin_addr.s_addr=ip; sa.sin_port=(unsigned short)htons(port);
     int rc = connect(fd,(struct sockaddr*)&sa,sizeof sa);
     if(rc!=0 && errno!=EINPROGRESS){ close(fd); return -1; }
     if(rc!=0){
@@ -90,15 +135,7 @@ int net_handshake_relay(const char* ip_str, int relay, int rcv_secs){
     struct timeval tv; tv.tv_sec = rcv_secs>0?rcv_secs:6; tv.tv_usec=0;
     setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
 
-    unsigned char v[102]; int o=0;
-    np_u32(v+o,70016);o+=4; np_u64(v+o,1);o+=8; np_u64(v+o,(unsigned long long)time(NULL));o+=8;
-    np_u64(v+o,1);o+=8; o+=16; np_u16(v+o,8333);o+=2; np_u64(v+o,1);o+=8; o+=16; np_u16(v+o,0);o+=2;
-    np_u64(v+o,0x0000000011223344ULL);o+=8;
-    const char* ua="/Satoshi:25.0.0/"; v[o]=(unsigned char)strlen(ua); o+=1;
-    memcpy(v+o,ua,strlen(ua)); o+=strlen(ua);
-    np_u32(v+o,0);o+=4;
-    v[o] = (unsigned char)(relay?1:0); o+=1;          /* <-- the whole point */
-    if(p2p_write(fd,"version",7,v,o)<=0){ fd_close(fd); return -1; }
+    if(p2p_write(fd,"version",7,v,(unsigned)vl)<=0){ fd_close(fd); return -1; }
 
     char cmd[12]; static unsigned char rb[1<<20]; unsigned plen=0; int va=0;
     for(int i=0;i<60;i++){
@@ -120,7 +157,7 @@ int net_handshake_relay(const char* ip_str, int relay, int rcv_secs){
  * peer is genuinely alive (completed a version/verack exchange), else 0.
  * Short timeout -- a feeler is a liveness probe, not a download. */
 int net_feeler_probe(const char* ip_str){
-    int fd = net_handshake_relay(ip_str, 1, 4);
+    int fd = net_handshake_relay(ip_str, 0, 4);   /* Core: RejectIncomingTxs is true for a feeler, so fRelay=0 */
     if(fd < 0) return 0;
     fd_close(fd);
     return 1;

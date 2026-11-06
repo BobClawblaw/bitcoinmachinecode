@@ -52,9 +52,9 @@ typedef struct { unsigned ng[AI_MAX_PER_RESPONSE]; int cnt[AI_MAX_PER_RESPONSE];
 #define AI_VIOL(q) do { if ((q)->viol) *(q)->viol = 1; } while (0)
 
 
-static void ai_u32(unsigned char*p,unsigned v){p[0]=v;p[1]=v>>8;p[2]=v>>16;p[3]=v>>24;}
-static void ai_u64(unsigned char*p,unsigned long long v){for(int i=0;i<8;i++){p[i]=v&0xff;v>>=8;}}
-static void ai_u16(unsigned char*p,unsigned v){p[0]=v>>8;p[1]=v&0xff;}
+/* daemon/net_policy.c: the node's own version payload, and "a.b.c.d[:port]" */
+extern long net_version_payload(unsigned char* v, int relay);
+extern int  net_parse_v4(const char* s, unsigned* ip, unsigned short* port);
 
 
 /* ---- the book and the parsers, version 2 (2026-08-28) ----------------------
@@ -222,21 +222,20 @@ long addr_ingest_msg(void* ab, const char* cmd, const unsigned char* pl, long pl
  * wait_s seconds. Returns entries added (0 on any failure -- this is a
  * best-effort enrichment and must never be able to fail a boot). */
 long addr_gather_from(void* ab, const char* ip_str, int wait_s){
-    unsigned ip;
-    if(inet_pton(AF_INET, ip_str, &ip)!=1) return 0;
+    unsigned ip; unsigned short port;
+    if(!net_parse_v4(ip_str, &ip, &port)) return 0;      /* a bare address: the chain's default port (was 8333 on every chain) */
+    /* the node's own version (2026-11-06: it was a hand-built /Satoshi:0.18.0/
+     * one, see net_policy.c); fRelay as the builder has it -- Core's
+     * addr-fetch connection follows -blocksonly */
+    unsigned char v[512]; long vl = net_version_payload(v, -1);
+    if(vl < 0) return 0;
     dial_gate_wait();
-    int fd = tcp_connect_ip(ip, (unsigned short)htons(8333));
+    int fd = tcp_connect_ip(ip, (unsigned short)htons(port));
     if(fd<0) return 0;
     struct timeval tv; tv.tv_sec=6; tv.tv_usec=0;
     setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
 
-    unsigned char v[102]; int o=0;
-    ai_u32(v+o,70016);o+=4; ai_u64(v+o,1);o+=8; ai_u64(v+o,(unsigned long long)time(NULL));o+=8;
-    ai_u64(v+o,1);o+=8; o+=16; ai_u16(v+o,8333);o+=2; ai_u64(v+o,1);o+=8; o+=16; ai_u16(v+o,0);o+=2;
-    ai_u64(v+o,0x0000000011223344ULL);o+=8;
-    const char* ua="/Satoshi:0.18.0/"; v[o]=(unsigned char)strlen(ua); o+=1; memcpy(v+o,ua,strlen(ua)); o+=strlen(ua);
-    ai_u32(v+o,789000);o+=4; v[o]=1;o+=1;
-    if(p2p_write(fd,"version",7,v,o)<=0){ fd_close(fd); return 0; }
+    if(p2p_write(fd,"version",7,v,(unsigned)vl)<=0){ fd_close(fd); return 0; }
 
     char cmd[12]; static unsigned char rb[4<<20]; unsigned plen=0; int va=0;
     for(int i=0;i<60;i++){

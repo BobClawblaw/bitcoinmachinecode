@@ -400,7 +400,6 @@ extern long mempool_expire_now(void);                    /* daemon/mempool_cfg.c
 extern long      upload_note_and_check(long bytes_added); /* daemon/upload_cap.c */
 extern long long upload_proc_wchar(int pid);              /* daemon/upload_cap.c */
 extern long long upload_bytes_this_window(void);          /* daemon/upload_cap.c */
-extern int  net_handshake_relay(const char* ip_str, int relay, int rcv_secs);  /* daemon/net_policy.c */
 extern int  net_feeler_probe(const char* ip_str);                             /* daemon/net_policy.c */
 extern unsigned net_netgroup_v4(unsigned ip);                                 /* daemon/net_policy.c */
 extern long p2p_addr_count(const void* pl, long plen);
@@ -1231,8 +1230,6 @@ static void txr_walletnotify_hook(const unsigned char* txid, const unsigned char
 #define CFG_PERSISTMEMPOOL() (g_cfg.persistmempool)
 /* Core -reindex-chainstate: rebuild the UTXO set from the archive. One-shot. */
 #define CFG_REINDEX_CHAINSTATE() (g_cfg.reindex_chainstate)
-#define CFG_BRO_N() \
-    (g_cfg.max_block_relay_only < MAX_BLOCK_RELAY_ONLY ? g_cfg.max_block_relay_only : MAX_BLOCK_RELAY_ONLY)
 /* Array capacity for outbound legs. The TARGET is g_cfg.max_outbound
  * (bitcoin.conf `bmc.maxoutbound`, Core's 8 full-relay by default); this is
  * only the ceiling those arrays can hold, and must be >= the knob's clamp.
@@ -1674,6 +1671,10 @@ extern unsigned char node_relay_flag;            /* bitcoind.asm: fRelay byte of
 extern unsigned node_start_height;               /* bitcoind.asm: start_height of OUR version (2026-09-09: was 0) */
 extern unsigned short node_listen_port_be;       /* bitcoind.asm: the port in OUR version's address fields, big-endian (was 8333) */
 static void version_tell_the_truth(void){ node_start_height = (unsigned)(*(int*)(store_buf+24) > 0 ? *(int*)(store_buf+24) : 0); node_listen_port_be = htons((unsigned short)g_cfg.port); }
+/* the feeler and seednode gathering (net_policy.c, addr_ingest.c) send this
+ * same version since 2026-11-06, not hand-built /Satoshi:/ ones */
+extern long node_make_version(unsigned char* out);                     /* bitcoind.asm */
+static long secondary_version(unsigned char* out){ version_tell_the_truth(); return node_make_version(out); }
 extern unsigned char g_serve_send_feefilter;     /* bitcoin_serve.asm: send `feefilter` at connect */
 static unsigned g_conn_perms_all;                /* whitelist | whitebind, this connection */
 static int      g_peer_relays_txs = 1;           /* the peer's version fRelay */
@@ -2211,14 +2212,6 @@ static volatile sig_atomic_t g_shutdown_requested = 0;
  * and keep the count. If this ever drifts it drifts LOW (the download worker
  * exiting also fires SIGCHLD), which fails open by allowing an extra
  * connection rather than locking inbound out entirely. */
-/* Block-relay-only legs (Core: MAX_BLOCK_RELAY_ONLY_CONNECTIONS). relay=0,
- * and deliberately never fed into addr gossip, so an attacker enumerating the
- * network cannot discover or crowd them out. These carry headers/blocks only
- * and exist so an eclipse of the ordinary legs still leaves us a true view of
- * the best chain -- which matters now that Stage B acts on peer chainwork. */
-static int  bro_fd[MAX_BLOCK_RELAY_ONLY];
-static char bro_host[MAX_BLOCK_RELAY_ONLY][64];
-
 /* Serve children we are metering for -maxuploadtarget. The parent samples
  * each child's /proc/<pid>/io rather than counting inside the asm serve loop
  * -- same technique dl_catchup uses on download workers, and it measures what
@@ -4898,9 +4891,14 @@ static long dl_bootstrap(void* ab, const char* peers[], int pool_len){
         char ipd[64];
         if(!dl_resolve1(g_cfg.seednode[i], ipd)){
             fprintf(stderr,"[boot] seednode=%s did not resolve\n", g_cfg.seednode[i]); continue; }
-        long got = addr_gather_from(ab, ipd, 20);
+        /* Core: seednode=host:port keeps its port; a bare host takes the chain's
+         * (2026-11-06: the gatherer dialed 8333 on every chain) */
+        char tgt[80];
+        if(g_cfg.seednode_port[i]) snprintf(tgt, sizeof tgt, "%s:%u", ipd, (unsigned)g_cfg.seednode_port[i]);
+        else snprintf(tgt, sizeof tgt, "%s", ipd);
+        long got = addr_gather_from(ab, tgt, 20);
         fprintf(stderr,"[boot] seednode %s (%s) -> +%ld peers (getaddr)\n",
-                g_cfg.seednode[i], ipd, got);
+                g_cfg.seednode[i], tgt, got);
         total += got;
     }
 
@@ -10604,7 +10602,6 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
      * appends via store_append while the others idle. A LONG per-pass budget,
      * DL_BUDGET_SECS, applies because this process does not serve inbound.) */
     long long next_feeler_ms = 0;
-    for(int b=0;b<MAX_BLOCK_RELAY_ONLY;b++){ bro_fd[b]=-1; bro_host[b][0]=0; }
     mux_n_out = 0;                                   /* isolate from any parent state */
     {
         int ntry = nsrc; if(ntry>MUX_MAX_OUT*3) ntry=MUX_MAX_OUT*3;   /* cap candidates */
@@ -11639,36 +11636,12 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
          * this worker's own legs happened to store, because an inbound serve
          * child's .do_block writes land in the shared archive independently.
          * A no-op (one lseek) when already in step. */
-        /* ---- block-relay-only legs (relay=0, no addr gossip) -------------
-         * Kept topped up alongside the full-relay legs. Chosen from a
-         * DIFFERENT netgroup than any existing leg where possible: two peers
-         * in the same /16 are far more likely to be the same operator, which
-         * defeats the point of having them. */
-        for(int b=0; b<CFG_BRO_N(); b++){
-            if(bro_fd[b] >= 0) continue;
-            if((rot % 16) != 0) break;             /* rate-limit re-dials */
-            for(int ci=0; ci<nsrc; ci++){
-                if(dialer_proxy_configured()) continue;            /* would bypass the proxy */
-                unsigned cip = pool_ipv4(srcpool[ci], NULL); if(!cip) continue;
-                int clash=0;
-                for(int k=0;k<mux_n_out;k++){
-                    unsigned oip; if(inet_pton(AF_INET,mux_out_host[k],&oip)!=1) continue;
-                    if(net_netgroup_v4(oip)==net_netgroup_v4(cip)){ clash=1; break; }
-                }
-                for(int k=0;k<CFG_BRO_N() && !clash;k++){
-                    if(bro_fd[k]<0) continue;
-                    unsigned oip; if(inet_pton(AF_INET,bro_host[k],&oip)!=1) continue;
-                    if(net_netgroup_v4(oip)==net_netgroup_v4(cip)) clash=1;
-                }
-                if(clash) continue;
-                int f = net_handshake_relay(srcpool[ci], 0 /* relay=0 */, 6);
-                if(f>=0){
-                    bro_fd[b]=f; strncpy(bro_host[b],srcpool[ci],63); bro_host[b][63]=0;
-                    fprintf(stderr,"[net] block-relay-only %d = %s (fd %d, relay=0)\n", b, bro_host[b], f);
-                    break;
-                }
-            }
-        }
+        /* (2026-11-06) A second block-relay-only dialer stood here: net_handshake_relay
+         * into bro_fd[], with nothing reading those fds once connected. It never
+         * connected (it handed "a.b.c.d:port" to inet_pton; production logged 0 such
+         * legs from 2026-09-27) and was superseded by CC-4's block-relay-only legs
+         * through the dial helpers (bo_want(), below), which are the ones that run.
+         * Removed. */
 
         /* ---- feeler: one short-lived probe every ~2 minutes ---------------
          * Validates a book entry and drops it. This is what keeps the address
@@ -11677,10 +11650,15 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         if(g_cfg.max_feeler > 0 && !g_cfg.connect_only && now_ms >= next_feeler_ms && nsrc > 0){   /* Core: no feelers under -connect */
             next_feeler_ms = now_ms + g_cfg.feeler_interval_ms;
             int pick = (int)((unsigned)rot * 2654435761u % (unsigned)nsrc);
-            unsigned char saved_relay = node_relay_flag; node_relay_flag = 0;   /* Core: feelers get fRelay=0 */
-            int alive = net_feeler_probe(srcpool[pick]);
-            node_relay_flag = saved_relay;
+            int alive = net_feeler_probe(srcpool[pick]);      /* fRelay=0, as Core's feelers (set in net_policy.c) */
             fprintf(stderr,"[net] feeler %s -> %s\n", srcpool[pick], alive?"alive":"dead");
+            /* Core: a feeler that completes the handshake is addrman.Good() -- the
+             * address moves to `tried`, as an outbound leg does (rpc_fill_peer_slot,
+             * NET-10). Until 2026-11-06 the result was only logged, and no feeler
+             * ever succeeded (see net_parse_v4). */
+            if(alive){ ab2_t* fb = addr_book();
+                if(fb){ bmc_addr_t a;
+                    if(bmc_addr_from_string_port(&a, srcpool[pick], 0) && bmc_addr_is_routable(&a)) ab2_mark_tried(fb, &a); } }
         }
         pb_rotation();
 
@@ -13525,6 +13503,8 @@ int main(int argc, char** argv){
                             "this node enforces ONLY noban\n");
     }
     if(!chainparams_select(g_cfg.chain)) return 1;
+    { extern void net_policy_set_version(long (*)(unsigned char*), unsigned short);
+      net_policy_set_version(secondary_version, g_chainp->default_port); }
     { extern void archive_set_chain_magic(unsigned);   /* the frame check accepts this chain's magic too (NET-15 frames) */
       archive_set_chain_magic(g_chainp->magic); }
     { extern void wallet_set_chain(const char*, unsigned char, unsigned char);
