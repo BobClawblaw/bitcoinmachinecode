@@ -17,6 +17,11 @@
  * leg is not held to the 30 s spacing; the claim is taken at launch and
  * released when no helper starts.
  *
+ * 2026-11-06: a helper that cannot start (EMFILE at its pipe) is named, not
+ * only counted, and five minutes of it end the worker so the node restarts
+ * (pass_start_note); the real leg_pass_start is run with the descriptor table
+ * full and must fail without forking and report EMFILE.
+ *
  * The relay check and the helper fork are seams (TXRELAY_REPLIES_PENDING,
  * LEG_PASS_START). These functions live beside main(), so this includes that
  * TU (renaming its main), as tests/test_dial_budget.c does.
@@ -26,11 +31,12 @@
 #include <time.h>
 
 static int g_pending[64];                 /* relay replies pending, by fd */
-static int g_start_ok = 1, g_starts;
+static int g_start_ok = 1, g_starts, g_start_err;
 static int test_pending(int fd){ return fd >= 0 && fd < 64 ? g_pending[fd] : 0; }
 static int test_start(int i, unsigned b){ (void)i; (void)b; g_starts++; return g_start_ok; }
 #define TXRELAY_REPLIES_PENDING(fd) test_pending(fd)
-#define LEG_PASS_START(i, b) test_start(i, b)
+/* the stub also says why it "failed", as leg_pass_start does (0 = declined) */
+#define LEG_PASS_START(i, b) (g_pass_start_errno = g_start_ok ? 0 : g_start_err, test_start(i, b))
 /* With LEG_PASS_START stubbed, gcc inlines this TU differently and reports a
  * format truncation in blk_src_note (a bounded snprintf into a 64-byte field)
  * that the daemon build does not; it is silenced for this test only. */
@@ -53,7 +59,11 @@ static void reset(void){
     memset(mux_out_announced, 0, sizeof mux_out_announced);
     memset(mux_out_lastpass_ms, 0, sizeof mux_out_lastpass_ms);
     memset(g_pending, 0, sizeof g_pending);
-    new_rotation(); g_start_ok = 1; g_starts = 0;
+    new_rotation(); g_start_ok = 1; g_starts = 0; g_start_err = 0;
+}
+static void reset_fail_state(void){
+    g_pass_fail_since_ms = 0; g_pass_fail_n = 0; g_pass_fail_logged_errno = 0;
+    g_worker_fatal = 0; g_shutdown_requested = 0;
 }
 
 int main(void){
@@ -110,6 +120,50 @@ int main(void){
     ck("...and releases the claim at once", inflight_count(&g_inflight) == 0);
     ck("...keeps the mark for the next rotation", mux_out_announced[1] == 1);
     ck("...and counts the fallback", g_pass_fallback == fb + 1);
+    ck("...a helper that only declined (busy, cap) is not a failure", g_pass_fail_since_ms == 0 && g_pass_fail_n == 0);
+
+    /* ---- 6. a helper that cannot start (2026-11-06: 974,810 and ten silent hours) ---- */
+    reset_fail_state();
+    long long t0 = 5000000;
+    ck("a declined start is not counted", pass_start_note(0, 0, t0) == 0 && g_pass_fail_since_ms == 0);
+    ck("the first EMFILE starts the clock", pass_start_note(0, EMFILE, t0) == 0 && g_pass_fail_since_ms == t0 && g_pass_fail_n == 1);
+    ck("...and is named", g_pass_fail_logged_errno == EMFILE);
+    ck("the same errno is not named again", pass_start_note(0, EMFILE, t0 + 1000) == 0 && g_pass_fail_logged_errno == EMFILE && g_pass_fail_n == 2);
+    ck("a different errno is named", pass_start_note(0, EAGAIN, t0 + 2000) == 0 && g_pass_fail_logged_errno == EAGAIN);
+    ck("just short of the limit the worker carries on", pass_start_note(0, EMFILE, t0 + PASS_START_FAIL_EXIT_MS - 1) == 0);
+    ck("at the limit the worker must end", pass_start_note(0, EMFILE, t0 + PASS_START_FAIL_EXIT_MS) == 1);
+    ck("a start that succeeds clears the record", pass_start_note(1, 0, t0 + PASS_START_FAIL_EXIT_MS + 1) == 0 &&
+                                                    g_pass_fail_since_ms == 0 && g_pass_fail_n == 0 && g_pass_fail_logged_errno == 0);
+    ck("...so a later failure starts a fresh clock", pass_start_note(0, EMFILE, t0 + 2 * PASS_START_FAIL_EXIT_MS) == 0);
+
+    /* ---- 7. launch wires the rule to the worker's shutdown ---- */
+    reset(); reset_fail_state(); announce(1); g_start_ok = 0; g_start_err = EMFILE;
+    ck("a failed start through launch is counted", leg_pass_launch(1, 1, 60) == 0 && g_pass_fail_n == 1 && g_pass_fail_since_ms > 0);
+    ck("...and does not end the worker yet", g_worker_fatal == 0 && g_shutdown_requested == 0);
+    g_pass_fail_since_ms = dh_now_ms() - PASS_START_FAIL_EXIT_MS - 1;
+    ck("failures past the limit through launch", leg_pass_launch(1, 1, 60) == 0);
+    ck("...request the worker's shutdown with status 1", g_worker_fatal == 1 && g_shutdown_requested == SIGTERM);
+    reset(); reset_fail_state(); announce(1); g_start_ok = 0; g_start_err = EMFILE;
+    (void)leg_pass_launch(1, 1, 60);
+    g_start_ok = 1; g_start_err = 0;
+    ck("a launch that starts clears the failure record", leg_pass_launch(1, 1, 60) == 1 && g_pass_fail_since_ms == 0 && g_worker_fatal == 0);
+    reset_fail_state();
+
+    /* ---- 8. the real leg_pass_start with the descriptor table full ---- */
+    {
+        struct rlimit rl; getrlimit(RLIMIT_NOFILE, &rl);
+        struct rlimit low = rl; if (low.rlim_cur > 256) low.rlim_cur = 256;
+        setrlimit(RLIMIT_NOFILE, &low);
+        int held[300]; int nheld = 0, last_err = 0;
+        while (nheld < 300){ int fd = open("/dev/null", O_RDONLY); if (fd < 0){ last_err = errno; break; } held[nheld++] = fd; }
+        int ret = (last_err == EMFILE) ? leg_pass_start(0, 1) : -1;
+        int err = g_pass_start_errno;
+        for (int k = 0; k < nheld; k++) close(held[k]);
+        setrlimit(RLIMIT_NOFILE, &rl);
+        ck("the table really is full (open says EMFILE)", last_err == EMFILE);
+        ck("leg_pass_start fails without forking", ret == 0 && g_pass[0].pid == 0);
+        ck("...and says why: EMFILE", err == EMFILE);
+    }
 
     printf("\n%s (%d checks, %d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", checks, fails);
     return fails ? 1 : 0;
