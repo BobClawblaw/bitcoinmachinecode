@@ -14,10 +14,11 @@
  * whole call. What is pinned:
  *   - interleave ON (the default): the connected height RISES while blocks
  *     are still missing from the archive -- a sample with applied >= 0 and
- *     stored < N; at the download gate (dl_catchup returned) the lag between
- *     the contiguous prefix and the connected tip is 0 (the final pass), and
- *     the progress line carries "applied=N lag=M"; the drain afterwards has
- *     nothing left to connect.
+ *     stored < N; the progress line carries "applied=N lag=M"; at the
+ *     download gate (dl_catchup returned) the lag is whatever the last
+ *     budget-bounded pass left (0 on an idle machine, more when a
+ *     checkpoint's fsync is slow -- 2026-11-06), and the drain afterwards
+ *     connects exactly that lag, ending at N-1.
  *   - NEGATIVE CONTROL, interleave OFF (g_dlc_interleave = 0, the seam): the
  *     connected height stays at its starting value (-1) in EVERY sample and
  *     at the gate; the drain then connects all N -- the pre-step-1 shape,
@@ -360,9 +361,15 @@ int main(void){
          * under the gate's -j8 it left 54 and failed a correct build. The
          * property under test is "connected during the download, far ahead
          * of the pre-step-1 loop" (lag NB-1 = 599 in the control below);
-         * a quarter of the download keeps a 4x margin over that. */
-        ckm("the connected tip at the gate is far ahead of the control (lag <= NB/4; the control leaves NB-1)", (NB-1) - gate_applied <= NB/4);
-        ckm("...and far past where the pre-step-1 loop left it (-1)", gate_applied >= NB - 1 - NB/4);
+         * a quarter of the download keeps a 4x margin over that.
+         * 2026-11-06: no bound on the lag at all. With fsync load on /tmp a
+         * checkpoint's fsync outlasts the 500 ms and the lag passed NB/4 in 8
+         * of 8 runs (the idle-tick case's "NB-1 at the gate" failed the x86
+         * gate the same way). The lag is the rotation's to drain, which the
+         * drain checks below pin exactly; "connected DURING the download" is
+         * pinned by the sample trace (applied rose while >= 40 blocks were
+         * still missing), not by where the last pass happened to stop. */
+        ckm("blocks were connected during the download (connected tip at the gate >= 0; the pre-step-1 loop left -1)", gate_applied >= 0);
         /* the sample trace: did applied rise while blocks were still missing? */
         long ns = g_ns, first_rise = -1, best_gap = -1, ooo = 0;
         for(long i=0;i<ns;i++){
@@ -441,12 +448,22 @@ int main(void){
         t_idle_ms = DLC_IDLE_MS; t_window = 120; g_dlc_n_idle_cut = 0;
         long got = run_download("tick", 1, &gate_applied, &log);
         ck("dl_catchup wrote every block", got, NB);
-        ck("connected tip == NB-1 at the gate", gate_applied, NB-1);
+        /* Not "connected tip == NB-1 at the gate": the download's last pass
+         * is bounded (500 ms here, 8 s in the daemon) and the rotation's
+         * drain owns what it leaves (main.c, "One more pass now that every
+         * helper has exited"). That check failed the 2026-11-06 x86 gate once
+         * (572 of 599) and every run with fsync load on /tmp (24 of 24, the
+         * tip 545-564), a checkpoint's fsync outlasting the budget. The
+         * contract, as the interleave-on case pins it: blocks were connected
+         * during the download, and the drain connects exactly the lag. */
+        ckm("blocks were connected during the download (connected tip at the gate >= 0)", gate_applied >= 0);
         printf("     elapsed %ld ms, idle waits cut short %ld (five 120-block windows; the old loop slept 2 s at each edge)\n", t_elapsed_ms, g_dlc_n_idle_cut);
         ckm("the idle wait was cut short at least once", g_dlc_n_idle_cut >= 1);
         ckm("the download did not pay a 2 s tick per window (elapsed < 4 s)", t_elapsed_ms < 4000);
         const char* gl = last_line_with(log, "idle waits cut short"); print_line(gl);
         ckm("the gate line reports the cut count", gl != NULL);
+        ck("the drain afterwards connects exactly the gate lag", utxo_live_catchup(store_buf), (NB-1) - gate_applied);
+        ck("connected tip == NB-1 after the drain", utxo_live_applied_height(), NB-1);
         free(log);
         utxo_live_close(); g_utxo_live_on = 0;
         t_idle_ms = 30; t_window = 0;
