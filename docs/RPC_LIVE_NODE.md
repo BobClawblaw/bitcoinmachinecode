@@ -1278,9 +1278,8 @@ field is an input to expiry, so a time in the future or past the expiry window
 is refused and the fresh stamp stands (`mempool_restore_accept_time`).
 
 **Still not restored**, stated rather than glossed: fee deltas (there is no
-`prioritisetransaction` path to replay one into) and the unbroadcast set,
-which this node does not track because `sendrawtransaction` relays to every
-live leg immediately.
+`prioritisetransaction` path to replay one into). The unbroadcast set is
+written and restored since 2026-11-06.
 
 Verified on the live mainnet node: a 284,485-byte dump of 184 real
 transactions that an independent parser walks to exactly the file length,

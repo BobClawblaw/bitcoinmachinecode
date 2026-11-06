@@ -9601,6 +9601,15 @@ static int txsub_package_accept(const unsigned char* const* txs, const unsigned 
 #define TXSUB_FOLLOW_MS      30       /* worker lingers this long for the next tx submission after acking one */
 #define TXSUB_ROTATION_BUDGET 2048   /* submissions serviced per rotation before the main loop runs again */
 #define TXSUB_ROTATION_MS     1000   /* ...or this much wall time, whichever comes first */
+/* the unbroadcast reattempt's announcement: what an accept in this worker
+ * does -- its own outbound announce queue, and the shared ring the inbound
+ * children read (the worker's drain skips ring entries it pushed itself) */
+static void ub_announce_again(const unsigned char* txid){
+    extern void txrelay_announce_own(const unsigned char txid[32]);
+    extern void tx_accept_ring_push(const unsigned char* txid);
+    txrelay_announce_own(txid);
+    tx_accept_ring_push(txid);
+}
 static long long txsub_now_ms(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec*1000LL + ts.tv_nsec/1000000; }
 #define DL_PARALLEL_GAP      2000L
 #define DL_PARALLEL_REARM_S  600L
@@ -10949,6 +10958,9 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 __atomic_thread_fence(__ATOMIC_ACQUIRE);   /* ARM64 (2026-09-25): the command's fields after its seq -- the RPC side fenced before publishing; a stale tx_submit_private/_test or ctl_op/arg would act on the previous request */
             int result; char reason[128]; reason[0]=0;
             { extern void tx_accept_clear_detail(void); tx_accept_clear_detail(); }   /* no stale detail on a path that never validates */
+            /* read once and cleared before any branch, so no later submission
+             * inherits it (the stagers also write it every time) */
+            int sub_local = g_node_status->tx_submit_local; g_node_status->tx_submit_local = 0;
             if(g_node_status->tx_submit_pkg_n > 0){
                 result = txsub_package(reason, sizeof reason);
             }
@@ -11002,6 +11014,17 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     result = txsub_accept_and_relay(txsub_pool(),
                                  (const unsigned char*)g_node_status->tx_submit_buf, tlen,
                                  mux_out_fd, mux_n_out, reason, sizeof reason, &relayed);
+                    /* Core BroadcastTransaction: a submission that NEWLY entered
+                     * the pool joins the unbroadcast set until a peer fetches
+                     * it. Not the already-in-mempool case below: Core only
+                     * reannounces that one. */
+                    if(result == 1 && sub_local){
+                        extern int tx_txid(unsigned char* out, const unsigned char* tx, unsigned long txlen, unsigned char* scratch, unsigned long scratchcap);
+                        extern int mempool_unbroadcast_add(const unsigned char txid[32]);
+                        static unsigned char uscratch[2000*81 + 8]; unsigned char tid[32];
+                        if(tx_txid(tid, (const unsigned char*)g_node_status->tx_submit_buf, tlen, uscratch, sizeof uscratch))
+                            (void)mempool_unbroadcast_add(tid);
+                    }
                     /* Core BroadcastTransaction (2026-10-01): a txid already in
                      * the mempool is not an error -- Core skips the submission,
                      * reannounces the mempool's copy and returns the txid. This
@@ -11620,6 +11643,19 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             { extern long txrelay_drain_handoff(void*, long); (void)txrelay_drain_handoff(txsub_pool(), 256); }
             { extern void txrelay_announce_own(const unsigned char txid[32]);
               txann_worker_drain(txrelay_announce_own); }
+            /* Core ReattemptInitialBroadcast: every 10-15 minutes (a fresh
+             * random delay each time, against fingerprinting), announce the
+             * node's own transactions no peer has fetched yet once more, to
+             * every leg -- outbound here, inbound through the ring. */
+            { static long long ub_next_ms = 0;
+              long long now = txsub_now_ms();
+              if(!ub_next_ms) ub_next_ms = now + 600000LL + (long long)(dl_pool_rng() % 300000ULL);
+              else if(now >= ub_next_ms){
+                  extern long mempool_unbroadcast_reattempt(void (*)(const unsigned char*));
+                  ub_next_ms = now + 600000LL + (long long)(dl_pool_rng() % 300000ULL);
+                  long k = mempool_unbroadcast_reattempt(ub_announce_again);
+                  if(k) fprintf(stderr,"[mempool] reattempting the initial broadcast of %ld transaction(s) no peer has fetched yet\n", k);
+              } }
             { int rfds[MUX_MAX_OUT]; int free_fds[MUX_MAX_OUT];                                 /* 2026-09-10: never a busy leg */
               for(int k = 0; k < mux_n_out; k++) free_fds[k] = leg_pass_busy(k) ? -1 : mux_out_fd[k];
               legs_relay_fds(free_fds, mux_out_kind, mux_n_out, rfds);   /* CC-4 */
@@ -12288,6 +12324,10 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
       extern void mp_lock(void); extern void mp_unlock(void);
       extern long mempool_time_of(const unsigned char*);
       extern long mempool_height_of(const unsigned char*);
+      extern int  mempool_unbroadcast_of(const unsigned char[32]);
+      extern long mempool_unbroadcast_count(void);
+      extern long mempool_unbroadcast_list(unsigned char (*)[32], long);
+      extern int  mempool_unbroadcast_add(const unsigned char[32]);
       extern long mpool_policy_entry(void*, const unsigned char*,
                                      unsigned long long*, unsigned long long*);
       extern long mpool_policy_graph_all(void*, struct mp_graph*);
@@ -12306,6 +12346,10 @@ extern long mpool_policy_entry_info(void*, const unsigned char*, struct mp_entry
           .lock = mp_lock, .unlock = mp_unlock,
           .time_of = mempool_time_of,
           .height_of = mempool_height_of,
+          .unbroadcast_of = mempool_unbroadcast_of,
+          .unbroadcast_count = mempool_unbroadcast_count,
+          .unbroadcast_list = mempool_unbroadcast_list,
+          .unbroadcast_add = mempool_unbroadcast_add,
           .pol_entry = mpool_policy_entry,
           .pol_entry_info = mpool_policy_entry_info,
           .pol_graph_all = mpool_policy_graph_all,

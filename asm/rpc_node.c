@@ -1273,7 +1273,9 @@ render:;
     /* every cluster is linearized optimally when it is read (2026-10-01) */
     rj_obj_set(o, "optimal", rj_bool(1));
     rj_obj_set(o, "incrementalrelayfee", rj_numf("%.8f", (double)g_incremental_satkvb / 1e8));
-    rj_obj_set(o, "unbroadcastcount", rj_numf("%d", 0));
+    /* Core GetUnbroadcastTxs().size(): own submissions no peer has fetched
+     * yet. The constant 0 until 2026-11-06. */
+    rj_obj_set(o, "unbroadcastcount", rj_numf("%ld", g_mph.unbroadcast_count ? g_mph.unbroadcast_count() : 0L));
     /* the real policy value, not a literal: reporting a setting the
      * operator cannot change was the honesty gap the audit called out */
     rj_obj_set(o, "permitbaremultisig", rj_bool(g_status ? g_status->permit_bare_multisig : 1));  /* standard relay policy */
@@ -1674,7 +1676,7 @@ typedef struct { unsigned char id[32]; unsigned long vs, w; long inf; unsigned c
                  /* 2026-10-06, the snapshot path (see cmd_getrawmempool): what
                   * mpe_entry_obj used to read from the pool and its hooks,
                   * copied under the pool lock so the build can run after it */
-                 unsigned char wtxid[32]; long tm; long long pri; unsigned long ord; long ht; } mpe_vs_t;
+                 unsigned char wtxid[32]; long tm; long long pri; unsigned long ord; long ht; int ub; } mpe_vs_t;
 static mpe_vs_t* g_mpe_vs; static unsigned long g_mpe_vs_n;
 /* 1 while verbose getrawmempool builds its entries AFTER releasing the pool
  * lock: every per-entry input then comes from g_mpe_vs / g_mpe_g, and
@@ -1939,6 +1941,7 @@ static int cmd_getrawmempool(const rj_val* params, rj_val** res, long* ec, const
                     else memcpy(v->wtxid, e2.txid, 32);
                     v->tm = g_mph.time_of ? g_mph.time_of(e2.txid) : 0;
                     v->ht = g_mph.height_of ? g_mph.height_of(e2.txid) : 0;
+                    v->ub = g_mph.unbroadcast_of ? g_mph.unbroadcast_of(e2.txid) : 0;
                     v->pri = pri_delta_of(e2.txid);
                     v->ord = g_mpe_vs_n;           /* the pool's order, the reply's */
                     g_mpe_vs_n++;
@@ -2310,7 +2313,12 @@ static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx,
           if (here){ char h2[65]; mpe_hex(h2, inf.spentby[i]); rj_arr_push(sb, rj_str(h2)); } }
       rj_obj_set(o, "spentby", sb); }
     rj_obj_set(o, "bip125-replaceable", rj_bool(rbf));
-    rj_obj_set(o, "unbroadcast", rj_bool(0));
+    /* Core: "initial broadcast not yet acknowledged by any peers" -- one of
+     * this node's own submissions that no peer has fetched yet (the
+     * unbroadcast set, daemon/mempool_cfg.c). The constant false until
+     * 2026-11-06. */
+    rj_obj_set(o, "unbroadcast", rj_bool(g_mpe_snap ? g_mpe_vs[sk].ub
+                                          : (g_mph.unbroadcast_of ? g_mph.unbroadcast_of(txid) : 0)));
     return o;
 }
 
@@ -2425,6 +2433,7 @@ static int mpe_snapshot_component(const unsigned char seed[32]){
         if (g_mph.sha256d) g_mph.sha256d(v->wtxid, tx, len); else memcpy(v->wtxid, id, 32);
         v->tm = g_mph.time_of ? g_mph.time_of(id) : 0;
         v->ht = g_mph.height_of ? g_mph.height_of(id) : 0;
+        v->ub = g_mph.unbroadcast_of ? g_mph.unbroadcast_of(id) : 0;
         v->pri = pri_delta_of(id);
         v->ord = nv;
         nv++;
@@ -2903,6 +2912,39 @@ extern long mempool_dump_read(const char* path,
                               int (*sink)(void*, const unsigned char*, unsigned long,
                                           long long, long long),
                               void* ctx, char* err, unsigned long errcap);
+extern long mempool_dump_write_ub(const char* path, const unsigned char* const* txs,
+                                  const unsigned long* lens, const long long* times,
+                                  const long long* deltas, long n,
+                                  const unsigned char* extra_txids,
+                                  const long long* extra_deltas, long n_extra,
+                                  const unsigned char* ub_txids, long n_ub);
+extern long mempool_dump_read_ub(const char* path,
+                                 int (*sink)(void*, const unsigned char*, unsigned long,
+                                             long long, long long),
+                                 void* ctx, char* err, unsigned long errcap,
+                                 unsigned char** ub_out, long* n_ub_out);
+/* The unbroadcast set for a dump (Core DumpMempool writes GetUnbroadcastTxs()).
+ * Into a malloc'd array the caller frees; *n = 0 and NULL when there is none
+ * or nothing tracks it. */
+static unsigned char* mpd_unbroadcast_snapshot(long* n){
+    *n = 0;
+    if (!g_mph.unbroadcast_count || !g_mph.unbroadcast_list) return NULL;
+    long want = g_mph.unbroadcast_count();
+    if (want <= 0) return NULL;
+    unsigned char (*ids)[32] = malloc((size_t)(want + 64) * 32);
+    if (!ids) return NULL;
+    *n = g_mph.unbroadcast_list(ids, want + 64);
+    return (unsigned char*)ids;
+}
+/* Core LoadMempool with apply_unbroadcast_set: each txid read joins the set
+ * if the transaction is in the pool by now. Returns how many were read --
+ * Core's "N waiting for initial broadcast" counts the file's set, not how
+ * many joined. */
+static long mpd_unbroadcast_apply(const unsigned char* ids, long n){
+    if (!ids || n <= 0) return 0;
+    if (g_mph.unbroadcast_add) for (long i = 0; i < n; i++) g_mph.unbroadcast_add(ids + (size_t)i*32);
+    return n;
+}
 
 #define MPD_MAX_DUMP 200000
 
@@ -2930,9 +2972,11 @@ long rpc_node_mempool_save(const char* path){
     /* Written under the pool lock ON PURPOSE: the entry pointers above are
      * into the shared blob, and releasing first would let an eviction move
      * the bytes out from under the writer. */
-    long w = mempool_dump_write(path ? path : "mempool.dat",
-                                txs, lens, times, deltas, n, NULL, NULL, 0);
+    long nub = 0; unsigned char* ub = mpd_unbroadcast_snapshot(&nub);
+    long w = mempool_dump_write_ub(path ? path : "mempool.dat",
+                                   txs, lens, times, deltas, n, NULL, NULL, 0, ub, nub);
     mpu();
+    free(ub);
     return w;
 }
 
@@ -2956,8 +3000,10 @@ static int cmd_savemempool(rj_val** res, long* ec, const char** em){
     /* The write happens under the pool lock ON PURPOSE: the entry pointers
      * above are into the shared blob, and releasing the lock first would let
      * an eviction move the bytes out from under the writer. */
-    long w = mempool_dump_write("mempool.dat", txs, lens, times, deltas, n, NULL, NULL, 0);
+    long nub = 0; unsigned char* ub = mpd_unbroadcast_snapshot(&nub);
+    long w = mempool_dump_write_ub("mempool.dat", txs, lens, times, deltas, n, NULL, NULL, 0, ub, nub);
     mpu();
+    free(ub);
     if (w < 0){ *ec = -1; *em = "unable to dump mempool to disk"; return 0; }
 
     char cwd[1024]; char full[1200];
@@ -3078,6 +3124,7 @@ static int mpd_import_one(void* vctx, const unsigned char* tx, unsigned long len
     st->tx_submit_len = len;
     st->tx_submit_test = 0;
     st->tx_submit_pkg_n = 0;
+    st->tx_submit_local = 0;             /* a reload is not a broadcast: the set comes from the file */
     st->tx_submit_reason[0] = 0;
     unsigned long long myseq = st->tx_submit_seq + 1;
     __sync_synchronize();
@@ -3198,8 +3245,9 @@ long rpc_node_mempool_load(const char* path){
     mpd_import_ctx c; memset(&c, 0, sizeof c); c.collecting = 1;
     char err[160]; err[0] = 0;
     mpd_collect_ctx col; memset(&col, 0, sizeof col);
-    long r = mempool_dump_read(path ? path : "mempool.dat", mpd_collect_sink, &col, err, sizeof err);
-    if (col.oom || (r < 0 && col.n == 0)){ for (long i = 0; i < col.n; i++) free(col.v[i].tx); free(col.v); return -1; }
+    unsigned char* ub = NULL; long nub = 0;
+    long r = mempool_dump_read_ub(path ? path : "mempool.dat", mpd_collect_sink, &col, err, sizeof err, &ub, &nub);
+    if (col.oom || (r < 0 && col.n == 0)){ free(ub); for (long i = 0; i < col.n; i++) free(col.v[i].tx); free(col.v); return -1; }
     if (r < 0){
         fprintf(stderr, "[mempool] %s is malformed after %ld transaction(s) (%s); loading those, as Core does\n",
                 path ? path : "mempool.dat", col.n, err[0] ? err : "parse error");
@@ -3212,6 +3260,8 @@ long rpc_node_mempool_load(const char* path){
     free(col.v); free(order);
     long deferred = c.nretry;
     long gained = mpd_retry_passes(&c);
+    long waiting = mpd_unbroadcast_apply(ub, nub);     /* after admission, as Core's LoadMempool */
+    free(ub);
     /* The old line read "%ld waited for a parent, %ld of them then accepted",
      * which said the refusals were an ORDERING problem. They are not: this
      * function topologically sorts parents before children before submitting
@@ -3222,10 +3272,11 @@ long rpc_node_mempool_load(const char* path){
      * which is the difference between a number and a diagnosis. */
     fprintf(stderr, "[mempool] loaded %s: %ld of %ld in the pool (%ld admitted, %ld already there); "
                     "%ld refused: %ld missing-inputs, %ld conflicting, %ld policy, %ld no-ack, %ld other "
-                    "(%ld re-offered, %ld then accepted); %ld arrival time(s) restored\n",
+                    "(%ld re-offered, %ld then accepted); %ld arrival time(s) restored; "
+                    "%ld waiting for initial broadcast\n",
             path ? path : "mempool.dat", c.accepted + c.already, r, c.accepted, c.already,
             c.rejected, c.rej_missing, c.rej_conflict, c.rej_policy, c.rej_noack, c.rej_other,
-            deferred, gained, c.restored_times);
+            deferred, gained, c.restored_times, waiting);
     return c.accepted;
 }
 
@@ -3245,16 +3296,38 @@ static int cmd_importmempool(const rj_val* params, rj_val** res, long* ec, const
         *ec = -10; *em = "Can only import the mempool after the block download and sync is done."; return 0; }
     if (!g_status_rw){
         *ec = -4; *em = "no download worker is attached, so nothing can admit these transactions"; return 0; }
+    /* options.apply_unbroadcast_set (Core: default false for this RPC, true
+     * for the startup load): whether the file's unbroadcast set joins this
+     * node's. use_current_time / apply_fee_delta_priority are not read: the
+     * arrival times are always restored (vetted against the expiry window)
+     * and fee deltas have no restore path. */
+    int apply_ub = 0;
+    if (params && params->typ == RJ_ARR && params->nitems > 1 && params->items[1] &&
+        params->items[1]->typ == RJ_OBJ){
+        const rj_val* v = rj_obj_get(params->items[1], "apply_unbroadcast_set");
+        if (v && v->typ != RJ_NULL){
+            if (v->typ != RJ_BOOL){
+                extern const char* rj_type_name(const rj_val*);
+                static __thread char tb[160];
+                snprintf(tb, sizeof tb, "JSON value of type %s is not of expected type bool", rj_type_name(v));
+                *ec = -3; *em = tb; return 0; }                       /* Core: RPC_TYPE_ERROR, its option type check */
+            apply_ub = v->str && v->str[0] == '1';
+        }
+    }
     mpd_import_ctx c; memset(&c, 0, sizeof c); c.collecting = 1;
     char err[160]; err[0] = 0;
-    long r = mempool_dump_read(path, mpd_import_one, &c, err, sizeof err);
+    unsigned char* ub = NULL; long nub = 0;
+    long r = mempool_dump_read_ub(path, mpd_import_one, &c, err, sizeof err, &ub, &nub);
     mpd_retry_passes(&c);
     if (r < 0){
+        free(ub);
         fprintf(stderr, "[rpc] importmempool %s: %s (%ld accepted before it)\n",
                 path, err[0] ? err : "malformed file", c.accepted);
         *ec = -1; *em = "Unable to import mempool file, see debug.log for details."; return 0; }
-    fprintf(stderr, "[rpc] importmempool %s: %ld accepted, %ld rejected of %ld\n",
-            path, c.accepted, c.rejected, r);
+    long waiting = apply_ub ? mpd_unbroadcast_apply(ub, nub) : 0;
+    free(ub);
+    fprintf(stderr, "[rpc] importmempool %s: %ld accepted, %ld rejected of %ld; %ld waiting for initial broadcast\n",
+            path, c.accepted, c.rejected, r, waiting);
     *res = rj_obj();               /* Core returns an empty object */
     return 1;
 }
@@ -3318,6 +3391,10 @@ static int cmd_sendrawtransaction(const rj_val* params, rj_val** res, long* ec, 
     s->tx_submit_len = n;
     s->tx_submit_result = 0;
     s->tx_submit_private = s->pb_enabled ? 1 : 0;
+    /* Core BroadcastTransaction(MEMPOOL_AND_BROADCAST_TO_ALL) puts a newly
+     * accepted submission in the unbroadcast set; private broadcast does not
+     * touch the mempool at all */
+    s->tx_submit_local = s->pb_enabled ? 0 : 1;
     /* explicit: a stale 1 left by a previous testmempoolaccept would turn a
      * real submission into a dry run and report a txid for a tx that was
      * never accepted or relayed. */
@@ -3388,6 +3465,7 @@ static int tma_stage(node_status_t* s, const unsigned char* tx, unsigned long n,
     s->tx_submit_result = 0;
     s->tx_submit_fee = 0;
     s->tx_submit_test = 1;
+    s->tx_submit_local = 0;
     s->tx_submit_reason[0] = 0;
     unsigned long long myseq = s->tx_submit_seq + 1;
     __sync_synchronize();
@@ -3489,6 +3567,7 @@ static int cmd_submitpackage(const rj_val* params, rj_val** res, long* ec, const
     st->tx_submit_len = total;
     st->tx_submit_test = 0;
     st->tx_submit_pkg_n = n;
+    st->tx_submit_local = 0;          /* Core's submitpackage broadcasts what is already in the pool: no unbroadcast entry */
     st->tx_submit_reason[0] = 0;
     st->pkg_msg[0] = 0;
     unsigned long long myseq = st->tx_submit_seq + 1;
@@ -3665,6 +3744,7 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
         s->tx_submit_len   = total;
         s->tx_submit_test  = 1;          /* dry run: pass 1 only, commits nothing */
         s->tx_submit_pkg_n = n;
+        s->tx_submit_local = 0;
         s->tx_submit_reason[0] = 0;
         s->pkg_msg[0] = 0;
         unsigned long long myseq = s->tx_submit_seq + 1;

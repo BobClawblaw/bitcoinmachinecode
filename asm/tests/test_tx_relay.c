@@ -1171,6 +1171,50 @@ int main(void){
             close(sq[0]); close(sq[1]);
         }
     }
+    /* ---- the unbroadcast set (2026-11-06): the worker serves its outbound
+     * legs' getdata here, and Core takes a served transaction out of the set
+     * (ProcessGetData, RemoveUnbroadcastTx). Both forms are asked for: the
+     * witness one, and the bare MSG_TX that goes through the strip. */
+    printf("\n== unbroadcast: served on an outbound leg -> out of the set ==\n");
+    {
+        extern int  mempool_configure(void);
+        extern void* mp_ext_area;
+        extern void mp_lock(void); extern void mp_unlock(void);
+        extern long mpool_put(void* mp, const unsigned char txid[32], const unsigned char* tx, unsigned long len);
+        extern void mempool_note_accept(const unsigned char* txid);
+        extern int  mempool_unbroadcast_add(const unsigned char txid[32]);
+        extern int  mempool_unbroadcast_of(const unsigned char txid[32]);
+        extern long mempool_unbroadcast_count(void);
+        g_cfg.maxmempool_mb = 8;
+        ck("shared pool configured", mempool_configure() == 1);
+        const u8* utx[2] = { s->tx, s2->tx }; unsigned long ul[2] = { (unsigned long)s->txlen, (unsigned long)s2->txlen };
+        u8 uid[2][32];
+        for (int k = 0; k < 2; k++){
+            tx_txid(uid[k], utx[k], ul[k], tb, sizeof tb);
+            mp_lock(); mpool_put(mp_ext_area, uid[k], utx[k], ul[k]); mp_unlock();
+            mempool_note_accept(uid[k]); mempool_unbroadcast_add(uid[k]);
+        }
+        ck("two flagged", mempool_unbroadcast_count() == 2);
+        int su[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, su) == 0){
+            u8 g[1 + 2*36]; g[0] = 2;
+            g[1] = 0x01; g[2] = 0; g[3] = 0; g[4] = 0x40; memcpy(g + 5, uid[0], 32);    /* MSG_WITNESS_TX */
+            g[37] = 0x01; g[38] = 0; g[39] = 0; g[40] = 0; memcpy(g + 41, uid[1], 32);  /* bare MSG_TX */
+            p2p_write(su[1], "getdata", 7, g, sizeof g);
+            (void)txrelay_poll_leg(su[0], mp_ext_area, 200);
+            char cmd[13]; static u8 pl[1 << 16]; int served = 0;
+            for (int k = 0; k < 2; k++){
+                int plen = read_msg_nb(su[1], cmd, pl, sizeof pl);
+                if (plen > 0 && !strcmp(cmd, "tx")) served++;
+            }
+            ck("both served", served == 2);
+            ck("the witness form's tx left the set", mempool_unbroadcast_of(uid[0]) == 0);
+            ck("the bare MSG_TX (stripped) one too", mempool_unbroadcast_of(uid[1]) == 0);
+            ck("count 0", mempool_unbroadcast_count() == 0);
+            close(su[0]); close(su[1]);
+        } else ck("socketpair", 0);
+    }
+
     printf("\n%s (%d checks, %d failures)\n", g_fails==0 ? "ALL PASS" : "SOME FAILED", g_checks, g_fails);
     return g_fails ? 1 : 0;
 }

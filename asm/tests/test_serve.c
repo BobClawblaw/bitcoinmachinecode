@@ -13,6 +13,7 @@
 #include <arpa/inet.h>
 #include <sys/wait.h>
 #include "test_tmpdir.h"
+#include "../daemon/node_config.h"
 
 extern long node_handshake(int fd);
 extern int  node_accept_handshake(int fd);
@@ -29,6 +30,27 @@ extern void idx_init(void* idx, unsigned long slots);
 extern int  idx_put(void* idx, const unsigned char hash[32], long height);
 extern long p2p_ping(unsigned char* out, uint64_t nonce);
 
+/* the unbroadcast set (2026-11-06, daemon/mempool_cfg.c) */
+extern int  mempool_configure(void);
+extern void* mp_ext_area;
+extern void mp_lock(void); extern void mp_unlock(void);
+extern long mpool_put(void* mp, const unsigned char txid[32], const unsigned char* tx, unsigned long len);
+extern void mempool_note_accept(const unsigned char* txid);
+extern int  mempool_unbroadcast_add(const unsigned char txid[32]);
+extern int  mempool_unbroadcast_of(const unsigned char txid[32]);
+extern long mempool_unbroadcast_count(void);
+extern int  txann_wtxid_of(const unsigned char txid[32], unsigned char wtxid_out[32]);
+/* a well-formed legacy transaction, tagged through its prevout */
+static unsigned long mk_tx(unsigned char* out, unsigned char tag){
+    unsigned char* p = out;
+    p[0]=2;p[1]=0;p[2]=0;p[3]=0; p+=4;
+    *p++ = 1; memset(p, tag, 32); p += 32; p[0]=0;p[1]=0;p[2]=0;p[3]=0; p+=4;
+    *p++ = 0; p[0]=0xfd;p[1]=0xff;p[2]=0xff;p[3]=0xff; p+=4;
+    *p++ = 1; for(int k=0;k<8;k++) *p++ = (unsigned char)(k==0?0x40:0);
+    *p++ = 22; *p++ = 0x00; *p++ = 0x14; for(int k=0;k<20;k++) *p++ = (unsigned char)(k+tag);
+    p[0]=0;p[1]=0;p[2]=0;p[3]=0; p+=4;
+    return (unsigned long)(p - out);
+}
 static int failures=0;
 static void cki(const char*l,long g,long e){ if(g==e)printf("PASS %s (got %ld)\n",l,g); else{printf("FAIL %s got=%ld exp=%ld\n",l,g,e);failures++;} }
 static void put_u32(unsigned char*p,unsigned v){p[0]=v;p[1]=v>>8;p[2]=v>>16;p[3]=v>>24;}
@@ -131,6 +153,29 @@ int main(void){
     { long gh = -1; extern int idx_get(void* ix, const unsigned char h[32], long* height);
       cki("STO-10 fixture: the stale mapping is in the index BEFORE the fork",
           idx_get(idx, ghost, &gh) == 1 && gh == 0, 1); }
+
+    /* ---- the unbroadcast set: Core takes a transaction out of it when a peer
+     * asks for it and is sent it (ProcessGetData, RemoveUnbroadcastTx).
+     * Inbound peers are served by THIS loop in a forked child, so the clear
+     * has to happen here and reach the table every process maps. Four
+     * flagged transactions in the shared pool: one asked for by each of the
+     * loop's three arms (MSG_WITNESS_TX, the bare MSG_TX stripping arm, and
+     * BIP339's MSG_WTX), one never asked for. */
+    g_cfg.maxmempool_mb = 8;
+    cki("unbroadcast fixture: shared pool configured", mempool_configure(), 1);
+    static unsigned char utx[4][128]; unsigned long ulen[4]; unsigned char uid[4][32], uwt[32];
+    for (int k = 0; k < 4; k++){
+        ulen[k] = mk_tx(utx[k], (unsigned char)(0x61 + k));
+        sha256d(uid[k], utx[k], (long)ulen[k]);
+        mp_lock(); mpool_put(mp_ext_area, uid[k], utx[k], ulen[k]); mp_unlock();
+        mempool_note_accept(uid[k]);
+        mempool_unbroadcast_add(uid[k]);
+    }
+    cki("unbroadcast fixture: four flagged before the fork", mempool_unbroadcast_count(), 4);
+    /* the MSG_WTX arm resolves a wtxid through the map txann fills as it
+     * announces; announcing it here, before the fork, is what a serve child
+     * inherits */
+    cki("unbroadcast fixture: tx 2's wtxid is mapped", txann_wtxid_of(uid[2], uwt), 1);
 
     pid_t pid=fork();
     if(pid==0){
@@ -415,6 +460,28 @@ int main(void){
         if(w2<=0||rr3<=0||strncmp(c5,"pong",4)!=0||rl2<8||memcmp(rp2,pg,8)!=0) pingok=0;
     }
     cki("25x ping/pong after multi-getdata (loop stable)", pingok, 1);
+
+    /* the unbroadcast set: ask for tx 0, 1 and 2 in one getdata, one per arm */
+    { unsigned char g[1 + 3*36]; g[0] = 3;
+      put_u32(g + 1,  0x40000001u); memcpy(g + 5,  uid[0], 32);     /* MSG_WITNESS_TX */
+      put_u32(g + 37, 1);           memcpy(g + 41, uid[1], 32);     /* bare MSG_TX: the stripping arm */
+      put_u32(g + 73, 5);           memcpy(g + 77, uwt,    32);     /* BIP339 MSG_WTX */
+      p2p_write(fd, "getdata", 7, g, sizeof g);
+      int got[3] = {0, 0, 0};
+      for (int k = 0; k < 3; k++){
+          char c7[12]; static unsigned char rb7[4096]; unsigned rl7 = 0;
+          if (p2p_read(fd, c7, rb7, sizeof rb7, &rl7) <= 0 || strncmp(c7, "tx", 3)) break;
+          if (rl7 == ulen[k] && !memcmp(rb7, utx[k], rl7)) got[k] = 1;
+      }
+      cki("unbroadcast: the three txs served byte-exact", got[0] + got[1] + got[2], 3);
+      /* a pong means the loop finished that getdata, clears included */
+      uint64_t n3 = 0x5542434153540001ull; p2p_ping(pg, n3); p2p_write(fd, "ping", 4, pg, 8);
+      { char c8[12]; static unsigned char rb8[1024]; unsigned rl8 = 0; p2p_read(fd, c8, rb8, sizeof rb8, &rl8); }
+      cki("unbroadcast: MSG_WITNESS_TX served -> out of the set", mempool_unbroadcast_of(uid[0]), 0);
+      cki("unbroadcast: bare MSG_TX served -> out of the set", mempool_unbroadcast_of(uid[1]), 0);
+      cki("unbroadcast: MSG_WTX served -> out of the set", mempool_unbroadcast_of(uid[2]), 0);
+      cki("unbroadcast: the one nobody asked for stays", mempool_unbroadcast_of(uid[3]), 1);
+      cki("unbroadcast: count 1", mempool_unbroadcast_count(), 1); }
 
     close(fd); waitpid(pid,0,0); close(ls);
 

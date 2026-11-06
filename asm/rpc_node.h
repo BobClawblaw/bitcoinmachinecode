@@ -558,6 +558,13 @@ typedef struct {
      * branch's blocks there were never servable until a restart. Appended:
      * every offset above is unchanged. */
     volatile unsigned long long reorg_gen;
+    /* 1 = this submission is the node's own broadcast (sendrawtransaction
+     * without -privatebroadcast, and so the wallet's, which goes through it):
+     * Core's BroadcastTransaction(MEMPOOL_AND_BROADCAST_TO_ALL), whose new
+     * pool entries join the unbroadcast set (2026-11-06). Every stager writes
+     * it; the worker reads and clears it before it branches. Appended: every
+     * offset above is unchanged. */
+    volatile int              tx_submit_local;
 } node_status_t;
 #define NODE_TIP_UNTRACKED (-2LL)
 
@@ -634,6 +641,14 @@ typedef struct {
      * "height" (2026-11-06, daemon/mempool_cfg.c mempool_height_of). NULL or
      * 0 = unknown, reported as 0 as before. */
     long (*height_of)(const unsigned char*);
+    /* the unbroadcast set (2026-11-06, daemon/mempool_cfg.c): membership for
+     * the entry objects' "unbroadcast", the size for getmempoolinfo's
+     * "unbroadcastcount", the members for mempool.dat, and the load's add.
+     * NULL = none tracked: false / 0 / an empty set, as before. */
+    int  (*unbroadcast_of)(const unsigned char*);
+    long (*unbroadcast_count)(void);
+    long (*unbroadcast_list)(unsigned char (*)[32], long);
+    int  (*unbroadcast_add)(const unsigned char*);
 } rpc_mempool_hooks;
 void rpc_node_set_mempool(const rpc_mempool_hooks* h);
 /* Clusters linearized by the mempool-entry builder since start (chunkweight /

@@ -342,9 +342,9 @@ tables and the writers themselves.
   read unconditionally; v2's obfuscation key is random so no writer can
   produce a byte-comparable artifact) and read both. `importmempool`
   re-submits each transaction through the normal admission path. Not
-  restored: fee deltas and the unbroadcast set (entry times ARE restored as
-  of 2026-09-16, vetted against the expiry window) — each stated at
-  the call site. *(This item was missing from the 2026-08-27 audit of this
+  restored: fee deltas (entry times ARE restored as of 2026-09-16, vetted
+  against the expiry window; the unbroadcast set as of 2026-11-06) — stated
+  at the call site. *(This item was missing from the 2026-08-27 audit of this
   list, which tracked it only in `docs/RPC_LIVE_NODE.md`. The audit was more
   accurate than what it replaced but not complete.)*
 - ~~**Package relay**~~ — **CLOSED 2026-08-27 (evening).** All five parts:
@@ -2976,6 +2976,35 @@ test, and the bug was in the measurement.
   its own. The previous build reported 0 in every case.
   `test_mempool_shared` checks the height across processes; it fails with
   the write removed.
+- ~~**The unbroadcast set is not tracked.**~~ **CLOSED 2026-11-06.**
+  `getmempoolinfo.unbroadcastcount` was the constant 0 and every entry's
+  `unbroadcast` the constant false; `mempool.dat` was written with an empty
+  set and the file's set was skipped on load. Core keeps the transactions it
+  submitted itself (`sendrawtransaction` without `-privatebroadcast`, and the
+  wallet's broadcast, which goes through it here) until a peer fetches one
+  with getdata and is sent it; the set is announced again every 10-15
+  minutes; leaving the pool leaves the set; `mempool.dat` carries it (the
+  startup load applies it, `importmempool` only with
+  `apply_unbroadcast_set`). A submission already in the pool, and so
+  `submitpackage`, does not join it. Now: a flag beside the arrival time and
+  entry height in the table every process maps (`mempool_cfg.c`), a shared
+  count changed only by the flag's own CAS, the clear in both serve paths
+  (the worker's `tx_relay.c` and the inbound children's
+  `bitcoin_serve.asm` / `port/osx/bitcoin_serve.S`), the reattempt in the
+  worker. `validation/unbroadcast_core_diff.py` (a Core peer, bmc and a
+  second Core each connected only to it): submission, fetch, networking off,
+  `savemempool`'s file section, a restart reload, the reattempt (both nodes
+  cleared within 780 s of networking coming back) and `importmempool`'s
+  option, 27 of 27 equal to v31.1; on the previous build (`deploy-20261106d`)
+  10 fail. Unit tests in `test_mempool_shared`,
+  `test_mempool_persist`, `test_serve` and `test_tx_relay` each fail with
+  their rule reverted.
+- **Found, not fixed: a `mempool.dat` reload announces every transaction.**
+  The reload re-submits through the `sendrawtransaction` channel, whose
+  accept queues an announcement on every live leg (production, 2026-11-06
+  09:04Z: 37,200 reloaded, each queued for announcement). Core's
+  `LoadMempool` admits without relaying. Not changed here: it needs its own
+  decision (the reload's legs, the time it runs).
 - **`getnetworkinfo` `version` is 310100, not 1.** It reported this node's
   own 0.0.1 encoded Core's way, and clients read the field as a capability
   level: Core Lightning's bcli refused to start ("Unsupported bitcoind

@@ -61,6 +61,7 @@ extern serve_block_ctx_ok
     extern mpool_put
     extern mpool_get
     extern txann_txid_for_wtxid     ; BIP339 (2026-10-03): getdata(MSG_WTX) -> the txid we announced
+    extern mempool_unbroadcast_clear ; 2026-11-06: a tx sent to a peer leaves the unbroadcast set (daemon/mempool_cfg.c)
     extern mpool_count
     extern tx_dispatch_init
     extern tx_policy_init
@@ -228,6 +229,7 @@ s_p:      dq 0
 s_abound: dq 0        ; getaddr reply: loop bound (min(book,1000)), kept in MEMORY
 s_n:      dq 0
 s_wtxtid: times 32 db 0   ; BIP339: the txid a getdata(MSG_WTX) resolved to
+s_gdtid:  dq 0            ; the txid being served (-> s_wtxtid or into the getdata entry), for the unbroadcast set
 s_served: dq 0
 s_tip:    dq 0
 s_from:   dq 0
@@ -1324,6 +1326,8 @@ node_serve_loop:
     mov  rbx, [s_ptr]
     test rax, rax
     jz   .gd_miss
+    lea  rcx, [s_wtxtid]
+    mov  [s_gdtid], rcx      ; the txid this entry resolved to
     jmp  .gdtx_have
 .gd_tx:
     ; txid at rbx+4; mpool_get(mp_cur, txid, &s_n) -> ptr or 0
@@ -1335,6 +1339,8 @@ node_serve_loop:
     mov  rbx, [s_ptr]
     test rax, rax
     jz   .gd_miss
+    lea  rcx, [rbx+4]
+    mov  [s_gdtid], rcx      ; the entry's own txid
     ; ---- MEM-24 (audit 2026-09-03): serve the FORM that was requested ------
     ; A bare MSG_TX (witness bit 0x40000000 CLEAR) asks for the non-witness
     ; serialization; Core sends TX_NO_WITNESS for it. This arm served the
@@ -1371,6 +1377,11 @@ node_serve_loop:
     pop  rbx
     pop  rbx
     add  qword [s_served], 1
+    ; Core ProcessGetData: sent to a peer, so no longer unbroadcast
+    ; (RemoveUnbroadcastTx). Same stack depth as the p2p_write call above
+    ; minus its two pads: 16-byte aligned here, as every call in this arm.
+    mov  rdi, [s_gdtid]
+    call mempool_unbroadcast_clear
     mov  rbx, [s_ptr]
     jmp  .gd_next
 .gd_miss:

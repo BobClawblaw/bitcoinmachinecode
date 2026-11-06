@@ -318,8 +318,8 @@ omission is now a declared one in the frozen fixture test
 
 ### Found, not fixed
 
-- `unbroadcast` is a constant `false`. Core is `true` for a transaction its own
-  RPC submitted until a peer requests it; this node keeps no unbroadcast set.
+- ~~`unbroadcast` is a constant `false`.~~ Fixed 2026-11-06: the unbroadcast
+  set is tracked as Core's is (FEATURE_GAPS, "The unbroadcast set").
 - `getmempoolinfo.bytes` is still the BIP141 vsize sum; v31.1 sums the adjusted
   entry size. Equal except for sigop-heavy transactions. The comment there
   keeps it independent of the policy registry on purpose, so it is left for a

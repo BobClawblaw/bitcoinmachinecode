@@ -69,12 +69,15 @@ static int get_cs(const u8* p, u64 avail, u64* out){
  * the number of transactions written, or -1. Writes to <path>.new and
  * renames, the same tmp+rename discipline every other durable file here
  * uses -- a torn mempool.dat should never be loadable. */
-long mempool_dump_write(const char* path,
-                        const u8* const* txs, const unsigned long* lens,
-                        const long long* times, const long long* deltas, long n,
-                        const u8* extra_delta_txids, const long long* extra_deltas,
-                        long n_extra){
-    if (!path || (n > 0 && (!txs || !lens))) return -1;
+/* Core serializes the set as a std::set<Txid>: sorted by the txid's bytes in
+ * internal order (base_blob's memcmp), so a sorted copy writes the same file */
+static int mpd_txid_cmp(const void* a, const void* b){ return memcmp(a, b, 32); }
+long mempool_dump_write_ub(const char* path,
+                           const u8* const* txs, const unsigned long* lens,
+                           const long long* times, const long long* deltas, long n,
+                           const u8* extra_delta_txids, const long long* extra_deltas,
+                           long n_extra, const u8* ub_txids, long n_ub){
+    if (!path || (n > 0 && (!txs || !lens)) || (n_ub > 0 && !ub_txids)) return -1;
     char tmp[1024];
     if (snprintf(tmp, sizeof tmp, "%s.new", path) >= (int)sizeof tmp) return -1;
     FILE* f = fopen(tmp, "wb");
@@ -101,12 +104,18 @@ long mempool_dump_write(const char* path,
         u8 d[8]; put_u64(d, (u64)extra_deltas[i]);
         if (fwrite(d, 1, 8, f) != 8) goto fail;
     }
-    /* unbroadcast set: this node does not track which transactions are still
-     * unbroadcast (sendrawtransaction relays to every live leg immediately),
-     * so the set is empty rather than invented. Core reads an empty set
-     * without complaint; it simply re-announces nothing extra. */
-    { u8 cs[9]; int cl = put_cs(cs, 0);
-      if (fwrite(cs, 1, (size_t)cl, f) != (size_t)cl) goto fail; }
+    /* the unbroadcast set (Core m_unbroadcast_txids), sorted as Core's
+     * std::set writes it. It was always empty until 2026-11-06, when this
+     * node started tracking its own submissions (daemon/mempool_cfg.c). */
+    { long nu = n_ub > 0 ? n_ub : 0;
+      u8* sorted = nu ? (u8*)malloc((size_t)nu * 32) : NULL;
+      if (nu && !sorted) goto fail;
+      if (nu){ memcpy(sorted, ub_txids, (size_t)nu * 32); qsort(sorted, (size_t)nu, 32, mpd_txid_cmp); }
+      u8 cs[9]; int cl = put_cs(cs, (u64)nu);
+      int bad = fwrite(cs, 1, (size_t)cl, f) != (size_t)cl;
+      if (!bad && nu) bad = fwrite(sorted, 32, (size_t)nu, f) != (size_t)nu;
+      free(sorted);
+      if (bad) goto fail; }
 
     /* MEM-19 (audit 2026-09-03): fflush only pushes stdio's buffer into the
      * kernel -- it does not put the bytes on the disk. The rename was then
@@ -133,15 +142,27 @@ fail:
     return -1;
 }
 
+long mempool_dump_write(const char* path,
+                        const u8* const* txs, const unsigned long* lens,
+                        const long long* times, const long long* deltas, long n,
+                        const u8* extra_delta_txids, const long long* extra_deltas,
+                        long n_extra){
+    return mempool_dump_write_ub(path, txs, lens, times, deltas, n,
+                                 extra_delta_txids, extra_deltas, n_extra, NULL, 0);
+}
+
 /* ---- reader -------------------------------------------------------------
  * Calls `sink` once per transaction, in file order. Returns the count, or -1
  * on a malformed file. Deliberately does NOT validate or admit anything --
  * the caller decides what to do with each transaction, because admission
  * belongs to the process that owns the mempool. */
-long mempool_dump_read(const char* path,
-                       int (*sink)(void* ctx, const u8* tx, unsigned long len,
-                                   long long time, long long delta),
-                       void* ctx, char* err, unsigned long errcap){
+long mempool_dump_read_ub(const char* path,
+                          int (*sink)(void* ctx, const u8* tx, unsigned long len,
+                                      long long time, long long delta),
+                          void* ctx, char* err, unsigned long errcap,
+                          u8** ub_out, long* n_ub_out){
+    if (ub_out) *ub_out = NULL;
+    if (n_ub_out) *n_ub_out = 0;
 #define MPD_ERR(...) do{ if (err && errcap) snprintf(err, errcap, __VA_ARGS__); }while(0)
     FILE* f = fopen(path, "rb");
     if (!f){ MPD_ERR("cannot open %s", path); return -1; }
@@ -210,7 +231,35 @@ long mempool_dump_read(const char* path,
       pos += (u64)k;
       if (nd > ((u64)fsz - pos) / 40){ free(buf); MPD_ERR("delta map overruns the file"); return -1; }
       pos += nd * 40; }
+    /* the unbroadcast set (2026-11-06: read, where it was skipped). Handed to
+     * the caller rather than applied: Core adds each txid only once the
+     * transactions are in the pool (LoadMempool's pool.get check), which is
+     * after admission, and admission is the caller's. A dump that ends right
+     * after the delta map -- every dump this node wrote before it tracked the
+     * set ended with an empty one, so that is not one of ours -- reads as an
+     * empty set rather than a fault. */
+    if (pos < (u64)fsz){
+        u64 nu = 0; int k = get_cs(buf + pos, (u64)fsz - pos, &nu);
+        if (!k){ free(buf); MPD_ERR("unbroadcast set count is truncated, non-canonical or above MAX_SIZE"); return -1; }
+        pos += (u64)k;
+        if (nu > ((u64)fsz - pos) / 32){ free(buf); MPD_ERR("unbroadcast set overruns the file"); return -1; }
+        if (nu && ub_out){
+            u8* ids = (u8*)malloc((size_t)nu * 32);
+            if (!ids){ free(buf); MPD_ERR("out of memory"); return -1; }
+            memcpy(ids, buf + pos, (size_t)nu * 32);
+            *ub_out = ids;
+            if (n_ub_out) *n_ub_out = (long)nu;
+        }
+        pos += nu * 32;
+    }
     free(buf);
     return done;
 #undef MPD_ERR
+}
+
+long mempool_dump_read(const char* path,
+                       int (*sink)(void* ctx, const u8* tx, unsigned long len,
+                                   long long time, long long delta),
+                       void* ctx, char* err, unsigned long errcap){
+    return mempool_dump_read_ub(path, sink, ctx, err, errcap, NULL, NULL);
 }
