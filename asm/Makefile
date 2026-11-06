@@ -3110,7 +3110,7 @@ rpc_json.o: rpc_json.c rpc_json.h
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -c -o $@ rpc_json.c
 rpc_net.o: rpc_net.c rpc_net.h rpc_json.h
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -c -o $@ rpc_net.c
-rpc_commands.o: rpc_commands.c rpc_commands.h rpc_json.h rpc_node.h
+rpc_commands.o: rpc_commands.c rpc_commands.h rpc_json.h rpc_node.h rpc_argnames.h
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -c -o $@ rpc_commands.c
 # the Esplora facade's routes against a canned rpc_dispatch (the test defines it)
 tests/test_rest: tests/test_rest.c rest.o rpc_json.o

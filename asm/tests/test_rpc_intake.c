@@ -33,6 +33,12 @@ long axt_read_events(int type, const unsigned char hash[32], long min_height,
     (void)type; (void)hash; (void)min_height; (void)cb; (void)ctx; return 0; }
 int rpc_chain_method_lane(const char* m){ (void)m; return 0; }
 int rpc_chain_method_lane_p(const char* m, const rj_val* p){ (void)m; (void)p; return 0; }
+/* the server converts named arguments through rpc_commands.o's
+ * rpc_named_params; this test links a canned rpc_dispatch instead, so it
+ * passes params through unchanged (2026-11-06) */
+int rpc_named_params(const char* method, const rj_val* params, rj_val** out, long* ec, const char** em){
+    (void)method; (void)params; (void)ec; (void)em; *out = NULL; return 1;
+}
 int rpc_dispatch(const char* method, const rj_val* params, const rpc_wallet* w, rj_val** result, long* ec, const char** em){
     (void)params; (void)w;
     if (!strcmp(method, "getblockcount")){ *result = rj_numf("%d", 7); return 1; }

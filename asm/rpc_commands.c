@@ -5135,47 +5135,128 @@ static const char ECHOIPC_USAGE[] =
     "\"method\": \"echo\", \"params\": [\"Hello world\"]}' -H 'content-type: application/json' "
     "http://127.0.0.1:8332/\n";
 
-/* Core's transformNamedArguments for a method whose arguments are names[0..n).
- * params is absent, null, an array (returned as a clone) or an object. Returns
- * a new array, or NULL with *ec and *em set. */
-static rj_val* echo_positional(const rj_val* params, const char* const* names, int n,
-                               long* ec, const char** em){
-    static __thread char msg[160];
-    if (!params || params->typ == RJ_NULL) return rj_arr();
-    if (params->typ == RJ_ARR) return rj_clone(params);
-    if (params->typ != RJ_OBJ){ *ec = -32600; *em = "Params must be an array or object"; return NULL; }
-    const rj_val* pos = NULL;           /* "args": the leading positional values */
-    for (size_t i = 0; i < params->nmembers; i++){
-        const rj_member* m = &params->members[i];
-        int known = !strcmp(m->key, "args");
-        for (int k = 0; k < n && !known; k++) known = !strcmp(m->key, names[k]);
-        if (!known){ snprintf(msg, sizeof msg, "Unknown named parameter %s", m->key); *ec = -8; *em = msg; return NULL; }
+/* Named arguments (2026-11-06): Core's transformNamedArguments
+ * (rpc/server.cpp), for every method in asm/rpc_argnames.h -- each method's
+ * argument names in Core's order, generated from Core v31.1's help by
+ * validation/gen_rpc_argnames.py. Until now only the echo methods converted
+ * a params object (echo_positional, a subset of this, now echo_args below);
+ * every other handler
+ * reads a positional array and got the object unconverted.
+ *
+ * Core's rules, kept: names fill their positions; a gap BEFORE a named
+ * argument becomes JSON null, a gap at the end stays absent; a named-only
+ * name (an options object's field, '*' in the table) is gathered into an
+ * object pushed at the options position, and a name given both ways there
+ * is "conflicts with parameter"; "args" supplies the leading positional
+ * values; a repeated name, a name given both positionally and by name, or
+ * an unknown name answers -8 with Core's message. A method with no table
+ * entry (one Core does not have) gets its object unchanged, as before;
+ * Core looks the method up first, so an unknown one stays "Method not
+ * found". params that is neither an array nor an object answers -32600
+ * for every method, as Core's request parser does.
+ *
+ * Returns 1 with *out a new array, or *out NULL to use params as it is;
+ * 0 with *ec and *em set. */
+#include "rpc_argnames.h"
+static int argnames_cmp(const void* k, const void* e){ return strcmp((const char*)k, ((const rpc_argnames_t*)e)->method); }
+static const char* rpc_argnames_of(const char* method){
+    const rpc_argnames_t* e = bsearch(method, RPC_ARGNAMES, sizeof RPC_ARGNAMES / sizeof RPC_ARGNAMES[0], sizeof RPC_ARGNAMES[0], argnames_cmp);
+    return e ? e->names : NULL;
+}
+/* the unconsumed member whose key is one of the '|'-separated names in [p, p+len) */
+static long named_find(const rj_val* params, const unsigned char* used, const char* p, size_t len){
+    while (len){
+        const char* bar = memchr(p, '|', len); size_t n = bar ? (size_t)(bar - p) : len;
+        for (size_t i = 0; i < params->nmembers; i++)
+            if (!used[i] && strlen(params->members[i].key) == n && !memcmp(params->members[i].key, p, n)) return (long)i;
+        if (!bar) break;
+        len -= n + 1; p = bar + 1;
+    }
+    return -1;
+}
+int rpc_named_params(const char* method, const rj_val* params, rj_val** out, long* ec, const char** em){
+    static __thread char msg[192];
+    *out = NULL;
+    if (!params || params->typ == RJ_NULL || params->typ == RJ_ARR) return 1;
+    if (params->typ != RJ_OBJ){ *ec = -32600; *em = "Params must be an array or object"; return 0; }
+    const char* names = rpc_argnames_of(method);
+    if (!names) return 1;
+    for (size_t i = 0; i < params->nmembers; i++)
         for (size_t j = 0; j < i; j++)
-            if (!strcmp(params->members[j].key, m->key)){
-                snprintf(msg, sizeof msg, "Parameter %s specified multiple times", m->key);
-                *ec = -8; *em = msg; return NULL;
+            if (!strcmp(params->members[j].key, params->members[i].key)){
+                snprintf(msg, sizeof msg, "Parameter %s specified multiple times", params->members[i].key);
+                *ec = -8; *em = msg; return 0; }
+    unsigned char used_small[64]; unsigned char* used = params->nmembers <= sizeof used_small ? used_small : calloc(params->nmembers, 1);
+    if (!used){ *ec = -32603; *em = "out of memory"; return 0; }
+    memset(used, 0, params->nmembers <= sizeof used_small ? sizeof used_small : params->nmembers);
+    rj_val* arr = rj_arr(); rj_val* options = rj_obj();
+    int hole = 0, initial_hole_size = 0, ok = 0;
+    const char* initial_param = NULL; size_t initial_len = 0;
+    for (const char* p = names; *p; ){
+        const char* comma = strchr(p, ','); size_t len = comma ? (size_t)(comma - p) : strlen(p);
+        int named_only = (*p == '*');
+        const char* pat = named_only ? p + 1 : p; size_t plen = named_only ? len - 1 : len;
+        long f = plen ? named_find(params, used, pat, plen) : -1;
+        if (named_only){
+            if (f >= 0){
+                const char* key = params->members[f].key;
+                if (rj_obj_get(options, key)){ snprintf(msg, sizeof msg, "Parameter %s specified multiple times", key); *ec = -8; *em = msg; goto done; }
+                rj_obj_set(options, key, rj_clone(params->members[f].val)); used[f] = 1;
             }
-        if (!strcmp(m->key, "args") && m->val->typ == RJ_ARR) pos = m->val;
-    }
-    rj_val* out = pos ? rj_clone(pos) : rj_arr();
-    int holes = 0;
-    for (int k = 0; k < n; k++){
-        const rj_val* v = rj_obj_get(params, names[k]);
-        if (!v){ if ((size_t)k >= out->nitems) holes++; continue; }
-        if ((size_t)k < out->nitems){
-            snprintf(msg, sizeof msg, "Parameter %s specified twice both as positional and named argument", names[k]);
-            *ec = -8; *em = msg; rj_free(out); return NULL;
+        } else {
+            if (options->nmembers || f >= 0){
+                for (; hole > 0; hole--) rj_arr_push(arr, rj_null());
+                if (!initial_param){ initial_param = pat; initial_len = plen; }
+            } else {
+                hole++;
+                if (!arr->nitems) initial_hole_size = hole;
+            }
+            if (f >= 0){
+                if (options->nmembers){
+                    snprintf(msg, sizeof msg, "Parameter %s conflicts with parameter %s", params->members[f].key, options->members[0].key);
+                    *ec = -8; *em = msg; goto done; }
+                rj_arr_push(arr, rj_clone(params->members[f].val)); used[f] = 1;
+            }
+            if (options->nmembers){ rj_arr_push(arr, options); options = rj_obj(); }
         }
-        for (; holes > 0; holes--) rj_arr_push(out, rj_null());
-        rj_arr_push(out, rj_clone(v));
+        if (!comma) break;
+        p = comma + 1;
     }
-    return out;
+    for (size_t i = 0; i < params->nmembers; i++){
+        if (used[i] || strcmp(params->members[i].key, "args")) continue;
+        used[i] = 1;                                   /* extracted whatever its type, as Core's */
+        const rj_val* pos = params->members[i].val;
+        if (pos->typ != RJ_ARR) break;
+        if ((size_t)initial_hole_size < pos->nitems && initial_param){
+            snprintf(msg, sizeof msg, "Parameter %.*s specified twice both as positional and named argument", (int)initial_len, initial_param);
+            *ec = -8; *em = msg; goto done; }
+        rj_val* merged = rj_clone(pos);
+        for (size_t k = merged->nitems; k < arr->nitems; k++) rj_arr_push(merged, rj_clone(arr->items[k]));
+        rj_free(arr); arr = merged;
+        break;
+    }
+    for (size_t i = 0; i < params->nmembers; i++)
+        if (!used[i]){ snprintf(msg, sizeof msg, "Unknown named parameter %s", params->members[i].key); *ec = -8; *em = msg; goto done; }
+    *out = arr; arr = NULL; ok = 1;
+done:
+    if (arr) rj_free(arr);
+    rj_free(options);
+    if (used != used_small) free(used);
+    return ok;
+}
+
+/* the echo methods' arguments as a new array, whatever form params took
+ * (rpc_dispatch's own callers pass arrays; the server converts first) */
+static rj_val* echo_args(const char* method, const rj_val* params, long* ec, const char** em){
+    rj_val* conv = NULL;
+    if (!rpc_named_params(method, params, &conv, ec, em)) return NULL;
+    if (conv) return conv;
+    return params && params->typ == RJ_ARR ? rj_clone(params) : rj_arr();
 }
 
 static int cmd_echo(const char* method, const rj_val* params, long* ec, const char** em, rj_val** result){
-    static const char* const names[10] = {"arg0","arg1","arg2","arg3","arg4","arg5","arg6","arg7","arg8","arg9"};
     static __thread char usage[sizeof ECHO_USAGE_TAIL + 16];
-    rj_val* a = echo_positional(params, names, 10, ec, em);
+    rj_val* a = echo_args(method, params, ec, em);
     if (!a) return 0;
     if (a->nitems > 10){
         rj_free(a);
@@ -5187,8 +5268,7 @@ static int cmd_echo(const char* method, const rj_val* params, long* ec, const ch
 }
 
 static int cmd_echoipc(const rj_val* params, long* ec, const char** em, rj_val** result){
-    static const char* const names[1] = {"arg"};
-    rj_val* a = echo_positional(params, names, 1, ec, em);
+    rj_val* a = echo_args("echoipc", params, ec, em);
     if (!a) return 0;
     if (a->nitems != 1){ rj_free(a); *ec = -1; *em = ECHOIPC_USAGE; return 0; }
     if (a->items[0]->typ != RJ_STR){

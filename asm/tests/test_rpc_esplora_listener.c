@@ -50,6 +50,12 @@ int rpc_chain_method_lane(const char* m){ (void)m; return 0; }
 int rpc_chain_method_lane_p(const char* m, const rj_val* p){ (void)m; (void)p; return 0; }
 #define SCRATCH (1u << 20)
 static long g_big_ids = 0;                       /* getrawmempool's size: the write-deadline case */
+/* the server converts named arguments through rpc_commands.o's
+ * rpc_named_params; this test links a canned rpc_dispatch instead, so it
+ * passes params through unchanged (2026-11-06) */
+int rpc_named_params(const char* method, const rj_val* params, rj_val** out, long* ec, const char** em){
+    (void)method; (void)params; (void)ec; (void)em; *out = NULL; return 1;
+}
 int rpc_dispatch(const char* method, const rj_val* params, const rpc_wallet* w, rj_val** result, long* ec, const char** em){
     (void)params; (void)w;
     if (!strcmp(method, "getblockchaininfo")){
