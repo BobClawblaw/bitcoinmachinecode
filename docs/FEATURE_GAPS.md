@@ -3048,10 +3048,35 @@ test, and the bug was in the measurement.
   `bmcgetcapabilities` still reports it. The Lightning e2e passes every phase
   with it, and its LND logs the warning 0 times (it logged it at every
   publish before).
-- **Found 2026-11-04, OPEN (a P2P identity question, not decided):** three
-  secondary kinds of outbound connection already introduce themselves as
-  Core, not as this node: block-relay-only legs and feeler probes
-  (`daemon/net_policy.c` net_handshake_relay, `/Satoshi:25.0.0/`) and
-  `seednode` address gathering (`daemon/addr_ingest.c` addr_gather_from,
-  `/Satoshi:0.18.0/`). The full-relay outbound and inbound connections send
-  `/BitcoinMachineCode:0.0.1/`.
+- ~~**Found 2026-11-04, OPEN (a P2P identity question, not decided):**
+  three secondary kinds of outbound connection introduce themselves as
+  Core.~~ **CLOSED 2026-11-06.** Partly wrong as written, and the paths were
+  broken beyond the agent:
+  - The block-relay-only legs that run are CC-4's, dialled through the dial
+    helpers with the ordinary handshake: `/BitcoinMachineCode:0.0.1/`,
+    fRelay=0. The `/Satoshi:25.0.0/` path (`net_handshake_relay` into
+    `bro_fd[]` in the worker loop) was an older duplicate that never
+    connected -- it handed the pool's `a.b.c.d:port` to `inet_pton` --
+    and nothing read its fds. Removed.
+  - Feelers used that same path, so none ever dialed: production logged
+    23,687 feelers from 2026-09-27, 0 alive, and the result was only
+    logged. They now parse `a.b.c.d:port`, send the node's own version
+    (`node_make_version`, registered through `net_policy_set_version`)
+    with fRelay=0 as Core's do (`RejectIncomingTxs` is true for a
+    feeler), and a live one is marked tried in the address book, Core's
+    `addrman.Good()`.
+  - `seednode` gathering sent `/Satoshi:0.18.0/` with services 1, a
+    constant nonce, start height 789000 and port 8333 in its address
+    fields, and dialed port 8333 on every chain. It now sends the node's
+    own version and dials `seednode=host:port`'s port, or the chain's
+    default for a bare host (the port was parsed and dropped). On regtest
+    against
+    v31.1 (port 18444) the previous build never reached Core; this one
+    does, and Core logs `/BitcoinMachineCode:0.0.1/`, blocks 0,
+    `us=[::]:19734` (our listen port), txrelay=1 (an addr-fetch
+    connection follows `-blocksonly`, as Core's).
+  - Every kind of connection now sends the same version, as Core's does.
+    `tests/test_net_policy` drives a feeler against a loopback peer:
+    reached at `a.b.c.d:port`, the registered builder's version byte for
+    byte with fRelay=0; it fails with the old parse (3 checks) or with
+    fRelay=1 (1 check).
