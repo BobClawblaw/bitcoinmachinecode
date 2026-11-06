@@ -493,7 +493,7 @@ int mp_lock_is_robust(void){ return g_mp_robust; }
  * after mp_unlock in daemon/tx_accept.c). A tombstone write is one word, the
  * same as the flag it replaces, so it is exactly as safe as what it replaces. */
 enum { MPS_EMPTY = 0, MPS_LIVE = 1, MPS_DEAD = 2, MPS_CLAIMED = 3 };
-typedef struct { unsigned char txid[32]; long t; int used; } mp_seen_t;
+typedef struct { unsigned char txid[32]; long t; int used; long h; } mp_seen_t;   /* h: chain height at entry (2026-11-06) */
 static mp_seen_t*   g_seen = 0;
 static unsigned long g_seen_mask = 0;
 static void*        g_mp_area = 0;
@@ -683,6 +683,26 @@ long mempool_time_of(const unsigned char txid[32]){
     return 0;
 }
 
+/* The chain height a pool tx entered at (0 if unknown) -- getmempoolentry's
+ * "height". Written beside the arrival time, by the same accept path. */
+long mempool_height_of(const unsigned char txid[32]){
+    if(!g_seen) return 0;
+    unsigned long i = tx_hash(txid) & g_seen_mask;
+    for(unsigned long p=0; p<=g_seen_mask; p++){
+        mp_seen_t* e = &g_seen[(i+p) & g_seen_mask];
+        int st = __atomic_load_n(&e->used, __ATOMIC_ACQUIRE);
+        if(st == MPS_EMPTY) return 0;
+        if(st == MPS_LIVE && !memcmp(e->txid, txid, 32)) return __atomic_load_n(&e->h, __ATOMIC_RELAXED);
+    }
+    return 0;
+}
+/* Where the entry height comes from: main.c registers the node's connected
+ * tip (the shared status block, so every accepting process reads the same
+ * one). Unset = 0, the old answer. */
+static long (*g_mp_height_fn)(void);
+void mempool_set_height_fn(long (*fn)(void)){ g_mp_height_fn = fn; }
+static long mp_entry_height(void){ long h = g_mp_height_fn ? g_mp_height_fn() : 0; return h > 0 ? h : 0; }
+
 /* Record an accepted tx's arrival time. Called from the accept path.
  *
  * THE SLOT IS CLAIMED WITH AN ATOMIC CAS, and that is not decoration. This
@@ -727,6 +747,7 @@ void mempool_note_accept(const unsigned char txid[32]){
         if(st == MPS_LIVE){
             if(!memcmp(e->txid, txid, 32)){
                 __atomic_store_n(&e->t, (long)time(0), __ATOMIC_RELAXED);   /* already here: refresh */
+                __atomic_store_n(&e->h, mp_entry_height(), __ATOMIC_RELAXED);
                 return; }
             continue;                                    /* a collision, keep probing */
         }
@@ -738,6 +759,7 @@ void mempool_note_accept(const unsigned char txid[32]){
                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) continue;
         memcpy(e->txid, txid, 32);
         e->t = (long)time(0);
+        e->h = mp_entry_height();
         __atomic_store_n(&e->used, MPS_LIVE, __ATOMIC_RELEASE);   /* publish last */
 
         /* INSERT, THEN VERIFY. Two processes accepting the same txid can both

@@ -226,8 +226,9 @@ Wire existing primitives onto JSON-RPC with Core shapes.
       anccount=2, ancsize=sum of member vsizes, fees.anc=sum incl self,
       parent desccount incl self, spentby). wtxid = sha256d(full
       serialization). Error parity: -5 not-in-mempool, -8 with Core's exact
-      bad-txid message. DOCUMENTED GAPS: height=0 (entry height untracked at
-      accept), unbroadcast=false. Hermetic test drives a REAL parent->child
+      bad-txid message. DOCUMENTED GAPS: unbroadcast=false. (height was 0,
+      the entry height untracked at accept, until 2026-11-06; it is now the
+      tip at entry -- see FEATURE_GAPS.) Hermetic test drives a REAL parent->child
       chain through the REAL mpool_policy_add path. Deploy batched with the
       rest (build-side).
 - [x] getmempoolancestors / getmempooldescendants -- same

@@ -2961,8 +2961,21 @@ test, and the bug was in the measurement.
   and status, Core's own `bitcoin-cli -named`) all match; against the
   previous build 38 fail. One case is printed "known": `getmempoolentry`'s
   POSITIONAL replies already differ (`time` and `unbroadcast` are each
-  node's own; bmc's `height` read 0 after a restart, against Core's 102 --
-  not looked into here).
+  node's own; bmc's `height` read 0 -- see the next entry).
+- ~~**`getmempoolentry` `height` is 0.**~~ **CLOSED 2026-11-06.** Not a
+  restart effect, as the entry above first guessed: the field was the
+  constant 0 for every entry (`rpc_node.c`, "entry height untracked"), in
+  `getmempoolentry`, verbose `getrawmempool` and the verbose ancestor and
+  descendant calls. Core reports the chain height when the transaction
+  entered the pool (a `mempool.dat` reload enters at the height then). The
+  accept path now records the connected tip beside the arrival time in the
+  shared table every accepting process writes (`mempool_cfg.c`
+  `mempool_height_of`). On regtest against v31.1, a transaction accepted at
+  102: both nodes report 102; after an empty block 103, both still 102;
+  after bmc's restart (reload) bmc reports 103, and Core reports 103 after
+  its own. The previous build reported 0 in every case.
+  `test_mempool_shared` checks the height across processes; it fails with
+  the write removed.
 - **`getnetworkinfo` `version` is 310100, not 1.** It reported this node's
   own 0.0.1 encoded Core's way, and clients read the field as a capability
   level: Core Lightning's bcli refused to start ("Unsupported bitcoind

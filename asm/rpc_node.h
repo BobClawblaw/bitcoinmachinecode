@@ -630,6 +630,10 @@ typedef struct {
      * with the txid walk, so the pair is one consistent snapshot. NULL = the
      * initial value, 1 (no pool has ever changed). */
     unsigned long long (*mempool_sequence)(void);
+    /* the chain height when the tx entered the pool, getmempoolentry's
+     * "height" (2026-11-06, daemon/mempool_cfg.c mempool_height_of). NULL or
+     * 0 = unknown, reported as 0 as before. */
+    long (*height_of)(const unsigned char*);
 } rpc_mempool_hooks;
 void rpc_node_set_mempool(const rpc_mempool_hooks* h);
 /* Clusters linearized by the mempool-entry builder since start (chunkweight /

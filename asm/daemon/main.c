@@ -468,6 +468,15 @@ static void hst_close(void* hst){ long fd = *(long*)hst; if(fd > 0) close((int)f
 #define L_SERVE  7
 
 static unsigned char store_buf[4096];
+/* a mempool entry's height (getmempoolentry, 2026-11-06): the tip every chain
+ * RPC reports -- the connected tip, or the stored one when live tracking is
+ * off (rpc_chain.c public_tip_cap) */
+static long mempool_entry_tip(void){
+    long t = rpc_public_tip();
+    if(t >= 0) return t;
+    long st = (long)*(int*)(store_buf + 24);
+    return st > 0 ? st : 0;
+}
 
 /* ---- block hash -> height index (for O(1) getdata/by-hash serving). ----
  * The table itself is 100% assembly (asm/bitcoin_idx.asm: idx_init/idx_put/
@@ -12278,6 +12287,7 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
       extern unsigned long mp_ext_blobcap;
       extern void mp_lock(void); extern void mp_unlock(void);
       extern long mempool_time_of(const unsigned char*);
+      extern long mempool_height_of(const unsigned char*);
       extern long mpool_policy_entry(void*, const unsigned char*,
                                      unsigned long long*, unsigned long long*);
       extern long mpool_policy_graph_all(void*, struct mp_graph*);
@@ -12295,6 +12305,7 @@ extern long mpool_policy_entry_info(void*, const unsigned char*, struct mp_entry
           .count = mpool_count, .get = mpool_get,
           .lock = mp_lock, .unlock = mp_unlock,
           .time_of = mempool_time_of,
+          .height_of = mempool_height_of,
           .pol_entry = mpool_policy_entry,
           .pol_entry_info = mpool_policy_entry_info,
           .pol_graph_all = mpool_policy_graph_all,
@@ -13625,6 +13636,7 @@ int main(int argc, char** argv){
      * before the fork, so every child inherits the same region rather than
      * each falling back to the 2 MiB static. */
     mempool_configure();
+    { extern void mempool_set_height_fn(long (*)(void)); mempool_set_height_fn(mempool_entry_tip); }
     /* Open the read-only UTXO snapshot the tx-validation path needs ONCE,
      * here, PRE-FORK -- for exactly the reason the mempool above is done
      * pre-fork. bitcoin_serve.asm used to do it lazily per CONNECTION, and
