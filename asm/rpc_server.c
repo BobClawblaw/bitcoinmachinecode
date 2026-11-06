@@ -645,14 +645,21 @@ static rj_val* exec_one(rj_val* req, int* status, int* is_notification) {
             *status = HTTP_BAD_REQUEST; /* -32600 -> 400 */
         } else {
             rj_val* result = NULL; long dec = 0; const char* dem = NULL;
-            /* the lock this METHOD needs, held for its dispatch only -- a
-             * batch takes it per entry (see rpc_method_class) */
-            int cls = rpc_method_class_p(method, params);
-            g_exec_label = method; g_exec_ctx[0] = 0;   /* who to name if this hold or wait is slow */
-            if (cls == RPC_CLASS_EXCL) exec_lock(); else if (cls == RPC_CLASS_SHARED) exec_rlock();
-            int ok = rpc_dispatch(method, params, g_wallet, &result, &dec, &dem);
-            if (cls == RPC_CLASS_EXCL || cls == RPC_CLASS_SHARED) exec_unlock();
-            g_exec_label = 0;
+            /* named arguments to positions first (Core: transformNamedArguments,
+             * 2026-11-06), so the lock class and the handler both see the array */
+            rj_val* named = NULL; int ok = 0;
+            if (rpc_named_params(method, params, &named, &dec, &dem)){
+                if (named) params = named;
+                /* the lock this METHOD needs, held for its dispatch only -- a
+                 * batch takes it per entry (see rpc_method_class) */
+                int cls = rpc_method_class_p(method, params);
+                g_exec_label = method; g_exec_ctx[0] = 0;   /* who to name if this hold or wait is slow */
+                if (cls == RPC_CLASS_EXCL) exec_lock(); else if (cls == RPC_CLASS_SHARED) exec_rlock();
+                ok = rpc_dispatch(method, params, g_wallet, &result, &dec, &dem);
+                if (cls == RPC_CLASS_EXCL || cls == RPC_CLASS_SHARED) exec_unlock();
+                g_exec_label = 0;
+            }
+            rj_free(named);
             /* A V2 NOTIFICATION (no id) gets no response whatever the
              * method did. This flag used to be set only on the success
              * path, so a notification whose method FAILED was answered

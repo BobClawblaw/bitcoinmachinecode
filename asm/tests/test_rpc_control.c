@@ -199,6 +199,46 @@ int main(void){
       ck("echoipc with no argument: -1 and the usage text", !r && ec == -1 && em && !strncmp(em, "echoipc \"arg\"\n", 14));
     }
 
+    /* ---- named arguments for every method (2026-11-06) ------------------
+     * rpc_named_params, Core's transformNamedArguments over asm/rpc_argnames.h
+     * (generated from v31.1's help). The expected arrays and messages are
+     * v31.1's (validation/named_args_core_diff.py compares the live replies). */
+    { static const struct { const char* m; const char* p; const char* want; long ec; const char* em; } N[] = {
+          {"getblockhash", "{\"height\":1}", "[1]", 0, NULL},
+          {"getblock", "{\"verbosity\":0,\"blockhash\":\"h\"}", "[\"h\",0]", 0, NULL},
+          {"getblock", "{\"blockhash\":\"h\",\"verbose\":0}", "[\"h\",0]", 0, NULL},              /* the alias */
+          {"getblock", "{\"verbosity\":2,\"args\":[\"h\"]}", "[\"h\",2]", 0, NULL},
+          {"getrawtransaction", "{\"txid\":\"t\",\"blockhash\":\"b\"}", "[\"t\",null,\"b\"]", 0, NULL},   /* a hole before a name */
+          {"gettxout", "{\"txid\":\"t\"}", "[\"t\"]", 0, NULL},                                    /* none at the end */
+          {"gettxspendingprevout", "{\"outputs\":[],\"return_spending_tx\":true}", "[[],{\"return_spending_tx\":true}]", 0, NULL},
+          {"getblockcount", "{}", "[]", 0, NULL},
+          {"getblock", "{\"verbose\":0,\"verbosity\":1,\"blockhash\":\"h\"}", NULL, -8, "Unknown named parameter verbose"},
+          {"getblockhash", "{\"height\":1,\"bogus\":2}", NULL, -8, "Unknown named parameter bogus"},
+          {"getblockhash", "{\"height\":1,\"height\":2}", NULL, -8, "Parameter height specified multiple times"},
+          {"getblock", "{\"args\":[\"h\"],\"blockhash\":\"h\"}", NULL, -8, "Parameter blockhash specified twice both as positional and named argument"},
+          {"gettxspendingprevout", "{\"outputs\":[],\"return_spending_tx\":true,\"options\":{}}", NULL, -8, "Parameter options conflicts with parameter return_spending_tx"},
+          {"getblockhash", "\"x\"", NULL, -32600, "Params must be an array or object"},
+      };
+      int all = 1;
+      for (unsigned i = 0; i < sizeof N / sizeof *N; i++){
+          rj_val* in = rj_parse(N[i].p, strlen(N[i].p)); rj_val* out = NULL; long nec = 0; const char* nem = NULL;
+          int ok = in && rpc_named_params(N[i].m, in, &out, &nec, &nem);
+          char* got = out ? rj_write_alloc(out, 0, NULL) : NULL;
+          int good = N[i].want ? (ok && got && !strcmp(got, N[i].want))
+                               : (!ok && nec == N[i].ec && nem && !strcmp(nem, N[i].em));
+          if (!good){ printf("      (%s %s: got %s ec=%ld em=%s)\n", N[i].m, N[i].p, got ? got : "-", nec, nem ? nem : "-"); all = 0; }
+          free(got); rj_free(out); rj_free(in);
+      }
+      ck("named arguments convert as v31.1's transformNamedArguments does", all);
+      rj_val* in = rj_parse("{\"a\":1}", 7); rj_val* out = (rj_val*)1; long nec = 0; const char* nem = NULL;
+      ck("a method Core does not have keeps its object (an unknown one stays \"Method not found\")",
+         rpc_named_params("bmcgetcapabilities", in, &out, &nec, &nem) == 1 && out == NULL);
+      rj_free(in);
+      in = rj_parse("[1]", 3); out = (rj_val*)1;
+      ck("an array passes as it is", rpc_named_params("getblockhash", in, &out, &nec, &nem) == 1 && out == NULL);
+      rj_free(in);
+    }
+
     /* ================================================================
      * The invariant: everything help advertises actually dispatches.
      * ================================================================ */

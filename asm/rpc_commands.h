@@ -43,6 +43,14 @@ int rpc_dispatch(const char* method, const rj_val* params,
                  const rpc_wallet* w,
                  rj_val** result, long* err_code, const char** err_msg);
 
+/* Named arguments: Core's transformNamedArguments for `method` (2026-11-06,
+ * rpc_commands.c). 1 with *out a new positional array, or *out NULL to use
+ * params as it is (an array, absent, or a method with no names); 0 with
+ * *err_code / *err_msg set (-8, or -32600 for params that is not an array
+ * or object). */
+int rpc_named_params(const char* method, const rj_val* params, rj_val** out,
+                     long* err_code, const char** err_msg);
+
 /* Parse a JSON-RPC param array element as a string; on error sets err. */
 const char* rpc_param_str(const rj_val* params, size_t i,
                           long* err_code, const char** err_msg);

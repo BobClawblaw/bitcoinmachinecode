@@ -2943,14 +2943,26 @@ test, and the bug was in the measurement.
   test hook (an "Internal bug detected" report naming Core's source file) is
   echoed here like any other string. Unlike Core, `help` lists the three:
   this node's `help` is generated from the dispatch tables and says so.
-- **Named arguments (JSON-RPC `params` as an object, `bitcoin-cli -named`)
-  are not supported by any other method.** Every handler reads a positional
-  array; an object reaches it unconverted, and the handler sees no arguments
-  or the wrong ones. Core converts names to positions for every method
-  (`transformNamedArguments`) and answers -8 for an unknown name. The echo
-  methods carry that transform themselves (`echo_positional`); a general
-  layer needs each method's argument names, which this node has nowhere in
-  one table. Not yet built.
+- ~~**Named arguments (JSON-RPC `params` as an object, `bitcoin-cli
+  -named`) are not supported by any other method.**~~ **CLOSED 2026-11-06.**
+  The server converts a params object to positions before it picks the lock
+  class and dispatches (`rpc_named_params`, `rpc_commands.c`), with Core's
+  `transformNamedArguments` rules: holes before a named argument become
+  null, an options object's fields may be passed as top-level names, `args`
+  supplies leading positions, and Core's -8 messages for unknown, repeated,
+  conflicting and doubly given names. The names are `asm/rpc_argnames.h`,
+  generated from v31.1's help by `validation/gen_rpc_argnames.py` (170
+  methods; `help` hides the "hidden" category, the `verbosity|verbose`
+  alias and `stop`'s hidden `wait`, which the script adds from v31.1's
+  source). A method Core does not have keeps its object. params that is
+  neither an array nor an object now answers -32600 for every method, as
+  Core's request parser does. `validation/named_args_core_diff.py` against
+  v31.1: 40 cases (named vs positional on both nodes, every error message
+  and status, Core's own `bitcoin-cli -named`) all match; against the
+  previous build 38 fail. One case is printed "known": `getmempoolentry`'s
+  POSITIONAL replies already differ (`time` and `unbroadcast` are each
+  node's own; bmc's `height` read 0 after a restart, against Core's 102 --
+  not looked into here).
 - **`getnetworkinfo` `version` is 310100, not 1.** It reported this node's
   own 0.0.1 encoded Core's way, and clients read the field as a capability
   level: Core Lightning's bcli refused to start ("Unsupported bitcoind
