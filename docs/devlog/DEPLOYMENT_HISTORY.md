@@ -2407,3 +2407,44 @@ were still on disk. Nothing in them is new measurement.
     (the previous build kept one per block).
 - **Rollback:** relink to `deploy-20261105d`. No on-disk format changed;
   that build leaks one descriptor per block again.
+
+## 2026-11-06 01:39Z — `deploy-20261106a`: feelers dial and send the node's own version (PR #468; also #466)
+
+- **What:** `main` at `1fd25f28`.
+  - #468: feelers and `seednode` gathering send the node's own version
+    (`node_make_version`), not hand-built `/Satoshi:25.0.0/` and
+    `/Satoshi:0.18.0/` ones; feelers parse the candidate pool's
+    `a.b.c.d:port` (they handed it to `inet_pton` and never dialed:
+    23,687 feelers in the logs from 2026-09-27, 0 alive), send fRelay=0
+    as Core's do, and mark a live address tried; seednode dials its
+    configured port or the chain's default (it dialed 8333 on every
+    chain); a dead duplicate block-relay-only dialer is removed (the
+    block-relay-only legs that run are the dial helpers', unchanged).
+  - #466: the ZMQ publisher listens with a backlog of 100 (was 8) and
+    keeps its handshake deadline in milliseconds. Production has no ZMQ
+    subscribers (none before the restart either); the publishers bound
+    as before.
+  - #467 changes a test only.
+- **Checked before the merge:** `make test` passes on x86 (gate-log-check:
+  all 480 gated tests ran); on the Mac the daemon builds with `-Werror`
+  and the affected tests pass. On regtest against Core v31.1 the
+  previous build's seednode never reached Core; this one does, and Core
+  logs `/BitcoinMachineCode:0.0.1/`, our listen port and txrelay=1.
+- Built from clean (`make -B daemon/bmcbitcoind` and the helpers by name) in
+  a clean worktree at the merge commit. All five exec'd helpers were
+  byte-identical; none was replaced. Wallet files were copied first.
+  `MALLOC_ARENA_MAX=4` stays in place.
+- **Started:** 01:39:55Z at tip 974,747 (= the oracle); RPC answered at
+  974,747 by 01:40:48Z.
+- **Verified live:**
+  - New block 974,748 applied with the Core v31.1 oracle's hash
+    (`00000000000000000000e3d5e1830f188e345e1d5e608b45911b0f075dfc09d3`)
+    at 02:09:06Z (the network found no block for 29 minutes after the
+    restart).
+  - `NRestarts=0` and `active` at 29 minutes; no `[crash]` line.
+  - The first live feelers in any production log: 4 alive and 11 dead
+    by 02:09Z, the first `38.42.215.212:8333 -> alive` at 01:55:08Z. The
+    dead ones are book entries that do not answer; the same code reports
+    a connected peer alive when run against it directly.
+  - Block-relay-only legs still dialled by the dial helpers (2 of 2).
+- **Rollback:** relink to `deploy-20261105e`. No on-disk format changed.
