@@ -2369,6 +2369,31 @@ were still on disk. Nothing in them is new measurement.
   11:08:26Z. `NRestarts=0` and `active` at 11 minutes; no `[crash]` line;
   65 fds.
 - **Rollback:** relink to `deploy-20261105c`. No on-disk format changed.
+- **Correction (2026-11-06):** the **Result** above names the wrong cause.
+  The growth was a leak of the verify threads' per-thread scratch, not the
+  per-call threads as such. Until `ae2085f0` ("BMC_TLS_BUF scratch is freed
+  at thread exit", 2026-10-08) no `BMC_TLS_BUF` buffer was ever freed, and
+  each per-call verify thread allocated the interpreter's scratch set
+  (midstate, offset tables, stacks, work space) and exited without freeing
+  it. That commit was made on `bmc_osx` and reached `main` only with the
+  #453 merge (`3aed07af`), deployed as `deploy-20261105b`. So
+  `deploy-20261105a`, the comparison run above, and the process
+  OOM-killed on 2026-11-03 both ran without it; `deploy-20261105b`, `-c` and
+  this deploy all had it. The leaked blocks filled 64 MB arena heaps but
+  were mostly never touched, which is why address space and page tables grew
+  while resident memory barely moved.
+  - Regtest check (Core v31.1's wallet relays 1,000 transactions of 10
+    inputs each to bmc; the arena heaps of every bmc process are sampled):
+    on `deploy-20261105a` the admitting process went from 0 to 1,335 heaps
+    and from 4.8 to 88.2 GB of address space (about 8.3 MB per verify
+    thread). On `deploy-20261105c` (the fix, still a thread per call) it
+    held 1-2 heaps. On this deploy (the fix and the pool) it held 18 heaps,
+    the pool's own arenas. All three stayed flat once admissions stopped.
+  - So neither the pool nor `MALLOC_ARENA_MAX=4` ended the growth; the fix
+    already running since `deploy-20261105b` did. The pool remains worth
+    having, since it avoids creating up to 16 threads per such transaction.
+    The scratch harness mentioned under **Why without the cap** was flat
+    because it was built after #453.
 
 ## 2026-11-05 23:48Z — `deploy-20261105e`: the header mirror is seeded from the archive and no longer leaks descriptors (PR #464)
 
