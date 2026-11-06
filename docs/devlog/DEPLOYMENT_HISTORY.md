@@ -2572,3 +2572,44 @@ were still on disk. Nothing in them is new measurement.
 - **Rollback:** relink to `deploy-20261106c`. No on-disk format changed;
   the two fields added to the lock page live only in shared memory, which
   a restart recreates.
+
+## 2026-11-06 14:57Z — `deploy-20261106e`: the mempool tracks the unbroadcast set, as Core does (PR #477)
+
+- **What:** `main` at `738dbb29`. #477: `getmempoolinfo.unbroadcastcount`
+  was the constant 0 and every entry's `unbroadcast` the constant false;
+  `mempool.dat` was written with an empty unbroadcast set and the file's set
+  was skipped on load. Now a transaction newly accepted through
+  `sendrawtransaction` without `-privatebroadcast` (the wallet's broadcasts
+  included) joins the set; it leaves when a peer fetches it with `getdata`
+  and is sent it (on the worker's serve path and the inbound children's) or
+  when it leaves the pool. The worker announces whatever is still in the
+  set again every 10-15 minutes. `mempool.dat` carries the set in Core's
+  order; the startup load applies it, `importmempool` only with
+  `apply_unbroadcast_set`.
+- **Checked before the merge:** `validation/unbroadcast_core_diff.py`
+  (new) runs bmc and a second Core v31.1 against one Core v31.1 peer on
+  regtest: 27 of 27 checks equal to Core, both reattempts cleared within
+  780 s; `deploy-20261106d` fails 10 of 27. `make test` passes on x86
+  (gate-log-check: all 480 gated tests ran); the new checks in
+  `test_mempool_shared`, `test_mempool_persist`, `test_serve` and
+  `test_tx_relay` each fail with their rule reverted. On the Mac those four
+  and `test_rpc_node` pass.
+- Built from clean (`make -B daemon/bmcbitcoind` and the helpers by name) in
+  a clean worktree at the merge commit, with no warnings. All five exec'd
+  helpers were byte-identical; none was replaced. Wallet files were copied
+  first. `MALLOC_ARENA_MAX=4` stays in place.
+- **Started:** 14:57:03Z at tip 974,817 (= the oracle); RPC answered at
+  974,817 by 14:57:55Z. The pool reload finished at 14:58:56Z: 53,732 of
+  53,734 transactions, "0 waiting for initial broadcast" (the previous
+  build had saved an empty set).
+- **Verified live:**
+  - New block 974,818 applied with the Core v31.1 oracle's hash
+    (`00000000000000000001cae82cf8a52feba66f9d138b85ccf3d5fe80bce66368`)
+    at 15:15:11Z.
+  - `NRestarts=0` and `active` at 18 minutes; no `[crash]` line; 50 open
+    descriptors in the main process; 10 peers.
+- **Found, not fixed:** a reload from `mempool.dat` still announces every
+  reloaded transaction to peers; Core announces none of them. Recorded in
+  `docs/FEATURE_GAPS.md`.
+- **Rollback:** relink to `deploy-20261106d`. It reads `mempool.dat` as
+  before and skips the unbroadcast section; it writes the section empty.
