@@ -565,6 +565,13 @@ typedef struct {
      * it; the worker reads and clears it before it branches. Appended: every
      * offset above is unchanged. */
     volatile int              tx_submit_local;
+    /* 1 = admit without announcing: a mempool.dat load (startup or
+     * importmempool). Core's LoadMempool calls AcceptToMemoryPool and never
+     * RelayTransaction, so a reload tells no peer about the pool it restores;
+     * only the file's unbroadcast set is announced, by the 10-15 minute
+     * reattempt (2026-11-06). Every stager writes it; the worker reads and
+     * clears it before it branches. Appended: every offset above is unchanged. */
+    volatile int              tx_submit_norelay;
 } node_status_t;
 #define NODE_TIP_UNTRACKED (-2LL)
 

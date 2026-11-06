@@ -9178,6 +9178,8 @@ extern void mpool_init(void* mp, unsigned long slots, void* blob, unsigned long 
 extern int  txsub_accept_and_relay(void* mp_area, const unsigned char* tx, unsigned long len,
                                    const int* peer_fds, int n_fds,
                                    char* reason, unsigned long rcap, int* relayed_out);
+extern int  txsub_accept_quiet(void* mp_area, const unsigned char* tx, unsigned long len,
+                               char* reason, unsigned long rcap);
 #define TXSUB_MP_SLOTS 1024
 static unsigned char txsub_mp_area[MPOOL_AREA_BYTES(TXSUB_MP_SLOTS)];
 static unsigned char txsub_mp_blob[2u<<20];
@@ -10961,6 +10963,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             /* read once and cleared before any branch, so no later submission
              * inherits it (the stagers also write it every time) */
             int sub_local = g_node_status->tx_submit_local; g_node_status->tx_submit_local = 0;
+            int sub_norelay = g_node_status->tx_submit_norelay; g_node_status->tx_submit_norelay = 0;
             if(g_node_status->tx_submit_pkg_n > 0){
                 result = txsub_package(reason, sizeof reason);
             }
@@ -11009,6 +11012,15 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                             }
                         }
                     }
+                }
+                else if(sub_norelay){
+                    /* a mempool.dat entry (startup load or importmempool):
+                     * Core's LoadMempool admits it and announces it to no
+                     * peer -- not on the legs, not on the inbound ring. A
+                     * txid already in the pool stays -27 "already in
+                     * mempool", which the loader counts as present (Core's
+                     * already_there), and is not announced again either. */
+                    result = txsub_accept_quiet(txsub_pool(), (const unsigned char*)g_node_status->tx_submit_buf, tlen, reason, sizeof reason);
                 }
                 else { int relayed=0;
                     result = txsub_accept_and_relay(txsub_pool(),

@@ -10,6 +10,10 @@
  *      and NOTHING written to the peer socket.
  *   3. peer_fds with a mix of live and -1 slots -> only the live legs receive
  *      the relay (relayed count matches).
+ *   4. txsub_accept_quiet, the mempool.dat load's path (2026-11-06): accepted
+ *      and stored, but announced nowhere -- not to the legs, not on the ring
+ *      the inbound children read -- and a txid already in the pool stays -27
+ *      with nothing announced. Core's LoadMempool never relays.
  * The relay proof against REAL mainnet peers is deferred to post-sync (a real
  * tx can't validate against an incomplete UTXO set); this proves the plumbing.
  */
@@ -22,6 +26,7 @@
 #include <errno.h>
 #include "modern_spend.h"
 #include "test_tmpdir.h"
+#include "../rpc_node.h"
 
 typedef unsigned char u8;
 typedef unsigned long u64;
@@ -40,6 +45,10 @@ extern int  tx_txid(u8 out[32], const u8* tx, unsigned long txlen, u8* buf, unsi
 extern int  txsub_accept_and_relay(void* mp_area, const u8* tx, unsigned long len,
                                    const int* peer_fds, int n_fds,
                                    char* reason, unsigned long rcap, int* relayed_out);
+extern int  txsub_accept_quiet(void* mp_area, const u8* tx, unsigned long len,
+                               char* reason, unsigned long rcap);
+extern void txann_set_status(node_status_t* st);
+extern int  g_txacc_no_announce;
 
 struct lsm_state {
     long log_fd, idx_fd;
@@ -98,8 +107,14 @@ int main(void){
     tt_isolate();
     const msend_t* s  = &modern_spends[0];
     const msend_t* s2 = &modern_spends[1];
-    const msend_t* seeds[2] = { s, s2 };
-    seed_utxos(seeds, 2);
+    const msend_t* s3 = &modern_spends[2];
+    const msend_t* seeds[3] = { s, s2, s3 };
+    seed_utxos(seeds, 3);
+    /* the announce ring every accept feeds (tx_accept.c -> txann_push): a
+     * private status block, so the test can count what went on it */
+    node_status_t* st = calloc(1, sizeof *st);
+    if (!st){ fprintf(stderr, "calloc node_status_t failed\n"); return 1; }
+    txann_set_status(st);
 
     if (!tx_dispatch_init()) { fprintf(stderr, "tx_dispatch_init failed\n"); return 1; }
     if (!tx_policy_init())   { fprintf(stderr, "tx_policy_init failed\n");   return 1; }
@@ -122,6 +137,7 @@ int main(void){
       unsigned long mlen=0; const u8* found = mpool_get(mp_area, txid, &mlen);
       ck("accepted tx stored in mempool", found != NULL && mlen == (unsigned long)s->txlen);
       ck("announce hook called exactly once", ann_calls == 1);
+      ck("and put on the inbound announce ring once", st->ann_seq == 1);
       ck("announced the accepted txid", memcmp(ann_txid, txid, 32) == 0);
       /* The whole point of the change: an accepted transaction must NOT be
        * pushed at the peer unasked. The socket has to be silent -- Core
@@ -175,6 +191,24 @@ int main(void){
       close(sp2[0]); close(sp2[1]);
     }
 
+    printf("\n== mempool.dat load (txsub_accept_quiet): accepted, announced NOWHERE ==\n");
+    { char reason[128]; int calls0 = ann_calls; unsigned long long seq0 = st->ann_seq;
+      int r = txsub_accept_quiet(mp_area, s3->tx, (unsigned long)s3->txlen, reason, sizeof reason);
+      ck("valid s3 accepted", r == 1);
+      u8 txid[32], tb[4096]; tx_txid(txid, s3->tx, (unsigned long)s3->txlen, tb, sizeof tb);
+      unsigned long mlen = 0;
+      ck("stored in the mempool", mpool_get(mp_area, txid, &mlen) != NULL && mlen == (unsigned long)s3->txlen);
+      ck("no announcement queued for the legs", ann_calls == calls0);
+      ck("nothing on the inbound announce ring", st->ann_seq == seq0);
+      ck("the ring switch is off again afterwards", g_txacc_no_announce == 0);
+      r = txsub_accept_quiet(mp_area, s3->tx, (unsigned long)s3->txlen, reason, sizeof reason);
+      ck("again: -27, already in the pool (the loader counts it present)",
+         r == -27 && strstr(reason, "already") != NULL);
+      ck("again: nothing announced anywhere", ann_calls == calls0 && st->ann_seq == seq0);
+      printf("     (second reason: %s)\n", reason);
+    }
+
+    free(st);
     close(sp[0]); close(sp[1]);
     printf("\n%s (%d checks, %d failures)\n", g_fails==0 ? "ALL PASS" : "SOME FAILED", g_checks, g_fails);
     return g_fails ? 1 : 0;
