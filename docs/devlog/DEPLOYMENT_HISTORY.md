@@ -2513,3 +2513,37 @@ were still on disk. Nothing in them is new measurement.
     for 2,113. The other 3 read 974,761 on bmc: accepted in the moment
     before bmc connected the block the oracle had already connected.
 - **Rollback:** relink to `deploy-20261106b`. No on-disk format changed.
+
+## 2026-11-06 09:03Z — `deploy-20261106d`: Linux's pool lock lets a woken waiter in first (PR #474)
+
+- **What:** `main` at `7eb6dd2d`. #474: the mempool's pool lock on Linux is
+  a process-shared robust `pthread_mutex`, and glibc's lets the unlocking
+  thread take it straight back ahead of the waiter it just woke. A thread
+  that arrives while others are already waiting now sleeps until somebody
+  else takes the lock, or 1 ms, before it locks: a futex on a take count in
+  the shared lock page, bumped and woken by each take. This ports the fix
+  the Mac's lock has carried since 2026-10-09. The wait is bounded, so it is
+  not a queue and cannot wedge, and the mutex keeps its robustness.
+- **Checked before the merge:** `make test` passes on x86 (gate-log-check:
+  all 480 gated tests ran). `test_mempool_lock_fair`, which now runs on
+  x86 for the first time, measured the longest wait at 4.7-8.0 s before the
+  fix and 1.8-2.1 ms after (five runs each). `test_mempool_lock_log`'s
+  convoy section, Mac-only since it hung the x86 gate on 2026-11-05, runs
+  on x86: 36 of 36 in 1.3 s. On the Mac `test_mempool_lock_fair`,
+  `test_mempool_lock_log` and `test_mempool_shared` pass.
+- Built from clean (`make -B daemon/bmcbitcoind` and the helpers by name) in
+  a clean worktree at the merge commit. All five exec'd helpers were
+  byte-identical; none was replaced. Wallet files were copied first.
+  `MALLOC_ARENA_MAX=4` stays in place.
+- **Started:** 09:03:30Z at tip 974,786 (= the oracle); RPC answered at
+  974,786 by 09:04:17Z.
+- **Verified live:**
+  - New block 974,789 applied with the Core v31.1 oracle's hash
+    (`00000000000000000000208c91954fdf05bcbaf551df613c875daeed2b5504a9`)
+    at 09:13:56Z.
+  - `NRestarts=0` and `active` at 11 minutes; no `[crash]` line; 71 and
+    43 open descriptors in the two processes; 32,076 transactions in the
+    pool.
+- **Rollback:** relink to `deploy-20261106c`. No on-disk format changed;
+  the two fields added to the lock page live only in shared memory, which
+  a restart recreates.
