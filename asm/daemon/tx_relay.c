@@ -571,6 +571,12 @@ extern int txann_txid_for_wtxid(const u8 wtxid[32], u8 txid_out[32]) __attribute
  * through a weak stub so the socketpair unit test links without this TU. */
 void txrelay_announce_own(const u8 txid[32]){ txr_ann_add(txid, -1); }
 
+/* A peer asked for a transaction and was sent it: Core's ProcessGetData
+ * takes it out of the unbroadcast set (RemoveUnbroadcastTx). Weak, so the
+ * link sets without daemon/mempool_cfg.c keep building. */
+extern void mempool_unbroadcast_clear(const u8 txid[32]) __attribute__((weak));
+static void txr_served(const u8 txid[32]){ if (mempool_unbroadcast_clear) mempool_unbroadcast_clear(txid); }
+
 /* find (or claim) this leg's slot; -1 when the table is full */
 static int txr_leg_slot(int fd, long long now){
     if (!txr_leg_ready){
@@ -1878,9 +1884,10 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
                 if (type != TXR_MSG_TX && type != TXR_MSG_WITNESS_TX && type != TXR_MSG_WTX) continue;
                 unsigned long got_len = 0;
                 const u8* bytes = 0;
+                u8 tid[32];
+                const u8* served_id = e + 4;              /* the txid, for the unbroadcast set */
                 if (type == TXR_MSG_WTX){                 /* BIP339: the wtxid we announced -> txid -> pool */
-                    u8 tid[32];
-                    if (txann_txid_for_wtxid && txann_txid_for_wtxid(e + 4, tid)) bytes = mpool_get(mp, tid, &got_len);
+                    if (txann_txid_for_wtxid && txann_txid_for_wtxid(e + 4, tid)){ bytes = mpool_get(mp, tid, &got_len); served_id = tid; }
                 } else bytes = mpool_get(mp, e + 4, &got_len);
                 if (bytes && got_len){
                     /* MEM-24 (audit 2026-09-03): a bare MSG_TX (witness bit
@@ -1903,10 +1910,11 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
                         static u8 stripped[TXR_MAX_TX_BYTES];
                         long sl = strip_witness(bytes, (long long)got_len,
                                                 stripped, (long)sizeof stripped);
-                        if (sl > 0) p2p_write(fd, "tx", 2, stripped, (unsigned)sl);
+                        if (sl > 0){ p2p_write(fd, "tx", 2, stripped, (unsigned)sl); txr_served(served_id); }
                         else { memcpy(nf + 1 + nmiss*36, e, 36); nmiss++; }
                     } else {
                         p2p_write(fd, "tx", 2, bytes, (unsigned)got_len);
+                        txr_served(served_id);
                     }
                 } else {
                     memcpy(nf + 1 + nmiss*36, e, 36);

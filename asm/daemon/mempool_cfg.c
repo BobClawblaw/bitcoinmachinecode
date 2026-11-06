@@ -532,10 +532,22 @@ int mp_lock_is_robust(void){ return g_mp_robust; }
  * after mp_unlock in daemon/tx_accept.c). A tombstone write is one word, the
  * same as the flag it replaces, so it is exactly as safe as what it replaces. */
 enum { MPS_EMPTY = 0, MPS_LIVE = 1, MPS_DEAD = 2, MPS_CLAIMED = 3 };
-typedef struct { unsigned char txid[32]; long t; int used; long h; } mp_seen_t;   /* h: chain height at entry (2026-11-06) */
+/* h: chain height at entry; ub: in the unbroadcast set (both 2026-11-06). ub
+ * sits in the padding after `used`, so the entry stays 56 bytes. */
+typedef struct { unsigned char txid[32]; long t; int used; int ub; long h; } mp_seen_t;
+_Static_assert(sizeof(mp_seen_t) == 56, "mp_seen_t grew: the table is ~1M entries at the default -maxmempool");
 static mp_seen_t*   g_seen = 0;
 static unsigned long g_seen_mask = 0;
 static void*        g_mp_area = 0;
+/* How many entries carry ub=1 -- getmempoolinfo's unbroadcastcount without a
+ * walk of the table. Shared like the table; changed only by a flag's own
+ * 0->1 / 1->0 transition (mp_ub_drop and mempool_unbroadcast_add), so it
+ * moves exactly when a flag does. */
+static long*        g_ub_n = 0;
+static void mp_ub_drop(mp_seen_t* e){
+    if(__atomic_exchange_n(&e->ub, 0, __ATOMIC_ACQ_REL) && g_ub_n)
+        __atomic_sub_fetch(g_ub_n, 1, __ATOMIC_ACQ_REL);
+}
 
 static unsigned long tx_hash(const unsigned char* txid){
     unsigned long h = 1469598103934665603UL;
@@ -700,6 +712,10 @@ int mempool_configure(void){
     g_seen = (mp_seen_t*)mmap(0, sizeof(mp_seen_t)*slots, PROT_READ|PROT_WRITE,
                               MAP_SHARED|MAP_ANONYMOUS, -1, 0);
     if(g_seen==MAP_FAILED){ g_seen=0; g_seen_mask=0; }   /* expiry off, pool still sized */
+    if(g_seen){
+        void* un = mmap(0, sizeof(long), PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
+        g_ub_n = un == MAP_FAILED ? 0 : (long*)un;      /* none: flags still kept, the count reads 0 */
+    }
 
     fprintf(stderr,"[mempool] maxmempool=%ldMB -> %lu slots, %lluMB tx storage (shared, locked%s%s)\n",
             mb, slots, blob_cap>>20,
@@ -799,6 +815,7 @@ void mempool_note_accept(const unsigned char txid[32]){
         memcpy(e->txid, txid, 32);
         e->t = (long)time(0);
         e->h = mp_entry_height();
+        mp_ub_drop(e);                                   /* a new entry starts broadcast-neutral */
         __atomic_store_n(&e->used, MPS_LIVE, __ATOMIC_RELEASE);   /* publish last */
 
         /* INSERT, THEN VERIFY. Two processes accepting the same txid can both
@@ -819,8 +836,9 @@ void mempool_note_accept(const unsigned char txid[32]){
             if(__atomic_load_n(&o->used, __ATOMIC_ACQUIRE) == MPS_LIVE &&
                !memcmp(o->txid, txid, 32)){
                 int mine = MPS_LIVE;                     /* someone earlier has it: stand down */
-                __atomic_compare_exchange_n(&e->used, &mine, MPS_DEAD, 0,
-                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+                if(__atomic_compare_exchange_n(&e->used, &mine, MPS_DEAD, 0,
+                                               __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+                    mp_ub_drop(e);
                 break;
             }
         }
@@ -928,8 +946,9 @@ static void mempool_forget(const unsigned char txid[32]){
         if(st == MPS_LIVE && !memcmp(e->txid, txid, 32)){
             /* CAS so a slot being re-claimed underneath is not stamped DEAD */
             int want = MPS_LIVE;
-            __atomic_compare_exchange_n(&e->used, &want, MPS_DEAD, 0,
-                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+            if(__atomic_compare_exchange_n(&e->used, &want, MPS_DEAD, 0,
+                                           __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+                mp_ub_drop(e);                           /* Core: leaving the pool leaves the unbroadcast set */
             /* KEEP WALKING: there may be more than one copy. Two processes
              * accepting the same txid can both publish before either sees the
              * other -- the probe-order tie-break below closes the common case
@@ -941,6 +960,108 @@ static void mempool_forget(const unsigned char txid[32]){
              * answer, and costs one extra walk of a chain we are already in. */
         }
     }
+}
+
+/* ---- the unbroadcast set (Core CTxMemPool::m_unbroadcast_txids, 2026-11-06)
+ * Core tracks the transactions this node submitted itself -- sendrawtransaction
+ * and the wallet's broadcast, BroadcastTransaction with
+ * MEMPOOL_AND_BROADCAST_TO_ALL, and only when the submission newly entered the
+ * pool -- until some peer asks for one with getdata and is sent it
+ * (net_processing ProcessGetData, RemoveUnbroadcastTx). Every 10-15 minutes
+ * the ones still waiting are announced again (ReattemptInitialBroadcast).
+ * Leaving the pool, for any reason, takes a transaction out of the set
+ * (removeUnchecked). getmempoolinfo reports the set's size as
+ * unbroadcastcount, every entry object its membership as unbroadcast, and
+ * mempool.dat carries the set across a restart.
+ *
+ * Here it is one flag beside the arrival time and entry height, in the table
+ * every process maps: the worker sets it, the worker AND the inbound serve
+ * children clear it as they serve the transaction, the parent's RPC reads it.
+ * Departure clears it in mempool_forget, which every removal path already
+ * reaches, so the set cannot outlive the pool the way a separate list could.
+ *
+ * No lock, like the rest of this table: the flag moves by CAS, and so does
+ * the count with it. An add that races the entry's departure re-checks the
+ * entry after setting the flag and takes it back, so no flag survives on a
+ * slot that no longer holds the transaction. */
+int mempool_unbroadcast_add(const unsigned char txid[32]){
+    if(!g_seen) return 0;
+    unsigned long i = tx_hash(txid) & g_seen_mask;
+    for(unsigned long p=0; p<=g_seen_mask; p++){
+        mp_seen_t* e = &g_seen[(i+p) & g_seen_mask];
+        int st = __atomic_load_n(&e->used, __ATOMIC_ACQUIRE);
+        if(st == MPS_EMPTY) return 0;                    /* not in the pool: Core adds only what exists */
+        if(st != MPS_LIVE || memcmp(e->txid, txid, 32)) continue;
+        int want = 0;
+        if(!__atomic_compare_exchange_n(&e->ub, &want, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            return 1;                                    /* already in the set */
+        if(g_ub_n) __atomic_add_fetch(g_ub_n, 1, __ATOMIC_ACQ_REL);
+        if(__atomic_load_n(&e->used, __ATOMIC_ACQUIRE) != MPS_LIVE || memcmp(e->txid, txid, 32)){
+            mp_ub_drop(e);                               /* it left (or the slot moved on) under us */
+            return 0;
+        }
+        return 1;
+    }
+    return 0;
+}
+/* Served to a peer (or gone): out of the set. Every copy, as forget does. */
+void mempool_unbroadcast_clear(const unsigned char txid[32]){
+    if(!g_seen) return;
+    unsigned long i = tx_hash(txid) & g_seen_mask;
+    for(unsigned long p=0; p<=g_seen_mask; p++){
+        mp_seen_t* e = &g_seen[(i+p) & g_seen_mask];
+        int st = __atomic_load_n(&e->used, __ATOMIC_ACQUIRE);
+        if(st == MPS_EMPTY) return;
+        if(st == MPS_LIVE && !memcmp(e->txid, txid, 32)) mp_ub_drop(e);
+    }
+}
+int mempool_unbroadcast_of(const unsigned char txid[32]){
+    if(!g_seen) return 0;
+    unsigned long i = tx_hash(txid) & g_seen_mask;
+    for(unsigned long p=0; p<=g_seen_mask; p++){
+        mp_seen_t* e = &g_seen[(i+p) & g_seen_mask];
+        int st = __atomic_load_n(&e->used, __ATOMIC_ACQUIRE);
+        if(st == MPS_EMPTY) return 0;
+        if(st == MPS_LIVE && !memcmp(e->txid, txid, 32)) return __atomic_load_n(&e->ub, __ATOMIC_ACQUIRE) ? 1 : 0;
+    }
+    return 0;
+}
+long mempool_unbroadcast_count(void){
+    long n = g_ub_n ? __atomic_load_n(g_ub_n, __ATOMIC_ACQUIRE) : 0;
+    return n > 0 ? n : 0;
+}
+/* Up to cap txids of the set into out; returns how many. The count gates
+ * the walk, so a node with nothing waiting (the usual case) reads one word. */
+long mempool_unbroadcast_list(unsigned char (*out)[32], long cap){
+    if(!g_seen || !out || cap <= 0 || mempool_unbroadcast_count() == 0) return 0;
+    long n = 0;
+    for(unsigned long i=0; i<=g_seen_mask && n<cap; i++){
+        mp_seen_t* e = &g_seen[i];
+        if(__atomic_load_n(&e->used, __ATOMIC_ACQUIRE) != MPS_LIVE) continue;
+        if(!__atomic_load_n(&e->ub, __ATOMIC_ACQUIRE)) continue;
+        memcpy(out[n], e->txid, 32);
+        if(__atomic_load_n(&e->used, __ATOMIC_ACQUIRE) == MPS_LIVE) n++;   /* re-check: not mid-reclaim */
+    }
+    return n;
+}
+/* Core ReattemptInitialBroadcast: announce every member still in the pool
+ * again (announce = the worker's accept-time announcement); drop any that is
+ * not. Returns how many were announced. */
+long mempool_unbroadcast_reattempt(void (*announce)(const unsigned char txid[32])){
+    long n = mempool_unbroadcast_count();
+    if(n == 0 || !announce) return 0;
+    unsigned char (*ids)[32] = malloc((size_t)(n + 64) * 32);
+    if(!ids) return 0;
+    long got = mempool_unbroadcast_list(ids, n + 64), sent = 0;
+    mp_lock_at(__func__);                                /* pool reads hold the pool lock (header note) */
+    for(long k = 0; k < got; k++){
+        unsigned long l = 0;
+        if(g_mp_area && mpool_get(g_mp_area, ids[k], &l)){ announce(ids[k]); sent++; }
+        else mempool_unbroadcast_clear(ids[k]);
+    }
+    mp_unlock();
+    free(ids);
+    return sent;
 }
 
 /* Evict anything older than -mempoolexpiry hours -- WITH its descendants
@@ -960,7 +1081,7 @@ long mempool_expire_now(void){
         unsigned char txid[32]; memcpy(txid, e->txid, 32);
         long r = mpool_policy_expire_one(mp_ext_polstate, g_mp_area, txid);
         if (r > 0) removed += r;
-        else e->used = MPS_DEAD;   /* not in the graph (pre-policy legacy entry) */
+        else { e->used = MPS_DEAD; mp_ub_drop(e); }   /* not in the graph (pre-policy legacy entry) */
     }
     mp_unlock();
     if(removed)

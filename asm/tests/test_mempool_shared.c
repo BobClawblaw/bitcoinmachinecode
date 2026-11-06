@@ -34,6 +34,15 @@ extern void mempool_set_height_fn(long (*fn)(void));
 static long g_test_tip = 777;
 static long test_tip(void){ return g_test_tip; }
 extern void mempool_note_accept(const unsigned char* txid);
+/* the unbroadcast set (2026-11-06) */
+extern int  mempool_unbroadcast_add(const unsigned char txid[32]);
+extern void mempool_unbroadcast_clear(const unsigned char txid[32]);
+extern int  mempool_unbroadcast_of(const unsigned char txid[32]);
+extern long mempool_unbroadcast_count(void);
+extern long mempool_unbroadcast_list(unsigned char (*out)[32], long cap);
+extern long mempool_unbroadcast_reattempt(void (*announce)(const unsigned char txid[32]));
+static int g_announced; static unsigned char g_announced_id[32];
+static void count_announce(const unsigned char txid[32]){ g_announced++; memcpy(g_announced_id, txid, 32); }
 extern const unsigned char* mpool_wtxid_at_slot(const void*, unsigned long);
 extern long mpool_del(void*, const unsigned char*);
 extern void sha256d(unsigned char out[32], const void* data, unsigned long len);
@@ -478,6 +487,101 @@ int main(void){
         ck("restoring a time for an absent transaction is a no-op",
            mempool_restore_accept_time(absent, now - 60) == 0);
         ck("...and it is NOT inserted by the attempt", mempool_time_of(absent) == 0);
+    }
+
+    /* ---- the unbroadcast set (Core m_unbroadcast_txids, 2026-11-06) --------
+     * The worker sets the flag on its own submissions, the worker and every
+     * inbound serve child clear it as they serve the transaction, and the
+     * parent's RPC reads the flag and the count. So every step that matters
+     * crosses a process boundary here, as it does in the daemon. */
+    {
+        unsigned char ua[32], ub_[32], uc[32], absent[32], txb[40];
+        memset(ua, 0x5A, 32); memset(ub_, 0x5B, 32); memset(uc, 0x5C, 32); memset(absent, 0x5F, 32);
+        memset(txb, 0xCC, sizeof txb);
+        mp_lock(); mpool_put(mp_ext_area, ua, txb, sizeof txb); mpool_put(mp_ext_area, ub_, txb, sizeof txb); mp_unlock();
+        mempool_note_accept(ua); mempool_note_accept(ub_);
+        ck("unbroadcast: empty at first", mempool_unbroadcast_count() == 0 && mempool_unbroadcast_of(ua) == 0);
+
+        pid_t up = fork();
+        if (up == 0) _exit(mempool_unbroadcast_add(ua) == 1 ? 0 : 1);   /* the worker's own submission */
+        int ust = -1; waitpid(up, &ust, 0);
+        ck("unbroadcast: a child's add returns 1", WIFEXITED(ust) && WEXITSTATUS(ust) == 0);
+        ck("unbroadcast: the parent sees the flag", mempool_unbroadcast_of(ua) == 1);
+        ck("unbroadcast: and the count", mempool_unbroadcast_count() == 1);
+        ck("unbroadcast: adding again changes nothing", mempool_unbroadcast_add(ua) == 1 && mempool_unbroadcast_count() == 1);
+        ck("unbroadcast: a txid not in the table is not added (Core adds only what exists)",
+           mempool_unbroadcast_add(absent) == 0 && mempool_unbroadcast_count() == 1 && mempool_unbroadcast_of(absent) == 0);
+        { unsigned char got[4][32];
+          ck("unbroadcast: the list is exactly that txid",
+             mempool_unbroadcast_list(got, 4) == 1 && !memcmp(got[0], ua, 32)); }
+
+        up = fork();
+        if (up == 0){ mempool_unbroadcast_clear(ua); _exit(0); }       /* an inbound child served it */
+        waitpid(up, &ust, 0);
+        ck("unbroadcast: served in another process -> cleared here", mempool_unbroadcast_of(ua) == 0);
+        ck("unbroadcast: count back to 0", mempool_unbroadcast_count() == 0);
+
+        /* leaving the pool leaves the set, and a txid that comes back later
+         * starts clear: Core's removeUnchecked; the slot is reused */
+        mempool_unbroadcast_add(ua);
+        mempool_forget_for_test(ua);
+        ck("unbroadcast: departure clears the flag", mempool_unbroadcast_of(ua) == 0);
+        ck("unbroadcast: departure takes it off the count", mempool_unbroadcast_count() == 0);
+        mempool_note_accept(ua);
+        ck("unbroadcast: re-accepted later, it starts clear", mempool_unbroadcast_of(ua) == 0 && mempool_unbroadcast_count() == 0);
+
+        /* the reattempt: a member still in the pool is announced again; one
+         * the table holds but the pool does not is dropped (Core removes a
+         * member that mempool.get no longer finds) */
+        mempool_note_accept(uc);                                       /* tracked, never put in the pool */
+        mempool_unbroadcast_add(ub_); mempool_unbroadcast_add(uc);
+        ck("unbroadcast: two members before the reattempt", mempool_unbroadcast_count() == 2);
+        g_announced = 0;
+        long k = mempool_unbroadcast_reattempt(count_announce);
+        ck("unbroadcast: the reattempt announces only the pool member",
+           k == 1 && g_announced == 1 && !memcmp(g_announced_id, ub_, 32));
+        ck("unbroadcast: ...keeps it in the set", mempool_unbroadcast_of(ub_) == 1);
+        ck("unbroadcast: ...and drops the one the pool lost", mempool_unbroadcast_of(uc) == 0 && mempool_unbroadcast_count() == 1);
+        mempool_unbroadcast_clear(ub_);
+        g_announced = 0;
+        ck("unbroadcast: an empty set announces nothing", mempool_unbroadcast_reattempt(count_announce) == 0 && g_announced == 0);
+        mempool_forget_for_test(uc);
+
+        /* THE COUNT STAYS EXACT under contention. Several processes add,
+         * clear and forget the same ids at once, with no lock -- the daemon's
+         * worker, its serve children and the policy layer's removals do. The
+         * count moves only on a flag's own CAS, so whatever interleaving
+         * happened, it must equal the number of flags set afterwards. */
+        enum { UN = 600, UK = 4, ROUNDS = 30 };
+        static unsigned char uids[UN][32];
+        for (int i = 0; i < UN; i++){ memset(uids[i], 0, 32); uids[i][0] = 0x77; uids[i][1] = (unsigned char)i; uids[i][2] = (unsigned char)(i >> 8); }
+        for (int i = 0; i < UN; i++) mempool_note_accept(uids[i]);
+        pid_t kids[UK];
+        for (int c = 0; c < UK; c++){
+            kids[c] = fork();
+            if (kids[c] == 0){
+                for (int r = 0; r < ROUNDS; r++)
+                    for (int i = 0; i < UN; i++){
+                        int j = (i * (c + 3) + r * 7) % UN;
+                        switch ((i + r + c) % 4){
+                            case 0: case 1: mempool_unbroadcast_add(uids[j]); break;
+                            case 2: mempool_unbroadcast_clear(uids[j]); break;
+                            default: if (c == 0){ mempool_forget_for_test(uids[j]); mempool_note_accept(uids[j]); }
+                                     else mempool_unbroadcast_add(uids[j]);
+                        }
+                    }
+                _exit(0);
+            }
+        }
+        for (int c = 0; c < UK; c++) waitpid(kids[c], NULL, 0);
+        static unsigned char ulist[UN + 64][32];
+        long listed = mempool_unbroadcast_list(ulist, UN + 64);
+        long counted = mempool_unbroadcast_count();
+        printf("      (contention: %ld flags set, count %ld)\n", listed, counted);
+        ck("unbroadcast: under contention the count equals the flags set", listed == counted);
+        for (int i = 0; i < UN; i++) mempool_unbroadcast_clear(uids[i]);
+        ck("unbroadcast: clearing every id brings the count to 0", mempool_unbroadcast_count() == 0);
+        for (int i = 0; i < UN; i++) mempool_forget_for_test(uids[i]);
     }
 
     printf("\n%s (%d checks, %d failures)\n", fails?"TESTS FAILED":"ALL TESTS PASSED", checks, fails);

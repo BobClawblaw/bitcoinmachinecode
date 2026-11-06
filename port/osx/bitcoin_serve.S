@@ -46,6 +46,7 @@
 	.extern _block_hash
 	.extern _mpool_init
 	.extern _mpool_get
+	.extern _mempool_unbroadcast_clear   /* 2026-11-06: a tx sent to a peer leaves the unbroadcast set (daemon/mempool_cfg.c) */
 	.extern _tx_dispatch_init
 	.extern _tx_policy_init
 	.extern _serve_idx_topup
@@ -129,6 +130,7 @@ s_addrsent:  .zero 1        /* getaddr answered once per conn (Core: m_getaddr_r
 s_abound:    .zero 8        /* getaddr loop bound in MEMORY (was clobbered in rdx) */
 s_n:         .zero 8
 s_wtxtid:    .zero 32                 /* BIP339: the txid a getdata(MSG_WTX) resolved to */
+s_gdtid:     .zero 8                  /* the txid being served (-> s_wtxtid or into the getdata entry), for the unbroadcast set */
 s_served:    .zero 8
 s_tip:       .zero 8
 s_from:      .zero 8
@@ -1304,6 +1306,9 @@ _node_serve_loop:
 	bl   _mpool_get
 	ldr  x9, [sp, #0]
 	cbz  x0, .gd_miss
+	LOADADDR x10, s_wtxtid
+	LOADADDR x11, s_gdtid
+	str  x10, [x11]                    /* the txid this entry resolved to */
 	mov  x3, x0                        /* tx bytes ptr (mpool blob) */
 	b    .gdtx_have
 
@@ -1316,6 +1321,9 @@ _node_serve_loop:
 	bl   _mpool_get
 	ldr  x9, [sp, #0]
 	cbz  x0, .gd_miss
+	add  x10, x9, #4
+	LOADADDR x11, s_gdtid
+	str  x10, [x11]                    /* the entry's own txid */
 	mov  x3, x0                        /* tx bytes ptr (mpool blob) */
 	/* ---- MEM-24 (audit 2026-09-03): serve the FORM that was requested ------
 	 * A bare MSG_TX (witness bit 0x40000000 CLEAR) asks for the non-witness
@@ -1354,6 +1362,12 @@ _node_serve_loop:
 	ldr  x11, [x10]
 	add  x11, x11, #1
 	str  x11, [x10]
+	/* Core ProcessGetData: sent to a peer, so no longer unbroadcast
+	 * (RemoveUnbroadcastTx) -- bitcoin_serve.asm 2026-11-06 */
+	LOADADDR x0, s_gdtid
+	ldr  x0, [x0]
+	bl   _mempool_unbroadcast_clear
+	ldr  x9, [sp, #0]
 	b    .gd_next
 
 .gd_miss:

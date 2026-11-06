@@ -123,6 +123,17 @@ __attribute__((weak)) void fest_on_block_begin(long height){ (void)height; }
 __attribute__((weak)) void fest_on_block_end(void){}
 __attribute__((weak)) void fest_shutdown_flush(void){}   /* main.c calls it at worker shutdown */
 static void* g_pol_state_for_fees;   /* set once the policy state exists (tx_policy_init) */
+/* The accept-time ring push again, for a transaction already in the pool:
+ * the unbroadcast reattempt (mempool_cfg.c mempool_unbroadcast_reattempt,
+ * Core ReattemptInitialBroadcast). With its fee and size, so each inbound
+ * child honours its peer's feefilter as it did the first time. The caller
+ * holds the pool lock, as the accept path does at its push. */
+void tx_accept_ring_push(const unsigned char* txid){
+    extern long mpool_policy_entry(void*, const unsigned char*, unsigned long long*, unsigned long long*);
+    unsigned long long fee = 0, vsize = 0;
+    if (!g_pol_state_for_fees || mpool_policy_entry(g_pol_state_for_fees, txid, &fee, &vsize) != 1){ txann_push(txid, 0, 0); return; }
+    txann_push(txid, fee, vsize);
+}
 static void txacc_fee_note(const unsigned char* txid){
     extern long mpool_policy_entry(void*, const unsigned char*, unsigned long long*, unsigned long long*);
     extern long mpool_policy_n_parents(void*, const unsigned char*);

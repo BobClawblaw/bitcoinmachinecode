@@ -27,6 +27,15 @@ extern long mempool_dump_read(const char* path,
                               int (*sink)(void*, const u8*, unsigned long, long long, long long),
                               void* ctx, char* err, unsigned long errcap);
 
+extern long mempool_dump_write_ub(const char* path, const u8* const* txs,
+                                  const unsigned long* lens, const long long* times,
+                                  const long long* deltas, long n,
+                                  const u8* extra_txids, const long long* extra_deltas,
+                                  long n_extra, const u8* ub_txids, long n_ub);
+extern long mempool_dump_read_ub(const char* path,
+                                 int (*sink)(void*, const u8*, unsigned long, long long, long long),
+                                 void* ctx, char* err, unsigned long errcap,
+                                 u8** ub_out, long* n_ub_out);
 static int failures = 0;
 static void ck(const char* l, int c){ if(c) printf("  ok  %s\n", l); else { printf("  FAIL %s\n", l); failures++; } }
 
@@ -158,6 +167,52 @@ int main(void){
           ck(l, cs[k].ok ? r == 0 : r == -1);
       }
       unlink("f6.dat"); }
+
+    /* ---- the unbroadcast set (2026-11-06) ---------------------------------
+     * Core writes m_unbroadcast_txids after the delta map as a std::set<Txid>:
+     * a compact-size count, then each txid's 32 bytes, sorted by those bytes.
+     * Every dump this node wrote before the set was tracked ends with a zero
+     * count; a file that stops right after the delta map is read as an empty
+     * set, not refused. */
+    printf("---- the unbroadcast set ----\n");
+    { u8 ids[3*32]; memset(ids, 0xC3, 32); memset(ids + 32, 0x1A, 32); memset(ids + 64, 0x7E, 32);
+      long w = mempool_dump_write_ub("ub.dat", txs, lens, times, deltas, 2, NULL, NULL, 0, ids, 3);
+      collect c; memset(&c, 0, sizeof c); char err[128]; err[0] = 0;
+      u8* got = NULL; long ng = -1;
+      long r = mempool_dump_read_ub("ub.dat", sink, &c, err, sizeof err, &got, &ng);
+      ck("a dump with a 3-txid set reads back both transactions", w == 2 && r == 2 && c.n == 2);
+      ck("...and the 3 txids", ng == 3 && got != NULL);
+      ck("...sorted by their bytes, as Core's std::set writes them",
+         got && got[0] == 0x1A && got[32] == 0x7E && got[64] == 0xC3);
+      free(got);
+      /* the section's bytes: count 3, then the three sorted ids, at the very end */
+      FILE* f = fopen("ub.dat", "rb"); fseek(f, 0, SEEK_END); long sz = ftell(f);
+      u8 tail[97]; fseek(f, sz - 97, SEEK_SET); (void)!fread(tail, 1, 97, f); fclose(f);
+      ck("the file ends with compact-size 3 and the sorted txids",
+         tail[0] == 3 && tail[1] == 0x1A && tail[33] == 0x7E && tail[65] == 0xC3 && tail[96] == 0xC3);
+      /* an empty set: the old writer's form */
+      long w0 = mempool_dump_write("ub0.dat", txs, lens, times, deltas, 2, NULL, NULL, 0);
+      got = (u8*)1; ng = -1;
+      r = mempool_dump_read_ub("ub0.dat", sink, (memset(&c, 0, sizeof c), &c), err, sizeof err, &got, &ng);
+      ck("the old writer's empty set reads as none", w0 == 2 && r == 2 && ng == 0 && got == NULL);
+      /* a file that stops right after the delta map */
+      f = fopen("ub0.dat", "rb"); fseek(f, 0, SEEK_END); sz = ftell(f); rewind(f);
+      u8* whole = malloc((size_t)sz); (void)!fread(whole, 1, (size_t)sz, f); fclose(f);
+      f = fopen("ubcut.dat", "wb"); (void)!fwrite(whole, 1, (size_t)sz - 1, f); fclose(f);
+      r = mempool_dump_read_ub("ubcut.dat", sink, (memset(&c, 0, sizeof c), &c), err, sizeof err, &got, &ng);
+      ck("a file without the section reads, with an empty set", r == 2 && ng == 0);
+      /* a count that promises more ids than the file holds */
+      whole[sz - 1] = 2;
+      f = fopen("ubbad.dat", "wb"); (void)!fwrite(whole, 1, (size_t)sz, f); (void)!fwrite(ids, 1, 32, f); fclose(f);
+      err[0] = 0; r = mempool_dump_read_ub("ubbad.dat", sink, (memset(&c, 0, sizeof c), &c), err, sizeof err, &got, &ng);
+      ck("a set count past the end of the file is refused", r == -1 && strstr(err, "unbroadcast"));
+      /* a non-canonical count (1 spelt fd 0100) */
+      f = fopen("ubbad.dat", "wb"); (void)!fwrite(whole, 1, (size_t)sz - 1, f);
+      { u8 nc[3] = { 0xfd, 0x01, 0x00 }; (void)!fwrite(nc, 1, 3, f); } (void)!fwrite(ids, 1, 32, f); fclose(f);
+      err[0] = 0; r = mempool_dump_read_ub("ubbad.dat", sink, (memset(&c, 0, sizeof c), &c), err, sizeof err, &got, &ng);
+      ck("a non-canonical set count is refused", r == -1 && strstr(err, "unbroadcast"));
+      free(whole);
+      unlink("ub.dat"); unlink("ub0.dat"); unlink("ubcut.dat"); unlink("ubbad.dat"); }
 
     if(failures) printf("\nFAILURES: %d\n", failures);
     else printf("\nALL TESTS PASSED (0 failures)\n");
