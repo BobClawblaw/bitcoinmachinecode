@@ -2999,12 +2999,26 @@ test, and the bug was in the measurement.
   10 fail. Unit tests in `test_mempool_shared`,
   `test_mempool_persist`, `test_serve` and `test_tx_relay` each fail with
   their rule reverted.
-- **Found, not fixed: a `mempool.dat` reload announces every transaction.**
-  The reload re-submits through the `sendrawtransaction` channel, whose
-  accept queues an announcement on every live leg (production, 2026-11-06
-  09:04Z: 37,200 reloaded, each queued for announcement). Core's
-  `LoadMempool` admits without relaying. Not changed here: it needs its own
-  decision (the reload's legs, the time it runs).
+- ~~**Found, not fixed: a `mempool.dat` reload announces every
+  transaction.**~~ **CLOSED 2026-11-06.** The startup load and
+  `importmempool` re-submitted every entry through the `sendrawtransaction`
+  channel, whose accept queued an announcement on every outbound leg and put
+  it on the ring every inbound peer reads (production, 2026-11-06 09:04Z:
+  37,200 reloaded, each queued for announcement). An entry already in the
+  pool was announced again and counted as admitted. Core's `LoadMempool`
+  admits through `AcceptToMemoryPool` and never calls `RelayTransaction`;
+  only the file's unbroadcast set goes out, at the 10-15 minute reattempt.
+  The loader now stages with `tx_submit_norelay`, and the worker admits
+  those through `txsub_accept_quiet` (`daemon/tx_submit.c`), which queues
+  nothing for the legs and keeps the accept off the announce ring
+  (`g_txacc_no_announce`, `daemon/tx_accept.c`); an entry already in the
+  pool stays -27, which the loader counts as already there.
+  `validation/reload_announce_core_diff.py` against Core v31.1 on regtest: 32
+  of 32 equal, including a control in which each subject's own
+  `sendrawtransaction` reaches both its peers; `deploy-20261106e` fails 3
+  (60 invs to each peer after an `importmempool`, 60 again to the outbound
+  peer after a second one). `test_tx_submit` covers both halves, each
+  revert-checked.
 - **`getnetworkinfo` `version` is 310100, not 1.** It reported this node's
   own 0.0.1 encoded Core's way, and clients read the field as a capability
   level: Core Lightning's bcli refused to start ("Unsupported bitcoind

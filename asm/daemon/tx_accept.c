@@ -134,6 +134,10 @@ void tx_accept_ring_push(const unsigned char* txid){
     if (!g_pol_state_for_fees || mpool_policy_entry(g_pol_state_for_fees, txid, &fee, &vsize) != 1){ txann_push(txid, 0, 0); return; }
     txann_push(txid, fee, vsize);
 }
+/* 1 while the worker admits a mempool.dat entry (tx_submit.c
+ * txsub_accept_quiet): the accept goes on no announce ring, as Core's
+ * LoadMempool relays nothing. Process-local; only the worker sets it. */
+int g_txacc_no_announce;
 static void txacc_fee_note(const unsigned char* txid){
     extern long mpool_policy_entry(void*, const unsigned char*, unsigned long long*, unsigned long long*);
     extern long mpool_policy_n_parents(void*, const unsigned char*);
@@ -143,8 +147,10 @@ static void txacc_fee_note(const unsigned char* txid){
      * (fee/vsize let the readers honour a peer's feefilter; 0/0 = unknown,
      * announced rather than dropped). This is the one place all three accept
      * paths meet, under the pool lock, so it is the one feed point. */
-    if (!g_pol_state_for_fees || mpool_policy_entry(g_pol_state_for_fees, txid, &fee, &vsize) != 1){ txann_push(txid, 0, 0); return; }
-    txann_push(txid, fee, vsize);
+    if (!g_pol_state_for_fees || mpool_policy_entry(g_pol_state_for_fees, txid, &fee, &vsize) != 1){
+        if (!g_txacc_no_announce) txann_push(txid, 0, 0);
+        return; }
+    if (!g_txacc_no_announce) txann_push(txid, fee, vsize);
     int valid = tx_accept_chainstate_current()
              && mpool_policy_n_parents(g_pol_state_for_fees, txid) == 0
              && !mpol_in_package_context();

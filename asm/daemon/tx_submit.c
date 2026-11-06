@@ -46,6 +46,37 @@ extern long p2p_write(int fd, const char* cmd, unsigned cmdlen, const void* pl, 
  * recording version of its own. */
 __attribute__((weak)) void txrelay_announce_own(const u8 txid[32]){ (void)txid; }
 
+/* decode + validate + insert; txid out. No announcement of any kind here. */
+static int txsub_accept(void* mp_area, const u8* tx, unsigned long len,
+                        u8 txid[32], char* reason, unsigned long rcap){
+    if (reason && rcap) reason[0] = 0;
+    if (!tx || len == 0){ if (reason && rcap) snprintf(reason, rcap, "TX decode failed"); return -22; }
+    static u8 scratch[2000*81 + 8];              /* worker is single-threaded */
+    if (!tx_txid(txid, tx, len, scratch, sizeof scratch)){
+        if (reason && rcap) snprintf(reason, rcap, "TX decode failed");
+        return -22; }
+    return (int)tx_accept_validate_reason(mp_area, txid, tx, len, reason, rcap);
+}
+
+/* tx_accept.c's switch for the announce-ring push every accept makes; weak so
+ * the socketpair test, which stubs the validator, links without it. */
+extern int g_txacc_no_announce __attribute__((weak));
+
+/* Validate + mempool-accept a mempool.dat entry and announce it NOWHERE: not
+ * on the outbound legs, not on the ring the inbound children read. Core's
+ * LoadMempool (startup and importmempool) admits through AcceptToMemoryPool
+ * and never calls RelayTransaction; until 2026-11-06 every reloaded
+ * transaction went to every peer (37,200 on one production boot). Returns
+ * what txsub_accept_and_relay returns. */
+int txsub_accept_quiet(void* mp_area, const u8* tx, unsigned long len,
+                       char* reason, unsigned long rcap){
+    u8 txid[32];
+    if (&g_txacc_no_announce) g_txacc_no_announce = 1;
+    int r = txsub_accept(mp_area, tx, len, txid, reason, rcap);
+    if (&g_txacc_no_announce) g_txacc_no_announce = 0;
+    return r;
+}
+
 /* Validate + mempool-accept the staged tx, and on accept queue its txid for
  * announcement on every live peer leg. Returns 1 on accept, or a negative
  * Core RPC error code on reject (reason filled). peer_fds[i] < 0 entries are
@@ -56,17 +87,9 @@ int txsub_accept_and_relay(void* mp_area, const u8* tx, unsigned long len,
                            const int* peer_fds, int n_fds,
                            char* reason, unsigned long rcap, int* relayed_out){
     if (relayed_out) *relayed_out = 0;
-    if (reason && rcap) reason[0] = 0;
-    if (!tx || len == 0){ if (reason && rcap) snprintf(reason, rcap, "TX decode failed"); return -22; }
-
     u8 txid[32];
-    static u8 scratch[2000*81 + 8];              /* worker is single-threaded */
-    if (!tx_txid(txid, tx, len, scratch, sizeof scratch)){
-        if (reason && rcap) snprintf(reason, rcap, "TX decode failed");
-        return -22; }
-
-    long r = tx_accept_validate_reason(mp_area, txid, tx, len, reason, rcap);
-    if (r != 1) return (int)r;
+    int r = txsub_accept(mp_area, tx, len, txid, reason, rcap);
+    if (r != 1) return r;
 
     int live = 0;
     for (int i = 0; i < n_fds; i++) if (peer_fds[i] >= 0) live++;

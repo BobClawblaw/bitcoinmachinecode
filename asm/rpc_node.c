@@ -3125,6 +3125,7 @@ static int mpd_import_one(void* vctx, const unsigned char* tx, unsigned long len
     st->tx_submit_test = 0;
     st->tx_submit_pkg_n = 0;
     st->tx_submit_local = 0;             /* a reload is not a broadcast: the set comes from the file */
+    st->tx_submit_norelay = 1;           /* ...and announces nothing: Core's LoadMempool never relays */
     st->tx_submit_reason[0] = 0;
     unsigned long long myseq = st->tx_submit_seq + 1;
     __sync_synchronize();
@@ -3326,8 +3327,8 @@ static int cmd_importmempool(const rj_val* params, rj_val** res, long* ec, const
         *ec = -1; *em = "Unable to import mempool file, see debug.log for details."; return 0; }
     long waiting = apply_ub ? mpd_unbroadcast_apply(ub, nub) : 0;
     free(ub);
-    fprintf(stderr, "[rpc] importmempool %s: %ld accepted, %ld rejected of %ld; %ld waiting for initial broadcast\n",
-            path, c.accepted, c.rejected, r, waiting);
+    fprintf(stderr, "[rpc] importmempool %s: %ld accepted, %ld already there, %ld rejected of %ld; %ld waiting for initial broadcast\n",
+            path, c.accepted, c.already, c.rejected, r, waiting);
     *res = rj_obj();               /* Core returns an empty object */
     return 1;
 }
@@ -3395,6 +3396,7 @@ static int cmd_sendrawtransaction(const rj_val* params, rj_val** res, long* ec, 
      * accepted submission in the unbroadcast set; private broadcast does not
      * touch the mempool at all */
     s->tx_submit_local = s->pb_enabled ? 0 : 1;
+    s->tx_submit_norelay = 0;
     /* explicit: a stale 1 left by a previous testmempoolaccept would turn a
      * real submission into a dry run and report a txid for a tx that was
      * never accepted or relayed. */
@@ -3466,6 +3468,7 @@ static int tma_stage(node_status_t* s, const unsigned char* tx, unsigned long n,
     s->tx_submit_fee = 0;
     s->tx_submit_test = 1;
     s->tx_submit_local = 0;
+    s->tx_submit_norelay = 0;
     s->tx_submit_reason[0] = 0;
     unsigned long long myseq = s->tx_submit_seq + 1;
     __sync_synchronize();
@@ -3568,6 +3571,7 @@ static int cmd_submitpackage(const rj_val* params, rj_val** res, long* ec, const
     st->tx_submit_test = 0;
     st->tx_submit_pkg_n = n;
     st->tx_submit_local = 0;          /* Core's submitpackage broadcasts what is already in the pool: no unbroadcast entry */
+    st->tx_submit_norelay = 0;
     st->tx_submit_reason[0] = 0;
     st->pkg_msg[0] = 0;
     unsigned long long myseq = st->tx_submit_seq + 1;
@@ -3745,6 +3749,7 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
         s->tx_submit_test  = 1;          /* dry run: pass 1 only, commits nothing */
         s->tx_submit_pkg_n = n;
         s->tx_submit_local = 0;
+        s->tx_submit_norelay = 0;
         s->tx_submit_reason[0] = 0;
         s->pkg_msg[0] = 0;
         unsigned long long myseq = s->tx_submit_seq + 1;
