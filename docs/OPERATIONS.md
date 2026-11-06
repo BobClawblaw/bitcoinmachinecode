@@ -442,6 +442,25 @@ deliberately not vendored into this repository (operator decision,
 - SIGTERM is honoured (the parent forwards it to the download worker);
   `TimeoutStopSec` is the wait before systemd SIGKILLs.
 - `Restart=on-failure`, `RestartSec=10`, at most 5 starts per 600 s.
+- **Watchdog (2026-11-06).** With `WatchdogSec=` on the unit (the reference
+  deployment's drop-in sets `10min`), the serve parent sends systemd
+  `WATCHDOG=1` only while the download worker's progress stamp moves: each
+  rotation of its loop, each block of a catch-up pass, each status tick of the
+  parallel downloader (`daemon/sd_watchdog.c`). A worker that is alive but
+  stuck, or a stuck parent loop, stops the pings; systemd sends `SIGABRT` to
+  every process in the unit (each writes its `[crash]` stack to the log,
+  which is where the stuck worker was) and `Restart=on-failure` starts it
+  again. A dead worker already restarted the unit (the parent exits non-zero).
+  Between 2026-09-27 and 11-06 a healthy worker never went more than 174 s
+  between heartbeats; the two stalls in that span (10-19, 42 minutes in one
+  ZMQ loop; 10-30 to 11-02, under memory throttling) went unrestarted for 44
+  minutes and about 3.6 days. Without `WatchdogSec=` the code does nothing.
+  **Set it only on a build that pings** (from `main` at this change on): an
+  older binary never pings, and systemd kills it while healthy one timeout
+  after the start. For an operation that legitimately stops the worker's
+  loop for longer (none is known), remove the drop-in first.
+  `validation/watchdog_regtest_e2e.py` checks both halves under a real
+  systemd user unit.
 - No `LimitNOFILE` is set, so the process gets the default soft limit of 1,024
   descriptors (`Max open files` in `/proc/<pid>/limits`). A healthy production
   process holds about 66. The Core oracle's unit sets 65,536. On 2026-10-07 a

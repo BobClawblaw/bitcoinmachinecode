@@ -42,7 +42,7 @@ CSRC=(
   bitcoin_scriptverify.c bitcoin_witness_v0.c wallet_msgsign.c daemon/serve_invbounds.c
   daemon/relay_policy.c daemon/wallet_pass.c daemon/v2transport.c crypto_bip324_transport.c
   crypto_bip324.c crypto_bip324_fs.c crypto_chacha20.c crypto_poly1305.c crypto_ellswift_ecdh.c
-  crypto_ellswift.c crypto_ellswift_enc.c crypto_fe_sqrt.c daemon/stale_tip.c daemon/peer_timeout.c
+  crypto_ellswift.c crypto_ellswift_enc.c crypto_fe_sqrt.c daemon/stale_tip.c daemon/peer_timeout.c daemon/sd_watchdog.c
   daemon/txann.c daemon/inbound_evict.c daemon/anchors.c daemon/archive_seed.c daemon/ibd_pipeline.c
   daemon/hdr_lowwork.c daemon/invalid_set.c daemon/cmpct_recv.c daemon/banlist.c
   daemon/addrbook.c daemon/addr_hist.c daemon/netaddr.c
