@@ -2448,3 +2448,36 @@ were still on disk. Nothing in them is new measurement.
     a connected peer alive when run against it directly.
   - Block-relay-only legs still dialled by the dial helpers (2 of 2).
 - **Rollback:** relink to `deploy-20261105e`. No on-disk format changed.
+
+## 2026-11-06 02:52Z — `deploy-20261106b`: named JSON-RPC arguments for every method (PR #470)
+
+- **What:** `main` at `c8691439`. #470 converts a JSON-RPC `params` object
+  (`bitcoin-cli -named`) to positions for every method, by Core's
+  `transformNamedArguments` rules, before the lock class is chosen and the
+  method dispatched. Until now only `echo` converted names; every other
+  handler got the object unconverted. Each method's argument names are
+  `asm/rpc_argnames.h`, generated from Core v31.1's help (170 methods). A
+  method Core does not have keeps its object. One behavior change for
+  every method: `params` that is neither an array nor an object answers
+  -32600, as Core's request parser does (it did for `echo` only).
+- **Checked before the merge:** `make test` passes on x86 (gate-log-check:
+  all 480 gated tests ran); on the Mac the four RPC tests pass.
+  `validation/named_args_core_diff.py` against v31.1: 40 cases, all match
+  (38 fail on the previous build); `validation/echo_core_diff.py`: 41 of
+  41.
+- Built from clean (`make -B daemon/bmcbitcoind` and the helpers by name) in
+  a clean worktree at the merge commit. All five exec'd helpers were
+  byte-identical; none was replaced. Wallet files were copied first.
+  `MALLOC_ARENA_MAX=4` stays in place.
+- **Started:** 02:52:27Z at tip 974,753 (= the oracle); RPC answered at
+  974,753 by 02:53:03Z. `bitcoin-cli -named getblockhash height=974753`
+  against the node gave the oracle's hash, and an unknown name (`bogus=2`)
+  answered -8, as Core does.
+- **Verified live:**
+  - New block 974,754 applied with the Core v31.1 oracle's hash
+    (`000000000000000000002c54a1dd34bb136209c90439e92bd1d4600c3911b417`)
+    at 03:25:04Z (the network found no block for 32 minutes after the
+    restart).
+  - `NRestarts=0` and `active` at 33 minutes; no `[crash]` line.
+  - Feelers: 8 alive and 8 dead since the restart.
+- **Rollback:** relink to `deploy-20261106a`. No on-disk format changed.
