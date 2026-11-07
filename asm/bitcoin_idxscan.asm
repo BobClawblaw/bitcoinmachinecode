@@ -142,7 +142,9 @@ idxscan_all_present:
 
 ; ----------------------------------------------------------------------------
 ; idxscan_tip(void)  -> rax: highest height with a non-zero record, or -1 if
-;   none/empty/missing.
+;   none/empty/missing -- AND -1 when index.dat cannot be opened or read
+;   (it opens the file by name: EMFILE says -1 too). A caller that would act
+;   on "empty" must confirm it another way; see idxscan_append_locked.
 ; ----------------------------------------------------------------------------
 global idxscan_tip
 idxscan_tip:
@@ -302,7 +304,7 @@ idxscan_append_locked:
     ;             path's job -- reorg reconnects through the nolocked variant
     ;             under its own outer lock, unaffected).
     cmp  rax, -1
-    je   .linked               ; empty store: genesis bootstrap, nothing to link
+    je   .empty_or_unread      ; empty store (genesis bootstrap) -- or a failed scan
     imul rax, 48               ; index record offset = tip*48
     mov  rdi, [r12+8]           ; idx_fd
     lea  rsi, [rbp-0x48]         ; tip-hash scratch
@@ -344,6 +346,33 @@ idxscan_append_locked:
     syscall
 .refuse_done:
     mov  rax, -2
+    jmp  .ret
+.empty_or_unread:
+    ; idxscan_tip answers -1 for an empty index AND when it cannot read it:
+    ; it opens index.dat by name, so a full descriptor table (EMFILE) is
+    ; "empty" to it. Taking that at its word wrote the block's record at
+    ; height 0, over genesis, with no linkage check (2026-11-06, the Mac
+    ; mainnet node: block 974,810's record landed in slot 0). The store's
+    ; own index fd is already open: only an index with no record in it is
+    ; really empty. Anything else is a failed append, never height 0.
+    mov  rdi, [r12+8]           ; idx_fd
+    xor  esi, esi
+    mov  edx, 2                 ; SEEK_END
+    mov  eax, 8                 ; lseek
+    syscall
+    test rax, rax
+    js   .unread
+    cmp  rax, 48
+    jl   .linked                ; truly empty: genesis bootstrap
+.unread:
+    mov  rdi, [r12+40]          ; release the lock we took
+    test rdi, rdi
+    js   .unread_done
+    mov  eax, 73                ; flock
+    mov  esi, 8                 ; LOCK_UN
+    syscall
+.unread_done:
+    mov  rax, -1
 .ret:
     add  rsp, 0x48
     pop  r15
@@ -397,7 +426,22 @@ idxscan_append_nolocked:
     mov  r14, rdx            ; raw
     mov  r15, rcx            ; len
     ; ---- true current tip, hole-aware (caller's lock is already held) ----
-    call idxscan_tip           ; -> rax = tip (-1 if empty)
+    call idxscan_tip           ; -> rax = tip (-1 if empty, or unreadable)
+    cmp  rax, -1
+    jne  .nl_have_tip
+    ; -1 is only "empty" when the store's own index fd holds no record (see
+    ; idxscan_append_locked's .empty_or_unread); otherwise fail, never height 0
+    mov  rdi, [r12+8]           ; idx_fd
+    xor  esi, esi
+    mov  edx, 2                 ; SEEK_END
+    mov  eax, 8                 ; lseek
+    syscall
+    test rax, rax
+    js   .nl_unread
+    cmp  rax, 48
+    jge  .nl_unread
+    mov  rax, -1
+.nl_have_tip:
     lea  rbx, [rax+1]          ; height = tip + 1 (callee-saved across the call below)
     mov  rdi, r12
     mov  rsi, rbx
@@ -411,6 +455,9 @@ idxscan_append_nolocked:
     lea  rcx, [rax+1]
     imul rcx, 48
     mov  [r12+16], rcx         ; idx_len = (height+1)*48
+    jmp  .nlret
+.nl_unread:
+    mov  rax, -1
 .nlret:
     pop  r15
     pop  r14

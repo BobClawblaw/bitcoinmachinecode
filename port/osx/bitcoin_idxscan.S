@@ -114,7 +114,9 @@ _idxscan_all_present:
     ldp  x29,x30,[sp],#16
     ret
 
-/* ================= _idxscan_tip(void) -> highest present / -1 ================= */
+/* ================= _idxscan_tip(void) -> highest present / -1 =================
+ * -1 also when index.dat cannot be opened or read (EMFILE included): a caller
+ * that would act on "empty" must confirm it; see _idxscan_append_locked. */
     .globl _idxscan_tip
 _idxscan_tip:
     stp  x29,x30,[sp,#-16]!
@@ -417,11 +419,11 @@ _idxscan_append_locked:
     mov  x1,#2                 /* LOCK_EX */
     svc #0x80
 .al_nof:
-    bl   _idxscan_tip           /* x0 = tip (-1 empty) */
+    bl   _idxscan_tip           /* x0 = tip (-1 empty, or unreadable) */
     add  x23,x0,#1             /* height = tip+1 */
     mov  x24,x0                /* tip (for linkage) */
     cmp  x24,#-1
-    b.eq .al_linked            /* empty: genesis bootstrap */
+    b.eq .al_empty_or_unread   /* empty: genesis bootstrap -- or a failed scan */
     /* pread idx_fd tip-hash (32B) at tip*48 */
     mov  x9,#48
     mul  x13,x24,x9            /* offset */
@@ -472,6 +474,32 @@ _idxscan_append_locked:
     svc #0x80
 .al_refuse_done:
     mov  x0,#-2
+    b    .al_ret
+.al_empty_or_unread:
+    /* _idxscan_tip answers -1 for an empty index AND when it cannot read it:
+     * it opens index.dat by name, so a full descriptor table (EMFILE) is
+     * "empty" to it. Taking that at its word wrote the block's record at
+     * height 0, over genesis, with no linkage check (2026-11-06, the Mac
+     * mainnet node: block 974,810's record landed in slot 0). The store's
+     * own index fd is already open: only an index with no record in it is
+     * really empty. Anything else is a failed append, never height 0. */
+    ldr  x0,[x19,#8]           /* idx_fd */
+    mov  x1,#0
+    mov  x2,#2                 /* SEEK_END */
+    mov  x16,#199              /* lseek */
+    svc  #0x80
+    b.cs .al_unread
+    cmp  x0,#48
+    b.lt .al_linked            /* truly empty: genesis bootstrap */
+.al_unread:
+    ldr  x9,[x19,#40]          /* release the lock we took */
+    tbnz x9,#63,.al_unread_done
+    mov  x0,x9
+    mov  x16,#131               /* flock (Darwin BSD nr, in x16) */
+    mov  x1,#8                 /* LOCK_UN */
+    svc #0x80
+.al_unread_done:
+    mov  x0,#-1
 .al_ret:
     add  sp,sp,#0x30
     ldp  x25,x26,[sp],#16
@@ -495,7 +523,21 @@ _idxscan_append_nolocked:
     mov  x20,x1
     mov  x21,x2
     mov  x22,x3
-    bl   _idxscan_tip
+    bl   _idxscan_tip           /* x0 = tip (-1 empty, or unreadable) */
+    cmn  x0,#1
+    b.ne .an_have_tip
+    /* -1 is only "empty" when the store's own index fd holds no record (see
+     * _idxscan_append_locked's .al_empty_or_unread); otherwise fail */
+    ldr  x0,[x19,#8]           /* idx_fd */
+    mov  x1,#0
+    mov  x2,#2                 /* SEEK_END */
+    mov  x16,#199              /* lseek */
+    svc  #0x80
+    b.cs .an_unread
+    cmp  x0,#48
+    b.ge .an_unread
+    mov  x0,#-1
+.an_have_tip:
     add  x23,x0,#1             /* height = tip+1 */
     mov  x0,x19
     mov  x1,x23
@@ -510,6 +552,9 @@ _idxscan_append_nolocked:
     mov  x10,#48
     mul  x9,x9,x10
     str  x9,[x19,#16]
+    b    .an_ret
+.an_unread:
+    mov  x0,#-1
 .an_ret:
     ldp  x23,x24,[sp],#16
     ldp  x21,x22,[sp],#16

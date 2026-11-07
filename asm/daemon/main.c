@@ -3931,11 +3931,16 @@ static long dl_store_pushed_block(int k, const unsigned char* blk, unsigned long
     if(r < 0){ fprintf(stderr,"[cmpct] %s from %s: locked append FAILED\n", how, mux_out_host[k]); return -1; }
     g_push_stored_n++; g_stored_now = 1;
     inflight_mark_stored(&g_inflight, bh, (long long)time(NULL));   /* a pass that forked before this append must not fetch it too */
+    /* the height logged is the one the append chose (r), not the tip + 1 we
+     * expected: on 2026-11-06 the line said 974810 while the record had gone
+     * to slot 0 */
     { char hs[68]; for(int j = 0; j < 32; j++) sprintf(hs + 2*j, "%02x", bh[31 - j]);   /* the whole hash: eight bytes of a mainnet hash are all zeros */
-      fprintf(stderr,"[block] stored height=%ld hash=%s bytes=%lu (%s from %s)\n", tip + 1, hs, len, how, mux_out_host[k]); }
-    /* tip + 1 is the EXPECTED height, not necessarily this block's -- the hash
-     * is what identifies it, and what tells two concurrent pushes of the same
-     * block apart from two different blocks */
+      fprintf(stderr,"[block] stored height=%ld hash=%s bytes=%lu (%s from %s)\n", r, hs, len, how, mux_out_host[k]);
+      if(r != tip + 1)
+          fprintf(stderr,"[block] WARNING: the append stored it at height %ld, not at %ld after our tip -- the index needs checking\n", r, tip + 1); }
+    /* tip + 1 below is the EXPECTED height -- the hash is what identifies the
+     * block, and what tells two concurrent pushes of the same block apart
+     * from two different blocks */
     if(how[0] == 'p' && how[7] == 'c') cmpct_overlap_line(tip + 1, bh, mux_out_host[k]);
     leg_hb_note_block(k);
     return 1;
