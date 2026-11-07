@@ -7915,12 +7915,17 @@ static struct { pid_t pid; int fd; long long t0; unsigned budget_s; } g_pass[MUX
 static int leg_pass_busy(int i){ return i >= 0 && i < MUX_MAX_OUT && g_pass[i].pid > 0; }
 static int pass_running(void){ int n = 0; for(int k = 0; k < MUX_MAX_OUT; k++) if(g_pass[k].pid > 0) n++; return n; }
 static long g_pass_started, g_pass_fallback, g_pass_crashed;
+/* why the last leg_pass_start returned 0: the errno of the pipe() or fork()
+ * that failed, or 0 when it only declined (the leg's helper is busy, or the
+ * cap) -- see pass_start_note */
+static int g_pass_start_errno;
 /* the child: the synchronous pass under its own budget alarm, then the report */
 static int leg_pass_start(int i, unsigned budget_s){
+    g_pass_start_errno = 0;
     if(leg_pass_busy(i) || pass_running() >= PASS_MAX_CONCURRENT) return 0;
-    int pp[2]; if(pipe(pp) != 0) return 0;
+    int pp[2]; if(pipe(pp) != 0){ g_pass_start_errno = errno ? errno : EIO; return 0; }
     pid_t pid = fork();
-    if(pid < 0){ close(pp[0]); close(pp[1]); return 0; }
+    if(pid < 0){ g_pass_start_errno = errno ? errno : EIO; close(pp[0]); close(pp[1]); return 0; }
     if(pid == 0){
         close(pp[0]); g_pass_in_child = 1; g_pass_child_rewound = -1;
         signal(SIGCHLD, SIG_DFL); signal(SIGPIPE, SIG_IGN);   /* a peer that hung up must not kill the report */
@@ -7966,6 +7971,52 @@ static int leg_pass_start(int i, unsigned budget_s){
 #define LEG_PASS_START(i, budget_s) leg_pass_start(i, budget_s)
 #endif
 extern int txrelay_replies_pending(int); extern void txrelay_note_sync_deferred(void);
+/* ---- a pass helper that cannot start (2026-11-06) ---------------------------
+ * The Mac mainnet node stored block 974,810 at 13:12Z and fetched nothing
+ * after it for ten hours. A headers.dat descriptor leak (fixed in 53a3b4c9)
+ * had filled the worker's table (256 on macOS), so every leg_pass_start
+ * failed at its pipe() with EMFILE. leg_pass_launch read that as "no helper,
+ * the next rotation tries again": it released the claim and counted
+ * g_pass_fallback, which nothing reads, and the rotation retried every leg on
+ * every turn for ten hours. Every announcement still logged "its pass runs
+ * next", the heartbeat and the tx relay ran on, and the rotation kept feeding
+ * the watchdog -- nothing said the node could no longer fetch a block.
+ * Reproduced on regtest: the pre-fix binary under ulimit -n 128 followed its
+ * peer to height 114, then logged eleven announcements and no pass.
+ *
+ * Now a failed start is named once per errno, its recovery is named, and a
+ * failure that lasts PASS_START_FAIL_EXIT_MS ends the worker: the serve parent
+ * sees it exit non-zero and exits so that systemd restarts the unit (a fresh
+ * process starts with a fresh descriptor table). A start that only declined
+ * (busy leg, cap) is not a failure. pass_start_note is the rule, apart from
+ * the clock and the fork, so tests/test_announce_claim.c drives it directly. */
+#define PASS_START_FAIL_EXIT_MS (5LL * 60 * 1000)
+static long long g_pass_fail_since_ms;    /* 0 = the last start did not fail */
+static long g_pass_fail_n;                /* failed starts since then */
+static int g_pass_fail_logged_errno;      /* the errno last named (0 = none) */
+static int g_worker_fatal;                /* the exit status the worker's shutdown uses */
+/* -> 1 when the failures have lasted long enough that the worker must end */
+static int pass_start_note(int started, int err, long long now_ms){
+    if(started){
+        if(g_pass_fail_since_ms)
+            fprintf(stderr,"[dl] pass helpers start again after %.0fs and %ld failed start(s)\n",
+                    (double)(now_ms - g_pass_fail_since_ms) / 1000.0, g_pass_fail_n);
+        g_pass_fail_since_ms = 0; g_pass_fail_n = 0; g_pass_fail_logged_errno = 0;
+        return 0;
+    }
+    if(!err) return 0;                                    /* declined, not failed */
+    if(!g_pass_fail_since_ms) g_pass_fail_since_ms = now_ms > 0 ? now_ms : 1;
+    g_pass_fail_n++;
+    if(err != g_pass_fail_logged_errno){
+        g_pass_fail_logged_errno = err;
+        fprintf(stderr,"[dl] a pass helper could not start: %s -- no announced block can be fetched until this clears; the worker exits after %llds of it\n",
+                strerror(err), PASS_START_FAIL_EXIT_MS / 1000);
+    }
+    if(now_ms - g_pass_fail_since_ms < PASS_START_FAIL_EXIT_MS) return 0;
+    fprintf(stderr,"[dl] FATAL: no pass helper has started for %.0fs (%ld failed start(s), last: %s) -- the worker exits so the node restarts\n",
+            (double)(now_ms - g_pass_fail_since_ms) / 1000.0, g_pass_fail_n, strerror(err));
+    return 1;
+}
 static int leg_pass_gate(int i, int announced_now, long long now_ms){
     if(!announced_now && mux_out_lastpass_ms[i] && now_ms - mux_out_lastpass_ms[i] < LEG_PASS_EVERY_MS) return 0;   /* no polling for headers between announcements */
     if(!announced_now && mux_out_fd[i] >= 0 && TXRELAY_REPLIES_PENDING(mux_out_fd[i])){ txrelay_note_sync_deferred(); return 0; }   /* retried next rotation */
@@ -7978,9 +8029,13 @@ static int leg_pass_launch(int i, int announced_now, unsigned budget_s){
     }
     if(!LEG_PASS_START(i, budget_s)){
         if(announced_now) inflight_release(&g_inflight, mux_out_announced_hash[i]);   /* no pass: no claim */
-        g_pass_fallback++; mux_out_lastpass_ms[i] = 0;    /* no helper (fork failed): never inline -- the next rotation tries again */
+        g_pass_fallback++; mux_out_lastpass_ms[i] = 0;    /* no helper: never inline -- the next rotation tries again */
+        if(pass_start_note(0, g_pass_start_errno, dh_now_ms()) && !g_shutdown_requested){
+            g_worker_fatal = 1; g_shutdown_requested = SIGTERM;   /* the rotation's own shutdown path, with status 1 */
+        }
         return 0;
     }
+    pass_start_note(1, 0, dh_now_ms());
     mux_out_announced[i] = 0;                             /* the pass consumed whatever was announced on this leg */
     return 1;
 }
@@ -11269,8 +11324,11 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             int live_peers=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) live_peers++;
             long long stop_ms; { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); stop_ms = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
             char upbuf[UPTIME_BUF];
-            fprintf(stderr,"[dl] shutting down (signal %d): tip=%d peers=%d txouts=%ld uptime=%s\n",
-                    (int)g_shutdown_requested, *(int*)(store_buf+24), live_peers,
+            char why[32];
+            if(g_worker_fatal) snprintf(why, sizeof why, "pass helpers cannot start");
+            else snprintf(why, sizeof why, "signal %d", (int)g_shutdown_requested);
+            fprintf(stderr,"[dl] shutting down (%s): tip=%d peers=%d txouts=%ld uptime=%s\n",
+                    why, *(int*)(store_buf+24), live_peers,
                     utxo_live_ok?live_utxo_disp():-1L,
                     fmt_uptime(upbuf, (stop_ms-boot_ms)/1000));
             /* fee_estimates.dat (Core Flush()) -- weak: the dial/sync test
@@ -11305,7 +11363,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             /* same rule as the serve parent's exit: no thread of this
              * process may be inside the mempool lock when _exit kills it */
             { extern int mp_quiesce(long) __attribute__((weak)); if (mp_quiesce) mp_quiesce(5000); }
-            _exit(0);
+            _exit(g_worker_fatal);              /* non-zero: the serve parent exits and systemd restarts the unit */
         }
         long long now_ms = 0;
         { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); now_ms = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
