@@ -1300,6 +1300,9 @@ static long long mux_out_since[MUX_MAX_OUT];      /* 2026-09-09: when the leg in
 /* 2026-09-09: one request per block across the legs (daemon/inflight.h); the
  * sync loop asks g_block_fetch_hook before every getdata */
 #include "inflight.h"
+/* 2026-11-07: the tip has stopped while the legs announce blocks (daemon/tip_watch.h) */
+#include "tip_watch.h"
+static tipw_t g_tipw;
 /* 2026-11-07: the table is a MAP_SHARED mapping from the worker's setup on
  * (inflight_shared), so the claims a pass helper takes and the blocks it
  * stores reach the worker and every sibling pass; before then each helper
@@ -3793,7 +3796,11 @@ static void leg_on_block_announce(int fd, const unsigned char hash[32], const ch
      * outbound the field never appeared at all. A novel block announced on a
      * leg is exactly what Core records here. */
     if(g_node_status && k < RPC_MAX_PEERS) g_node_status->peers[k].last_block_time = (long long)time(NULL);
-    fprintf(stderr,"[tip] %s announced block %02x%02x%02x%02x.. by %s: its pass runs next\n", mux_out_host[k], hash[31], hash[30], hash[29], hash[28], how);
+    if(!g_in_dial_helper && !invset_has(hash)) tipw_announce(&g_tipw, hash, k, mono_now_ms());
+    /* the whole hash (2026-11-07): the first four bytes printed before are
+     * zero for every block, so no line could be matched to its block */
+    char hs[65]; for(int j = 0; j < 32; j++) sprintf(hs + 2*j, "%02x", hash[31 - j]);
+    fprintf(stderr,"[tip] %s announced block %s by %s: its pass runs next\n", mux_out_host[k], hs, how);
 }
 static void leg_on_block_inv(int fd, const unsigned char hash[32]){ g_announce_inv_n++; leg_on_block_announce(fd, hash, "inv"); }
 /* the peer's sendcmpct (BIP152: high_bandwidth u8, version u64): version 2 is
@@ -8030,6 +8037,7 @@ static long long g_pass_fail_since_ms;    /* 0 = the last start did not fail */
 static long g_pass_fail_n;                /* failed starts since then */
 static int g_pass_fail_logged_errno;      /* the errno last named (0 = none) */
 static int g_worker_fatal;                /* the exit status the worker's shutdown uses */
+static const char* g_worker_fatal_why = "pass helpers cannot start";   /* its reason, for the shutdown line */
 /* -> 1 when the failures have lasted long enough that the worker must end */
 static int pass_start_note(int started, int err, long long now_ms){
     if(started){
@@ -8051,6 +8059,34 @@ static int pass_start_note(int started, int err, long long now_ms){
     fprintf(stderr,"[dl] FATAL: no pass helper has started for %.0fs (%ld failed start(s), last: %s) -- the worker exits so the node restarts\n",
             (double)(now_ms - g_pass_fail_since_ms) / 1000.0, g_pass_fail_n, strerror(err));
     return 1;
+}
+/* The tip-progress watch (daemon/tip_watch.h has the rule and the numbers):
+ * once per rotation. A halted UTXO set does not move by design, so it is
+ * not watched. Ends the worker the way pass_start_note does. */
+static void tip_watch_tick(void* store_buf){
+    if(utxo_live_halted()){ g_tipw.have_tip = 0; return; }
+    long long now = mono_now_ms(), age = 0; int legs = 0;
+    long tip = node_public_tip(store_buf);
+    switch(tipw_check(&g_tipw, tip, now, invset_count(), invset_has, &age, &legs)){
+    case TIPW_WARN:
+        fprintf(stderr,"[tip] %d legs announced a block %.0f min ago and the tip is still %ld -- the worker exits if it has not moved %lld min after the announcement\n",
+                legs, (double)age / 60000.0, tip, TIPW_FATAL_MS / 60000);
+        break;
+    case TIPW_RECOVERED:
+        fprintf(stderr,"[tip] the tip moved to %ld, %.0f min after %d legs announced a block\n", tip, (double)age / 60000.0, legs);
+        break;
+    case TIPW_REFUSED:
+        fprintf(stderr,"[tip] a block was refused since the tip last moved (%ld): a stalled tip is not a reason to restart until it moves\n", tip);
+        break;
+    case TIPW_FATAL:
+        if(g_shutdown_requested) break;
+        fprintf(stderr,"[tip] FATAL: %d legs announced a block %.0f min ago and the tip is still %ld -- the worker exits so the node restarts\n",
+                legs, (double)age / 60000.0, tip);
+        g_worker_fatal = 1; g_worker_fatal_why = "the tip stopped while legs announce";
+        g_shutdown_requested = SIGTERM;
+        break;
+    default: break;
+    }
 }
 static int leg_pass_gate(int i, int announced_now, long long now_ms){
     if(!announced_now && mux_out_lastpass_ms[i] && now_ms - mux_out_lastpass_ms[i] < LEG_PASS_EVERY_MS) return 0;   /* no polling for headers between announcements */
@@ -10897,6 +10933,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     long long dl_parallel_last_s = 0;
     for(;;){
         wd_beat();   /* one rotation: the systemd watchdog's progress stamp */
+        tip_watch_tick(store_buf);
         dl_publish_peer_table(store_buf, 1);   /* the peer table the RPC reads (2026-09-16: shared with dl_catchup) */
         /* peer control: one command per ack, executed HERE because this is the
          * process that holds the legs. Every branch reports what it actually
@@ -11359,8 +11396,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             int live_peers=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) live_peers++;
             long long stop_ms; { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); stop_ms = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
             char upbuf[UPTIME_BUF];
-            char why[32];
-            if(g_worker_fatal) snprintf(why, sizeof why, "pass helpers cannot start");
+            char why[64];
+            if(g_worker_fatal) snprintf(why, sizeof why, "%s", g_worker_fatal_why);
             else snprintf(why, sizeof why, "signal %d", (int)g_shutdown_requested);
             fprintf(stderr,"[dl] shutting down (%s): tip=%d peers=%d txouts=%ld uptime=%s\n",
                     why, *(int*)(store_buf+24), live_peers,
