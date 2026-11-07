@@ -298,6 +298,8 @@ asm: $(OBJS)
 
 %.o: %.asm
 	$(NASM) $(NASMFLAGS) -o $@ $<
+# the weak bmc_tls_scratch fallback each of these includes (2026-11-07)
+bitcoin_utxo_lsm.o secp256k1_taproot.o: bmc_tls_scratch.inc
 # safegcd_var.inc is the shared body of sc_inv_var and fe_inv_var.
 secp256k1_scalar.o secp256k1_fe.o: safegcd_var.inc
 # The other %include'd sources. Without these an edit to one leaves a stale

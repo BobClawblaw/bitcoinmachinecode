@@ -91,6 +91,15 @@ typedef unsigned char u8;
 typedef unsigned int u32;
 typedef unsigned long u64;
 
+/* The asm's large per-thread scratch, made on first use (2026-11-07):
+ * secp256k1_taproot.asm's long-leaf preimage and bitcoin_utxo_lsm.asm's
+ * bloom copy, which were static TLS and so resident in every thread. This
+ * definition puts each on the thread's bmc_tls list, freed when the thread
+ * exits; it overrides the weak malloc-only copy in bmc_tls_scratch.inc,
+ * which the binaries without this file link. Never returns NULL. */
+void* bmc_tls_scratch(size_t size);
+void* bmc_tls_scratch(size_t size){ return bmc_tls_alloc(size); }
+
 /* ---- legacy verifier (bitcoin_scriptverify.c) ---- */
 extern int sv_verify_script(const unsigned char* scriptSig, unsigned long ssl,
                             const unsigned char* scriptPubKey, unsigned long spl,

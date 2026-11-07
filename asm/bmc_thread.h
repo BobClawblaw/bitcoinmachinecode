@@ -17,6 +17,14 @@
  * 64 workers cost nothing extra in practice; measured usable ~52 MB above
  * the TLS block. BMC_THREAD_STACK_MB overrides (0 = library default attrs,
  * used by the regression test to reproduce the overflow).
+ *
+ * 2026-11-07: the static TLS is 277 KB now, not 12-14 MB. The stack is
+ * virtual until touched, but the TLS block inside it is not: glibc
+ * zero-fills it when it creates the thread, so the 13.9 MB block was
+ * resident in every thread. The three large buffers (vfexec, the LSM bloom
+ * copy, the long-leaf taproot preimage) are gone or made on first use
+ * (bmc_tls_scratch), and tests/test_elf_hardening holds the block under
+ * 1 MiB. The explicit 64 MB stack stays.
  */
 #ifndef BMC_THREAD_H
 #define BMC_THREAD_H

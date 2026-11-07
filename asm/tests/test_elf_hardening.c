@@ -142,6 +142,21 @@ static int check_one(const char* path){
           printf("        HARDENFLAGS did not reach the link -- note the Makefile is\n"
                  "        not a prerequisite, so a stale binary can mask this\n"); }
 
+    /* 2026-11-07: static TLS is not demand-paged. glibc zero-fills a
+     * thread's whole static TLS block when it creates the thread, so every
+     * byte of .tbss is resident in every thread of every process. Three asm
+     * buffers (vfexec 5 MiB, lsm_get_scratch 4 MiB, tap_preimg 4 MiB) made
+     * it 13.9 MB: 13.3 MB written in each of the serve parent's 27 thread
+     * stacks, ~0.8 GB across the node. A large per-thread buffer belongs
+     * behind a TLS pointer filled on first use (bmc_tls_scratch). */
+    printf("== static TLS stays small (it is resident in every thread) ==\n");
+    { unsigned long long tls = 0;
+      for (int i = 0; i < eh->e_phnum; i++) if (ph[i].p_type == PT_TLS) tls = ph[i].p_memsz;
+      printf("        PT_TLS: %llu bytes\n", tls);
+      ck("the static TLS block is under 1 MiB", tls < (1ULL << 20));
+      if (tls >= (1ULL << 20))
+          printf("        a .tbss buffer of megabytes: allocate it on first use instead\n"); }
+
     free(b);
     if (fails) printf("  FAILURES: %d in %s\n", fails, path);
     return fails ? 1 : 0;

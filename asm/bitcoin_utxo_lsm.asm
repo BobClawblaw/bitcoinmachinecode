@@ -231,7 +231,7 @@ MAGIC_MANIFEST   equ 0x4E414D55      ; "UMAN" little-endian dword -- OLD format,
 ; one-time full dedup recount (mac_lsm_recount) to establish the baseline,
 ; mirroring the MAGIC_RUN -> MAGIC_RUN2 discipline for run files above.
 MAGIC_MANIFEST2  equ 0x324E4D55      ; "UMN2" little-endian dword -- adds trailing total_live qword
-BLOOM_MAX_BYTES  equ 4*1024*1024     ; 4MB: the get-time bloom scratch (lsm_get_scratch, static TLS) and the
+BLOOM_MAX_BYTES  equ 4*1024*1024     ; 4MB: the get-time bloom copy (lsm_bloom_p, per thread, on first use) and the
                                      ; flush scratch's bloom area (the callers' scratch_cap counts it)
 ; RUN_BLOOM_MAX_BYTES (2026-10-09): the largest bloom a run is written with.
 ; The bloom was capped at BLOOM_MAX_BYTES, sized for ~3.35M entries at 10
@@ -262,9 +262,18 @@ SCRIPT_MAX_BYTES equ 65536           ; get-time script-read scratch
     mov  %1, [rel %2 wrt ..gottpoff]
     add  %1, qword [fs:0]
 %endmacro
+;
+; 2026-11-07: SPLIT. The bloom copy (BLOOM_MAX_BYTES) moved out of static TLS:
+; glibc zero-fills a thread's static TLS when it creates the thread, so all
+; 4 MiB were resident in every thread of every process, though only the
+; fallback below (taken when lsm_run_lookup_mm declines) ever reads a bloom
+; into it. That path now asks bmc_tls_scratch for the thread's copy the
+; first time it needs one (lsm_bloom_p), freed when the thread exits. The
+; script area, which every frozen-memtable hit uses, stays here.
 section .tbss nobits alloc noexec write tls align=16
-global lsm_get_scratch
-lsm_get_scratch: resb BLOOM_MAX_BYTES + SCRIPT_MAX_BYTES
+global lsm_get_script, lsm_bloom_p
+lsm_get_script: resb SCRIPT_MAX_BYTES
+lsm_bloom_p:    resq 1
 section .text
 
 ; ---- sparse index (added after Phase 2 shipped without one -- see
@@ -1982,10 +1991,11 @@ mac_run_lookup:
     mov  rax, [rbp+32]
     mov  [rbp-0x80], rax    ; &slen
 
-    ; off_bloom is always 0 now: bloom/script live in the dedicated
-    ; lsm_get_scratch TLS buffer (see its header comment above), not in
-    ; lst->scratch_buf's ping/pong-prefixed layout mac_flush still uses.
-    mov  qword [rbp-0x60], 0    ; off_bloom
+    ; [rbp-0x60]: this thread's bloom copy, set by the fallback below when it
+    ; reads a bloom (see lsm_bloom_p above); the script goes to the TLS
+    ; lsm_get_script, not lst->scratch_buf's ping/pong-prefixed layout
+    ; mac_flush still uses.
+    mov  qword [rbp-0x60], 0    ; bloom copy
 
     ; ---- PERF_SCOPE.md 4.1 fast path ----------------------------------
     ; Try the mmap-cached lookup first. It answers from a mapping already
@@ -2041,11 +2051,25 @@ mac_run_lookup:
     mov  [rbp-0x58], rcx        ; bits_mask
     mov  rax, [rbp-0x200+16]    ; bloom_bytes
     cmp  rax, BLOOM_MAX_BYTES
-    ja   .ml_nobloom            ; larger than the TLS copy (RUN_BLOOM_MAX_BYTES): search without it
+    ja   .ml_nobloom            ; larger than the per-thread copy (RUN_BLOOM_MAX_BYTES): search without it
+
+    ; this thread's bloom copy, made on first use. rsp is 8 (mod 16) here
+    ; (see the fast path above); the push of bloom_bytes aligns the call.
+    TLS_ADDR rcx, lsm_bloom_p
+    mov  rsi, [rcx]
+    test rsi, rsi
+    jnz  .ml_have_copy
+    push rax
+    mov  edi, BLOOM_MAX_BYTES
+    call bmc_tls_scratch        ; aborts rather than return NULL
+    TLS_ADDR rcx, lsm_bloom_p
+    mov  [rcx], rax
+    mov  rsi, rax
+    pop  rax
+.ml_have_copy:
+    mov  [rbp-0x60], rsi
 
     mov  rdi, [rbp-0x68]
-    TLS_ADDR rsi, lsm_get_scratch
-    add  rsi, [rbp-0x60]
     mov  rdx, rax
     call mac_read_exact2
     test rax, rax
@@ -2058,8 +2082,7 @@ mac_run_lookup:
     mov  eax, [rbp-0x38]
     mov  [rbp-0x100+32], eax
 
-    TLS_ADDR rdx, lsm_get_scratch
-    add  rdx, [rbp-0x60]
+    mov  rdx, [rbp-0x60]        ; the bloom copy
     mov  ecx, [rbp-0x58]
     lea  rdi, [rbp-0x100]
     mov  esi, 0x811c9dc5
@@ -2301,9 +2324,7 @@ mac_run_lookup:
     test r14d, r14d
     jz   .ml_push_noscript
     mov  rdi, [rbp-0x68]
-    TLS_ADDR rsi, lsm_get_scratch
-    add  rsi, [rbp-0x60]
-    add  rsi, BLOOM_MAX_BYTES
+    TLS_ADDR rsi, lsm_get_script
     mov  rdx, r14
     call mac_read_exact2
     test rax, rax
@@ -2314,9 +2335,7 @@ mac_run_lookup:
     syscall
     ; script ptr
     mov  rcx, [rbp-0x78]
-    TLS_ADDR rax, lsm_get_scratch
-    add  rax, [rbp-0x60]
-    add  rax, BLOOM_MAX_BYTES
+    TLS_ADDR rax, lsm_get_script
     mov  [rcx], rax
     ; slen
     mov  rcx, [rbp-0x80]
@@ -2453,8 +2472,7 @@ utxo_lsm_get:
     add  rsp, 0x10
     cmp  eax, 1
     jne  .lg_fz_tomb
-    TLS_ADDR rdi, lsm_get_scratch
-    add  rdi, BLOOM_MAX_BYTES        ; the script area of the per-thread scratch
+    TLS_ADDR rdi, lsm_get_script     ; the per-thread script area
     mov  rsi, [rbp-0x118]
     mov  rdx, [rbp-0x110]
     cmp  rdx, SCRIPT_MAX_BYTES
@@ -5464,5 +5482,7 @@ utxo_lsm_compact:
     pop  rbx
     pop  rbp
     ret
+
+%include "bmc_tls_scratch.inc"
 
 section .note.GNU-stack noalloc noexec nowrite progbits
