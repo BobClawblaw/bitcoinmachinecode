@@ -2699,3 +2699,44 @@ were still on disk. Nothing in them is new measurement.
 - **Rollback:** remove `70-watchdog.conf` and `daemon-reload` FIRST, then
   relink to `deploy-20261106f` and restart. Relinking with the drop-in in
   place gets the older build killed ten minutes after it starts.
+
+## 2026-11-07 01:39Z — `deploy-20261107a`: one fetch per block across the legs' pass helpers (PR #485)
+
+- **What:** `main` at `4363bdfd`. #485: since 2026-09-10 each leg's sync
+  pass runs in a forked helper, and the table that keeps one request per
+  block across the legs was a private copy in each helper, so concurrent
+  passes fetched the same block; a pass that ran after a sibling had stored
+  it fetched all of its transactions again. Production's log of 2026-11-06
+  12:12-23:10Z: 4 of 58 compact blocks reconstructed by passes on 2 to 7
+  legs, 14,878 KB of `getblocktxn` for blocks already fetched against
+  1,345 KB for the first reconstructions. The table now lives in a
+  `MAP_SHARED` mapping behind a lock any process can take, and a stored
+  block is refused to every leg for 120 s.
+- **Checked before the merge:** `tests/test_inflight` (15 -> 31 checks,
+  including a cross-process sibling check with a private-table control,
+  an 8-process race, and a dead lock holder; with the lock disabled the
+  race check fails 5 of 5 runs). `validation/dup_fetch_regtest_e2e.py`
+  (new, four Core v31.1 regtest legs): 6 payloads for 6 blocks with the
+  fix, against 15 (all legs direct) and 11 (three legs delayed 1.5 s) on
+  `deploy-20261106g`; without the stored marks, 12 for 6 delayed.
+  `make test` passes on x86 (481 tests); a first gate run failed
+  `test_stop_waits_for_worker`, which fails on `main` too (2 of 8 runs).
+- Built from clean (`make -B daemon/bmcbitcoind` and the helpers by name) in
+  a clean worktree at the merge commit, with no warnings. All five exec'd
+  helpers were byte-identical; none was replaced. Wallet files were copied
+  first. `MALLOC_ARENA_MAX=4` and `70-watchdog.conf` stay in place.
+- **Started:** 01:39:11Z at tip 974,874 (= the oracle). The `[watchdog]`
+  line came at 01:39:58Z; RPC answered at 974,874 by 01:40:00Z.
+- **Verified live:**
+  - New block 974,875 applied with the Core v31.1 oracle's hash
+    (`000000000000000000012eecf9ab36f051f0770e9d42ada81ed5bb3cfef579b3`)
+    at 01:50:55Z, reconstructed once (2,818 tx, 267 fetched by
+    `getblocktxn`, 175 KB).
+  - `NRestarts=0` and `active` at 12 minutes, `WatchdogTimestamp`
+    advancing (01:49:59Z); no `[crash]` line; 61 open descriptors in the
+    main process.
+  - The `[dial] memory` line reported 7 duplicate fetches avoided, 0 of
+    them for an already-stored block. One compact block is not a
+    measurement; the saving is to be read over hours against the 11-06 log.
+- **Rollback:** relink to `deploy-20261106g` and restart (it pings the
+  watchdog too, so `70-watchdog.conf` stays). No on-disk format changed.
