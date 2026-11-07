@@ -1150,6 +1150,40 @@ long archive_trim_derived_tails(void){
             trimmed++; n = cut;
         }
     }
+    /* Record 0 must be a genesis block: the block it points at hashes to the
+     * record and its prev field is all zeros (every chain's genesis). An
+     * append that misread a failed index scan as "empty" (2026-11-06, the Mac
+     * mainnet node: EMFILE) wrote block 974,810's record here, and the mirror
+     * check below then blamed headers.dat -- a sound file, cut to nothing.
+     * A record 0 shown to be something else is cleared (the boot's genesis
+     * seed writes it again; a seed that ever stops running on every boot must
+     * still fill a cleared record 0), and the mirror check skips the hole. A
+     * record whose block cannot be read is left alone: no proof, no change. */
+    {
+        FILE* f0 = fopen("index.dat", "r+b"); unsigned char r0[48];
+        if (f0 && fread(r0, 1, 48, f0) == 48){
+            int zero = 1; for (int i = 0; i < 48; i++) if (r0[i]){ zero = 0; break; }
+            unsigned int fno; unsigned long long pos; unsigned int size;
+            memcpy(&fno, r0 + 32, 4); memcpy(&pos, r0 + 36, 8); memcpy(&size, r0 + 44, 4);
+            char fn[64]; snprintf(fn, sizeof fn, "blk%05u.dat", fno);
+            FILE* bf = zero ? NULL : fopen(fn, "rb"); unsigned char hdr[80]; int okr = 0;
+            if (bf){ okr = (fseek(bf, (long)(pos + ARCHIVE_FRAME_LEN), SEEK_SET) == 0 && fread(hdr, 1, 80, bf) == 80); fclose(bf); }
+            if (okr){
+                unsigned char bh[32]; block_hash(bh, hdr);
+                int prev_zero = 1; for (int i = 4; i < 36; i++) if (hdr[i]){ prev_zero = 0; break; }
+                if (memcmp(bh, r0, 32) != 0 || !prev_zero){
+                    char hs[65]; for (int j = 0; j < 32; j++) sprintf(hs + 2*j, "%02x", r0[31 - j]);
+                    static const unsigned char z48[48];
+                    if (fseek(f0, 0, SEEK_SET) != 0 || fwrite(z48, 1, 48, f0) != 48 || fflush(f0) != 0){ fclose(f0); return -1; }
+                    fprintf(stderr, "[boot] index.dat record 0 is not a genesis block (it names %s, %s) -- cleared; "
+                                    "genesis is seeded again and headers.dat is left alone\n",
+                            hs, memcmp(bh, r0, 32) != 0 ? "and its block hashes to something else" : "a block with a parent");
+                    trimmed++;
+                }
+            }
+        }
+        if (f0) fclose(f0);
+    }
     /* the header mirror must agree with the index height by height; cut it at
      * the first disagreement (the daemon re-derives the rest from the blocks) */
     if (stat("headers.dat", &st) == 0 && st.st_size >= 112){

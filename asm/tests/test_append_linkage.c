@@ -13,6 +13,9 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/resource.h>
 #include "test_tmpdir.h"
 
 extern long store_init(void* st);
@@ -20,6 +23,32 @@ extern long store_append(void* st, const unsigned char hash[32], const void* raw
 extern long idxscan_append_locked(void* st, const unsigned char hash[32],
                                   const void* raw, long len);
 extern long idxscan_tip(void* st);
+extern long idxscan_append_nolocked(void* st, const unsigned char hash[32],
+                                    const void* raw, long len);
+
+/* Fill the descriptor table (soft limit lowered to 64 first, so it fills
+ * fast), run fn, then free it all. Returns fn's result; *full says whether
+ * open() really reported EMFILE before fn ran. */
+static long with_fds_exhausted(long (*fn)(void*, const unsigned char*, const void*, long),
+                               void* st, const unsigned char* h, const void* raw, long len, int* full){
+    struct rlimit rl, low; getrlimit(RLIMIT_NOFILE, &rl); low = rl;
+    if (low.rlim_cur > 64) low.rlim_cur = 64;
+    setrlimit(RLIMIT_NOFILE, &low);
+    int held[128], n = 0, err = 0;
+    while (n < 128){ int fd = open("/dev/null", O_RDONLY); if (fd < 0){ err = errno; break; } held[n++] = fd; }
+    long r = (err == EMFILE) ? fn(st, h, raw, len) : -99;
+    for (int i = 0; i < n; i++) close(held[i]);
+    setrlimit(RLIMIT_NOFILE, &rl);
+    *full = (err == EMFILE);
+    return r;
+}
+static void rec0_read(unsigned char out[48]){
+    FILE* f = fopen("index.dat", "rb"); memset(out, 0, 48);
+    if (f){ if (fread(out, 1, 48, f) != 48) memset(out, 0, 48); fclose(f); }
+}
+static int rec0_is(const unsigned char want[48]){
+    unsigned char r[48]; rec0_read(r); return memcmp(r, want, 48) == 0;
+}
 
 static int failures = 0;
 static void ck(const char* l, long long g, long long e){
@@ -157,6 +186,46 @@ int main(void){
             long stale = store_append(s3, hi, I, 90);
             printf("      (UNLOCKED store_append from a stale state -> h%ld, while the archive was at h6)\n", stale);
             ck("STO-5 control: the unlocked appender writes BEHIND the true tip", (long long)(stale < 6), 1);
+        }
+    }
+
+    /* ================================================================
+     * 2026-11-06, the Mac mainnet node: idxscan_tip opens index.dat by name
+     * and answers -1 when it cannot -- the same -1 as an empty index. With
+     * the descriptor table full (EMFILE), the append took that as "empty,
+     * genesis bootstrap", skipped the linkage gate and wrote block 974,810's
+     * record at height 0, over genesis. A store that holds records must fail
+     * the append instead, and leave record 0 alone.
+     * ================================================================ */
+    printf("\n== an index scan that fails is not an empty index ==\n");
+    {
+        long tip0 = idxscan_tip(store_buf);
+        ck("the archive is at h6 before the test", tip0, 6);
+        /* record 0 as it stands (the STO-5 control above wrote there) */
+        unsigned char rec0[48]; rec0_read(rec0);
+        unsigned char hh[32], hj[32]; memset(hh, 0x44, 32); memset(hj, 0x66, 32);
+        static unsigned char J[90]; mk_raw(J, hh, 10);     /* the genuine next block */
+        int full = 0;
+        long r = with_fds_exhausted(idxscan_append_locked, store_buf, hj, J, 90, &full);
+        ck("the descriptor table really was full", full, 1);
+        ck("locked append with the scan unable to open index.dat -> -1, not height 0", r, -1);
+        ck("...record 0 is untouched", rec0_is(rec0), 1);
+        ck("...and the tip is unchanged", idxscan_tip(store_buf), 6);
+        r = with_fds_exhausted(idxscan_append_nolocked, store_buf, hj, J, 90, &full);
+        ck("nolocked append, same failure -> -1", r, -1);
+        ck("...record 0 is untouched", rec0_is(rec0), 1);
+        ck("with descriptors free again the same block lands at h7", idxscan_append_locked(store_buf, hj, J, 90), 7);
+    }
+    printf("\n== a truly empty index still takes its first block at height 0 ==\n");
+    {
+        char sub[] = "empty_store";
+        mkdir(sub, 0755);
+        if (chdir(sub) == 0){
+            static unsigned char s4[4096]; memset(s4, 0, sizeof s4);
+            ck("store_init on an empty directory", store_init(s4), 1);
+            unsigned char hk[32]; memset(hk, 0x77, 32); static unsigned char K[90]; mk_raw(K, zero, 11);
+            ck("first block on the empty store -> h0", idxscan_append_locked(s4, hk, K, 90), 0);
+            (void)!chdir("..");
         }
     }
 

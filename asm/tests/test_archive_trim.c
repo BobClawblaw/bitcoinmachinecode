@@ -81,6 +81,9 @@ int main(void){
       extern void block_hash(unsigned char out[32], const unsigned char hdr[80]);
       unsigned char hdr[7][80], hh[7][32]; unsigned char prev[32]; memset(prev, 0, 32);
       for (int i = 0; i < 7; i++){ memset(hdr[i], 0, 80); hdr[i][0] = 1; memcpy(hdr[i] + 4, prev, 32); hdr[i][36] = (unsigned char)(0xa0 + i); block_hash(hh[i], hdr[i]); memcpy(prev, hh[i], 32); }
+      FILE* bf = fopen("blk00000.dat", "wb");            /* the 3 stored blocks, where their records point */
+      for (int i = 0; i < 3; i++){ unsigned char fr[8] = {80,0,0,0, 0xf9,0xbe,0xb4,0xd9}; fwrite(fr, 1, 8, bf); fwrite(hdr[i], 1, 80, bf); }
+      fclose(bf);
       FILE* fi = fopen("index.dat", "wb"); FILE* fh = fopen("headers.dat", "wb"); FILE* fc = fopen("chainwork.dat", "wb");
       for (int i = 0; i < 3; i++){ unsigned char rec[48]; memset(rec, 0, 48); memcpy(rec, hh[i], 32); unsigned int fno = 0, size = 80; unsigned long long pos = (unsigned long long)i * 88; memcpy(rec + 32, &fno, 4); memcpy(rec + 36, &pos, 8); memcpy(rec + 44, &size, 4); fwrite(rec, 1, 48, fi);
                                    unsigned char cwr[16]; memset(cwr, 0, 16); cwr[0] = (unsigned char)i; fwrite(cwr, 1, 16, fc); }
@@ -131,6 +134,36 @@ int main(void){
       fh = fopen("headers.dat", "r+b"); fseek(fh, 6*112 + 80, SEEK_SET); unsigned char bad[32]; memset(bad, 0xab, 32); fwrite(bad, 1, 32, fh); fclose(fh);
       long r = archive_trim_derived_tails();
       ck("index record 6 is not on the header chain: the index is cut there (records 0..5 kept, the hole included)", r >= 1 && fsize("index.dat") == 6*48); }
+    printf("== record 0 overwritten by a later block: index.dat is at fault, not headers.dat ==\n");
+    { /* 2026-11-06, the Mac mainnet node: an append misread an EMFILE index
+       * scan as "empty" and wrote block 974,810's record into slot 0. The
+       * mirror check then found headers.dat[0] (genesis) disagreeing with it
+       * and cut a sound headers.dat to nothing. Record 0 is checked first:
+       * the block it names must hash to it and have no parent. */
+      extern void block_hash(unsigned char out[32], const unsigned char hdr[80]);
+      unsigned char hdr[6][80], hh[6][32]; unsigned char prev[32]; memset(prev, 0, 32);
+      for (int i = 0; i < 6; i++){ memset(hdr[i], 0, 80); hdr[i][0] = 1; memcpy(hdr[i] + 4, prev, 32); hdr[i][36] = (unsigned char)(0xd0 + i); block_hash(hh[i], hdr[i]); memcpy(prev, hh[i], 32); }
+      unlink("chainwork.dat");
+      FILE* bf = fopen("blk00000.dat", "wb"); FILE* fi = fopen("index.dat", "wb"); FILE* fh = fopen("headers.dat", "wb");
+      for (int i = 0; i < 6; i++){                       /* blocks 0..5 in the blk file */
+          unsigned char fr[8] = {80,0,0,0, 0xf9,0xbe,0xb4,0xd9}; fwrite(fr, 1, 8, bf); fwrite(hdr[i], 1, 80, bf); }
+      for (int i = 0; i < 5; i++){                       /* index 0..4, but record 0 names block 5 */
+          int b = i == 0 ? 5 : i; unsigned char rec[48]; memset(rec, 0, 48); memcpy(rec, hh[b], 32);
+          unsigned int fno = 0, size = 80; unsigned long long pos = (unsigned long long)b * 88;
+          memcpy(rec + 32, &fno, 4); memcpy(rec + 36, &pos, 8); memcpy(rec + 44, &size, 4); fwrite(rec, 1, 48, fi);
+          unsigned char hr[112]; memcpy(hr, hdr[i], 80); memcpy(hr + 80, hh[i], 32); fwrite(hr, 1, 112, fh); }
+      fclose(bf); fclose(fi); fclose(fh);
+      long r = archive_trim_derived_tails();
+      ck("one file repaired", r == 1);
+      ck("headers.dat is left whole (5 records)", fsize("headers.dat") == 5*112);
+      ck("index.dat keeps its length (5 records)", fsize("index.dat") == 5*48);
+      { FILE* f = fopen("index.dat", "rb"); unsigned char r0[48]; int zero = f && fread(r0, 1, 48, f) == 48; if (f) fclose(f);
+        for (int i = 0; zero && i < 48; i++) if (r0[i]) zero = 0;
+        ck("record 0 is cleared for the genesis seed", zero); }
+      ck("a second pass finds nothing", archive_trim_derived_tails() == 0);
+      /* a record 0 naming a parentless block that hashes to it is genesis: untouched */
+      fi = fopen("index.dat", "r+b"); { unsigned char rec[48]; memset(rec, 0, 48); memcpy(rec, hh[0], 32); fwrite(rec, 1, 48, fi); } fclose(fi);
+      ck("a genuine genesis record 0 is left alone", archive_trim_derived_tails() == 0 && fsize("headers.dat") == 5*112); }
     if (cwd0[0]) (void)!chdir(cwd0);
     printf("== the catch-up's worker-wait loop honours SIGTERM (structural) ==\n");
     { FILE* f = fopen("daemon/main.c", "r"); ck("daemon/main.c readable", f != NULL);
