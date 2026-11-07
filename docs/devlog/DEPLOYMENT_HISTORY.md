@@ -2740,3 +2740,54 @@ were still on disk. Nothing in them is new measurement.
     measurement; the saving is to be read over hours against the 11-06 log.
 - **Rollback:** relink to `deploy-20261106g` and restart (it pings the
   watchdog too, so `70-watchdog.conf` stays). No on-disk format changed.
+
+## 2026-11-07 11:38Z — `deploy-20261107b`: per-thread buffers on first use, the validation snapshot sized to its reload, malloc_trim (PR #487)
+
+- **What:** `main` at `e9da5ef4`. #487: three parts of the memory the
+  kernel could not reclaim on `deploy-20261107a`:
+  - static TLS was 13.9 MB per thread and glibc zero-fills it in every
+    thread it creates (13.3 MB written in each of the serve parent's 27
+    thread stacks). The `vfexec` entries (never read), the LSM bloom copy
+    and the long-leaf taproot preimage are gone or made on first use;
+    static TLS is 277,168 bytes.
+  - the validation snapshot sized its table from `utxo.dat`'s length,
+    which keeps retired WAL generations as punched-out holes, so it built
+    the 2^24-slot cap (767 MB) for 4.3 MB of data. It now sizes from what
+    a reload reads (the `utxo.idx` checkpoint and the WAL past its
+    `log_off`), with twice that as room.
+  - the serve parent and the worker call `malloc_trim(0)` every 10
+    minutes, with a `[mem]` line when it returns 16 MB or more or takes
+    100 ms or more.
+- **Checked before the merge:** `tests/test_elf_hardening` holds every
+  shipped binary's static TLS under 1 MiB (fails at 13,900,432 bytes with
+  the old asm); `tests/test_txacc_snapshot_size` sizes a WAL behind a
+  4 GiB hole as it does alone (2^19 slots; fails at 2^24 with the old
+  sizing). `make test` passes on x86 (481 tests). Regtest, old and new
+  side by side for 11 minutes: the worker's thread stacks held 11.94 MB
+  written each against 0.25 MB; private anonymous memory 127.1 MB against
+  10.2 MB.
+- Built from clean (`make -B daemon/bmcbitcoind` and the helpers by name) in
+  a clean worktree at the merge commit, with no warnings. The binary
+  differs from the tested one only in its build time and commit strings.
+  `bmc_build_addr_hist` links the changed LSM object and was replaced (the
+  old one kept as `bmc_build_addr_hist.pre-20261107b`); the other four
+  exec'd helpers were byte-identical. Wallet files were copied first.
+  `MALLOC_ARENA_MAX=4` and `70-watchdog.conf` stay in place.
+- **Started:** 11:38:47Z at tip 974,929 (= the oracle). RPC answered at
+  974,929 by 11:39:24Z. Boot line: "a reload reads 2121039 bytes
+  (checkpoint + WAL tail) -- sizing the validation snapshot at 2^17
+  slots".
+- **Verified live:**
+  - New block 974,930 applied with the Core v31.1 oracle's hash
+    (`00000000000000000000642ee55c6672864ce72cb64e30c7e4361845c7d453e4`)
+    by 11:42:09Z.
+  - `NRestarts=0` and `active` at 12 minutes; no `[crash]` line; 64 open
+    descriptors in the main process.
+  - First trim at 11:49:23Z: "serve: malloc_trim gave 262 MB back to the
+    kernel in 13 ms".
+  - The service's anonymous memory was 1,200 MB at 12 minutes up. Just
+    before the restart `deploy-20261107a` held 4,083 MB after 10 hours;
+    a like-for-like figure needs the same uptime.
+- **Rollback:** relink to `deploy-20261107a`, restore
+  `bmc_build_addr_hist.pre-20261107b`, and restart (`70-watchdog.conf`
+  stays). No on-disk format changed.
