@@ -2791,3 +2791,42 @@ were still on disk. Nothing in them is new measurement.
 - **Rollback:** relink to `deploy-20261107a`, restore
   `bmc_build_addr_hist.pre-20261107b`, and restart (`70-watchdog.conf`
   stays). No on-disk format changed.
+
+## 2026-11-07 17:29Z — `deploy-20261107c`: the worker ends when the tip stops while the legs announce blocks (PR #489)
+
+- **What:** `main` at `b3d142c1`. #489: the Mac mainnet node's stall of
+  2026-11-06 kept the worker's loop turning (and so the systemd watchdog
+  fed) for ten hours while no block could be fetched. A block hash
+  announced on 3 distinct legs now starts a clock: if the tip has not
+  moved 15 minutes later the worker warns, at 30 minutes it logs a
+  `[tip] FATAL` line and exits with status 1 (the #484 path), so systemd
+  restarts the unit. A block we refused since the tip last moved stands
+  the watch down; a halted UTXO set is not watched. From production's log
+  2026-10-05..11-07, the tip followed a 3-leg announcement in a median
+  1 s and at most 610 s outside the two real stalls (10-19, 10-30), both
+  of which the rule would have caught. The `[tip] ... announced block`
+  line now prints the whole hash.
+- **Checked before the merge:** `tests/test_tip_watch` (new, 29 checks)
+  and `tests/test_announce_claim` section 9 (the real announcement
+  handler, rotation check and shutdown), each revert-checked;
+  `validation/dup_fetch_regtest_e2e.py` on the new binary, 12/12 with no
+  warning; `make test` passes on x86 (482 tests).
+- Built from clean (`make -B daemon/bmcbitcoind` and the helpers by name) in
+  a clean worktree at the merge commit, with no warnings. All five exec'd
+  helpers were byte-identical; none was replaced. Wallet files were copied
+  first. `MALLOC_ARENA_MAX=4` and `70-watchdog.conf` stay in place.
+- **Before the restart:** `deploy-20261107b`, 5 h 51 m up, held 781 MB of
+  anonymous memory (`deploy-20261107a` held 4,083 MB at about 10 h); its
+  10-minute `malloc_trim` returned 284-452 MB each time.
+- **Started:** 17:29:33Z at tip 974,955 (= the oracle). RPC answered at
+  974,955 by 17:30:10Z.
+- **Verified live:**
+  - New block 974,956 announced at 17:31:09Z (the first full-hash `[tip]`
+    line), stored 17:31:10Z and applied with the Core v31.1 oracle's hash
+    (`0000000000000000000196aa0062fcd2b44eddc1d93bd17ef5ea6576c56e2d05`)
+    at 17:31:11Z.
+  - `NRestarts=0` and `active` at 11 minutes, `WatchdogTimestamp`
+    advancing (17:40:08Z); no `[crash]`, `FATAL`, tip-watch warning or
+    stand-down line; 60 open descriptors in the main process.
+- **Rollback:** relink to `deploy-20261107b` and restart
+  (`70-watchdog.conf` stays). No on-disk format changed.
