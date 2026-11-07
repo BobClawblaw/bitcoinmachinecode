@@ -48,6 +48,7 @@ static int test_start(int i, unsigned b){ (void)i; (void)b; g_starts++; return g
 static int (*keep_leg_pass_start)(int, unsigned) __attribute__((unused)) = leg_pass_start;
 #include "test_tmpdir.h"
 
+extern void utxo_live_test_set_halted(int);   /* daemon/utxo_live.c */
 static int fails = 0, checks = 0;
 static void ck(const char* w, int c){ checks++; if (c) printf("ok  : %s\n", w); else { printf("FAIL: %s\n", w); fails++; } }
 
@@ -163,6 +164,42 @@ int main(void){
         ck("the table really is full (open says EMFILE)", last_err == EMFILE);
         ck("leg_pass_start fails without forking", ret == 0 && g_pass[0].pid == 0);
         ck("...and says why: EMFILE", err == EMFILE);
+    }
+
+    /* ---- 9. the tip watch is fed by the announcement handler and ends the
+     * worker through the same shutdown (2026-11-07, daemon/tip_watch.h) ---- */
+    {
+        reset_fail_state(); memset(&g_tipw, 0, sizeof g_tipw);
+        static char fake_store[64]; *(int*)(fake_store + 24) = 974810;
+        tip_watch_tick(fake_store);                          /* the episode starts at 974,810 */
+        unsigned char B[32]; for (int i = 0; i < 32; i++) B[i] = (unsigned char)(0x40 + i);
+        leg_on_block_announce(10, B, "headers");
+        leg_on_block_announce(11, B, "headers");
+        ck("two legs announcing a block do not count yet", g_tipw.n == 1 && g_tipw.quorum_ms[0] == 0);
+        leg_on_block_announce(12, B, "inv");
+        ck("the third leg's announcement counts it", g_tipw.quorum_ms[0] > 0);
+        tip_watch_tick(fake_store);
+        ck("...and a fresh announcement ends nothing", g_worker_fatal == 0 && g_shutdown_requested == 0);
+        g_tipw.quorum_ms[0] = mono_now_ms() - TIPW_FATAL_MS - 1;   /* half an hour on, at the same tip */
+        tip_watch_tick(fake_store);
+        ck("half an hour at the same tip ends the worker with status 1",
+           g_worker_fatal == 1 && g_shutdown_requested == SIGTERM && !strcmp(g_worker_fatal_why, "the tip stopped while legs announce"));
+        reset_fail_state(); memset(&g_tipw, 0, sizeof g_tipw);
+        tip_watch_tick(fake_store);
+        leg_on_block_announce(10, B, "headers"); leg_on_block_announce(11, B, "headers"); leg_on_block_announce(12, B, "headers");
+        g_tipw.quorum_ms[0] = mono_now_ms() - TIPW_FATAL_MS - 1;
+        *(int*)(fake_store + 24) = 974811;
+        tip_watch_tick(fake_store);
+        ck("a tip that moved clears the record instead", g_worker_fatal == 0 && g_shutdown_requested == 0 && g_tipw.n == 0);
+        reset_fail_state(); memset(&g_tipw, 0, sizeof g_tipw);
+        utxo_live_test_set_halted(1);
+        tip_watch_tick(fake_store);
+        leg_on_block_announce(10, B, "headers"); leg_on_block_announce(11, B, "headers"); leg_on_block_announce(12, B, "headers");
+        if (g_tipw.n) g_tipw.quorum_ms[0] = mono_now_ms() - TIPW_FATAL_MS - 1;
+        tip_watch_tick(fake_store);
+        ck("a halted UTXO set is not watched", g_worker_fatal == 0 && g_shutdown_requested == 0);
+        utxo_live_test_set_halted(0);
+        reset_fail_state(); memset(&g_tipw, 0, sizeof g_tipw);
     }
 
     printf("\n%s (%d checks, %d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", checks, fails);
