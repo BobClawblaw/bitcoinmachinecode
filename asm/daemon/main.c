@@ -1300,7 +1300,15 @@ static long long mux_out_since[MUX_MAX_OUT];      /* 2026-09-09: when the leg in
 /* 2026-09-09: one request per block across the legs (daemon/inflight.h); the
  * sync loop asks g_block_fetch_hook before every getdata */
 #include "inflight.h"
-static inflight_t g_inflight; static int g_sync_leg = -1;
+/* 2026-11-07: the table is a MAP_SHARED mapping from the worker's setup on
+ * (inflight_shared), so the claims a pass helper takes and the blocks it
+ * stores reach the worker and every sibling pass; before then each helper
+ * claimed into its own copy-on-write copy and no sibling ever saw it
+ * (daemon/inflight.h). g_inflight names whichever table is current: the
+ * private one until the mapping exists (tests, a failed mmap). */
+static inflight_t g_inflight_own, *g_inflight_p = &g_inflight_own;
+#define g_inflight (*g_inflight_p)
+static int g_sync_leg = -1;
 extern void* g_block_fetch_hook;
 static void leg_note_best_known(int k, long h);   /* getpeerinfo's synced_headers; defined with the leg hooks */
 static long block_fetch_gate(const unsigned char* hash){
@@ -3880,6 +3888,7 @@ static long dl_store_pushed_block(int k, const unsigned char* blk, unsigned long
     if(r == -2){ g_push_skipped_n++; return 0; }                        /* the tip moved under us: a sibling stored it first */
     if(r < 0){ fprintf(stderr,"[cmpct] %s from %s: locked append FAILED\n", how, mux_out_host[k]); return -1; }
     g_push_stored_n++; g_stored_now = 1;
+    inflight_mark_stored(&g_inflight, bh, (long long)time(NULL));   /* a pass that forked before this append must not fetch it too */
     { char hs[68]; for(int j = 0; j < 32; j++) sprintf(hs + 2*j, "%02x", bh[31 - j]);   /* the whole hash: eight bytes of a mainnet hash are all zeros */
       fprintf(stderr,"[block] stored height=%ld hash=%s bytes=%lu (%s from %s)\n", tip + 1, hs, len, how, mux_out_host[k]); }
     /* tip + 1 is the EXPECTED height, not necessarily this block's -- the hash
@@ -4103,6 +4112,17 @@ static long do_outbound_sync(int i){
     g_sync_leg = i;
     unsigned long p_r, p_n, p_f; cmpct_recv_stats(&p_r, &p_n, &p_f);   /* at entry, not a static: a pass child's static was the parent's snapshot at fork, so every child reprinted the previous block's overlap line (2026-09-10) */
     long ok=node_sync_multi(mux_out_fd[i], store_buf, loc, nloc, cbuf, (long)sizeof cbuf, &cnt);
+    /* 2026-11-07: every block this pass stored is marked before its claims
+     * go, so a sibling pass -- which forked before the store and whose
+     * ht_idx is a stale copy -- is refused it instead of fetching it again
+     * (production 2026-11-06: six late passes refetched one 2,900-tx block
+     * whole, 1,692 KB each, its transactions already gone from the pool) */
+    { int t1 = *(int*)(store_buf+24); long long now_s = (long long)time(NULL);
+      for(int h = st_tip_before + 1; h <= t1; h++){
+          unsigned char bh[32];   /* index.dat's 48-byte record at h starts with the block hash (store_get_tip_hash, reorg.c's our_hash_at) */
+          if(pread(*(int*)((char*)store_buf + 8), bh, 32, (off_t)h * 48) != 32) continue;
+          inflight_mark_stored(&g_inflight, bh, now_s);
+      } }
     inflight_release_leg(&g_inflight, i); g_sync_leg = -1;   /* the claims live with the pass */
     g_last_sync_ok = ok;
     if(g_peer_sendcmpct && !mux_out_cmpct[i]){ mux_out_cmpct[i] = 1; fprintf(stderr, "[cmpct] %s accepts compact blocks: requesting MSG_CMPCT_BLOCK on this leg from now on\n", mux_out_host[i]); }
@@ -8002,6 +8022,7 @@ static long leg_pass_poll(int* stored_leg, const char* srcpool[], int nsrc, int 
         if(pr <= 0){
             if(age > (long long)g_pass[i].budget_s * 1000 + 15000){          /* the alarm did not end it: kill, treat as budget */
                 { int st; dl_kill_reap(g_pass[i].pid, &st, "pass helper"); } close(g_pass[i].fd); g_pass[i].pid = 0;
+                inflight_release_leg(&g_inflight, i);   /* the helper's claims are in the shared table: they do not die with it */
                 g_pass_crashed++;
                 leg_close_ours(i, "sync-budget", "the pass helper overran its budget and was killed");
                 mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i] = dh_now_ms() + redial_gap_ms();
@@ -8013,6 +8034,7 @@ static long leg_pass_poll(int* stored_leg, const char* srcpool[], int nsrc, int 
         static unsigned char blob[DH_V2_BLOB_CAP]; unsigned long got = 0;
         if(good && r.v2_len){ if(r.v2_len > DH_V2_BLOB_CAP) good = 0; else while(got < r.v2_len){ ssize_t n = read(g_pass[i].fd, blob + got, r.v2_len - got); if(n <= 0) break; got += (unsigned long)n; } }
         int st = 0; if(!dl_reap_bounded(g_pass[i].pid, &st, 5000)) dl_kill_reap(g_pass[i].pid, &st, "pass helper"); close(g_pass[i].fd); g_pass[i].pid = 0;
+        if(!good || (r.v2_len && got != r.v2_len) || r.budget_fired) inflight_release_leg(&g_inflight, i);   /* ended without a report the bookkeeping below trusts: its claims go now */
         if(!good || (r.v2_len && got != r.v2_len)){
             secure_zero(blob, got);        /* CRY-4: a partial session is still key material */
             g_pass_crashed++;
@@ -8039,7 +8061,7 @@ static long leg_pass_poll(int* stored_leg, const char* srcpool[], int nsrc, int 
     return stored;
 }
 static void leg_pass_stop_all(void){
-    for(int i = 0; i < MUX_MAX_OUT; i++) if(g_pass[i].pid > 0){ int st; kill(g_pass[i].pid, SIGTERM); if(!dl_reap_bounded(g_pass[i].pid, &st, 5000)) dl_kill_reap(g_pass[i].pid, &st, "pass helper"); close(g_pass[i].fd); g_pass[i].pid = 0; }
+    for(int i = 0; i < MUX_MAX_OUT; i++) if(g_pass[i].pid > 0){ int st; kill(g_pass[i].pid, SIGTERM); if(!dl_reap_bounded(g_pass[i].pid, &st, 5000)) dl_kill_reap(g_pass[i].pid, &st, "pass helper"); close(g_pass[i].fd); g_pass[i].pid = 0; inflight_release_leg(&g_inflight, i); }
 }
 /* ---- the legs' sweep (2026-09-09; factored 2026-09-10) ---------------------
  * Every OTHER leg's buffered messages now -- a ping used to wait for its
@@ -9757,6 +9779,7 @@ static int dl_should_parallel_fetch(long archive_tip, long best_peer_height,
 static int g_dl_last_seen_tip = -1;
 static void dl_after_gate_rewind(long back){
     g_dl_parallel_now = 1;
+    inflight_forget_stored(&g_inflight);   /* the store may no longer hold a block marked stored */
     if(back < (long)g_dl_last_seen_tip) g_dl_last_seen_tip = (int)back;
 }
 /* new-block choke point (3.1: watching the CONNECTED tip, not the
@@ -9928,6 +9951,7 @@ static void ixw_catchup_stop(const char* why){
 }
 static void dl_new_block_choke(void){
     int now_tip = (int)node_public_tip(store_buf);
+    if(g_dl_last_seen_tip >= 0 && now_tip < g_dl_last_seen_tip) inflight_forget_stored(&g_inflight);   /* the tip went down: a stored mark may name a block the store dropped */
     if(g_dl_last_seen_tip >= 0 && now_tip > g_dl_last_seen_tip){
         static unsigned char thb[8u<<20]; unsigned char th[32]; char hex[65];
         /* 2026-09-08: during initial block download (Core's rule: the tip is
@@ -10188,7 +10212,10 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
       /* 2026-09-09: bmc.cmpctrecv is gone -- a compact block that reconstructs badly falls back to a full one, as Core, so no valve is needed */
       g_cmpct_hook_type = (void*)cmpct_getdata_type; g_cmpct_hook_cmpct = (void*)cmpct_recv_cmpctblock; g_cmpct_hook_blocktxn = (void*)cmpct_recv_blocktxn; }
       { extern void* g_cmpct_hook_fallback; extern void cmpct_recv_note_fallback(void); g_cmpct_hook_fallback = (void*)cmpct_recv_note_fallback; }
-      { extern void (*txrelay_on_pong)(int, const unsigned char*); txrelay_on_pong = leg_on_pong; inflight_init(&g_inflight); g_block_fetch_hook = (void*)block_fetch_gate; }
+      { extern void (*txrelay_on_pong)(int, const unsigned char*); txrelay_on_pong = leg_on_pong;
+        /* before any pass helper forks: they inherit the mapping (daemon/inflight.h) */
+        { inflight_t* sh = inflight_shared(); if(sh) g_inflight_p = sh; else { inflight_init(&g_inflight); fprintf(stderr, "[dl] the in-flight block table could not be shared (mmap failed): pass helpers will not see each other's claims\n"); } }
+        g_block_fetch_hook = (void*)block_fetch_gate; }
       { extern void* g_block_ctx_hook; g_block_ctx_hook = (void*)hdr_accept_check; }   /* P2P-1: the pass's block passes Core's header rules before it is stored */
       { extern void (*txrelay_on_block_inv)(int, const unsigned char*); extern void (*txrelay_on_headers)(int, const unsigned char*, unsigned long);
         extern long (*txrelay_on_cmpctblock)(int, const unsigned char*, unsigned long); extern long (*txrelay_on_blocktxn)(int, const unsigned char*, unsigned long); extern long (*txrelay_on_block)(int, const unsigned char*, unsigned long);
@@ -11622,6 +11649,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                           fprintf(stderr,"[dl] reorg to fork height %ld: replaying the new-block choke point from %ld (was %d)\n",
                                   fh, fh + 1, g_dl_last_seen_tip);
                           g_dl_last_seen_tip = (int)fh;
+                          inflight_forget_stored(&g_inflight);
                       } }
                 } else if(pr == 3){
                     /* handed off: the archive is at the fork point; the far-behind
@@ -11629,7 +11657,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     for(int k=0;k<mux_n_out;k++) if(mux_out_fd[k]>=0) anchor_locator(mux_out_loc[k]);
                     did = 1; dl_parallel_last_s = 0;
                     { extern long reorg_last_handoff_fork(void); long fh = reorg_last_handoff_fork();
-                      if(fh >= 0 && fh < (long)g_dl_last_seen_tip) g_dl_last_seen_tip = (int)fh; }
+                      if(fh >= 0 && fh < (long)g_dl_last_seen_tip){ g_dl_last_seen_tip = (int)fh; inflight_forget_stored(&g_inflight); } }
                 } else if(pr < 0){
                     probe_memo_note(mux_out_host[i], now_ms / 1000);
                     fprintf(stderr,"[reorg] probe of %s rejected a candidate chain (no action taken); not probed again for %ld min\n",
@@ -11867,7 +11895,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
               extern long txrelay_ibd_dropped_count(void);
               if(g_dl_in_ibd) snprintf(relaybuf, sizeof relaybuf, " relay=off(ibd, %ld dropped)", txrelay_ibd_dropped_count());
               else if(!txsub_worker_ready()) snprintf(relaybuf, sizeof relaybuf, " txsub=not-ready"); }
-            if(g_dialmem) fprintf(stderr,"[dial] memory: %d address(es) remembered, %llu candidate(s) skipped under backoff; blocks: %lu claimed, %lu duplicate fetch(es) avoided\n", dialmem_count(g_dialmem), (unsigned long long)g_dialmem->skips, g_inflight.claims, g_inflight.refused);
+            if(g_dialmem) fprintf(stderr,"[dial] memory: %d address(es) remembered, %llu candidate(s) skipped under backoff; blocks: %lu claimed, %lu duplicate fetch(es) avoided (%lu of them already stored)\n", dialmem_count(g_dialmem), (unsigned long long)g_dialmem->skips, g_inflight.claims, g_inflight.refused, g_inflight.refused_stored);
             fprintf(stderr,"[dl] heartbeat: tip=%ld%s peers=%d/%d txouts=%ld uptime=%s%s%s%s\n",
                     node_public_tip(store_buf), storedbuf, live_peers, mux_n_out,
                     utxo_live_ok?live_utxo_disp():-1L,
