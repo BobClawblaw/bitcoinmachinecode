@@ -1241,8 +1241,10 @@ tests/test_banlist_persist: tests/test_banlist_persist.c daemon/banlist.c daemon
 # test_archive_seed -- 2026-09-06: slot 0 of the archive index is genesis on
 # EVERY chain. main() skipped the seeding on mainnet, so a fresh mainnet
 # datadir whose first block came from the serial leg was shifted by one for
-# life and rejected a valid block with a false bad-txns-BIP30.
-tests/test_archive_seed: tests/test_archive_seed.c daemon/archive_seed.c daemon/archive_seed.h bitcoin_store.o bitcoin_store_fast.o bitcoin_hash.o sha256.o $(TEST_TMPDIR_H)
+# life and rejected a valid block with a false bad-txns-BIP30. 2026-11-07:
+# only when index.dat is empty -- keyed on the store handle's tip (always -1
+# after store_init), it re-seeded on every boot.
+tests/test_archive_seed: tests/test_archive_seed.c daemon/archive_seed.c daemon/archive_seed.h daemon/log_ts.h bitcoin_store.o bitcoin_store_fast.o bitcoin_hash.o sha256.o $(TEST_TMPDIR_H)
 	$(CC) $(WARNFLAGS) -O2 -I. -I daemon -I tests -o $@ tests/test_archive_seed.c daemon/archive_seed.c bitcoin_store.o bitcoin_store_fast.o bitcoin_hash.o sha256.o
 
 tests/test_hdr_lowwork: tests/test_hdr_lowwork.c daemon/hdr_lowwork.c daemon/hdr_lowwork.h daemon/minchainwork.c bitcoin_chainwork.o

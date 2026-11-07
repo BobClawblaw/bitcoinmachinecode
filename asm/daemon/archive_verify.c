@@ -1156,8 +1156,8 @@ long archive_trim_derived_tails(void){
      * mainnet node: EMFILE) wrote block 974,810's record here, and the mirror
      * check below then blamed headers.dat -- a sound file, cut to nothing.
      * A record 0 shown to be something else is cleared (the boot's genesis
-     * seed writes it again; a seed that ever stops running on every boot must
-     * still fill a cleared record 0), and the mirror check skips the hole. A
+     * seed fills a cleared record 0: it points it at the original genesis
+     * before block 1, or appends genesis), and the mirror check skips the hole. A
      * record whose block cannot be read is left alone: no proof, no change. */
     {
         FILE* f0 = fopen("index.dat", "r+b"); unsigned char r0[48];

@@ -47,6 +47,28 @@ static const unsigned char GENESIS[] = {
  0x57,0x8a,0x4c,0x70,0x2b,0x6b,0xf1,0x1d,0x5f,0xac,0x00,0x00,0x00,0x00 };
 #define GENESIS_HASH "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
 
+/* index.dat records are 48 bytes: hash, u32 file_no, u64 pos, u32 size */
+static void rec_read(long h, unsigned char r[48]){ FILE* f = fopen("index.dat", "rb"); memset(r, 0, 48); if (f){ fseek(f, h * 48, SEEK_SET); if (fread(r, 1, 48, f) != 48) memset(r, 0, 48); fclose(f); } }
+static void rec_write(long h, const unsigned char r[48]){ FILE* f = fopen("index.dat", "r+b"); fseek(f, h * 48, SEEK_SET); fwrite(r, 1, 48, f); fclose(f); }
+static unsigned long long rec_pos(long h){ unsigned char r[48]; unsigned long long p; rec_read(h, r); memcpy(&p, r + 36, 8); return p; }
+static long fsize(const char* p){ FILE* f = fopen(p, "rb"); if (!f) return -1; fseek(f, 0, SEEK_END); long n = ftell(f); fclose(f); return n; }
+
+/* a boot: a fresh handle from store_init (tip -1, index length 0), then the seed */
+static unsigned char boot_store[1<<16];
+static int boot_and_seed(void){
+    memset(boot_store, 0, sizeof boot_store);
+    if (store_init(boot_store) != 1) return -9;
+    return archive_seed_genesis_if_empty(boot_store, GENESIS, (unsigned long)sizeof GENESIS);
+}
+/* what each boot's re-seed did: a frame holding genesis, appended to the newest blk file */
+static long append_genesis_copy(void){
+    long pos = fsize("blk00001.dat");
+    FILE* f = fopen("blk00001.dat", "ab");
+    unsigned int len = (unsigned int)sizeof GENESIS, magic = 0xd9b4bef9;
+    fwrite(&len, 4, 1, f); fwrite(&magic, 4, 1, f); fwrite(GENESIS, 1, sizeof GENESIS, f); fclose(f);
+    return pos;
+}
+
 int main(void){
     tt_isolate();
     static unsigned char store[1<<16];
@@ -83,6 +105,67 @@ int main(void){
       long n = store_read_at(store, 0, buf, sizeof buf);
       block_hash(g, buf); hex32(hex, g);
       ok(n >= 80 && strcmp(hex, GENESIS_HASH) == 0, "height 0 still reads genesis after that append"); }
+
+    /* 2026-11-07: the "second boot" above reuses the same handle, whose tip is
+     * already 0. A real boot calls store_init, which always sets the tip to -1,
+     * so the seed ran on every boot: another genesis copy appended to the
+     * newest blk file and record 0 pointed at it, after record 1. Every boot
+     * then logged "NOT laid out monotonically (first break at height 1)".
+     * Watched to fail first against the tip-keyed seed: checks in each of the
+     * first three sections below fail (the fourth seeds under both).
+     *
+     * A second, newer blk file, as every archive past its first 128 MiB has:
+     * store_append's frontier walk moves to it and appends there. With one
+     * file the fresh handle's position (0) is trusted instead, and a re-seed
+     * would rewrite genesis over itself at offset 0 -- harmless, and not what
+     * happened on the nodes. */
+    { FILE* f = fopen("blk00001.dat", "wb"); if (f) fclose(f); }
+    unsigned char orig0[48]; rec_read(0, orig0);
+    printf("== a real second boot (store_init again) does not seed again ==\n");
+    { long isz = fsize("index.dat"), bsz = fsize("blk00001.dat");
+      int r2 = boot_and_seed();
+      unsigned char now[48]; rec_read(0, now);
+      ok(r2 == 0, "the seed reports nothing to do");
+      ok(fsize("blk00001.dat") == bsz, "no genesis copy is appended to the newest blk file");
+      ok(fsize("index.dat") == isz && memcmp(now, orig0, 48) == 0, "index.dat is unchanged");
+      ok(*(int*)(boot_store+24) == 1, "the handle's tip is the archive's (1), read from index.dat"); }
+
+    printf("== a record 0 naming a later copy (what every earlier boot left) points back at the original ==\n");
+    { unsigned long long pos = (unsigned long long)append_genesis_copy();
+      unsigned char r0[48]; unsigned int f1 = 1; memcpy(r0, orig0, 48); memcpy(r0 + 32, &f1, 4); memcpy(r0 + 36, &pos, 8);
+      rec_write(0, r0);
+      long bsz = fsize("blk00001.dat");
+      int r2 = boot_and_seed();
+      unsigned char now[48]; rec_read(0, now);
+      ok(r2 == 0, "nothing is seeded");
+      ok(memcmp(now, orig0, 48) == 0, "record 0 names the original genesis again (blk00000.dat at 0)");
+      ok(fsize("blk00001.dat") == bsz, "no further copy is appended");
+      ok(rec_pos(0) < rec_pos(1), "record 0 lies before record 1 again (the layout is monotonic)"); }
+
+    printf("== a cleared record 0 (archive_trim_derived_tails) points at the original ==\n");
+    { static const unsigned char z48[48]; rec_write(0, z48);
+      long bsz = fsize("blk00001.dat"), isz = fsize("index.dat");
+      int r2 = boot_and_seed();
+      unsigned char now[48]; rec_read(0, now);
+      ok(r2 == 0, "nothing is appended");
+      ok(memcmp(now, orig0, 48) == 0, "record 0 names the original genesis");
+      ok(fsize("blk00001.dat") == bsz && fsize("index.dat") == isz, "neither file grows"); }
+
+    printf("== a cleared record 0 with no original before record 1 is seeded ==\n");
+    { /* spoil the original's bytes: no exact copy of genesis sits before block 1 */
+      FILE* f = fopen("blk00000.dat", "r+b"); unsigned char b = 0x02;
+      fseek(f, 8 + 100, SEEK_SET); fwrite(&b, 1, 1, f); fclose(f);
+      static const unsigned char z48[48]; rec_write(0, z48);
+      long isz = fsize("index.dat");
+      int r2 = boot_and_seed();
+      unsigned char now[48]; rec_read(0, now);
+      ok(r2 == 1, "the seed reports that it seeded");
+      ok(memcmp(now, orig0, 32) == 0, "record 0 names genesis");
+      ok(fsize("index.dat") == isz, "index.dat keeps its length (record 0 written in place)");
+      static unsigned char buf[4096]; unsigned char g[32]; char hex[65];
+      long n = store_read_at(boot_store, 0, buf, sizeof buf);
+      block_hash(g, buf); hex32(hex, g);
+      ok(n >= 80 && strcmp(hex, GENESIS_HASH) == 0, "height 0 reads genesis"); }
 
     printf("\n%s (%d checks, %d failures)\n", fails?"TESTS FAILED":"ALL TESTS PASSED", checks, fails);
     return fails?1:0;
