@@ -20,11 +20,19 @@
  * early -- the moment the parallel downloader (which writes by height) filled
  * in beside the shifted region.
  *
- * So: seed on EVERY chain, keyed only on the archive being empty. */
+ * So: seed on EVERY chain, keyed only on the archive being empty.
+ *
+ * 2026-11-07: "empty" is read from index.dat, not from the handle's tip,
+ * which store_init always sets to -1: keyed on the tip, the seed ran on every
+ * boot (see archive_seed.c). A cleared record 0, or one naming a later copy
+ * of genesis, is pointed at the original copy just before block 1 when that
+ * copy is there byte for byte. A non-empty archive leaves the handle
+ * reloaded from index.dat (store_reload). */
 #ifndef ARCHIVE_SEED_H
 #define ARCHIVE_SEED_H
-/* 1 = seeded genesis at height 0, 0 = archive not empty (nothing to do),
- * -1 = the append failed (errno set by the store). */
+/* 1 = seeded genesis at height 0, 0 = archive not empty (nothing appended;
+ * record 0 may have been pointed at the original genesis), -1 = an index
+ * read, write or append failed (errno set). */
 int archive_seed_genesis_if_empty(void* store_buf, const unsigned char* genesis,
                                   unsigned long genesis_len);
 #endif
