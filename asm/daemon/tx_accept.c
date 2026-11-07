@@ -33,6 +33,7 @@
 #include "node_config.h"
 #include "benchlog.h"      /* benchlog_mem_name_region (M1, 2026-10-06) */
 #include "mempool_seq.h"   /* the ZMQ sequence topic's C event (tx_accept_block_connect_h) */
+#include "utxo_wal_tail.h" /* the WAL a reload replays (the snapshot's size) */
 
 typedef unsigned char u8;
 typedef unsigned long u64;
@@ -70,6 +71,7 @@ struct lsm_state {
 static void* g_table = 0;
 static struct lsm_state g_lst;
 static int   g_ready = 0;
+static unsigned long g_slots = 0;   /* the snapshot's size (txacc_snapshot_slots) */
 
 /* Incident #48: an injected LIVE resolver replaces the snapshot below.
  * The snapshot (utxo_lsm_reload of the datadir) is only coherent while
@@ -188,19 +190,29 @@ int tx_dispatch_init(void){
      * subset of the WAL's bytes, so the WAL size bounds that too. The
      * bulk-shaped worst case is ~200 MB of table + the WAL again for the
      * blob, inherited copy-on-write by children -- acceptable, and it only
-     * ever happens when the writer itself is already holding a 1 GB blob. */
+     * ever happens when the writer itself is already holding a 1 GB blob.
+     *
+     * 2026-11-07: the bytes are what a reload READS -- utxo.idx's checkpoint
+     * and utxo.dat past its log_off (daemon/utxo_wal_tail.h) -- not
+     * utxo.dat's length: retired generations stay in the length as
+     * punched-out holes. Sized from st_size, production's serve parent
+     * built this table at 2^24 slots (767 MB, every byte written by
+     * utxo_init, inherited by every child) and a 4.3 GB blob for a utxo.dat
+     * holding 4.3 MB of data. The measure is taken just before the replay
+     * and the writer may append a block in between, so the room is twice
+     * the measure: a steady-state store gets 2^16 or 2^17 slots (3-6 MB). */
     unsigned long slots = 1UL << TXACC_SLOTS_LOG2;
     u64 blob_cap = TXACC_BLOB_BYTES;
-    long wal_bytes = -1;
-    { struct stat st; if (stat("utxo.dat", &st) == 0) wal_bytes = (long)st.st_size; }
+    long wal_bytes = (long)utxo_reload_bytes();
     if (wal_bytes > 0){
-        u64 max_entries = (u64)wal_bytes / 44 + 1;
+        u64 room = (u64)wal_bytes * 2;          /* a block may land before the replay */
+        u64 max_entries = room / 44 + 1;
         u64 want = max_entries * 4 / 3 + 1;
         while (slots < want && slots < (1UL << 24)) slots <<= 1;
-        if ((u64)wal_bytes + (16UL<<20) > blob_cap) blob_cap = (u64)wal_bytes + (16UL<<20);
+        if (room + (16UL<<20) > blob_cap) blob_cap = room + (16UL<<20);
     }
     if (slots > (1UL << TXACC_SLOTS_LOG2))
-        fprintf(stderr, "[tx_accept] WAL is %ld bytes -- sizing the validation snapshot at 2^%d slots, "
+        fprintf(stderr, "[tx_accept] a reload reads %ld bytes (checkpoint + WAL tail) -- sizing the validation snapshot at 2^%d slots, "
                         "%llu MB blob (the writer was bulk-sized when it last wrote)\n",
                 wal_bytes, __builtin_ctzl(slots), (unsigned long long)(blob_cap >> 20));
 
@@ -222,6 +234,7 @@ int tx_dispatch_init(void){
         return 0;
     }
     utxo_init(g_table, slots, blob, blob_cap);
+    g_slots = slots;
     /* M1 (2026-10-06): named for maps/smaps and the [mem] line; the serve
      * parent allocates these and every fork inherits them */
     benchlog_mem_name_region(g_table, (size_t)ustruct, "txdv-table");
@@ -1072,6 +1085,9 @@ long txacc_snapshot_count(void){
     extern long utxo_count(void*);
     return (g_ready && g_table) ? utxo_count(g_table) : -1;
 }
+/* The slot count the snapshot was sized at (0 before one): for the test that
+ * pins the sizing to the bytes a reload reads, not utxo.dat's length. */
+unsigned long txacc_snapshot_slots(void){ return g_slots; }
 
 /* Core v31.1 TX_RECONSIDERABLE (2026-10-01: the RBF fee verdicts added).
  * The fee floors, AND ReplacementChecks' "insufficient fee" (PaysForRBF) and

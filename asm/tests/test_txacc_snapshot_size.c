@@ -11,13 +11,20 @@
  *
  * Seeds a WAL with more entries than 2^16 can hold and asserts the snapshot
  * (a) comes up, (b) holds every entry, and (c) refuses when the writer's own
- * persisted count disagrees with what it replayed. */
+ * persisted count disagrees with what it replayed.
+ *
+ * 2026-11-07: (d) the size follows the bytes a reload READS, not utxo.dat's
+ * length. A retired WAL generation is punched out and stays in the length
+ * as a hole behind utxo.idx's log_off; production's utxo.dat was 4.3 GB
+ * long with 4.3 MB of data, and the snapshot was built at the 2^24-slot cap
+ * (767 MB). The same WAL behind a 4 GiB hole must size as it does alone. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include "test_tmpdir.h"
 typedef uint8_t u8; typedef uint32_t u32;
 
@@ -29,6 +36,7 @@ extern long   utxo_lsm_put(void* lst, void* u, const u8 txid[32], u32 index, uns
 extern void   utxo_lsm_close(void* lst);
 extern int    tx_dispatch_init(void);
 extern long   txacc_snapshot_count(void);
+extern unsigned long txacc_snapshot_slots(void);
 
 struct lsm_state {
     long log_fd, idx_fd;
@@ -97,6 +105,29 @@ int main(void){
     r = tx_dispatch_init();
     ok(r == 1, "with the writer's count matching, it comes up again");
     unlink("utxo_lsm_table.map");
+
+    printf("== the same WAL behind a 4 GiB punched-out hole sizes as it does alone ==\n");
+    unsigned long alone = txacc_snapshot_slots();
+    printf("      the WAL alone: 2^%d slots\n", __builtin_ctzl(alone));
+    { /* utxo.dat = a hole of H bytes, then the seeded WAL; utxo.idx says the
+       * log starts at H with no checkpoint records -- what a retire leaves */
+      const off_t H = (off_t)4 << 30;
+      struct stat st; stat("utxo.dat", &st);
+      size_t w = (size_t)st.st_size; u8* buf = malloc(w);
+      FILE* f = fopen("utxo.dat", "rb"); size_t got = fread(buf, 1, w, f); fclose(f);
+      int fd = open("utxo.dat", O_WRONLY | O_TRUNC);
+      int okw = got == w && fd >= 0 && ftruncate(fd, H) == 0 && pwrite(fd, buf, w, H) == (ssize_t)w;
+      if (fd >= 0) close(fd);
+      free(buf);
+      u8 idx[20]; uint32_t m = 0x55545849u; uint64_t off = (uint64_t)H, n = 0;
+      memcpy(idx, &m, 4); memcpy(idx + 4, &off, 8); memcpy(idx + 12, &n, 8);
+      f = fopen("utxo.idx", "wb"); okw = okw && f && fwrite(idx, 1, 20, f) == 20; if (f) fclose(f);
+      ok(okw, "utxo.dat rebuilt as a 4 GiB hole + the WAL, utxo.idx pointing past the hole"); }
+    r = tx_dispatch_init();
+    unsigned long holed = txacc_snapshot_slots();
+    printf("      behind the hole: 2^%d slots (sized from the length: 2^24)\n", __builtin_ctzl(holed));
+    ok(r == 1 && txacc_snapshot_count() == N, "it comes up and holds every entry");
+    ok(holed == alone, "and is sized as the WAL alone, not as the 4 GiB file");
 
     printf("\n%s (%d failure%s)\n", fails?"TESTS FAILED":"ALL TESTS PASSED", fails, fails==1?"":"s");
     return fails ? 1 : 0;

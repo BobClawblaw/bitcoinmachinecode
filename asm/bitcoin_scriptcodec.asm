@@ -52,9 +52,17 @@ snum_overflow: resq 1
 ; buffer now covers 5 MiB of script bytes (a leaf cannot exceed the 4 MiB
 ; block witness limit, so no validly-framed script can reach the cap) and
 ; vfexec_push enforces it.
+;
+; 2026-11-07: NO BYTE BUFFER. The 5 MiB of entries was static TLS, and glibc
+; zero-fills a thread's static TLS when it creates the thread, so every
+; thread of every process held it resident whether or not it ever ran a
+; script (27 threads in the serve parent alone). Nothing read the entries:
+; all_true, pop and toggle_top decide from vfexec_ff, exactly as Core's
+; ConditionStack keeps only m_stack_size and m_first_false_pos. What is left
+; is Core's representation: the depth (vfexec_sp), the first false
+; (vfexec_ff), and VFEXEC_MAX as the depth cap vfexec_push enforces.
 alignb 16                 ; alignb, not align: this is .tbss, padding bytes cannot be "initialized" (nasm -w+other)
 VFEXEC_MAX equ 5*1024*1024
-vfexec:     resb VFEXEC_MAX
 vfexec_sp:  resq 1
 ; ---- IR-6 (INTERP_REVIEW_2026-09-05): position -> slot handle table -------
 ; stack_erase_index shifted whole 524-byte records to close a hole, so a
@@ -87,9 +95,9 @@ hnd_tab:    resd MAX_STACK_SIZE
 ; compare. vfexec_all_true used to scan the whole buffer on every opcode --
 ; O(depth) per opcode, O(N^2) per script, and tapscript has no opcode or
 ; script-size cap: a valid ~4 MB leaf of nested OP_IF took tens of minutes.
-; The byte buffer stays (memory-safety backstop, SCR-2 tests); this caches.
+; Since 2026-11-07 this, with the depth, is the whole condition stack.
 vfexec_ff:  resq 1        ; index of first false, or VFEXEC_NO_FALSE
-global vfexec, vfexec_sp, vfexec_ff
+global vfexec_sp, vfexec_ff
 VFEXEC_NO_FALSE equ -1
 
     section .text
@@ -937,11 +945,12 @@ get_op:
 ; vfexec helpers (condition stack, static)
 ; ============================================================================
 ; vfexec_push(value in edi) -- push a 0/1
-;   SCR-2 fix (audit 2026-09-03): the push is now bounded. The buffer covers
+;   SCR-2 fix (audit 2026-09-03): the push is now bounded. The cap covers
 ;   every nesting depth a script that fits in a block can express, so hitting
-;   the cap means the script is malformed; fail the push (rax=0) and let the
-;   interpreter treat it as an internal error rather than scribbling past
-;   vfexec into vfexec_sp.
+;   it means the script is malformed; fail the push (rax=0) and let the
+;   interpreter treat it as an internal error. Only a false entry is
+;   recorded (as the first false, if there is none yet); a true one is the
+;   depth alone, as in Core's ConditionStack::push_back.
 global vfexec_push
 vfexec_push:
     push  rdx
@@ -950,8 +959,6 @@ vfexec_push:
     mov   rcx, [r8]
     cmp   rcx, VFEXEC_MAX
     jae   .full
-    TLS_ADDR rdx, vfexec
-    mov   [rdx+rcx], dil
     test  dil, dil
     jnz   .ff_done
     TLS_ADDR rdx, vfexec_ff       ; IR-4: first false, if none yet
@@ -1000,19 +1007,16 @@ vfexec_toggle_top:
     push  rcx
     push  rdx
     push  r8
-    push  r9
     TLS_ADDR r8, vfexec_sp
     mov   rax, [r8]
     test  rax, rax
     jz    .empty
     mov   rcx, [r8]
-    TLS_ADDR r9, vfexec
-    movzx eax, byte [r9+rcx-1]
-    xor   eax, 1
-    mov   [r9+rcx-1], al
     ; IR-4: Core's ConditionStack::toggle_top -- if nothing was false the top
     ; just became the first false; if the top WAS the first false it is now
-    ; true and nothing is false; a false below the top leaves it unchanged.
+    ; true and nothing is false; a false below the top leaves it unchanged
+    ; (every entry above the first false is unobservable, which is why no
+    ; entry is stored).
     dec   rcx                     ; index of top
     TLS_ADDR rdx, vfexec_ff
     cmp   qword [rdx], VFEXEC_NO_FALSE
@@ -1024,7 +1028,6 @@ vfexec_toggle_top:
     jne   .empty
     mov   qword [rdx], VFEXEC_NO_FALSE
 .empty:
-    pop   r9
     pop   r8
     pop   rdx
     pop   rcx

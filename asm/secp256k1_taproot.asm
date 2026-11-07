@@ -96,13 +96,28 @@ TAP_PREIMG_CAP equ 4*1024*1024
 ; why daemon/tx_verify.c had to verify every taproot input in a SEQUENTIAL
 ; pass while every other input shape fanned out across the worker pool --
 ; see PERF_SCOPE.md section 14 for the profile that measured the cost.
-; .tbss is demand-paged, so TAP_PREIMG_CAP is 4 MiB of address space per
-; thread but only the touched pages are ever resident.
+;
+; 2026-11-07: TWO SIZES. This said .tbss is demand-paged, so the 4 MiB would
+; be address space only; it is not so for static TLS: glibc zero-fills a
+; thread's static TLS block when it creates the thread, so all 4 MiB were
+; resident in every thread of every process (measured: 13.3 MB written per
+; thread stack with this buffer, vfexec's and the LSM bloom copy). Now
+; tap_preimg is TAP_PREIMG_SMALL of static TLS, which holds every fixed-size
+; preimage (branch hashes, the merkle-root workspace up to +256, TapTweak,
+; TapSighash) and any leaf script up to TAP_PREIMG_SMALL - 70 bytes; a
+; longer message goes to the thread's TAP_PREIMG_CAP buffer (tap_preimg_big),
+; made on first use by bmc_tls_scratch and freed when the thread exits.
+; tagged_hash256 picks the large buffer exactly when msglen exceeds
+; TAP_PREIMG_SMALL - 64, and tap_leaf_hash builds its message there whenever
+; that can happen, so the in-place copy below never moves a message from
+; the large buffer into the small one.
+TAP_PREIMG_SMALL equ 8192
 section .tbss nobits alloc noexec write tls align=16
 global tagh_buf
 tagh_buf:   resb 32
-global tap_preimg
-tap_preimg: resb TAP_PREIMG_CAP
+global tap_preimg, tap_preimg_big
+tap_preimg: resb TAP_PREIMG_SMALL
+tap_preimg_big: resq 1
 
 ; ============================================================================
 ; tagged_hash256(out[32]=rdi, tag=rsi, taglen=rdx, msg=rcx, msglen=r8)
@@ -134,26 +149,34 @@ tagged_hash256:
     mov  r14, rdx
     mov  rbx, rcx
     mov  r15, r8
+    ; [rsp] = the preimage buffer: the TLS one, or the thread's large one
+    ; for a message that does not fit it (rsp is 16-aligned here)
+    TLS_ADDR rax, tap_preimg
+    cmp  r15, TAP_PREIMG_SMALL - 64
+    jbe  .have_buf
+    call tap_preimg_big_get
+.have_buf:
+    mov  [rsp], rax
     TLS_ADDR rdi, tagh_buf
     mov  rsi, r13
     mov  rdx, r14
     call sha256_full
-    TLS_ADDR rdi, tap_preimg
+    mov  rdi, [rsp]
     TLS_ADDR rsi, tagh_buf
     mov  rcx, 32
     rep movsb
-    TLS_ADDR rdi, tap_preimg
+    mov  rdi, [rsp]
     add  rdi, 32
     TLS_ADDR rsi, tagh_buf
     mov  rcx, 32
     rep movsb
-    TLS_ADDR rdi, tap_preimg
+    mov  rdi, [rsp]
     add  rdi, 64
     mov  rsi, rbx
     mov  rcx, r15
     rep movsb
     mov  rdi, r12
-    TLS_ADDR rsi, tap_preimg
+    mov  rsi, [rsp]
     mov  rdx, r15
     add  rdx, 64
     call sha256_full
@@ -165,6 +188,25 @@ tagged_hash256:
     pop  rbx
     mov  rsp, rbp
     pop  rbp
+    ret
+
+; ============================================================================
+; tap_preimg_big_get() -> rax = this thread's TAP_PREIMG_CAP preimage buffer,
+;   made on first use (bmc_tls_scratch never returns NULL). An ordinary
+;   C-ABI call: it may clobber every caller-saved register.
+; ============================================================================
+tap_preimg_big_get:
+    TLS_ADDR rax, tap_preimg_big
+    mov  rax, [rax]
+    test rax, rax
+    jnz  .ret
+    sub  rsp, 8                    ; 16-byte alignment for the call
+    mov  edi, TAP_PREIMG_CAP
+    call bmc_tls_scratch
+    add  rsp, 8
+    TLS_ADDR rcx, tap_preimg_big
+    mov  [rcx], rax
+.ret:
     ret
 
 ; ============================================================================
@@ -253,6 +295,7 @@ tap_leaf_hash:
     mov  r12, rdi
     mov  r13, rdx
     mov  r14, rcx
+    mov  ebx, esi                  ; leaf_version (rsi does not survive a call)
     ; Bound slen against the buffer's real usable capacity BEFORE writing
     ; anything: 64 (tag-hash-doubled prefix) + 1 (ver) + up to 5 (compact-
     ; size) + slen must fit in TAP_PREIMG_CAP. Clean, loud failure instead
@@ -260,11 +303,19 @@ tap_leaf_hash:
     mov  rax, TAP_PREIMG_CAP - 70
     cmp  r14, rax
     ja   .too_large
-    ; msg at tap_preimg+64: ver || compact(slen) || script
+    ; [rsp] = the buffer: the TLS tap_preimg while the whole message is sure
+    ; to fit it, else the thread's large one (see tap_preimg's comment)
     TLS_ADDR r15, tap_preimg
+    cmp  r14, TAP_PREIMG_SMALL - 70
+    jbe  .have_buf
+    call tap_preimg_big_get        ; rsp is 16-aligned here
+    mov  r15, rax
+.have_buf:
+    mov  [rsp], r15
+    ; msg at buf+64: ver || compact(slen) || script
     add  r15, 64
-    mov  byte [r15], sil
-    inc  r15                       ; r15 = tap_preimg+65, as before
+    mov  byte [r15], bl
+    inc  r15                       ; r15 = buf+65, as before
     cmp  r14, 0xfd
     jb   .small
     cmp  r14, 0x10000
@@ -291,14 +342,14 @@ tap_leaf_hash:
     mov  rsi, r13
     mov  rcx, r14
     rep movsb
-    TLS_ADDR rax, tap_preimg
+    mov  rax, [rsp]
     add  rax, 64
     sub  r15, rax
     add  r15, r14
     mov  rdi, r12
     lea  rsi, [rel TAPLEAF_TAG]
     mov  rdx, TAPLEAF_TAG_LEN
-    TLS_ADDR rcx, tap_preimg
+    mov  rcx, [rsp]
     add  rcx, 64
     mov  r8, r15
     call tagged_hash256
@@ -673,5 +724,7 @@ tap_merkle_root:
     mov  rsp, rbp
     pop  rbp
     ret
+
+%include "bmc_tls_scratch.inc"
 
 section .note.GNU-stack noalloc noexec nowrite progbits

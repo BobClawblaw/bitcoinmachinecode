@@ -1284,17 +1284,9 @@ static inline int shutdown_requested(void){ return g_shutdown_flag && *g_shutdow
 static int g_recovery_checked = 0;
 static long g_recovery_result = 0;   /* utxo_live_recover_partial_block's verdict, once */
 
-/* The WAL bytes a reload would replay: the file past utxo.idx's log_off.
- * Plan B3 (2026-10-06) retires a flushed generation by advancing that
- * offset and punching its bytes out, so utxo.dat's LENGTH keeps every
- * retired byte (a hole) for the life of the store -- st_size alone would
- * call a steady-state store "a huge tail" at every boot after a sync. */
-static unsigned long long wal_tail_bytes(void){
-    struct stat wb; if (stat("utxo.dat", &wb) != 0) return 0;
-    unsigned long long off = 0; FILE* f = fopen("utxo.idx", "rb");
-    if (f){ unsigned char h[20]; if (fread(h, 1, 20, f) == 20){ u32 m; memcpy(&m, h, 4); if (m == 0x55545849u) memcpy(&off, h + 4, 8); } fclose(f); }
-    return (unsigned long long)wb.st_size > off ? (unsigned long long)wb.st_size - off : 0;
-}
+/* The WAL bytes a reload would replay: daemon/utxo_wal_tail.h (shared with
+ * tx_accept.c's snapshot sizing since 2026-11-07). */
+#include "utxo_wal_tail.h"
 static void* mmap_file(const char* path, u64 size){
     int fd = open(path, O_RDWR | O_CREAT, 0644);
     if (fd < 0) { fprintf(stderr, "[utxo_live] open(%s) failed: %s\n", path, strerror(errno)); return 0; }
@@ -3971,7 +3963,7 @@ int utxo_live_init(const char* dir){
      * not resident memory, so over-selecting it is cheap and under-selecting
      * it is what wedges a restart. */
     {
-        unsigned long long tail = wal_tail_bytes();
+        unsigned long long tail = utxo_wal_tail_bytes();
         if (!g_bulk_mode && tail >= UTXO_LIVE_BULK_WAL_BYTES) {
             fprintf(stderr, "[utxo_live] WAL tail is %lluMB -- bulk-sizing the memtable despite gap=%ld (see incident #32)\n",
                     tail >> 20, boot_gap);

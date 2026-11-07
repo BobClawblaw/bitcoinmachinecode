@@ -2788,6 +2788,41 @@ static void lock_holders_fmt(const lock_holder_t* h, int n, char* buf, size_t ca
 }
 static long long mono_now_ms(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec*1000LL + t.tv_nsec/1000000; }
 
+/* Hand malloc's free space back to the kernel, once every HEAP_TRIM_EVERY_MS
+ * (2026-11-07). glibc returns memory only from the top of an arena, so the
+ * free blocks a burst leaves inside one stay resident: production's serve
+ * parent held 921 MB of arena memory of which 491 MB was free blocks, 4 h 45 m
+ * after a start. malloc_trim(0) releases the free pages inside the arenas as
+ * well. It holds each arena's lock while it walks it, so it runs rarely, from
+ * the serve parent's poll loop and the worker's heartbeat, and says so when
+ * it gave back 16 MB or more or took 100 ms or more. A no-op outside glibc. */
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
+#define HEAP_TRIM_EVERY_MS (10LL*60*1000)
+static void heap_trim_tick(const char* who){
+#ifdef __GLIBC__
+    static long long last = -1;
+    long long now = mono_now_ms();
+    if (last < 0){ last = now; return; }
+    if (now - last < HEAP_TRIM_EVERY_MS) return;
+    last = now;
+    long pg = sysconf(_SC_PAGESIZE);
+    long long before = -1, after = -1; long sz, res;
+    FILE* f = fopen("/proc/self/statm", "r");
+    if (f){ if (fscanf(f, "%ld %ld", &sz, &res) == 2) before = (long long)res * pg; fclose(f); }
+    malloc_trim(0);
+    long long took = mono_now_ms() - now;
+    f = fopen("/proc/self/statm", "r");
+    if (f){ if (fscanf(f, "%ld %ld", &sz, &res) == 2) after = (long long)res * pg; fclose(f); }
+    long long freed = (before >= 0 && after >= 0) ? before - after : 0;
+    if (freed >= (16LL << 20) || took >= 100)
+        fprintf(stderr, "[mem] %s: malloc_trim gave %lld MB back to the kernel in %lld ms\n", who, freed >> 20, took);
+#else
+    (void)who;
+#endif
+}
+
 /* Wait until no other process holds this process's datadir lock, so that
  * our exit releases it. The children were signalled by the caller; each is
  * expected to stop its own children. What is left holding the lock after the
@@ -11975,6 +12010,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
              * index builders tick there too, so this heartbeat only has to
              * cover the caught-up phase, where the choke point is quiet. */
             dl_index_trail_tick(utxo_live_ok ? utxo_live_applied_height() : -1);
+            heap_trim_tick("worker");
             /* Relay-pool health. Silent when nothing has been parked, so a
              * node with no orphan traffic prints nothing extra. */
             { extern long txrelay_stats(long*,long*,long*,long*,long*,long*);
@@ -13000,6 +13036,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
         /* systemd's watchdog: ping only while the worker's stamp moves (no-op
          * without WatchdogSec=; daemon/sd_watchdog.c) */
         if(g_node_status) sdw_tick(mono_now_ms(), g_node_status->wd_worker_ms);
+        heap_trim_tick("serve");
         int pr=poll(pfds, nfds, 300);
         if(pr<0){ if(errno==EINTR) continue; break; }
         /* -mempoolexpiry sweep. Bounded scan of a fixed table, so running it
