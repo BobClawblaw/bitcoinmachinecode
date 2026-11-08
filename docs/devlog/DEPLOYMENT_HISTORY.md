@@ -2830,3 +2830,60 @@ were still on disk. Nothing in them is new measurement.
     stand-down line; 60 open descriptors in the main process.
 - **Rollback:** relink to `deploy-20261107b` and restart
   (`70-watchdog.conf` stays). No on-disk format changed.
+
+## 2026-11-08 00:35Z — `deploy-20261108a`: genesis is seeded only into an empty index, and record 0 points at the original (PRs #490, #492)
+
+- **What:** `main` at `6d7f074d`. #492: `archive_seed_genesis_if_empty`
+  decided "empty" from the store handle's tip, which `store_init` always
+  sets to -1 without reading `index.dat`, so every boot appended another
+  copy of genesis (293 bytes with its frame) to the newest blk file and
+  pointed index record 0 at it. That is where the boot lines `genesis
+  seeded at height 0 (empty archive)` and `NOT laid out monotonically
+  (first break at height 1)` came from, and why truncation and pruning
+  refused to run. The seed now reads `index.dat`: an empty index is
+  seeded; a record 0 that is cleared or names a later copy of genesis is
+  pointed back at the original copy just before block 1 when that copy is
+  intact byte for byte; otherwise nothing is written. #490: an index scan
+  that fails is reported as a failure, not read as an empty index.
+- **Checked before the restart (read-only):** record 0 named genesis in
+  `blk05850.dat` at 5,870,665 (a re-seeded copy); record 1 named block 1
+  in `blk00000.dat` at 293; the 285-byte frame at offset 0 of
+  `blk00000.dat` carried the right length, magic and genesis hash.
+- Built from clean (`make -B daemon/bmcbitcoind` and the helpers by name) in
+  a clean worktree at the merge commit, with no warnings. All five exec'd
+  helpers were byte-identical; none was replaced. Wallet files and the
+  first two index records were copied first. `MALLOC_ARENA_MAX=4` and
+  `70-watchdog.conf` stay in place.
+- **Before the restart:** `deploy-20261107c`, up since 19:18:20Z on 11-07
+  (the machine rebooted at 19:17Z and the unit came back by itself,
+  `NRestarts=0`), tip 975,009 = the Core v31.1 oracle.
+- **Started:** 00:35:18Z. At 00:35:25.632Z the boot logged `index.dat
+  record 0 named a later copy of genesis (blk05850.dat at 5870665) --
+  pointed back at the original in blk00000.dat at 0`; no `genesis seeded`
+  line. The layout check now reports `first break at height 964924`: the
+  archive has 48 out-of-order spans between 964,924 and 967,456 (catch-up
+  writes of 10-07..10-08, not corruption), so truncation and pruning still
+  refuse on this archive. Archive loaded at tip 975,009; RPC answered by
+  00:35:26Z; `mempool.dat` reloaded 49,506 of 49,508 by 00:36:10Z.
+- **Verified live:**
+  - New block 975,010 announced at 00:36:26Z, stored 00:36:27.004Z and
+    applied at 00:36:27.072Z with the oracle's hash
+    (`000000000000000000006c876318953844d1d25fbd7dc62e901a5b97ff36c8e3`).
+  - `NRestarts=0` and `active` at 10 minutes, `WatchdogTimestamp`
+    advancing (00:42:56Z); no `[crash]`, `FATAL` or tip-watch line; 63 open
+    descriptors in the main process; 157 recent client connections on the
+    RPC and facade ports.
+- **Found while checking, not caused by this deploy:** a header-hash scan
+  of all 975,011 index records (frame length, magic and the double-SHA of
+  the 80-byte header against the record's hash) found one bad frame:
+  block 970,357, at offset 0 of `blk05793.dat`, whose first 271,787 bytes
+  are concatenated HTTP JSON-RPC responses of our own server written on
+  2026-10-07 (the day the thread-per-request descriptor leak exhausted the
+  fd table at 16:26Z); the rest of the frame equals the oracle's block.
+  `getblock` serves the garbage for that height. The repair (rewriting the
+  frame from the oracle's copy) is pending; it is a separate entry.
+- **Rollback:** relink to `deploy-20261107c` and restart
+  (`70-watchdog.conf` stays). Record 0 now names `blk00000.dat` at 0; the
+  older build re-seeds on every boot again (another appended copy, record
+  0 pointed at it), which is its known behavior, not a breakage. No
+  on-disk format changed.
