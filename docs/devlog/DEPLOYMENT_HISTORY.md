@@ -2887,3 +2887,56 @@ were still on disk. Nothing in them is new measurement.
   older build re-seeds on every boot again (another appended copy, record
   0 pointed at it), which is its known behavior, not a breakage. No
   on-disk format changed.
+
+## 2026-11-08 00:49Z — block 970,357 rewritten in place from the oracle's copy (no binary change; the cause was ST2-5, fixed 10-23)
+
+- **What was found:** while checking `deploy-20261108a`'s record-0 repair, a
+  scan of all 975,011 index records (frame length == record size, the
+  network magic, and the double-SHA of the 80-byte header against the
+  record's hash; read-only, seconds) found one bad frame: height 970,357,
+  at offset 0 of `blk05793.dat`. Its first 271,787 bytes were two HTTP
+  JSON-RPC responses of this node's own server, each written whole from
+  offset 0 -- a 394-byte `getmempoolinfo` reply (its `id` is the epoch
+  millisecond 2026-10-07 18:11:24Z) over the head of a 271 KB batch reply.
+  From payload offset 271,779 on, the frame equalled the Core v31.1
+  oracle's block byte for byte. `getblock` on 8331 served the garbage
+  (version 808464928, a merkle root made of ASCII) and the chain was
+  otherwise unaffected: the block had been applied correctly when it
+  arrived, on 2026-10-07 at 15:45:29Z.
+- **Cause, read from the build that was running then (`deploy-20261006d`,
+  `b194dd01`):** `open_file` in `asm/bitcoin_store.asm` closes the handle's
+  current blk descriptor N and then opens the requested file. On that build
+  a failed open left N in `cur_blk_fd`. From 16:26Z that day the process was
+  at 1,023 of 1,024 descriptors (the facade's per-thread lane leak, PR #402),
+  so every open failed. Each handle's next `open_file` closed the stale N
+  again -- by then an accepted RPC client socket -- and the open right after
+  it got the number back as the current block file, `O_RDWR` at position 0.
+  The RPC thread's reply went into the file. Once per failing open, hence
+  two replies. This is the security audit's ST2-5, fixed on 2026-10-23
+  (`58dfcd18`: the field is set to -1 right after the close, and both
+  rollovers store a qword -1), with the gate test
+  `tests/test_store_rollover_fd`; on production since `deploy-20261024a`.
+  The same scan on the Mac node's archive found 0 bad records, and a check
+  of every close site in the block store, the reader fd cache, the UTXO
+  store and the C-side open paths on today's main found no other place that
+  keeps a closed number.
+- **Repair (data only, the daemon kept running on `deploy-20261108a`):** the
+  first 2 MB of `blk05793.dat` were copied aside; then the 8-byte frame
+  header (length 1,650,824, magic `f9beb4d9`) and the oracle's
+  `getblock <hash> 0` bytes were written with one `pwrite` at offset 0,
+  1,650,832 bytes, and the file synced. The script refused to write unless
+  the index record already named that hash, file and length, and the
+  untouched tail of the frame already equalled the oracle's bytes; both
+  held. The index record was not changed. Block 970,358's frame follows
+  intact at offset 1,650,832.
+- **Verified:** `getblock <hash> 0` from this node has the same SHA-256 as
+  the oracle's; verbose `getblock` agrees on the merkle root
+  (`e7fd34732ec754cea0e0affeb62a988250f404c7382079e4159c757b259a425c`)
+  and 4,739 transactions; the header scan now reports 0 bad records;
+  `NRestarts=0`, tip = the oracle throughout.
+- **Rollback:** copy the saved 2 MB head back over offset 0 of
+  `blk05793.dat` -- which restores the corrupt frame, so there is no reason
+  to. Nothing else changed.
+- **Lesson:** a descriptor-exhaustion episode is now a reason to run the
+  header scan afterwards. A header check does not prove block bodies; a
+  full body scan of this archive is about 700 GB of reads and was not run.
