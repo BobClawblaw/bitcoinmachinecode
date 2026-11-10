@@ -1,0 +1,115 @@
+/* winsys.h -- Linux x86_64 syscall emulation on Win32 (bmc_win).
+ *
+ * winsys is the only Win64-ABI code in a bmc_win binary. Everything above it
+ * (musl, rt, the bmc C and assembly) is SysV/LP64 and talks to it through
+ * __bmc_win_syscall (Linux numbers, Linux argument/struct layouts, -errno
+ * results) and a few ms_abi helpers declared below. No C runtime is linked:
+ * this code uses Win32 only, and its compiler-emitted mem* calls are renamed
+ * to the __ws_ copies at build time (build.py WINSYS_RENAMES). */
+#ifndef BMC_WINSYS_H
+#define BMC_WINSYS_H
+
+#include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <stdint.h>
+
+#define SV __attribute__((sysv_abi))
+#define WSAPI __attribute__((ms_abi))
+
+typedef int64_t i64;
+typedef uint64_t u64;
+
+/* ---- Linux errno values (x86_64) ---- */
+enum {
+	L_EPERM = 1, L_ENOENT = 2, L_ESRCH = 3, L_EINTR = 4, L_EIO = 5, L_ENXIO = 6, L_E2BIG = 7,
+	L_ENOEXEC = 8, L_EBADF = 9, L_ECHILD = 10, L_EAGAIN = 11, L_ENOMEM = 12, L_EACCES = 13,
+	L_EFAULT = 14, L_EBUSY = 16, L_EEXIST = 17, L_EXDEV = 18, L_ENODEV = 19, L_ENOTDIR = 20,
+	L_EISDIR = 21, L_EINVAL = 22, L_ENFILE = 23, L_EMFILE = 24, L_ENOTTY = 25, L_EFBIG = 27,
+	L_ENOSPC = 28, L_ESPIPE = 29, L_EROFS = 30, L_EMLINK = 31, L_EPIPE = 32, L_ERANGE = 34,
+	L_EDEADLK = 35, L_ENAMETOOLONG = 36, L_ENOLCK = 37, L_ENOSYS = 38, L_ENOTEMPTY = 39,
+	L_ELOOP = 40, L_ENOTSOCK = 88, L_EDESTADDRREQ = 89, L_EMSGSIZE = 90, L_EPROTOTYPE = 91,
+	L_ENOPROTOOPT = 92, L_EPROTONOSUPPORT = 93, L_EOPNOTSUPP = 95, L_EAFNOSUPPORT = 97,
+	L_EADDRINUSE = 98, L_EADDRNOTAVAIL = 99, L_ENETDOWN = 100, L_ENETUNREACH = 101,
+	L_ECONNABORTED = 103, L_ECONNRESET = 104, L_ENOBUFS = 105, L_EISCONN = 106,
+	L_ENOTCONN = 107, L_ETIMEDOUT = 110, L_ECONNREFUSED = 111, L_EHOSTDOWN = 112,
+	L_EHOSTUNREACH = 113, L_EALREADY = 114, L_EINPROGRESS = 115, L_ECANCELED = 125,
+};
+
+/* ---- ws_util.c ---- */
+void *__ws_memcpy(void *d, const void *s, size_t n);
+void *__ws_memset(void *d, int c, size_t n);
+void *__ws_memmove(void *d, const void *s, size_t n);
+int __ws_memcmp(const void *a, const void *b, size_t n);
+size_t ws_strlen(const char *s);
+size_t ws_wcslen(const wchar_t *s);
+void *ws_alloc(size_t n);          /* process heap, zeroed */
+void ws_free(void *p);
+/* UTF-8 <-> UTF-16; results from ws_alloc */
+wchar_t *ws_utf8_to_w(const char *s);
+char *ws_w_to_utf8(const wchar_t *w);
+i64 ws_err(DWORD e);              /* GetLastError() value -> -Linux errno */
+i64 ws_wsaerr(int e);             /* WSAGetLastError() value -> -Linux errno */
+void ws_write_stderr(const char *s);
+void ws_fatal(const char *msg) __attribute__((noreturn));
+void ws_fmt_u64(char *buf, u64 v);
+
+/* ---- ws_path.c ---- */
+/* Linux path (UTF-8, relative to dirfd) -> Windows path (UTF-16, ws_alloc'd).
+ * Returns NULL and sets *err on failure. */
+wchar_t *ws_path(int dirfd, const char *path, i64 *err);
+
+/* ---- ws_fd.c ---- */
+enum { FT_FREE = 0, FT_FILE, FT_DIR, FT_CONSOLE, FT_PIPE, FT_NULL, FT_RANDOM, FT_SOCKET };
+typedef struct ws_desc {
+	volatile LONG refs;
+	int type;
+	int flags;            /* Linux O_* status flags (O_APPEND, O_NONBLOCK, access mode) */
+	HANDLE h;
+	SOCKET s;
+	i64 off;              /* file offset (we always do positioned I/O) */
+	SRWLOCK lock;
+	wchar_t *wpath;       /* for directories / fstat fallbacks / openat */
+	HANDLE find;          /* directory enumeration */
+	int find_state;       /* 0 = not started, 1 = entry pending, 2 = done */
+	WIN32_FIND_DATAW fd;
+	i64 dir_pos;
+	int flock_held;        /* flock: 0 none, 1 shared, 2 exclusive */
+} ws_desc;
+void ws_fd_init(void);
+ws_desc *ws_fd_get(int fd);       /* +1 ref, NULL if not open */
+void ws_desc_put(ws_desc *d);
+int ws_fd_install(ws_desc *d, int cloexec, int min_fd); /* consumes the ref; -EMFILE */
+ws_desc *ws_desc_new(int type);
+i64 ws_sys_file(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *handled);
+
+/* ---- ws_mem.c ---- */
+i64 ws_sys_mem(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *handled);
+
+/* ---- ws_net.c ---- */
+i64 ws_sys_net(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *handled);
+void ws_net_init(void);
+i64 ws_sock_read(ws_desc *d, void *buf, size_t n);
+i64 ws_sock_write(ws_desc *d, const void *buf, size_t n);
+
+/* ---- ws_thread.c ---- */
+i64 ws_sys_thread(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *handled);
+
+/* ---- ws_time.c ---- */
+i64 ws_sys_time(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *handled);
+
+/* ---- entry points used by the SysV side (ms_abi there) ---- */
+WSAPI i64 __bmc_win_syscall(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6);
+WSAPI void *__bmc_win_heap_alloc(size_t n, int zero);
+WSAPI void *__bmc_win_heap_realloc(void *p, size_t n);
+WSAPI void __bmc_win_heap_free(void *p);
+WSAPI size_t __bmc_win_heap_size(void *p);
+typedef SV void *(*ws_thread_fn)(void *);
+WSAPI i64 __bmc_win_thread_create(ws_thread_fn fn, void *arg, size_t stack, void **handle_out, int *tid_out);
+WSAPI i64 __bmc_win_thread_join(void *handle);
+WSAPI void __bmc_win_thread_close(void *handle);
+WSAPI void __bmc_win_run_ctors(void);
+
+extern char **ws_envp;
+
+#endif
