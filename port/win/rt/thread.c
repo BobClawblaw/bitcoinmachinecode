@@ -270,3 +270,14 @@ int pthread_getattr_np(pthread_t t, pthread_attr_t *a)
 	a->_a_stacksize = t->stack_size;
 	return 0;
 }
+
+/* no asynchronous cancellation on bmc_win */
+void pthread_testcancel(void)
+{
+}
+
+/* musl runs __synccall to apply set*id to every thread; ids are fixed here */
+void __synccall(void (*func)(void *), void *ctx)
+{
+	func(ctx);
+}

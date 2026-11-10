@@ -2,6 +2,7 @@
  *
  *   /dev/null          -> NUL
  *   /tmp, /tmp/...     -> %TEMP% (GetTempPathW) + rest
+ *   /c/x               -> C:\x  (the form getcwd returns; MSYS spelling)
  *   /x/y               -> \x\y on the current drive
  *   C:/x, rel/x        -> unchanged apart from '/' -> '\'
  *   rel with a dirfd   -> <the dirfd's path>\rel
@@ -56,6 +57,15 @@ wchar_t *ws_path(int dirfd, const char *path, i64 *err)
 			tmp[n - 1] = 0;
 		wchar_t *rest = ws_utf8_to_w(path + 4);
 		w = rest ? wcat3(tmp, L"", rest) : NULL;
+		ws_free(rest);
+	} else if (path[0] == '/' && ((path[1] >= 'a' && path[1] <= 'z') || (path[1] >= 'A' && path[1] <= 'Z')) &&
+		   (path[2] == '/' || path[2] == 0)) {
+		/* "/c/x" -> "C:\x": the drive form getcwd hands out (MSYS spelling) */
+		char drive[4] = { (char)(path[1] & ~0x20), ':', '\\', 0 };
+		wchar_t *d = ws_utf8_to_w(drive);
+		wchar_t *rest = ws_utf8_to_w(path[2] ? path + 3 : "");
+		w = (d && rest) ? wcat3(d, L"", rest) : NULL;
+		ws_free(d);
 		ws_free(rest);
 	} else if (path[0] == '/' || (path[0] && path[1] == ':') || dirfd == L_AT_FDCWD) {
 		w = ws_utf8_to_w(path);

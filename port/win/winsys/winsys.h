@@ -13,6 +13,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <stdint.h>
+#include "ws_ws2.h"
 
 #define SV __attribute__((sysv_abi))
 #define WSAPI __attribute__((ms_abi))
@@ -75,6 +76,7 @@ typedef struct ws_desc {
 	WIN32_FIND_DATAW fd;
 	i64 dir_pos;
 	int flock_held;        /* flock: 0 none, 1 shared, 2 exclusive */
+	DWORD rcvtimeo, sndtimeo;  /* sockets: SO_RCVTIMEO / SO_SNDTIMEO in ms, 0 = none */
 } ws_desc;
 void ws_fd_init(void);
 ws_desc *ws_fd_get(int fd);       /* +1 ref, NULL if not open */
@@ -91,12 +93,31 @@ i64 ws_sys_net(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *handl
 void ws_net_init(void);
 i64 ws_sock_read(ws_desc *d, void *buf, size_t n);
 i64 ws_sock_write(ws_desc *d, const void *buf, size_t n);
+i64 ws_sock_nread(ws_desc *d);
 
 /* ---- ws_thread.c ---- */
 i64 ws_sys_thread(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *handled);
 
 /* ---- ws_time.c ---- */
 i64 ws_sys_time(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *handled);
+
+/* ---- ws_sig.c ---- */
+enum { WS_WAIT_TIMEOUT = -1, WS_WAIT_INTR = -2, WS_WAIT_FAILED = -3 };
+/* wait on hs[0..n) and this thread's signal event: index, or WS_WAIT_* */
+int ws_wait(const HANDLE *hs, int n, DWORD ms);
+void ws_sig_init(void);
+void ws_sig_thread_start(int is_main);
+void ws_sig_thread_end(void);
+int ws_sig_pending_here(void);
+i64 ws_sig_deliver(i64 r, int *restart);
+void ws_sig_futex_begin(volatile void *addr);
+int ws_sig_futex_end(void);
+void ws_sig_sync_io(int on);
+int ws_sig_raise_process(int sig, int code);
+i64 ws_sig_kill_self(int sig);
+u64 ws_sig_current_mask(void);
+void ws_sig_thread_inherit_mask(u64 m);
+i64 ws_sys_sig(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *handled);
 
 /* ---- entry points used by the SysV side (ms_abi there) ---- */
 WSAPI i64 __bmc_win_syscall(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6);

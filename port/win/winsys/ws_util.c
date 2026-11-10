@@ -201,3 +201,13 @@ void ws_fmt_u64(char *buf, u64 v)
 
 /* clang emits a reference to _fltused for floating point on MSVC targets */
 int _fltused = 0;
+
+/* ---- stack protector (sspstrong frames on a Windows triple use the MSVC
+ * names). The cookie is seeded at entry (ws_entry.c). ---- */
+uintptr_t __security_cookie = 0x2B992DDFA232ULL;
+
+void __security_check_cookie(uintptr_t c)
+{
+	if (c != __security_cookie)
+		ws_fatal("stack smashing detected (security cookie)");
+}

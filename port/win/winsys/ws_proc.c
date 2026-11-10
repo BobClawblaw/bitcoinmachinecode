@@ -66,11 +66,12 @@ static i64 sys_clock_gettime(int clk, struct l_timespec *ts)
 static __thread HANDLE sleep_timer;
 
 /* sleep for ns nanoseconds with a high-resolution waitable timer */
-static void sleep_ns(i64 ns)
+/* 0, or -1 when a signal interrupted the sleep */
+static int sleep_ns(i64 ns)
 {
 	if (ns <= 0) {
 		SwitchToThread();
-		return;
+		return 0;
 	}
 	if (!sleep_timer)
 		sleep_timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
@@ -78,19 +79,18 @@ static void sleep_ns(i64 ns)
 	if (sleep_timer) {
 		LARGE_INTEGER due;
 		due.QuadPart = -(ns / 100 ? ns / 100 : 1);
-		if (SetWaitableTimer(sleep_timer, &due, 0, NULL, NULL, FALSE)) {
-			WaitForSingleObject(sleep_timer, INFINITE);
-			return;
-		}
+		if (SetWaitableTimer(sleep_timer, &due, 0, NULL, NULL, FALSE))
+			return ws_wait(&sleep_timer, 1, INFINITE) == WS_WAIT_INTR ? -1 : 0;
 	}
-	Sleep((DWORD)((ns + 999999) / 1000000));
+	return ws_wait(NULL, 0, (DWORD)((ns + 999999) / 1000000)) == WS_WAIT_INTR ? -1 : 0;
 }
 
 static i64 sys_nanosleep(const struct l_timespec *req, struct l_timespec *rem)
 {
 	if (req->nsec < 0 || req->nsec >= 1000000000 || req->sec < 0)
 		return -L_EINVAL;
-	sleep_ns(req->sec * 1000000000LL + req->nsec);
+	if (sleep_ns(req->sec * 1000000000LL + req->nsec))
+		return -L_EINTR;          /* rem: the remaining time is not tracked */
 	if (rem) {
 		rem->sec = 0;
 		rem->nsec = 0;
@@ -107,8 +107,7 @@ static i64 sys_clock_nanosleep(int clk, int flags, const struct l_timespec *req,
 	if (r)
 		return r;
 	i64 ns = (req->sec - now.sec) * 1000000000LL + (req->nsec - now.nsec);
-	sleep_ns(ns);
-	return 0;
+	return sleep_ns(ns) ? -L_EINTR : 0;
 }
 
 /* ---- identity ---- */
@@ -224,99 +223,21 @@ static i64 sys_sched_getaffinity(int pid, size_t len, unsigned char *mask)
 	return (i64)need;
 }
 
-/* ---- signals ----
- * Handlers are recorded per signal. Console Ctrl+C / Ctrl+Break / close run
- * the SIGINT / SIGTERM handler (on the console's handler thread); kill() of
- * our own pid runs the handler synchronously; a default action terminates
- * with 128+sig, as a shell would report it. */
-struct l_sigaction { void *handler; u64 flags; void *restorer; u64 mask; };
-typedef SV void (*sig_fn)(int);
-typedef SV void (*sig_info_fn)(int, void *, void *);
-static struct l_sigaction actions[65];
-static SRWLOCK sig_lock = SRWLOCK_INIT;
-
-static void deliver(int sig)
-{
-	struct l_sigaction a;
-	AcquireSRWLockShared(&sig_lock);
-	a = actions[sig];
-	ReleaseSRWLockShared(&sig_lock);
-	if (a.handler == (void *)1)            /* SIG_IGN */
-		return;
-	if (a.handler == NULL) {               /* SIG_DFL */
-		if (sig == 17 || sig == 23 || sig == 28)  /* SIGCHLD, SIGURG, SIGWINCH */
-			return;
-		ExitProcess(128 + (UINT)sig);
-	}
-	if (a.flags & 4) {                     /* SA_SIGINFO */
-		unsigned char info[128];
-		__ws_memset(info, 0, sizeof info);
-		*(int *)info = sig;
-		((sig_info_fn)a.handler)(sig, info, NULL);
-	} else {
-		((sig_fn)a.handler)(sig);
-	}
-	if (a.flags & 0x80000000u) {           /* SA_RESETHAND */
-		AcquireSRWLockExclusive(&sig_lock);
-		actions[sig].handler = NULL;
-		ReleaseSRWLockExclusive(&sig_lock);
-	}
-}
-
-static BOOL WINAPI ctrl_handler(DWORD t)
-{
-	int sig = t == CTRL_C_EVENT ? 2 : t == CTRL_BREAK_EVENT ? 15 : t == CTRL_CLOSE_EVENT ? 1 : 15;
-	struct l_sigaction a;
-	AcquireSRWLockShared(&sig_lock);
-	a = actions[sig];
-	ReleaseSRWLockShared(&sig_lock);
-	if (a.handler == NULL)
-		return FALSE;                      /* default: let Windows end us */
-	deliver(sig);
-	if (t == CTRL_CLOSE_EVENT || t == CTRL_LOGOFF_EVENT || t == CTRL_SHUTDOWN_EVENT)
-		Sleep(5000);                       /* give the handler's shutdown a moment */
-	return TRUE;
-}
-
-static i64 sys_rt_sigaction(int sig, const struct l_sigaction *act, struct l_sigaction *old)
-{
-	static volatile LONG installed;
-	if (sig < 1 || sig > 64 || sig == 9 || sig == 19)
-		return act ? -L_EINVAL : 0;
-	AcquireSRWLockExclusive(&sig_lock);
-	if (old)
-		*old = actions[sig];
-	if (act)
-		actions[sig] = *act;
-	ReleaseSRWLockExclusive(&sig_lock);
-	if (act && (sig == 2 || sig == 15 || sig == 1) && !InterlockedExchange(&installed, 1))
-		SetConsoleCtrlHandler(ctrl_handler, TRUE);
-	return 0;
-}
-
 static i64 sys_kill(int pid, int sig)
 {
-	if (pid == 0 || pid == -1 || pid == (int)GetCurrentProcessId()) {
-		if (sig == 0)
-			return 0;
-		if (sig < 1 || sig > 64)
-			return -L_EINVAL;
-		deliver(sig);
-		return 0;
-	}
+	if (pid == 0 || pid == -1 || pid == (int)GetCurrentProcessId())
+		return ws_sig_kill_self(sig);
 	if (pid < 0)
 		return -L_ESRCH;
 	HANDLE h = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)pid);
 	if (!h)
 		return -L_ESRCH;
 	i64 r = 0;
-	if (sig != 0) {
-		DWORD code;
-		if (GetExitCodeProcess(h, &code) && code != STILL_ACTIVE)
-			r = -L_ESRCH;
-		else if (!TerminateProcess(h, 128 + (UINT)sig))
-			r = ws_err(GetLastError());
-	}
+	DWORD code;
+	if (GetExitCodeProcess(h, &code) && code != STILL_ACTIVE)
+		r = -L_ESRCH;
+	else if (sig != 0 && !TerminateProcess(h, 128 + (UINT)sig))
+		r = ws_err(GetLastError());
 	CloseHandle(h);
 	return r;
 }
@@ -371,17 +292,7 @@ i64 ws_sys_time(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *hand
 	case 98: return sys_getrusage((int)a1, (struct l_rusage *)a2);
 	case 204: return sys_sched_getaffinity((int)a1, (size_t)a2, (unsigned char *)a3);
 	case 203: return 0;                    /* sched_setaffinity */
-	case 13: return sys_rt_sigaction((int)a1, (const struct l_sigaction *)a2, (struct l_sigaction *)a3);
-	case 14:                               /* rt_sigprocmask: no async signals to block */
-		if (a3)
-			__ws_memset((void *)a3, 0, (size_t)(a4 > 0 && a4 <= 128 ? a4 : 8));
-		return 0;
-	case 127: return -L_EINTR;             /* rt_sigpending */
-	case 131: return 0;                    /* sigaltstack */
 	case 62: return sys_kill((int)a1, (int)a2);
-	case 200: return a1 == (i64)GetCurrentThreadId() ? (deliver((int)a2), 0) : -L_ESRCH;  /* tkill */
-	case 234: return sys_kill((int)a1, (int)a3);   /* tgkill */
-	case 37: return 0;                     /* alarm: unsupported, no-op */
 	case 157:                              /* prctl */
 		if (a1 == 16) {                    /* PR_GET_NAME */
 			__ws_memcpy((void *)a2, "bmc", 4);

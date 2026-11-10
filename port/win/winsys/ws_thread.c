@@ -8,13 +8,17 @@
 
 struct l_timespec { i64 sec, nsec; };
 
-typedef struct { ws_thread_fn fn; void *arg; } tramp;
+typedef struct { ws_thread_fn fn; void *arg; u64 mask; } tramp;
 
 static DWORD WINAPI thread_main(LPVOID p)
 {
 	tramp t = *(tramp *)p;
 	ws_free(p);
-	return (DWORD)(uintptr_t)t.fn(t.arg);
+	ws_sig_thread_start(0);
+	ws_sig_thread_inherit_mask(t.mask);
+	DWORD r = (DWORD)(uintptr_t)t.fn(t.arg);
+	ws_sig_thread_end();
+	return r;
 }
 
 WSAPI i64 __bmc_win_thread_create(ws_thread_fn fn, void *arg, size_t stack, void **handle_out, int *tid_out)
@@ -24,6 +28,7 @@ WSAPI i64 __bmc_win_thread_create(ws_thread_fn fn, void *arg, size_t stack, void
 		return -L_ENOMEM;
 	t->fn = fn;
 	t->arg = arg;
+	t->mask = ws_sig_current_mask();
 	if (stack < (1 << 20))
 		stack = 1 << 20;
 	/* committed in full (no STACK_SIZE_PARAM_IS_A_RESERVATION): the SysV
@@ -83,8 +88,17 @@ static i64 futex_wait(volatile int *addr, int val, DWORD ms)
 {
 	if (*addr != val)
 		return -L_EAGAIN;
-	if (!WaitOnAddress(addr, &val, sizeof val, ms))
-		return GetLastError() == ERROR_TIMEOUT ? -L_ETIMEDOUT : ws_err(GetLastError());
+	ws_sig_futex_begin(addr);
+	if (ws_sig_pending_here()) {
+		ws_sig_futex_end();
+		return -L_EINTR;
+	}
+	BOOL ok = WaitOnAddress(addr, &val, sizeof val, ms);
+	DWORD e = ok ? 0 : GetLastError();
+	if (ws_sig_futex_end())
+		return -L_EINTR;
+	if (!ok)
+		return e == ERROR_TIMEOUT ? -L_ETIMEDOUT : ws_err(e);
 	return 0;
 }
 
@@ -135,7 +149,9 @@ i64 ws_sys_thread(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *ha
 	case 218: return (i64)GetCurrentThreadId();       /* set_tid_address */
 	case 273: case 274: case 334: return 0;            /* robust lists, rseq */
 	case 324: return 0;                                /* membarrier */
-	case 60: ExitThread((DWORD)a1);                    /* exit (this thread) */
+	case 60:                                           /* exit (this thread) */
+		ws_sig_thread_end();
+		ExitThread((DWORD)a1);
 	case 231: ExitProcess((UINT)a1);                   /* exit_group */
 	default:
 		*handled = 0;

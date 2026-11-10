@@ -77,8 +77,14 @@ SV int __bmc_start(int argc, char **argv, char **envp);
 WSAPI void __bmc_win_entry(void)
 {
 	ws_check_tls();
+	extern uintptr_t __security_cookie;
+	extern i64 ws_getrandom(void *buf, size_t n);
+	uintptr_t ck;
+	if (ws_getrandom(&ck, sizeof ck) == sizeof ck && ck)
+		__security_cookie = ck & 0x0000FFFFFFFFFFFFULL;
 	SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
 	SetConsoleOutputCP(CP_UTF8);
+	ws_sig_init();
 	ws_fd_init();
 	ws_net_init();
 	int argc;
@@ -91,7 +97,7 @@ WSAPI void __bmc_win_entry(void)
 /* ---- the syscall dispatcher ---- */
 static volatile LONG warned[512];
 
-WSAPI i64 __bmc_win_syscall(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6)
+static i64 dispatch(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6)
 {
 	int handled = 0;
 	i64 r;
@@ -102,6 +108,9 @@ WSAPI i64 __bmc_win_syscall(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a
 	if (handled)
 		return r;
 	r = ws_sys_time(n, a1, a2, a3, a4, a5, a6, &handled);
+	if (handled)
+		return r;
+	r = ws_sys_sig(n, a1, a2, a3, a4, a5, a6, &handled);
 	if (handled)
 		return r;
 	r = ws_sys_thread(n, a1, a2, a3, a4, a5, a6, &handled);
@@ -119,4 +128,19 @@ WSAPI i64 __bmc_win_syscall(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a
 		ws_write_stderr("\n");
 	}
 	return -L_ENOSYS;
+}
+
+/* Signals pending for this thread are handled on the way out of a syscall;
+ * an interrupted call whose handlers all have SA_RESTART runs again. */
+WSAPI i64 __bmc_win_syscall(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6)
+{
+	for (;;) {
+		i64 r = dispatch(n, a1, a2, a3, a4, a5, a6);
+		if (!ws_sig_pending_here())
+			return r;
+		int restart;
+		r = ws_sig_deliver(r, &restart);
+		if (!restart)
+			return r;
+	}
 }

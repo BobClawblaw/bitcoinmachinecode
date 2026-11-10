@@ -25,6 +25,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import functools
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -35,6 +36,7 @@ DEPS = os.path.join(HERE, '.deps')
 sys.path.insert(0, os.path.join(HERE, 'tools'))
 import retarget  # noqa: E402
 import asm_xform  # noqa: E402
+import mkrules  # noqa: E402
 
 MUSL_VER = '1.2.5'
 MUSL_URL = 'https://musl.libc.org/releases/musl-%s.tar.gz' % MUSL_VER
@@ -179,6 +181,7 @@ MUSL_EXCLUDE = {
     'src/thread/synccall.c', 'src/thread/__unmapself.c', 'src/linux/clone.c',
     'src/thread/pthread_getattr_np.c', 'src/thread/__set_thread_area.c',
     'src/internal/vdso.c',
+    'src/network/getaddrinfo.c', 'src/network/freeaddrinfo.c',
 }
 MUSL_EXCLUDE_DIRS = {'src/malloc', 'src/ldso', 'src/aio', 'src/mq', 'src/ipc', 'src/crypt'}
 
@@ -305,7 +308,7 @@ def cc_win(src, obj, flags=()):
     return obj
 
 
-def nasm_win(src, obj, extra_inc=()):
+def nasm_win(src, obj, extra_inc=(), defines=()):
     """Assemble one bmc .asm for win64 through the asm transform."""
     xs = obj + '.asm'
     os.makedirs(os.path.dirname(obj), exist_ok=True)
@@ -321,7 +324,7 @@ def nasm_win(src, obj, extra_inc=()):
            '-I' + os.path.join(HERE, 'asm') + os.sep]
     for i in incs:
         cmd.append('-I' + i + os.sep)
-    run(cmd + ['-MD', obj + '.d', '-MT', obj, '-o', obj, xs])
+    run(cmd + list(defines) + ['-MD', obj + '.d', '-MT', obj, '-o', obj, xs])
     return obj
 
 
@@ -347,18 +350,21 @@ def parallel(fn, items):
 
 
 def archive(lib, objs):
-    if not newer(lib, *objs) and os.path.exists(lib):
+    rsp = lib + '.rsp'
+    listing = '\n'.join('"%s"' % o for o in objs)
+    same = os.path.exists(rsp) and open(rsp).read() == listing
+    if same and os.path.exists(lib) and not newer(lib, *objs):
         return lib
     if os.path.exists(lib):
         os.remove(lib)
-    rsp = lib + '.rsp'
     with open(rsp, 'w') as f:
-        f.write('\n'.join('"%s"' % o for o in objs))
+        f.write(listing)
     run([LLVM_LIB, '/out:' + lib, '@' + rsp])
     return lib
 
 
 # ---------------------------------------------------------------- libraries
+@functools.lru_cache(maxsize=None)
 def build_musl():
     fetch_musl()
     musl_headers()
@@ -381,6 +387,7 @@ WINSYS_SRCS = sorted(glob.glob(os.path.join(HERE, 'winsys', '*.c')))
 WINSYS_ASM = sorted(glob.glob(os.path.join(HERE, 'winsys', '*.asm')))
 
 
+@functools.lru_cache(maxsize=None)
 def build_rt():
     """rt: the SysV-side runtime (startup, pthreads, malloc) -- musl internals visible."""
     flags = musl_cflags() + ['-Wall', '-Werror']
@@ -391,6 +398,7 @@ def build_rt():
     return sorted(objs)
 
 
+@functools.lru_cache(maxsize=None)
 def build_winsys():
     items = [(s, os.path.join(OUT, 'winsys', os.path.basename(s)[:-2] + '.obj'),
               ['-I' + os.path.join(HERE, 'winsys')]) for s in WINSYS_SRCS]
@@ -403,38 +411,65 @@ def build_winsys():
 
 
 # ---------------------------------------------------------------- bmc
-BMC_CFLAGS = ['-I' + ASM, '-I' + os.path.join(ASM, 'daemon'), '-I' + os.path.join(ASM, 'tests'),
-              '-Wall', '-Werror', '-D_GNU_SOURCE', '-DBMC_WIN=1']
+BMC_CFLAGS = ['-Wall', '-Werror', '-DBMC_WIN=1',
+              # clang-only diagnostics the gcc gate (asm/Makefile) does not have
+              '-Wno-unused-but-set-global', '-Wno-unused-but-set-variable',
+              '-Wno-tautological-overlap-compare']
+_MK = None
 
 
-def bmc_c(src):
-    rel = os.path.relpath(os.path.abspath(src), ASM)
-    obj = os.path.join(OUT, 'bmc', os.path.splitext(rel)[0] + '.obj')
-    return cc_sysv(os.path.abspath(src), obj, user_inc() + BMC_CFLAGS)
+def makefile():
+    global _MK
+    if _MK is None:
+        _MK = mkrules.Makefile(os.path.join(ASM, 'Makefile'))
+    return _MK
 
 
-def bmc_asm(src):
-    rel = os.path.relpath(os.path.abspath(src), ASM)
-    obj = os.path.join(OUT, 'bmc', os.path.splitext(rel)[0] + '.asm.obj')
-    return nasm_win(os.path.abspath(src), obj, [ASM])
+def _variant(extra):
+    """Object-name suffix for a per-target flag set (same source, other -D/-I)."""
+    if not extra:
+        return ''
+    return '.' + hashlib.sha1(' '.join(extra).encode()).hexdigest()[:8]
 
 
-def bmc_obj(path):
-    path = os.path.join(ASM, path) if not os.path.isabs(path) else path
+def bmc_c(src, extra=()):
+    src = os.path.abspath(os.path.join(ASM, src))
+    rel = os.path.relpath(src, ASM)
+    obj = os.path.join(OUT, 'bmc', os.path.splitext(rel)[0] + _variant(extra) + '.obj')
+    incs = ['-I' + ASM, '-I' + os.path.join(ASM, 'daemon'), '-I' + os.path.join(ASM, 'tests')]
+    return cc_sysv(src, obj, user_inc() + incs + BMC_CFLAGS + list(extra))
+
+
+def bmc_asm(src, defines=(), tag=''):
+    src = os.path.abspath(os.path.join(ASM, src))
+    rel = os.path.relpath(src, ASM)
+    obj = os.path.join(OUT, 'bmc', os.path.splitext(rel)[0] + tag + _variant(defines) + '.asm.obj')
+    return nasm_win(src, obj, [ASM], defines)
+
+
+def bmc_obj(path, extra=()):
+    """One Makefile input (.c, .asm, or a .o built by a pattern or explicit rule)."""
     if path.endswith('.c'):
-        return bmc_c(path)
-    if path.endswith('.o'):  # Makefile object name -> the .asm or .c it is built from
-        stem = path[:-2]
+        return bmc_c(path, extra)
+    if path.endswith('.asm'):
+        return bmc_asm(path)
+    if path.endswith('.o'):
+        spec = mkrules.obj_spec(makefile(), path)
+        if spec:
+            if spec['kind'] == 'nasm':
+                return bmc_asm(spec['src'], spec['defines'], tag='.' + os.path.basename(path)[:-2])
+            fl = spec['defines'] + ['-I' + os.path.join(ASM, i) for i in spec['includes']]
+            return bmc_c(spec['src'], fl)
+        stem = os.path.join(ASM, path[:-2])
         if os.path.exists(stem + '.asm'):
             return bmc_asm(stem + '.asm')
         if os.path.exists(stem + '.c'):
             return bmc_c(stem + '.c')
         raise RuntimeError('no source for ' + path)
-    if path.endswith('.asm'):
-        return bmc_asm(path)
     raise RuntimeError('unknown input ' + path)
 
 
+@functools.lru_cache(maxsize=None)
 def build_portlib():
     """Archive of port/win/asm fallbacks (only pulled in when undefined elsewhere)."""
     objs = [nasm_plain(s, os.path.join(OUT, 'port', os.path.basename(s)[:-4] + '.obj'))
@@ -442,10 +477,12 @@ def build_portlib():
     return archive(os.path.join(OUT, 'bmcport.lib'), objs)
 
 
-SYSLIBS = ['kernel32.lib', 'synchronization.lib', 'shell32.lib', 'ws2_32.lib', 'ntdll.lib', 'bcrypt.lib', 'advapi32.lib']
+# Only libraries whose exports cannot collide with C names: Winsock (POSIX
+# names) is bound at run time (winsys/ws_ws2.c); ntdll (a C runtime) is not linked.
+SYSLIBS = ['kernel32.lib', 'synchronization.lib', 'shell32.lib']
 
 
-def link(exe, objs, base='0x10000000'):
+def link(exe, objs, base='0x10000000', wraps=()):
     rt = build_rt()
     ws = build_winsys()
     musl = build_musl()
@@ -456,34 +493,48 @@ def link(exe, objs, base='0x10000000'):
            '/opt:ref', '/debug:none', '/map:' + exe[:-4] + '.map', '/pdbaltpath:%_PDB%', '/Brepro']
     builtins = os.path.join(os.path.dirname(_clang_resource_inc()), 'lib', 'windows',
                             'clang_rt.builtins-x86_64.lib')
+    cmd += ['-wrap:' + w for w in wraps]
     cmd += list(objs) + rt + ws + [build_portlib(), musl, builtins] + SYSLIBS
     run(cmd)
     return exe
 
 
 # ---------------------------------------------------------------- targets
-def makefile_rule(target):
-    """Prerequisites of `target` from asm/Makefile (variables expanded naively)."""
-    mk = open(os.path.join(ASM, 'Makefile'), encoding='utf-8').read().replace('\\\n', ' ')
-    vars_ = {}
-    for m in re.finditer(r'^([A-Z][A-Z0-9_]*)\s*:?=\s*(.*)$', mk, re.M):
-        vars_.setdefault(m.group(1), m.group(2))
+def _archive_inputs(lib):
+    """The objects an .a target archives (its prerequisites)."""
+    mk = makefile()
+    if lib not in mk.rules:
+        raise RuntimeError('no Makefile rule for ' + lib)
+    return [q for q in mk.expand(mk.rules[lib][0][0]).split() if q.endswith(('.c', '.o', '.asm'))]
 
-    def expand(s, depth=0):
-        if depth > 10:
-            return s
-        return re.sub(r'\$\(([A-Z0-9_]+)\)', lambda m: expand(vars_.get(m.group(1), ''), depth + 1), s)
-    m = re.search(r'^%s:\s*(.*)$' % re.escape(target), mk, re.M)
-    if not m:
-        raise RuntimeError('no Makefile rule for ' + target)
-    return [p for p in expand(m.group(1)).split() if p.endswith(('.c', '.o', '.asm'))]
+
+def target_objs(target):
+    """Objects + --wrap symbols for a Makefile target, from its $(CC) recipe."""
+    try:
+        spec = makefile().link_spec(target)
+    except KeyError as e:
+        raise RuntimeError(str(e))
+    extra = spec['defines'] + ['-I' + os.path.join(ASM, i) for i in spec['includes']]
+    for f in spec['forced']:
+        extra += ['-include', os.path.join(ASM, f)]
+    objs, seen = [], set()
+    for p in spec['inputs']:
+        for q in (_archive_inputs(p) if p.endswith('.a') else [p]):
+            if q in seen:
+                continue
+            seen.add(q)
+            objs.append(bmc_obj(q, extra if q.endswith('.c') else ()))
+    return objs, spec['wraps']
+
+
+def build_target(target, exe_name=None):
+    objs, wraps = target_objs(target)
+    name = exe_name or os.path.basename(target)
+    return link(os.path.join(OUT, 'bin', name + '.exe'), objs, wraps=wraps)
 
 
 def build_test(name):
-    target = 'tests/' + name
-    srcs = makefile_rule(target)
-    objs = [bmc_obj(s) for s in srcs]
-    return link(os.path.join(OUT, 'bin', name + '.exe'), objs)
+    return build_target('tests/' + name)
 
 
 def main(argv):

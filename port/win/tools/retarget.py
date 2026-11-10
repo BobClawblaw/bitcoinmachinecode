@@ -71,18 +71,36 @@ for _n in _LIBM:
 _LIBCALL_RE = re.compile(r'@(%s)(?![\w.$])' % '|'.join(sorted(LIBCALL_NAMES, key=len, reverse=True)))
 
 
+_STRLIT_RE = re.compile(r'c"[^"]*"|![\w.]*"[^"]*"')
+
+
+def _code_only(ln, fn):
+    """Apply fn to ln with string literals (c"..." and metadata strings) masked out."""
+    lits = []
+
+    def keep(m):
+        lits.append(m.group(0))
+        return '\x00%d\x00' % (len(lits) - 1)
+    masked = _STRLIT_RE.sub(keep, ln)
+    masked = fn(masked)
+    return re.sub(r'\x00(\d+)\x00', lambda m: lits[int(m.group(1))], masked)
+
+
 def retarget_text(text, triple='x86_64-pc-windows-msvc'):
-    text = _LIBCALL_RE.sub(lambda m: '@__bmc_sv_' + m.group(1), text)
     res = []
     for ln in text.split('\n'):
         if ln.startswith('target triple'):
             ln = 'target triple = "%s"' % triple
         elif ln.startswith('target datalayout'):
             ln = ln.replace('-m:e-', '-m:w-')
-        elif ln.startswith('define') or ln.startswith('declare'):
-            ln = _fix_defdecl(ln)
-        elif 'call ' in ln or 'invoke ' in ln:
-            ln = _fix_calls(ln)
+        elif ln.startswith('!') or ln.startswith('attributes') or ln.startswith(';'):
+            pass
+        else:
+            ln = _code_only(ln, lambda s: _LIBCALL_RE.sub(lambda m: '@__bmc_sv_' + m.group(1), s))
+            if ln.startswith('define') or ln.startswith('declare'):
+                ln = _fix_defdecl(ln)
+            elif not ln.startswith('@') and ('call ' in ln or 'invoke ' in ln):
+                ln = _code_only(ln, _fix_calls)
         res.append(ln)
     return '\n'.join(res)
 

@@ -449,11 +449,17 @@ static i64 rw_stream(ws_desc *d, void *buf, size_t n, int write)
 	if (n > 0x7ffff000)
 		n = 0x7ffff000;
 	DWORD got = 0;
+	if (!write)
+		ws_sig_sync_io(1);           /* a signal cancels the read: -EINTR */
 	BOOL ok = write ? WriteFile(d->h, buf, (DWORD)n, &got, NULL) : ReadFile(d->h, buf, (DWORD)n, &got, NULL);
+	if (!write)
+		ws_sig_sync_io(0);
 	if (!ok) {
 		DWORD e = GetLastError();
 		if (!write && (e == ERROR_BROKEN_PIPE || e == ERROR_HANDLE_EOF))
 			return 0;
+		if (e == ERROR_OPERATION_ABORTED)
+			return -L_EINTR;
 		return ws_err(e);
 	}
 	return (i64)got;
@@ -812,12 +818,9 @@ static i64 sys_fcntl(int fd, int cmd, i64 arg)
 		r = d->flags & (L_O_ACCMODE | L_O_APPEND | L_O_NONBLOCK);
 		break;
 	case 4:      /* F_SETFL */
+		/* sockets stay blocking at the Winsock level; ws_net.c emulates
+		 * O_NONBLOCK from this flag */
 		d->flags = (d->flags & ~(L_O_APPEND | L_O_NONBLOCK)) | ((int)arg & (L_O_APPEND | L_O_NONBLOCK));
-		if (d->type == FT_SOCKET) {
-			u_long nb = (arg & L_O_NONBLOCK) ? 1 : 0;
-			if (ioctlsocket(d->s, FIONBIO, &nb))
-				r = ws_wsaerr(WSAGetLastError());
-		}
 		break;
 	case 5: case 6: case 7: case 36: case 37: case 38:
 		r = fcntl_lock(d, cmd, (struct l_flock *)arg);
@@ -872,16 +875,16 @@ static i64 sys_ioctl(int fd, u64 req, i64 arg)
 	} else if (req == 0x5401 && d->type == FT_CONSOLE) {  /* TCGETS */
 		__ws_memset((void *)arg, 0, 60);
 		r = 0;
-	} else if (req == 0x5421 && d->type == FT_SOCKET) {   /* FIONBIO */
-		u_long nb = *(int *)arg ? 1 : 0;
-		r = ioctlsocket(d->s, FIONBIO, &nb) ? ws_wsaerr(WSAGetLastError()) : 0;
-		if (!r)
-			d->flags = nb ? (d->flags | L_O_NONBLOCK) : (d->flags & ~L_O_NONBLOCK);
+	} else if (req == 0x5421 && d->type == FT_SOCKET) {   /* FIONBIO: emulated flag */
+		d->flags = *(int *)arg ? (d->flags | L_O_NONBLOCK) : (d->flags & ~L_O_NONBLOCK);
+		r = 0;
 	} else if (req == 0x541B) {                            /* FIONREAD */
 		if (d->type == FT_SOCKET) {
-			u_long n = 0;
-			r = ioctlsocket(d->s, FIONREAD, &n) ? ws_wsaerr(WSAGetLastError()) : 0;
-			*(int *)arg = (int)n;
+			r = ws_sock_nread(d);
+			if (r >= 0) {
+				*(int *)arg = (int)r;
+				r = 0;
+			}
 		} else if (d->type == FT_PIPE) {
 			DWORD avail = 0;
 			r = PeekNamedPipe(d->h, NULL, 0, NULL, &avail, NULL) ? 0 : ws_err(GetLastError());
@@ -1103,6 +1106,16 @@ static i64 sys_getcwd(char *buf, size_t size)
 	for (size_t i = 0; i < l; i++)
 		if (u[i] == '\\')
 			u[i] = '/';
+	if (l >= 2 && u[1] == ':') {
+		/* "C:/x" -> "/c/x": an absolute POSIX path (musl's getcwd insists
+		 * on a leading '/'); ws_path maps it back */
+		u[1] = (char)(u[0] | 0x20);
+		u[0] = '/';
+		if (l == 3) {           /* "C:/" -> "/c" */
+			u[2] = 0;
+			l = 2;
+		}
+	}
 	i64 r;
 	if (l + 1 > size) {
 		r = -L_ERANGE;
