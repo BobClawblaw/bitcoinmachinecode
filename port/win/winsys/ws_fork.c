@@ -165,6 +165,7 @@ void ws_fork_init(void)
 	self_box.box->pid = (LONG)GetCurrentProcessId();
 	wake_ev = CreateEventW(NULL, FALSE, FALSE, NULL);
 	start_listener();
+	ws_prof_start(0);
 }
 
 /* ---------------------------------------------------------------- fork */
@@ -247,6 +248,7 @@ static i64 sys_fork(void)
 		pdeathsig = 0;
 		wake_ev = CreateEventW(NULL, FALSE, FALSE, NULL);
 		start_listener();
+		ws_prof_start(1);
 		return 0;
 	}
 

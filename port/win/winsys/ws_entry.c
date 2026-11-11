@@ -288,6 +288,7 @@ WSAPI i64 __bmc_win_syscall(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a
 		char v[4] = "";
 		strace_on = GetEnvironmentVariableA("BMC_WIN_STRACE", v, sizeof v) ? (v[0] == '2' ? 2 : 1) : 0;
 	}
+	ws_prof_count(n);
 	for (;;) {
 		if (strace_on == 2)                 /* BMC_WIN_STRACE=2: calls as they start, too */
 			strace_line(n, a1, a2, a3, -4095);

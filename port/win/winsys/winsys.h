@@ -143,6 +143,9 @@ void ws_broker_start(void);
 void ws_broker_child(void);
 /* the private heap (ws_util.c) */
 HANDLE ws_heap(void);
+/* the sampling profiler (ws_prof.c, BMC_WIN_PROF) */
+void ws_prof_count(i64 nr);
+void ws_prof_start(int child);
 void ws_heap_lock(void);
 void ws_heap_unlock(void);
 void ws_heap_reset_child(void);
