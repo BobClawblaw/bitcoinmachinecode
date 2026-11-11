@@ -85,13 +85,14 @@ WSAPI void __bmc_win_entry(void)
 	SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
 	SetConsoleOutputCP(CP_UTF8);
 	ws_sig_init();
+	ws_fork_init();
 	ws_fd_init();
 	ws_net_init();
 	int argc;
 	char **argv = build_argv(&argc);
 	ws_envp = build_envp();
 	ws_start_fn start = __bmc_start;
-	ExitProcess((UINT)start(argc, argv, ws_envp));
+	ws_exit_process((UINT)start(argc, argv, ws_envp));
 }
 
 /* ---- the syscall dispatcher ---- */
@@ -105,6 +106,12 @@ static i64 dispatch(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6)
 	if (handled)
 		return r;
 	r = ws_sys_mem(n, a1, a2, a3, a4, a5, a6, &handled);
+	if (handled)
+		return r;
+	r = ws_sys_exec(n, a1, a2, a3, a4, a5, a6, &handled);
+	if (handled)
+		return r;
+	r = ws_sys_fork(n, a1, a2, a3, a4, a5, a6, &handled);
 	if (handled)
 		return r;
 	r = ws_sys_time(n, a1, a2, a3, a4, a5, a6, &handled);

@@ -52,8 +52,12 @@ void ws_desc_put(ws_desc *d)
 {
 	if (!d || InterlockedDecrement(&d->refs) != 0)
 		return;
-	if (d->type == FT_SOCKET && d->s != INVALID_SOCKET)
-		closesocket(d->s);
+	if (d->type == FT_SOCKET && d->s != INVALID_SOCKET) {
+		if (ws_is_root)
+			closesocket(d->s);
+		else
+			CloseHandle((HANDLE)d->s);   /* no Winsock in a forked process */
+	}
 	if (d->h != INVALID_HANDLE_VALUE && d->h != NULL)
 		CloseHandle(d->h);
 	if (d->find && d->find != INVALID_HANDLE_VALUE)
@@ -1231,4 +1235,65 @@ i64 ws_sys_file(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *hand
 		return 0;
 	}
 	(void)a5;
+}
+
+/* ---- fork (ws_fork.c): the table is locked across the clone and every
+ * handle in it made inheritable, so the child sees the same fds ---- */
+static void inherit(HANDLE h)
+{
+	if (h && h != INVALID_HANDLE_VALUE)
+		SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+}
+
+void ws_fd_fork_prepare(void)
+{
+	AcquireSRWLockExclusive(&fdt_lock);
+	for (int i = 0; i < fdt_cap; i++) {
+		ws_desc *d = fdt[i].d;
+		if (!d)
+			continue;
+		inherit(d->h);
+		if (d->type == FT_SOCKET)
+			inherit((HANDLE)d->s);
+		if (d->find && d->find != INVALID_HANDLE_VALUE) {
+			/* a FindFirstFile enumeration is not a kernel handle: the child
+			 * restarts the listing from its position on next getdents */
+			d->find_state = d->find_state == 1 ? 0 : d->find_state;
+		}
+	}
+}
+
+void ws_fd_fork_done(int child)
+{
+	if (child) {
+		/* enumeration handles are process-local; rewind them in the child */
+		for (int i = 0; i < fdt_cap; i++) {
+			ws_desc *d = fdt[i].d;
+			if (d && d->find && d->find != INVALID_HANDLE_VALUE) {
+				d->find = NULL;
+				d->find_state = 0;
+				d->dir_pos = 0;
+			}
+		}
+	}
+	ReleaseSRWLockExclusive(&fdt_lock);
+}
+
+/* execve: the fds the new image would not have inherited */
+void ws_fd_close_on_exec(void)
+{
+	for (int fd = 0;; fd++) {
+		ws_desc *d = NULL;
+		AcquireSRWLockExclusive(&fdt_lock);
+		if (fd >= fdt_cap) {
+			ReleaseSRWLockExclusive(&fdt_lock);
+			break;
+		}
+		if (fdt[fd].d && fdt[fd].cloexec) {
+			d = fdt[fd].d;
+			fdt[fd].d = NULL;
+		}
+		ReleaseSRWLockExclusive(&fdt_lock);
+		ws_desc_put(d);
+	}
 }

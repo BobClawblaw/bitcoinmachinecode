@@ -203,6 +203,16 @@ static i64 sys_socket(int fam, int type, int proto)
 	return install_socket(s, nb, ce);
 }
 
+/* A connect Winsock did not see complete (it finished while we waited on
+ * AFD, or in the root on a handle it has since closed) leaves the socket's
+ * stored context at "connecting"; this is the documented refresh (as after
+ * ConnectEx). */
+#define SO_UPDATE_CONNECT_CONTEXT_ 0x7010
+static void refresh_connected(SOCKET s)
+{
+	setsockopt(s, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT_, NULL, 0);
+}
+
 static i64 sys_connect(int fd, const void *addr, int len)
 {
 	i64 err;
@@ -216,6 +226,9 @@ static i64 sys_connect(int fd, const void *addr, int len)
 		ws_desc_put(d);
 		return -L_EINVAL;
 	}
+	d->peer = a;
+	d->peerlen = wl;
+	d->connected = 0;
 	u_long on = 1, off = 0;
 	ioctlsocket(d->s, FIONBIO, &on);
 	int c = connect(d->s, (struct sockaddr *)&a, wl);
@@ -223,8 +236,10 @@ static i64 sys_connect(int fd, const void *addr, int len)
 	ioctlsocket(d->s, FIONBIO, &off);
 	if (c == 0) {
 		r = 0;
+		d->connected = 1;
 	} else if (e != WSAEWOULDBLOCK) {
 		r = ws_wsaerr(e);
+		d->peerlen = 0;
 	} else if (d->flags & L_O_NONBLOCK) {
 		r = -L_EINPROGRESS;
 	} else {
@@ -237,6 +252,9 @@ static i64 sys_connect(int fd, const void *addr, int len)
 			int so = 0, sl = sizeof so;
 			getsockopt(d->s, SOL_SOCKET, SO_ERROR, (char *)&so, &sl);
 			r = so ? ws_wsaerr(so) : -L_ECONNREFUSED;
+		} else {
+			refresh_connected(d->s);
+			d->connected = 1;
 		}
 	}
 	ws_desc_put(d);
@@ -287,7 +305,44 @@ static i64 sys_accept(int fd, void *addr, int *alen, int flags)
 	u_long off = 0;
 	ioctlsocket(s, FIONBIO, &off);
 	addr_out(&a, wl, addr, alen);
-	return install_socket(s, (flags & L_SOCK_NONBLOCK) != 0, (flags & L_SOCK_CLOEXEC) != 0);
+	i64 nfd = install_socket(s, (flags & L_SOCK_NONBLOCK) != 0, (flags & L_SOCK_CLOEXEC) != 0);
+	if (nfd >= 0) {
+		ws_desc *nd = ws_fd_get((int)nfd);
+		if (nd) {
+			nd->peer = a;
+			nd->peerlen = wl;
+			nd->connected = 1;
+			ws_desc_put(nd);
+		}
+	}
+	return nfd;
+}
+
+/* local/remote address straight from AFD (no Winsock: works in a forked
+ * process, and is never stale): the socket-name and remote-address
+ * ioctls return a SOCKADDR at the start of their output */
+#define IOCTL_AFD_GET_SOCK_NAME_ 0x0001202F
+#define IOCTL_AFD_GET_REMOTE_ADDRESS_ 0x0001203F
+static int afd_name(SOCKET s, int peer, struct sockaddr_storage *out, int *len)
+{
+	unsigned char buf[256];
+	OVERLAPPED ov;
+	__ws_memset(&ov, 0, sizeof ov);
+	ov.hEvent = thread_event();
+	DWORD code = peer ? IOCTL_AFD_GET_REMOTE_ADDRESS_ : IOCTL_AFD_GET_SOCK_NAME_;
+	BOOL ok = DeviceIoControl((HANDLE)s, code, NULL, 0, buf, sizeof buf, NULL, &ov);
+	i64 n = io_finish((HANDLE)s, &ov, ok, INFINITE);
+	if (n < 2)
+		return -1;
+	int fam = *(unsigned short *)buf;
+	int l = fam == AF_INET ? (int)sizeof(struct sockaddr_in) : fam == AF_INET6 ? (int)sizeof(struct sockaddr_in6) : 0;
+	if (!l || n < l)
+		return -1;
+	if (peer && fam == AF_INET && !*(u_long *)(buf + 4) && !*(u_short *)(buf + 2))
+		return -1;                   /* not connected */
+	__ws_memcpy(out, buf, (size_t)l);
+	*len = l;
+	return 0;
 }
 
 static i64 sys_name(int fd, void *addr, int *alen, int peer)
@@ -298,7 +353,35 @@ static i64 sys_name(int fd, void *addr, int *alen, int peer)
 		return err;
 	struct sockaddr_storage a;
 	int wl = sizeof a;
+	if (peer && d->peerlen) {
+		/* the address connect() was given / accept() returned, once the
+		 * connection is seen up (Linux: ENOTCONN before that) */
+		if (!d->connected) {
+			i64 ev = sock_wait(d, AFD_POLL_SEND | AFD_POLL_RECEIVE, 0);
+			if (ev > 0 && !(ev & (AFD_POLL_CONNECT_FAIL | AFD_POLL_ABORT)))
+				InterlockedExchange(&d->connected, 1);
+		}
+		i64 r = d->connected ? 0 : -L_ENOTCONN;
+		if (!r) {
+			a = d->peer;
+			wl = d->peerlen;
+		}
+		ws_desc_put(d);
+		if (!r)
+			addr_out(&a, wl, addr, alen);
+		return r;
+	}
+	if (!peer && afd_name(d->s, 0, &a, &wl) == 0) {
+		ws_desc_put(d);
+		addr_out(&a, wl, addr, alen);
+		return 0;
+	}
 	int r = peer ? getpeername(d->s, (struct sockaddr *)&a, &wl) : getsockname(d->s, (struct sockaddr *)&a, &wl);
+	if (r == SOCKET_ERROR && peer && WSAGetLastError() == WSAENOTCONN) {
+		refresh_connected(d->s);
+		wl = sizeof a;
+		r = getpeername(d->s, (struct sockaddr *)&a, &wl);
+	}
 	ws_desc_put(d);
 	if (r == SOCKET_ERROR)
 		return lasterr();
@@ -939,4 +1022,10 @@ i64 ws_sys_net(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *handl
 		*handled = 0;
 		return 0;
 	}
+}
+
+/* fork child: the thread's overlapped event was not inherited */
+void ws_net_fork_child(void)
+{
+	io_ev = NULL;
 }

@@ -228,18 +228,8 @@ static i64 sys_kill(int pid, int sig)
 	if (pid == 0 || pid == -1 || pid == (int)GetCurrentProcessId())
 		return ws_sig_kill_self(sig);
 	if (pid < 0)
-		return -L_ESRCH;
-	HANDLE h = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)pid);
-	if (!h)
-		return -L_ESRCH;
-	i64 r = 0;
-	DWORD code;
-	if (GetExitCodeProcess(h, &code) && code != STILL_ACTIVE)
-		r = -L_ESRCH;
-	else if (sig != 0 && !TerminateProcess(h, 128 + (UINT)sig))
-		r = ws_err(GetLastError());
-	CloseHandle(h);
-	return r;
+		return ws_kill_other(-pid, sig);  /* process groups: the leader only */
+	return ws_kill_other(pid, sig);
 }
 
 i64 ws_sys_time(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *handled)
@@ -305,4 +295,10 @@ i64 ws_sys_time(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *hand
 		*handled = 0;
 		return 0;
 	}
+}
+
+/* fork child: the cached sleep timer was not inherited */
+void ws_proc_fork_child(void)
+{
+	sleep_timer = NULL;
 }

@@ -97,17 +97,120 @@ static void free_region(region *r)
 	ws_free(r);
 }
 
+/* ---- placeholders (Windows 10 1803+): what lets MAP_FIXED place a file
+ * view inside memory we already handed out. Private anonymous regions are
+ * reserved as a placeholder and committed into it, so they can later be
+ * turned back into a placeholder, split at page granularity, and refilled. */
+typedef PVOID (WINAPI *va2_fn)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER *, ULONG);
+typedef PVOID (WINAPI *mv3_fn)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER *, ULONG);
+static va2_fn va2;
+static mv3_fn mv3;
+
+static void ph_init(void)
+{
+	static volatile LONG done;
+	if (InterlockedExchange(&done, 1))
+		return;
+	HMODULE kb = GetModuleHandleW(L"kernelbase.dll");
+	if (kb) {
+		va2 = (va2_fn)(void *)GetProcAddress(kb, "VirtualAlloc2");
+		mv3 = (mv3_fn)(void *)GetProcAddress(kb, "MapViewOfFile3");
+	}
+}
+
+static char *va_commit(char *at, u64 len, int prot)
+{
+	if (!va2)
+		return VirtualAlloc(at, len, MEM_RESERVE | MEM_COMMIT, page_prot(prot, 0));
+	if (!at) {
+		at = va2(NULL, NULL, len, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, NULL, 0);
+		if (!at)
+			return NULL;
+	}
+	char *p = va2(NULL, at, len, MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER, page_prot(prot, 0), NULL, 0);
+	if (!p)
+		VirtualFree(at, 0, MEM_RELEASE);
+	return p;
+}
+
+/* MAP_FIXED of a file view at [addr, addr+len) inside a private anonymous
+ * region: the region becomes [head][view][tail]. The head and tail read as
+ * zero afterwards -- bmc maps over a region it has just created (utxo_live:
+ * the table's header page is the file's first page), never over live data. */
+static i64 map_fixed_view(char *addr, u64 len, int prot, HANDLE section, HANDLE file, i64 off)
+{
+	if (!va2 || !mv3 || (off & 0xffff))
+		return -L_EINVAL;
+	AcquireSRWLockExclusive(&reg_lock);
+	region **pp = &regions, *r = NULL;
+	for (; *pp; pp = &(*pp)->next)
+		if (addr >= (*pp)->user && addr + len <= (*pp)->user + (*pp)->len && (*pp)->kind == R_VA) {
+			r = *pp;
+			break;
+		}
+	if (!r) {
+		ReleaseSRWLockExclusive(&reg_lock);
+		return -L_EINVAL;
+	}
+	char *s = r->base, *e = r->base + r->len, *b = addr + len;
+	if (!VirtualFree(s, (SIZE_T)r->len, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) ||
+	    (addr > s && !VirtualFree(s, (SIZE_T)(addr - s), MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) ||
+	    (b < e && !VirtualFree(addr, (SIZE_T)len, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER))) {
+		ReleaseSRWLockExclusive(&reg_lock);
+		return ws_err(GetLastError());
+	}
+	DWORD vp = (prot & L_PROT_WRITE) ? PAGE_READWRITE : PAGE_READONLY;
+	char *v = mv3(section, GetCurrentProcess(), addr, (ULONG64)off, (SIZE_T)len, MEM_REPLACE_PLACEHOLDER, vp, NULL, 0);
+	char *h = addr > s ? va_commit(s, (u64)(addr - s), r->prot) : s;
+	char *t = b < e ? va_commit(b, (u64)(e - b), r->prot) : b;
+	if (!v || !h || !t) {
+		ReleaseSRWLockExclusive(&reg_lock);
+		return -L_ENOMEM;
+	}
+	*pp = r->next;                         /* replace r by its pieces */
+	region *pieces[3] = { NULL, NULL, NULL };
+	if (addr > s) {
+		pieces[0] = ws_alloc(sizeof(region));
+		*pieces[0] = *r;
+		pieces[0]->base = pieces[0]->user = s;
+		pieces[0]->len = (u64)(addr - s);
+	}
+	pieces[1] = ws_alloc(sizeof(region));
+	pieces[1]->kind = R_VIEW;
+	pieces[1]->base = pieces[1]->user = v;
+	pieces[1]->len = len;
+	pieces[1]->section = section;
+	pieces[1]->file = file;
+	pieces[1]->shared = 1;
+	pieces[1]->prot = prot;
+	if (b < e) {
+		pieces[2] = ws_alloc(sizeof(region));
+		*pieces[2] = *r;
+		pieces[2]->base = pieces[2]->user = b;
+		pieces[2]->len = (u64)(e - b);
+	}
+	for (int i = 0; i < 3; i++)
+		if (pieces[i]) {
+			pieces[i]->next = regions;
+			regions = pieces[i];
+		}
+	ws_free(r);
+	ReleaseSRWLockExclusive(&reg_lock);
+	return (i64)addr;
+}
+
 static i64 sys_mmap(char *addr, u64 len, int prot, int flags, int fd, i64 off)
 {
 	if (!len || (off & (PAGE - 1)) || off < 0)
 		return -L_EINVAL;
-	if (flags & (L_MAP_FIXED | L_MAP_FIXED_NOREPLACE)) {
-		/* bmc does not place mappings; refuse rather than corrupt */
-		(void)addr;
+	ph_init();
+	int fixed = (flags & (L_MAP_FIXED | L_MAP_FIXED_NOREPLACE)) != 0;
+	if (fixed && ((u64)addr & (PAGE - 1)))
 		return -L_EINVAL;
-	}
 	len = (len + PAGE - 1) & ~(PAGE - 1);
 	int shared = (flags & 3) == L_MAP_SHARED || (flags & 3) == L_MAP_SHARED_VALIDATE;
+	if (fixed && ((flags & L_MAP_ANONYMOUS) || !shared))
+		return -L_EINVAL;                  /* only the shared file view bmc places */
 	region *r = ws_alloc(sizeof *r);
 	if (!r)
 		return -L_ENOMEM;
@@ -116,7 +219,7 @@ static i64 sys_mmap(char *addr, u64 len, int prot, int flags, int fd, i64 off)
 	r->prot = prot;
 	if ((flags & L_MAP_ANONYMOUS) && !shared) {
 		r->kind = R_VA;
-		r->base = VirtualAlloc(NULL, len, MEM_RESERVE | MEM_COMMIT, page_prot(prot, 0));
+		r->base = va_commit(NULL, len, prot);
 		if (!r->base) {
 			ws_free(r);
 			return -L_ENOMEM;
@@ -124,6 +227,38 @@ static i64 sys_mmap(char *addr, u64 len, int prot, int flags, int fd, i64 off)
 		r->user = r->base;
 		link_region(r);
 		return (i64)r->user;
+	}
+	if (fixed) {
+		ws_desc *d = ws_fd_get(fd);
+		if (!d || d->type != FT_FILE) {
+			if (d)
+				ws_desc_put(d);
+			ws_free(r);
+			return -L_EBADF;
+		}
+		if ((prot & L_PROT_WRITE) && !(d->flags & 3)) {
+			ws_desc_put(d);
+			ws_free(r);
+			return -L_EACCES;
+		}
+		HANDLE sec = CreateFileMappingW(d->h, NULL, (prot & L_PROT_WRITE) ? PAGE_READWRITE : PAGE_READONLY, 0, 0,
+						NULL);
+		HANDLE file = NULL;
+		DuplicateHandle(GetCurrentProcess(), d->h, GetCurrentProcess(), &file, 0, FALSE, DUPLICATE_SAME_ACCESS);
+		ws_desc_put(d);
+		ws_free(r);
+		if (!sec) {
+			if (file)
+				CloseHandle(file);
+			return ws_err(GetLastError());
+		}
+		i64 res = map_fixed_view(addr, len, prot, sec, file, off);
+		if (res < 0) {
+			CloseHandle(sec);
+			if (file)
+				CloseHandle(file);
+		}
+		return res;
 	}
 	r->kind = R_VIEW;
 	DWORD acc;
@@ -333,5 +468,38 @@ i64 ws_sys_mem(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *handl
 	default:
 		*handled = 0;
 		return 0;
+	}
+}
+
+/* ---- fork (ws_fork.c): views of sections are shared with the child
+ * (MAP_SHARED stays shared), private memory is copied on write; the region
+ * list's own handles must be inheritable to stay valid there ---- */
+void ws_mem_fork_prepare(void)
+{
+	AcquireSRWLockExclusive(&reg_lock);
+	for (region *r = regions; r; r = r->next) {
+		if (r->section)
+			SetHandleInformation(r->section, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+		if (r->file)
+			SetHandleInformation(r->file, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+	}
+}
+
+void ws_mem_fork_done(int child)
+{
+	(void)child;
+	ReleaseSRWLockExclusive(&reg_lock);
+}
+
+WSAPI void __bmc_win_heap_stats(size_t *committed, size_t *allocated)
+{
+	HEAP_SUMMARY hs;
+	__ws_memset(&hs, 0, sizeof hs);
+	hs.cb = sizeof hs;
+	if (HeapSummary(GetProcessHeap(), 0, &hs)) {
+		*committed = hs.cbCommitted;
+		*allocated = hs.cbAllocated;
+	} else {
+		*committed = *allocated = 0;
 	}
 }

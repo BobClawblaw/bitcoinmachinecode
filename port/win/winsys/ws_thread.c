@@ -34,7 +34,7 @@ WSAPI i64 __bmc_win_thread_create(ws_thread_fn fn, void *arg, size_t stack, void
 	/* committed in full (no STACK_SIZE_PARAM_IS_A_RESERVATION): the SysV
 	 * assembly moves rsp by large frames without probing guard pages */
 	DWORD tid;
-	HANDLE h = CreateThread(NULL, stack, thread_main, t, 0, &tid);
+	HANDLE h = ws_create_thread(thread_main, t, stack, &tid);
 	if (!h) {
 		ws_free(t);
 		return ws_err(GetLastError());
@@ -152,9 +152,48 @@ i64 ws_sys_thread(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *ha
 	case 60:                                           /* exit (this thread) */
 		ws_sig_thread_end();
 		ExitThread((DWORD)a1);
-	case 231: ExitProcess((UINT)a1);                   /* exit_group */
+	case 231: ws_exit_process((UINT)a1);              /* exit_group */
 	default:
 		*handled = 0;
 		return 0;
 	}
+}
+
+/* ---- every winsys thread starts through here ----
+ * A thread is "starting" from CreateThread until its own code runs, i.e.
+ * until the loader has finished its DLL thread-attach. RtlCloneUserProcess
+ * waits for such threads, and they may need locks the forking thread holds
+ * (the heap), so fork waits until none is starting (ws_threads_settle). */
+static volatile LONG starting;
+
+typedef struct { LPTHREAD_START_ROUTINE fn; void *arg; } starter;
+
+static DWORD WINAPI start_main(LPVOID p)
+{
+	starter s = *(starter *)p;
+	ws_free(p);
+	InterlockedDecrement(&starting);
+	return s.fn(s.arg);
+}
+
+HANDLE ws_create_thread(LPTHREAD_START_ROUTINE fn, void *arg, size_t stack, DWORD *tid)
+{
+	starter *s = ws_alloc(sizeof *s);
+	if (!s)
+		return NULL;
+	s->fn = fn;
+	s->arg = arg;
+	InterlockedIncrement(&starting);
+	HANDLE h = CreateThread(NULL, stack, start_main, s, 0, tid);
+	if (!h) {
+		InterlockedDecrement(&starting);
+		ws_free(s);
+	}
+	return h;
+}
+
+void ws_threads_settle(void)
+{
+	while (starting)
+		SwitchToThread();
 }

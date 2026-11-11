@@ -77,6 +77,9 @@ typedef struct ws_desc {
 	i64 dir_pos;
 	int flock_held;        /* flock: 0 none, 1 shared, 2 exclusive */
 	DWORD rcvtimeo, sndtimeo;  /* sockets: SO_RCVTIMEO / SO_SNDTIMEO in ms, 0 = none */
+	struct sockaddr_storage peer;  /* sockets: the address connected to / accepted from */
+	int peerlen;
+	volatile LONG connected;   /* sockets: the connection is known to be up */
 } ws_desc;
 void ws_fd_init(void);
 ws_desc *ws_fd_get(int fd);       /* +1 ref, NULL if not open */
@@ -118,6 +121,21 @@ i64 ws_sig_kill_self(int sig);
 u64 ws_sig_current_mask(void);
 void ws_sig_thread_inherit_mask(u64 m);
 i64 ws_sys_sig(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *handled);
+
+/* ---- ws_fork.c ---- */
+extern int ws_is_root;             /* 0 in a forked (cloned) process */
+void ws_fork_init(void);
+void ws_broker_start(void);
+void ws_broker_child(void);
+HANDLE ws_create_thread(LPTHREAD_START_ROUTINE fn, void *arg, size_t stack, DWORD *tid);
+void ws_threads_settle(void);
+int ws_sig_take_pending(void);
+i64 ws_sys_exec(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *handled);
+i64 ws_sys_fork(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *handled);
+i64 ws_kill_other(int pid, int sig);
+void ws_exit_process(UINT code) __attribute__((noreturn));
+int ws_sig_disposition(int sig);
+void ws_exit_signaled(int sig) __attribute__((noreturn));
 
 /* ---- entry points used by the SysV side (ms_abi there) ---- */
 WSAPI i64 __bmc_win_syscall(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6);

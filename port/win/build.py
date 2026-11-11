@@ -31,7 +31,7 @@ import urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, '..', '..'))
 ASM = os.path.join(ROOT, 'asm')
-OUT = os.path.join(HERE, 'out')
+OUT = os.environ.get('BMC_WIN_OUT') or os.path.join(HERE, 'out')
 DEPS = os.path.join(HERE, '.deps')
 sys.path.insert(0, os.path.join(HERE, 'tools'))
 import retarget  # noqa: E402
@@ -225,6 +225,8 @@ def musl_cflags():
 
 def user_inc():
     """The include path user code (bmc, rt) sees: musl's public headers."""
+    fetch_musl()
+    musl_headers()
     return ['-nostdinc', '-isystem', os.path.join(HERE, 'include'),
             '-isystem', os.path.join(MUSL_OBJ, 'include'),
             '-isystem', os.path.join(MUSL, 'arch', 'x86_64'),
@@ -414,7 +416,7 @@ def build_winsys():
 BMC_CFLAGS = ['-Wall', '-Werror', '-DBMC_WIN=1',
               # clang-only diagnostics the gcc gate (asm/Makefile) does not have
               '-Wno-unused-but-set-global', '-Wno-unused-but-set-variable',
-              '-Wno-tautological-overlap-compare']
+              '-Wno-tautological-overlap-compare', '-Wno-uninitialized-const-pointer']
 _MK = None
 
 
@@ -432,7 +434,29 @@ def _variant(extra):
     return '.' + hashlib.sha1(' '.join(extra).encode()).hexdigest()[:8]
 
 
+def generated_headers():
+    """asm/version_gen.h and asm/build_gen.h, as asm/Makefile makes them (both gitignored)."""
+    vg = os.path.join(ASM, 'version_gen.h')
+    if newer(vg, os.path.join(ASM, 'version.inc'), os.path.join(ASM, 'gen_version_header.py')):
+        run([sys.executable, 'gen_version_header.py', '--out', 'version_gen.h', '--version-inc', 'version.inc'],
+            cwd=ASM)
+    r = subprocess.run(['git', '-C', ROOT, 'rev-parse', '--short', 'HEAD'], capture_output=True, text=True)
+    commit = r.stdout.strip() or 'unknown'
+    dirty = subprocess.run(['git', '-C', ROOT, 'diff', '--quiet', 'HEAD'], capture_output=True).returncode != 0
+    text = ('/* build_gen.h -- GENERATED. Do not edit. */\n#ifndef BMC_BUILD_GEN_H\n#define BMC_BUILD_GEN_H\n'
+            '#define BMC_BUILD_COMMIT "%s"\n#define BMC_BUILD_DIRTY %d\n#endif\n' % (commit, int(dirty)))
+    bg = os.path.join(ASM, 'build_gen.h')
+    if not os.path.exists(bg) or open(bg).read() != text:
+        open(bg, 'w', newline='\n').write(text)
+
+
+_GEN_DONE = []
+
+
 def bmc_c(src, extra=()):
+    if not _GEN_DONE:
+        generated_headers()
+        _GEN_DONE.append(1)
     src = os.path.abspath(os.path.join(ASM, src))
     rel = os.path.relpath(src, ASM)
     obj = os.path.join(OUT, 'bmc', os.path.splitext(rel)[0] + _variant(extra) + '.obj')
@@ -551,6 +575,11 @@ def main(argv):
             print(build_winsys())
         elif t.startswith('test:'):
             print(build_test(t[5:]))
+        elif t.startswith('port:'):         # port/win/tests/<name>.c, the port's own harnesses
+            src = os.path.join(HERE, 'tests', t[5:] + '.c')
+            obj = os.path.join(OUT, 'porttests', t[5:] + '.obj')
+            o = cc_sysv(src, obj, user_inc() + BMC_CFLAGS)
+            print(link(os.path.join(OUT, 'bin', t[5:] + '.exe'), [o]))
         else:
             sys.exit('unknown target ' + t)
 

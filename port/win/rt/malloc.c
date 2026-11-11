@@ -118,3 +118,18 @@ int __malloc_replaced;
 int __aligned_alloc_replaced;
 void __malloc_atfork(int who) { (void)who; }
 void __malloc_donate(char *a, char *b) { (void)a; (void)b; }
+
+/* glibc's mallinfo2: the process heap's committed and in-use bytes */
+struct bmc_mallinfo2 { size_t arena, ordblks, smblks, hblks, hblkhd, usmblks, fsmblks, uordblks, fordblks, keepcost; };
+__attribute__((ms_abi)) void __bmc_win_heap_stats(size_t *committed, size_t *allocated);
+
+struct bmc_mallinfo2 mallinfo2(void)
+{
+	struct bmc_mallinfo2 m = { 0 };
+	size_t c = 0, a = 0;
+	__bmc_win_heap_stats(&c, &a);
+	m.arena = c;
+	m.uordblks = a;
+	m.fordblks = c > a ? c - a : 0;
+	return m;
+}

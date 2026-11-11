@@ -242,10 +242,11 @@ static i64 raise_thread(DWORD tid, int sig)
 }
 
 /* ---------------------------------------------------------------- delivery */
-void ws_exit_signaled(int sig) __attribute__((noreturn));
 void ws_exit_signaled(int sig)
 {
-	ExitProcess(128 + (UINT)sig);
+	/* the root reports 128+sig as a shell would; a forked process uses the
+	 * marker wait4 decodes as "killed by sig" */
+	ws_exit_process(ws_is_root ? 128 + (UINT)sig : 0x4B4D5300u | (UINT)sig);
 }
 
 static void default_action(int sig)
@@ -423,7 +424,7 @@ static i64 set_itimer(i64 value_ms, i64 interval_ms, i64 *old_value_ms, i64 *old
 		itimer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
 		if (!itimer)
 			itimer = CreateWaitableTimerW(NULL, FALSE, NULL);
-		HANDLE th = CreateThread(NULL, 64 * 1024, itimer_main, NULL, 0, NULL);
+		HANDLE th = ws_create_thread(itimer_main, NULL, 64 * 1024, NULL);
 		if (th)
 			CloseHandle(th);
 	}
@@ -626,4 +627,68 @@ void ws_sig_init(void)
 	ws_sig_thread_start(1);
 	AddVectoredExceptionHandler(1, veh);
 	SetConsoleCtrlHandler(ctrl_handler, TRUE);
+}
+
+/* ---- fork (ws_fork.c) ----
+ * The child has only the forking thread: its registry is rebuilt around it
+ * with a fresh event, pending signals are cleared, dispositions and the
+ * mask are kept, and timers are not inherited (POSIX). */
+void ws_sig_fork_prepare(void)
+{
+	AcquireSRWLockExclusive(&alock);
+	AcquireSRWLockExclusive(&itlock);
+	AcquireSRWLockExclusive(&tlock);
+}
+
+void ws_sig_fork_done(int child)
+{
+	if (child) {
+		ws_ts *t = self;
+		threads = t;
+		if (t) {
+			t->next = NULL;
+			t->is_main = 1;
+			t->pending = 0;
+			t->futex = NULL;
+			t->sync_io = 0;
+			t->tid = GetCurrentThreadId();
+			t->ev = CreateEventW(NULL, TRUE, FALSE, NULL);
+			DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &t->th, 0, FALSE,
+					DUPLICATE_SAME_ACCESS);
+		}
+		itimer = NULL;
+		it_due_ms = 0;
+		it_interval_ms = 0;
+	}
+	ReleaseSRWLockExclusive(&tlock);
+	ReleaseSRWLockExclusive(&itlock);
+	ReleaseSRWLockExclusive(&alock);
+}
+
+int ws_sig_disposition(int sig)
+{
+	/* 0 default, 1 ignore, 2 handler */
+	AcquireSRWLockShared(&alock);
+	void *h = actions[sig].handler;
+	ReleaseSRWLockShared(&alock);
+	return h == NULL ? 0 : h == (void *)1 ? 1 : 2;
+}
+
+/* take one deliverable pending signal without running its handler (execve's
+ * stand-in forwards it to the program instead); 0 when none */
+int ws_sig_take_pending(void)
+{
+	ws_ts *t = self;
+	if (!deliverable(t))
+		return 0;
+	u64 d = (u64)t->pending & ~(u64)t->blocked;
+	int sig = 1;
+	while (!(d & 1)) {
+		d >>= 1;
+		sig++;
+	}
+	InterlockedAnd64(&t->pending, ~(LONG64)BIT(sig));
+	if (!t->pending)
+		ResetEvent(t->ev);
+	return sig;
 }

@@ -281,3 +281,11 @@ void __synccall(void (*func)(void *), void *ctx)
 {
 	func(ctx);
 }
+
+void __pthread_testcancel(void)
+{
+}
+
+void __testcancel(void)
+{
+}
