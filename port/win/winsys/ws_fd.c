@@ -105,12 +105,14 @@ ws_desc *ws_fd_get(int fd)
 	return d;
 }
 
+volatile int ws_nofile_cur = MAX_FD;    /* RLIMIT_NOFILE's soft limit (ws_proc.c) */
+
 int ws_fd_install(ws_desc *d, int cloexec, int min_fd)
 {
 	AcquireSRWLockExclusive(&fdt_lock);
 	int fd = min_fd < 0 ? 0 : min_fd;
 	for (;; fd++) {
-		int r = grow(fd);
+		int r = fd >= ws_nofile_cur ? -L_EMFILE : grow(fd);
 		if (r) {
 			ReleaseSRWLockExclusive(&fdt_lock);
 			ws_desc_put(d);
@@ -129,7 +131,7 @@ static int install_at(ws_desc *d, int fd, int cloexec)
 {
 	ws_desc *old = NULL;
 	AcquireSRWLockExclusive(&fdt_lock);
-	int r = grow(fd);
+	int r = fd >= ws_nofile_cur ? -L_EBADF : grow(fd);
 	if (r) {
 		ReleaseSRWLockExclusive(&fdt_lock);
 		ws_desc_put(d);
@@ -1329,10 +1331,41 @@ static i64 sys_chdir(const char *path)
 	return ok ? 0 : ws_err(e);
 }
 
+/* an anonymous pipe as a uniquely named one: CreatePipe opens through a
+ * named-pipe directory handle kernelbase caches at startup, which a forked
+ * (cloned) process does not have -- pipe() there failed */
+static BOOL make_pipe(HANDLE *r, HANDLE *w)
+{
+	static volatile LONG seq;
+	wchar_t name[96], *q = name;
+	const wchar_t *pre = L"\\\\.\\pipe\\bmc-anon-";
+	while (*pre)
+		*q++ = *pre++;
+	u64 parts[3] = { GetCurrentProcessId(), (u64)InterlockedIncrement(&seq), GetTickCount64() };
+	for (int i = 0; i < 3; i++) {
+		for (int sh = 60; sh >= 0; sh -= 4)
+			*q++ = L"0123456789abcdef"[(parts[i] >> sh) & 15];
+		*q++ = i < 2 ? L'-' : 0;
+	}
+	*r = CreateNamedPipeW(name, PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,
+			      PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+			      1, 65536, 65536, 0, NULL);
+	if (*r == INVALID_HANDLE_VALUE)
+		return FALSE;
+	*w = CreateFileW(name, GENERIC_WRITE | FILE_READ_ATTRIBUTES, 0, NULL, OPEN_EXISTING, 0, NULL);
+	if (*w == INVALID_HANDLE_VALUE) {
+		DWORD e = GetLastError();
+		CloseHandle(*r);
+		SetLastError(e);
+		return FALSE;
+	}
+	return TRUE;
+}
+
 static i64 sys_pipe(int *fds, int flags)
 {
 	HANDLE r, w;
-	if (!CreatePipe(&r, &w, NULL, 65536))
+	if (!make_pipe(&r, &w))
 		return ws_err(GetLastError());
 	ws_desc *dr = ws_desc_new(FT_PIPE), *dw = ws_desc_new(FT_PIPE);
 	if (!dr || !dw) {

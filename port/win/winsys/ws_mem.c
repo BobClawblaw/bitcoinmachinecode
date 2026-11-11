@@ -57,6 +57,8 @@ typedef struct region {
 	i64 off;             /* file views: file offset of user */
 	char *path;          /* file views: the file, POSIX form (for /proc/self/maps) */
 	char name[64];       /* anonymous: the PR_SET_VMA_ANON_NAME name */
+	int locked;          /* mlock'd (smaps Locked:) */
+	int dontdump;        /* MADV_DONTDUMP (smaps VmFlags dd) */
 } region;
 
 static region *regions;
@@ -431,8 +433,32 @@ static i64 sys_mprotect(char *addr, u64 len, int prot)
 	return 0;
 }
 
+/* mark the regions overlapping [addr, addr+len) (len 0: all of them):
+ * field 0 locked, 1 dontdump */
+static i64 mark_regions(char *addr, u64 len, int field, int val)
+{
+	int hit = 0;
+	AcquireSRWLockExclusive(&reg_lock);
+	for (region *r = regions; r; r = r->next)
+		if (!len || (r->user < addr + len && r->user + r->len > addr)) {
+			if (field == 0)
+				r->locked = val;
+			else
+				r->dontdump = val;
+			hit = 1;
+		}
+	ReleaseSRWLockExclusive(&reg_lock);
+	if (field == 0 && len && val)
+		VirtualLock(addr, len);        /* best effort: the working-set quota may refuse */
+	else if (field == 0 && len)
+		VirtualUnlock(addr, len);
+	return hit || !len ? 0 : -L_ENOMEM;
+}
+
 static i64 sys_madvise(char *addr, u64 len, int advice)
 {
+	if (advice == 16 || advice == 17)    /* MADV_DONTDUMP / MADV_DODUMP */
+		return mark_regions(addr, len, 1, advice == 16);
 	if (advice != 4)                     /* only MADV_DONTNEED changes contents */
 		return 0;
 	AcquireSRWLockShared(&reg_lock);
@@ -483,7 +509,12 @@ i64 ws_sys_mem(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *handl
 			return 0;
 		}
 		return name_regions((char *)a3, (u64)a4, (const char *)a5);
-	case 149: case 150: case 151: case 152: case 325: return 0;   /* mlock family */
+	case 149: case 325:                  /* mlock, mlock2 */
+		return a2 ? mark_regions((char *)((u64)a1 & ~(u64)(PAGE - 1)), (u64)a2 + ((u64)a1 & (PAGE - 1)), 0, 1) : 0;
+	case 150:                            /* munlock */
+		return a2 ? mark_regions((char *)((u64)a1 & ~(u64)(PAGE - 1)), (u64)a2 + ((u64)a1 & (PAGE - 1)), 0, 0) : 0;
+	case 151: return mark_regions(NULL, 0, 0, 1);   /* mlockall (MCL_FUTURE not kept) */
+	case 152: return mark_regions(NULL, 0, 0, 0);   /* munlockall */
 	default:
 		*handled = 0;
 		return 0;
@@ -593,7 +624,21 @@ char *ws_mem_maps_text(u64 *len, int smaps)
 			ws_sbuf_dec(&b, r->len / 1024);
 			ws_sbuf_str(&b, " kB\nRss:            ");
 			ws_sbuf_dec(&b, r->len / 1024);
-			ws_sbuf_str(&b, " kB\n");
+			ws_sbuf_str(&b, " kB\nLocked:         ");
+			ws_sbuf_dec(&b, r->locked ? r->len / 1024 : 0);
+			ws_sbuf_str(&b, " kB\nVmFlags:");
+			if (r->prot & L_PROT_READ)
+				ws_sbuf_str(&b, " rd");
+			if (r->prot & L_PROT_WRITE)
+				ws_sbuf_str(&b, " wr");
+			if (r->prot & L_PROT_EXEC)
+				ws_sbuf_str(&b, " ex");
+			ws_sbuf_str(&b, r->shared ? " sh mr mw me ms" : " mr mw me");
+			if (r->locked)
+				ws_sbuf_str(&b, " lo");
+			if (r->dontdump)
+				ws_sbuf_str(&b, " dd");
+			ws_sbuf_str(&b, "\n");
 		}
 		total += r->len;
 	}

@@ -164,14 +164,16 @@ static i64 sys_sysinfo(struct l_sysinfo *s)
 
 struct l_rlimit { u64 cur, max; };
 
+extern volatile int ws_nofile_cur;      /* ws_fd.c */
+
 static i64 sys_prlimit(int pid, int res, const struct l_rlimit *nw, struct l_rlimit *old)
 {
 	(void)pid;
-	(void)nw;
 	if (old) {
 		switch (res) {
 		case 7:  /* RLIMIT_NOFILE */
-			old->cur = old->max = 1 << 20;
+			old->cur = (u64)ws_nofile_cur;
+			old->max = 1 << 20;
 			break;
 		case 3:  /* RLIMIT_STACK */
 			old->cur = old->max = 16 << 20;
@@ -179,6 +181,11 @@ static i64 sys_prlimit(int pid, int res, const struct l_rlimit *nw, struct l_rli
 		default:
 			old->cur = old->max = ~0ULL;
 		}
+	}
+	if (nw && res == 7) {
+		if (nw->cur > nw->max || nw->max > (1 << 20))
+			return nw->max > (1 << 20) ? -L_EPERM : -L_EINVAL;
+		ws_nofile_cur = (int)nw->cur;
 	}
 	return 0;
 }
@@ -277,7 +284,7 @@ i64 ws_sys_time(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *hand
 	case 121: case 124: return (i64)GetCurrentProcessId();  /* getpgid / getsid */
 	case 109: return 0;                    /* setpgid */
 	case 97: return sys_prlimit(0, (int)a1, NULL, (struct l_rlimit *)a2);
-	case 160: return 0;                    /* setrlimit */
+	case 160: return sys_prlimit(0, (int)a1, (const struct l_rlimit *)a2, NULL);   /* setrlimit */
 	case 302: return sys_prlimit((int)a1, (int)a2, (const struct l_rlimit *)a3, (struct l_rlimit *)a4);
 	case 98: return sys_getrusage((int)a1, (struct l_rusage *)a2);
 	case 204: return sys_sched_getaffinity((int)a1, (size_t)a2, (unsigned char *)a3);
