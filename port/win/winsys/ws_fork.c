@@ -406,3 +406,8 @@ i64 ws_sys_fork(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *hand
 		return 0;
 	}
 }
+
+DWORD ws_parent_pid_of_self(void)
+{
+	return ws_is_root ? 1 : parent_pid;
+}

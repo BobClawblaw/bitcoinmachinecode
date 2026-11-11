@@ -86,9 +86,71 @@ def _code_only(ln, fn):
     return re.sub(r'\x00(\d+)\x00', lambda m: lits[int(m.group(1))], masked)
 
 
+_ELF_ONLY = re.compile(r'^\s*\.(type|size|ident|note\b)|^\s*\.section\s+"?\.note\.GNU-stack')
+
+
+def _asm_line(body):
+    """One top-level asm line: None to drop an ELF-only directive COFF has no
+    meaning for (.type/.size/.ident, the GNU-stack note), else the line."""
+    if _ELF_ONLY.match(body.replace('\\09', '\t')):
+        return None
+    return re.sub(r'^(\s*)\.section\s+\.rodata\b', r'\1.section .rdata', body)
+
+
+# Data the assembly exports is only as aligned as its .asm places it, but
+# clang takes the SysV ABI's word for an `extern` array of 16+ bytes (16) and
+# may fold a load of it into an alignment-checked SSE operand (the gcc gate
+# never emits one there; tests/test_bip39's m39_guard sits at 8 mod 16). In a
+# module that declares such an external global, its declared alignment and
+# the alignment claimed by loads/stores/memory intrinsics are capped at 8;
+# allocas keep theirs (the assembly may rely on aligned stack buffers).
+_EXT_ALIGN_RE = re.compile(r'^(@[\w.$"\-]+ = (?:[\w()]+ )*?external (?:[\w()]+ )*?global .*, align )(\d+)(.*)$')
+_OP_ALIGN_RE = re.compile(r'\balign (16|32|64)\b')
+
+
+def _cap_external_alignment(lines):
+    capped = False
+    for i, ln in enumerate(lines):
+        m = _EXT_ALIGN_RE.match(ln)
+        if m and int(m.group(2)) > 8:
+            lines[i] = m.group(1) + '8' + m.group(3)
+            capped = True
+    if not capped:
+        return
+    for i, ln in enumerate(lines):
+        if not ln.startswith(' ') or ' alloca ' in ln:
+            continue
+        if ' load ' in ln or ln.lstrip().startswith('store ') or '@llvm.mem' in ln or ' load atomic' in ln:
+            lines[i] = _OP_ALIGN_RE.sub('align 8', ln)
+
+
 def retarget_text(text, triple='x86_64-pc-windows-msvc'):
+    lines = text.split('\n')
+    _cap_external_alignment(lines)
+    text = '\n'.join(lines)
     res = []
+    in_masm = False
     for ln in text.split('\n'):
+        # module asm: `module asm "..."` (older) or a `module asm(...)` header
+        # followed by indented "..." lines (LLVM 23)
+        m = re.match(r'^module asm "(.*)"$', ln)
+        if m:
+            body = _asm_line(m.group(1))
+            if body is not None:
+                res.append('module asm "%s"' % body)
+            continue
+        if ln.startswith('module asm('):
+            in_masm = True
+            res.append(ln)
+            continue
+        if in_masm:
+            m = re.match(r'^(\s+)"(.*)"$', ln)
+            if m:
+                body = _asm_line(m.group(2))
+                if body is not None:
+                    res.append('%s"%s"' % (m.group(1), body))
+                continue
+            in_masm = False
         if ln.startswith('target triple'):
             ln = 'target triple = "%s"' % triple
         elif ln.startswith('target datalayout'):

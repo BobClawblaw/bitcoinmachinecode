@@ -9,6 +9,7 @@
  * aligned is mapped from the granule below and the pointer adjusted. A view
  * is only released once every byte of it has been munmapped. */
 #include "winsys.h"
+#include <psapi.h>
 
 #define L_PROT_READ 1
 #define L_PROT_WRITE 2
@@ -53,6 +54,9 @@ typedef struct region {
 	HANDLE section;      /* views: the section handle */
 	HANDLE file;         /* file views: duplicated file handle, for msync */
 	int shared, prot;
+	i64 off;             /* file views: file offset of user */
+	char *path;          /* file views: the file, POSIX form (for /proc/self/maps) */
+	char name[64];       /* anonymous: the PR_SET_VMA_ANON_NAME name */
 } region;
 
 static region *regions;
@@ -94,6 +98,7 @@ static void free_region(region *r)
 		if (r->file)
 			CloseHandle(r->file);
 	}
+	ws_free(r->path);
 	ws_free(r);
 }
 
@@ -137,7 +142,7 @@ static char *va_commit(char *at, u64 len, int prot)
  * region: the region becomes [head][view][tail]. The head and tail read as
  * zero afterwards -- bmc maps over a region it has just created (utxo_live:
  * the table's header page is the file's first page), never over live data. */
-static i64 map_fixed_view(char *addr, u64 len, int prot, HANDLE section, HANDLE file, i64 off)
+static i64 map_fixed_view(char *addr, u64 len, int prot, HANDLE section, HANDLE file, i64 off, char *path)
 {
 	if (!va2 || !mv3 || (off & 0xffff))
 		return -L_EINVAL;
@@ -150,6 +155,7 @@ static i64 map_fixed_view(char *addr, u64 len, int prot, HANDLE section, HANDLE 
 		}
 	if (!r) {
 		ReleaseSRWLockExclusive(&reg_lock);
+		ws_free(path);
 		return -L_EINVAL;
 	}
 	char *s = r->base, *e = r->base + r->len, *b = addr + len;
@@ -183,6 +189,8 @@ static i64 map_fixed_view(char *addr, u64 len, int prot, HANDLE section, HANDLE 
 	pieces[1]->file = file;
 	pieces[1]->shared = 1;
 	pieces[1]->prot = prot;
+	pieces[1]->path = path;
+	pieces[1]->off = off;
 	if (b < e) {
 		pieces[2] = ws_alloc(sizeof(region));
 		*pieces[2] = *r;
@@ -245,6 +253,7 @@ static i64 sys_mmap(char *addr, u64 len, int prot, int flags, int fd, i64 off)
 						NULL);
 		HANDLE file = NULL;
 		DuplicateHandle(GetCurrentProcess(), d->h, GetCurrentProcess(), &file, 0, FALSE, DUPLICATE_SAME_ACCESS);
+		char *path = d->wpath ? ws_path_to_posix(d->wpath) : NULL;
 		ws_desc_put(d);
 		ws_free(r);
 		if (!sec) {
@@ -252,7 +261,7 @@ static i64 sys_mmap(char *addr, u64 len, int prot, int flags, int fd, i64 off)
 				CloseHandle(file);
 			return ws_err(GetLastError());
 		}
-		i64 res = map_fixed_view(addr, len, prot, sec, file, off);
+		i64 res = map_fixed_view(addr, len, prot, sec, file, off, path);
 		if (res < 0) {
 			CloseHandle(sec);
 			if (file)
@@ -337,6 +346,8 @@ static i64 sys_mmap(char *addr, u64 len, int prot, int flags, int fd, i64 off)
 		return e;
 	}
 	DuplicateHandle(GetCurrentProcess(), d->h, GetCurrentProcess(), &r->file, 0, FALSE, DUPLICATE_SAME_ACCESS);
+	r->path = d->wpath ? ws_path_to_posix(d->wpath) : NULL;
+	r->off = off;
 	ws_desc_put(d);
 	r->user = r->base + delta;
 	link_region(r);
@@ -453,6 +464,8 @@ static i64 sys_msync(char *addr, u64 len, int flags)
 	return 0;
 }
 
+static i64 name_regions(char *a, u64 len, const char *name);
+
 i64 ws_sys_mem(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *handled)
 {
 	*handled = 1;
@@ -464,6 +477,12 @@ i64 ws_sys_mem(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *handl
 	case 28: return sys_madvise((char *)a1, (u64)a2, (int)a3);
 	case 26: return sys_msync((char *)a1, (u64)a2, (int)a3);
 	case 12: return 0;                   /* brk: no program break; malloc is the heap */
+	case 157:                            /* prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, a, len, name) */
+		if (a1 != 0x53564d41 || a2 != 0) {
+			*handled = 0;
+			return 0;
+		}
+		return name_regions((char *)a3, (u64)a4, (const char *)a5);
 	case 149: case 150: case 151: case 152: case 325: return 0;   /* mlock family */
 	default:
 		*handled = 0;
@@ -502,4 +521,100 @@ WSAPI void __bmc_win_heap_stats(size_t *committed, size_t *allocated)
 	} else {
 		*committed = *allocated = 0;
 	}
+}
+
+/* PR_SET_VMA_ANON_NAME: name the anonymous regions in [a, a+len) */
+static i64 name_regions(char *a, u64 len, const char *name)
+{
+	AcquireSRWLockExclusive(&reg_lock);
+	int hit = 0;
+	for (region *r = regions; r; r = r->next) {
+		if (r->user + r->len <= a || r->user >= a + len || r->path)
+			continue;
+		size_t i = 0;
+		for (; name && name[i] && i < sizeof r->name - 1; i++)
+			r->name[i] = name[i];
+		r->name[i] = 0;
+		hit = 1;
+	}
+	ReleaseSRWLockExclusive(&reg_lock);
+	return hit ? 0 : -L_EINVAL;
+}
+
+/* /proc/self/maps (smaps: 1 adds Size/Rss per region; smaps_rollup: 2) */
+char *ws_mem_maps_text(u64 *len, int smaps)
+{
+	struct { char *p; u64 n, cap; } b = { 0 };
+	AcquireSRWLockShared(&reg_lock);
+	u64 total = 0, n = 0;
+	for (region *r = regions; r; r = r->next)
+		n++;
+	region **v = ws_alloc(sizeof(region *) * (size_t)(n ? n : 1));
+	n = 0;
+	for (region *r = regions; r; r = r->next)
+		v[n++] = r;
+	for (u64 i = 1; i < n; i++)             /* by address, as the kernel lists them */
+		for (u64 j = i; j > 0 && v[j - 1]->user > v[j]->user; j--) {
+			region *t = v[j];
+			v[j] = v[j - 1];
+			v[j - 1] = t;
+		}
+	for (u64 i = 0; i < n && smaps != 2; i++) {
+		region *r = v[i];
+		ws_sbuf_hex(&b, (u64)r->user, 8);
+		ws_sbuf_str(&b, "-");
+		ws_sbuf_hex(&b, (u64)(r->user + r->len), 8);
+		ws_sbuf_str(&b, (r->prot & L_PROT_READ) ? " r" : " -");
+		ws_sbuf_str(&b, (r->prot & L_PROT_WRITE) ? "w" : "-");
+		ws_sbuf_str(&b, (r->prot & L_PROT_EXEC) ? "x" : "-");
+		ws_sbuf_str(&b, r->shared ? "s " : "p ");
+		ws_sbuf_hex(&b, (u64)r->off, 8);
+		ws_sbuf_str(&b, " 00:00 0");
+		const char *col = r->path ? r->path : NULL;
+		char nm[80];
+		if (!col && r->name[0]) {
+			size_t k = 0;
+			const char *pre = "[anon:";
+			for (; *pre; pre++)
+				nm[k++] = *pre;
+			for (const char *q = r->name; *q && k < sizeof nm - 2; q++)
+				nm[k++] = *q;
+			nm[k++] = ']';
+			nm[k] = 0;
+			col = nm;
+		}
+		if (col) {
+			ws_sbuf_str(&b, "                          ");
+			ws_sbuf_str(&b, col);
+		}
+		ws_sbuf_str(&b, "\n");
+		if (smaps == 1) {
+			ws_sbuf_str(&b, "Size:           ");
+			ws_sbuf_dec(&b, r->len / 1024);
+			ws_sbuf_str(&b, " kB\nRss:            ");
+			ws_sbuf_dec(&b, r->len / 1024);
+			ws_sbuf_str(&b, " kB\n");
+		}
+		total += r->len;
+	}
+	ReleaseSRWLockShared(&reg_lock);
+	ws_free(v);
+	if (smaps == 2) {
+		PROCESS_MEMORY_COUNTERS pm;
+		__ws_memset(&pm, 0, sizeof pm);
+		pm.cb = sizeof pm;
+		K32GetProcessMemoryInfo(GetCurrentProcess(), &pm, sizeof pm);
+		ws_sbuf_str(&b, "00000000-ffffffff ---p 00000000 00:00 0                          [rollup]\nRss:            ");
+		ws_sbuf_dec(&b, pm.WorkingSetSize / 1024);
+		ws_sbuf_str(&b, " kB\nPss:            ");
+		ws_sbuf_dec(&b, pm.WorkingSetSize / 1024);
+		ws_sbuf_str(&b, " kB\nAnonymous:      ");
+		ws_sbuf_dec(&b, pm.PagefileUsage / 1024);
+		ws_sbuf_str(&b, " kB\n");
+	}
+	(void)total;
+	if (!b.p)
+		ws_sbuf_str(&b, "");
+	*len = b.n;
+	return b.p;
 }

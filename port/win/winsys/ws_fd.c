@@ -30,6 +30,11 @@
 
 #define MAX_FD (1 << 20)
 
+static int is_proc(const char *path)
+{
+	return path && !__ws_memcmp(path, "/proc/", 6);
+}
+
 typedef struct { ws_desc *d; int cloexec; } ws_slot;
 static ws_slot *fdt;
 static int fdt_cap;
@@ -63,6 +68,7 @@ void ws_desc_put(ws_desc *d)
 	if (d->find && d->find != INVALID_HANDLE_VALUE)
 		FindClose(d->find);
 	ws_free(d->wpath);
+	ws_free(d->mem);
 	ws_free(d);
 }
 
@@ -232,6 +238,14 @@ static i64 stat_handle(HANDLE h, int type, struct l_stat *st)
 		st->st_mode = 0010000 | 0600;
 		return 0;
 	}
+	if (type == FT_MEM) {
+		st->st_mode = 0100000 | 0444;
+		return 0;
+	}
+	if (type == FT_MEMDIR) {
+		st->st_mode = 0040000 | 0555;
+		return 0;
+	}
 	if (type == FT_SOCKET) {
 		st->st_mode = 0140000 | 0777;
 		return 0;
@@ -291,6 +305,19 @@ static i64 sys_stat_path(int dirfd, const char *path, struct l_stat *st, int fla
 		if (!d)
 			return -L_EBADF;
 		i64 r = stat_handle(d->h, d->type, st);
+		if (!r && d->type == FT_MEM)
+			st->st_size = (i64)d->memlen;
+		ws_desc_put(d);
+		return r;
+	}
+	if (is_proc(path)) {
+		i64 e2;
+		ws_desc *d = ws_procfs_open(path, &e2);
+		if (!d)
+			return e2;
+		i64 r = stat_handle(NULL, d->type, st);
+		if (d->type == FT_MEM)
+			st->st_size = (i64)d->memlen;
 		ws_desc_put(d);
 		return r;
 	}
@@ -315,6 +342,15 @@ static i64 sys_open(int dirfd, const char *path, int flags, int mode)
 {
 	i64 err;
 	int cloexec = (flags & L_O_CLOEXEC) != 0;
+	if (is_proc(path)) {
+		if ((flags & L_O_ACCMODE) != 0)
+			return -L_EACCES;
+		ws_desc *d = ws_procfs_open(path, &err);
+		if (!d)
+			return err;
+		d->flags = flags & L_O_ACCMODE;
+		return ws_fd_install(d, cloexec, 0);
+	}
 	if (path && (!__ws_memcmp(path, "/dev/urandom", 13) || !__ws_memcmp(path, "/dev/random", 12))) {
 		ws_desc *d = ws_desc_new(FT_RANDOM);
 		return d ? ws_fd_install(d, cloexec, 0) : -L_ENOMEM;
@@ -491,6 +527,25 @@ static i64 do_rw(int fd, void *buf, size_t n, i64 pos, int write, int positioned
 	case FT_NULL:
 		r = write ? (i64)n : 0;
 		break;
+	case FT_MEM:
+		if (write) {
+			r = -L_EBADF;
+		} else {
+			AcquireSRWLockExclusive(&d->lock);
+			i64 at = positioned ? pos : d->off;
+			u64 avail = (u64)at < d->memlen ? d->memlen - (u64)at : 0;
+			if (n > avail)
+				n = (size_t)avail;
+			__ws_memcpy(buf, d->mem + at, n);
+			if (!positioned)
+				d->off = at + (i64)n;
+			ReleaseSRWLockExclusive(&d->lock);
+			r = (i64)n;
+		}
+		break;
+	case FT_MEMDIR:
+		r = -L_EISDIR;
+		break;
 	case FT_RANDOM:
 		r = write ? (i64)n : fill_random(buf, n);
 		break;
@@ -553,7 +608,8 @@ static i64 sys_lseek(int fd, i64 off, int whence)
 	if (!d)
 		return -L_EBADF;
 	i64 r;
-	if (d->type != FT_FILE && d->type != FT_DIR && d->type != FT_NULL) {
+	if (d->type != FT_FILE && d->type != FT_DIR && d->type != FT_NULL && d->type != FT_MEM &&
+	    d->type != FT_MEMDIR) {
 		ws_desc_put(d);
 		return -L_ESPIPE;
 	}
@@ -564,7 +620,7 @@ static i64 sys_lseek(int fd, i64 off, int whence)
 	} else if (whence == 1) {
 		base = d->off;
 	} else if (whence == 2) {
-		r = d->type == FT_FILE ? file_size(d->h, &sz) : (sz = 0, 0);
+		r = d->type == FT_FILE ? file_size(d->h, &sz) : (sz = d->type == FT_MEM ? (i64)d->memlen : 0, 0);
 		if (r) {
 			ReleaseSRWLockExclusive(&d->lock);
 			ws_desc_put(d);
@@ -594,7 +650,7 @@ static i64 sys_lseek(int fd, i64 off, int whence)
 		d->off = base + off;
 		r = (i64)d->off;
 	}
-	if (d->type == FT_DIR && d->off == 0) {
+	if ((d->type == FT_DIR || d->type == FT_MEMDIR) && d->off == 0) {
 		if (d->find && d->find != INVALID_HANDLE_VALUE)
 			FindClose(d->find);
 		d->find = NULL;
@@ -909,6 +965,33 @@ static i64 sys_getdents64(int fd, void *buf, size_t cnt)
 	ws_desc *d = ws_fd_get(fd);
 	if (!d)
 		return -L_EBADF;
+	if (d->type == FT_MEMDIR) {
+		AcquireSRWLockExclusive(&d->lock);
+		char *out = buf;
+		size_t used = 0;
+		i64 idx = 0;
+		for (u64 at = 0; at < d->memlen; idx++) {
+			const char *name = d->mem + at;
+			size_t nl = ws_strlen(name);
+			at += nl + 1;
+			if (idx < d->dir_pos)
+				continue;
+			size_t rec = (sizeof(struct l_dirent64) + nl + 1 + 7) & ~(size_t)7;
+			if (used + rec > cnt)
+				break;
+			struct l_dirent64 *e = (struct l_dirent64 *)(out + used);
+			e->d_ino = (u64)(idx + 1);
+			e->d_off = idx + 1;
+			e->d_reclen = (unsigned short)rec;
+			e->d_type = 4;
+			__ws_memcpy(e->d_name, name, nl + 1);
+			used += rec;
+			d->dir_pos = idx + 1;
+		}
+		ReleaseSRWLockExclusive(&d->lock);
+		ws_desc_put(d);
+		return (i64)used;
+	}
 	if (d->type != FT_DIR) {
 		ws_desc_put(d);
 		return -L_ENOTDIR;
@@ -1224,7 +1307,10 @@ i64 ws_sys_file(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *hand
 	case 257: return sys_open((int)a1, (const char *)a2, (int)a3, (int)a4);
 	case 262: return sys_stat_path((int)a1, (const char *)a2, (struct l_stat *)a3, (int)a4);
 	case 217: return sys_getdents64((int)a1, (void *)a2, (size_t)a3);
-	case 89: case 267: return -L_EINVAL;   /* readlink: no symlinks are made */
+	case 89:                               /* readlink: /proc links; no others are made */
+		return is_proc((const char *)a1) ? ws_procfs_readlink((const char *)a1, (char *)a2, (size_t)a3) : -L_EINVAL;
+	case 267:
+		return is_proc((const char *)a2) ? ws_procfs_readlink((const char *)a2, (char *)a3, (size_t)a4) : -L_EINVAL;
 	case 86: case 265: case 88: case 266: return -L_EPERM;  /* link / symlink */
 	case 90: case 91: case 268: case 92: case 93: case 94: case 260: return 0;  /* chmod/chown */
 	case 95: return 022;                   /* umask */
@@ -1296,4 +1382,18 @@ void ws_fd_close_on_exec(void)
 		ReleaseSRWLockExclusive(&fdt_lock);
 		ws_desc_put(d);
 	}
+}
+
+/* /proc/self/fd: the open fd numbers */
+int ws_fd_list(void (*emit)(void *ctx, int fd), void *ctx)
+{
+	int n = 0;
+	AcquireSRWLockShared(&fdt_lock);
+	for (int i = 0; i < fdt_cap; i++)
+		if (fdt[i].d) {
+			emit(ctx, i);
+			n++;
+		}
+	ReleaseSRWLockShared(&fdt_lock);
+	return n;
 }

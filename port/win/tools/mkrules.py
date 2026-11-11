@@ -228,5 +228,9 @@ def obj_spec(mk, target):
                     defs.append(w if len(w) > 2 else '-D' + words[k + 1])
                 elif w.startswith('-I') and kind == 'cc':
                     incs.append(w[2:] if len(w) > 2 else words[k + 1])
-            return {'src': srcs[0], 'kind': kind, 'defines': defs, 'includes': incs}
+            renames = []
+            for later in recipe:
+                if 'objcopy' in later:
+                    renames += re.findall(r'--redefine-sym\s+(\S+=\S+)', mk.expand(later, auto))
+            return {'src': srcs[0], 'kind': kind, 'defines': defs, 'includes': incs, 'renames': renames}
     return None

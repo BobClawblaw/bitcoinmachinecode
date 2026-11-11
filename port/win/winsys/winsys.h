@@ -61,7 +61,8 @@ void ws_fmt_u64(char *buf, u64 v);
 wchar_t *ws_path(int dirfd, const char *path, i64 *err);
 
 /* ---- ws_fd.c ---- */
-enum { FT_FREE = 0, FT_FILE, FT_DIR, FT_CONSOLE, FT_PIPE, FT_NULL, FT_RANDOM, FT_SOCKET };
+enum { FT_FREE = 0, FT_FILE, FT_DIR, FT_CONSOLE, FT_PIPE, FT_NULL, FT_RANDOM, FT_SOCKET,
+       FT_MEM, FT_MEMDIR };  /* /proc files and directories built at open (ws_procfs.c) */
 typedef struct ws_desc {
 	volatile LONG refs;
 	int type;
@@ -80,6 +81,8 @@ typedef struct ws_desc {
 	struct sockaddr_storage peer;  /* sockets: the address connected to / accepted from */
 	int peerlen;
 	volatile LONG connected;   /* sockets: the connection is known to be up */
+	char *mem;                 /* FT_MEM: the content; FT_MEMDIR: NUL-separated names */
+	u64 memlen;
 } ws_desc;
 void ws_fd_init(void);
 ws_desc *ws_fd_get(int fd);       /* +1 ref, NULL if not open */
@@ -121,6 +124,14 @@ i64 ws_sig_kill_self(int sig);
 u64 ws_sig_current_mask(void);
 void ws_sig_thread_inherit_mask(u64 m);
 i64 ws_sys_sig(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *handled);
+
+/* ---- ws_procfs.c ---- */
+ws_desc *ws_procfs_open(const char *path, i64 *err);
+i64 ws_procfs_readlink(const char *path, char *buf, size_t cap);
+char *ws_path_to_posix(const wchar_t *w);
+void ws_sbuf_hex(void *b, u64 v, int width);
+void ws_sbuf_str(void *b, const char *s);
+void ws_sbuf_dec(void *b, u64 v);
 
 /* ---- ws_fork.c ---- */
 extern int ws_is_root;             /* 0 in a forked (cloned) process */

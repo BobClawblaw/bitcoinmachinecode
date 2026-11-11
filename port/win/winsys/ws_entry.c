@@ -137,12 +137,89 @@ static i64 dispatch(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6)
 	return -L_ENOSYS;
 }
 
+/* BMC_WIN_STRACE=1: every syscall to stderr as "[pid] nr(a1, a2, a3) = r",
+ * with path arguments of the common file calls shown as strings */
+static int strace_on = -1;
+
+static void hex64(char *o, u64 v)
+{
+	char t[17];
+	int i = 0;
+	do {
+		t[i++] = "0123456789abcdef"[v & 15];
+		v >>= 4;
+	} while (v);
+	*o++ = '0';
+	*o++ = 'x';
+	while (i)
+		*o++ = t[--i];
+	*o = 0;
+}
+
+static void strace_line(i64 n, i64 a1, i64 a2, i64 a3, i64 r)
+{
+	char line[512], num[24];
+	size_t k = 0;
+#define PUT(s) do { const char *s_ = (s); while (*s_ && k < sizeof line - 2) line[k++] = *s_++; } while (0)
+	PUT("[");
+	ws_fmt_u64(num, GetCurrentProcessId());
+	PUT(num);
+	PUT("] ");
+	ws_fmt_u64(num, (u64)n);
+	PUT(num);
+	PUT("(");
+	int path1 = n == 2 || n == 4 || n == 6 || n == 21 || n == 83 || n == 84 || n == 87 || n == 82 || n == 80;
+	int path2 = n == 257 || n == 262 || n == 263 || n == 258 || n == 269;
+	i64 args[3] = { a1, a2, a3 };
+	for (int i = 0; i < 3; i++) {
+		if (i)
+			PUT(", ");
+		if ((path1 && i == 0) || (path2 && i == 1)) {
+			PUT("\"");
+			const char *s = (const char *)args[i];
+			for (int j = 0; s && s[j] && j < 160; j++) {
+				char c[2] = { s[j], 0 };
+				PUT(c);
+			}
+			PUT("\"");
+		} else if (args[i] < 0 && args[i] > -4096) {
+			PUT("-");
+			ws_fmt_u64(num, (u64)-args[i]);
+			PUT(num);
+		} else if ((u64)args[i] > 0xffff) {
+			hex64(num, (u64)args[i]);
+			PUT(num);
+		} else {
+			ws_fmt_u64(num, (u64)args[i]);
+			PUT(num);
+		}
+	}
+	PUT(") = ");
+	if (r < 0 && r > -4096) {
+		PUT("-");
+		ws_fmt_u64(num, (u64)-r);
+	} else if ((u64)r > 0xffff) {
+		hex64(num, (u64)r);
+	} else {
+		ws_fmt_u64(num, (u64)r);
+	}
+	PUT(num);
+	PUT("\n");
+#undef PUT
+	line[k] = 0;
+	ws_write_stderr(line);
+}
+
 /* Signals pending for this thread are handled on the way out of a syscall;
  * an interrupted call whose handlers all have SA_RESTART runs again. */
 WSAPI i64 __bmc_win_syscall(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6)
 {
+	if (strace_on < 0)
+		strace_on = GetEnvironmentVariableA("BMC_WIN_STRACE", NULL, 0) ? 1 : 0;
 	for (;;) {
 		i64 r = dispatch(n, a1, a2, a3, a4, a5, a6);
+		if (strace_on)                  /* the trace itself writes with WriteFile, not a syscall */
+			strace_line(n, a1, a2, a3, r);
 		if (!ws_sig_pending_here())
 			return r;
 		int restart;

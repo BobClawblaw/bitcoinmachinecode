@@ -269,7 +269,9 @@ def cc_sysv(src, obj, flags, opt='-O2'):
     wll = obj + '.w.ll'
     with open(wll, 'w', encoding='utf-8', newline='\n') as f:
         f.write(text)
-    run([CLANG, '--target=x86_64-pc-windows-msvc', opt, '-Wno-override-module',
+    # code generation only: the IR was optimized for the Linux triple already, and
+    # re-running the middle end under the Windows triple could add Win64 libcalls
+    run([CLANG, '--target=x86_64-pc-windows-msvc', opt, '-Wno-override-module', '-Xclang', '-disable-llvm-passes',
          '-ffunction-sections', '-fdata-sections', '-c', wll, '-o', obj])
     os.remove(ll)
     os.remove(wll)
@@ -471,8 +473,29 @@ def bmc_asm(src, defines=(), tag=''):
     return nasm_win(src, obj, [ASM], defines)
 
 
+def bmc_S(src):
+    """GNU-assembler (.S) source: preprocessed as for Linux, ELF-only directives
+    dropped (retarget._asm_line), assembled for the Windows triple."""
+    src = os.path.abspath(os.path.join(ASM, src))
+    rel = os.path.relpath(src, ASM)
+    obj = os.path.join(OUT, 'bmc', os.path.splitext(rel)[0] + '.S.obj')
+    if not newer(obj, src, RETARGET_PY):
+        return obj
+    os.makedirs(os.path.dirname(obj), exist_ok=True)
+    pre = run([CLANG, '--target=x86_64-pc-linux-gnu', '-E', '-P', '-x', 'assembler-with-cpp',
+               '-I' + ASM, src]).stdout
+    lines = [retarget._asm_line(ln) for ln in pre.split('\n')]
+    s = obj + '.s'
+    with open(s, 'w', encoding='utf-8', newline='\n') as f:
+        f.write('\n'.join(ln for ln in lines if ln is not None) + '\n')
+    run([CLANG, '--target=x86_64-pc-windows-msvc', '-c', s, '-o', obj])
+    return obj
+
+
 def bmc_obj(path, extra=()):
-    """One Makefile input (.c, .asm, or a .o built by a pattern or explicit rule)."""
+    """One Makefile input (.c, .asm, .S, or a .o built by a pattern or explicit rule)."""
+    if path.endswith('.S'):
+        return bmc_S(path)
     if path.endswith('.c'):
         return bmc_c(path, extra)
     if path.endswith('.asm'):
@@ -481,9 +504,19 @@ def bmc_obj(path, extra=()):
         spec = mkrules.obj_spec(makefile(), path)
         if spec:
             if spec['kind'] == 'nasm':
-                return bmc_asm(spec['src'], spec['defines'], tag='.' + os.path.basename(path)[:-2])
-            fl = spec['defines'] + ['-I' + os.path.join(ASM, i) for i in spec['includes']]
-            return bmc_c(spec['src'], fl)
+                o = bmc_asm(spec['src'], spec['defines'], tag='.' + os.path.basename(path)[:-2])
+            else:
+                fl = spec['defines'] + ['-I' + os.path.join(ASM, i) for i in spec['includes']]
+                o = bmc_c(spec['src'], fl)
+            if spec.get('renames'):          # the rule's objcopy --redefine-sym step
+                ro = os.path.splitext(o)[0] + '.' + os.path.basename(path)[:-2] + '.renamed.obj'
+                if newer(ro, o):
+                    cmd = [OBJCOPY]
+                    for r in spec['renames']:
+                        cmd += ['--redefine-sym', r]
+                    run(cmd + [o, ro])
+                o = ro
+            return o
         stem = os.path.join(ASM, path[:-2])
         if os.path.exists(stem + '.asm'):
             return bmc_asm(stem + '.asm')
@@ -518,7 +551,8 @@ def link(exe, objs, base='0x10000000', wraps=()):
     builtins = os.path.join(os.path.dirname(_clang_resource_inc()), 'lib', 'windows',
                             'clang_rt.builtins-x86_64.lib')
     cmd += ['-wrap:' + w for w in wraps]
-    cmd += list(objs) + rt + ws + [build_portlib(), musl, builtins] + SYSLIBS
+    first = nasm_plain(os.path.join(HERE, 'link', 'data_bounds.asm'), os.path.join(OUT, 'link', 'data_bounds.obj'))
+    cmd += [first] + list(objs) + rt + ws + [build_portlib(), musl, builtins] + SYSLIBS
     run(cmd)
     return exe
 
@@ -543,11 +577,19 @@ def target_objs(target):
         extra += ['-include', os.path.join(ASM, f)]
     objs, seen = [], set()
     for p in spec['inputs']:
-        for q in (_archive_inputs(p) if p.endswith('.a') else [p]):
-            if q in seen:
-                continue
-            seen.add(q)
-            objs.append(bmc_obj(q, extra if q.endswith('.c') else ()))
+        if p.endswith('.a'):
+            # a real archive, as on Linux: only the members something needs are linked
+            members = [bmc_obj(q) for q in _archive_inputs(p)]
+            lib = os.path.join(OUT, 'bmc', os.path.splitext(p)[0].replace('/', os.sep) + '.lib')
+            os.makedirs(os.path.dirname(lib), exist_ok=True)
+            if lib not in seen:
+                seen.add(lib)
+                objs.append(archive(lib, members))
+            continue
+        if p in seen:
+            continue
+        seen.add(p)
+        objs.append(bmc_obj(p, extra if p.endswith('.c') else ()))
     return objs, spec['wraps']
 
 
