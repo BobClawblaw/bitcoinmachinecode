@@ -822,6 +822,31 @@ static i64 set_eof(HANDLE h, i64 len)
 	return 0;
 }
 
+/* (f)truncate. Windows refuses to cut a file below a live mapping of it
+ * (ERROR_USER_MAPPED_FILE: this process's or another's); Linux allows it.
+ * Then the cut range is zeroed instead and the call succeeds: the file keeps
+ * its physical size, but everything past the new end reads as zeros, as it
+ * would after Linux's shrink and a later regrow -- the use here is always
+ * "truncate, then map that size" */
+static i64 truncate_handle(HANDLE h, i64 len)
+{
+	FILE_END_OF_FILE_INFO e;
+	e.EndOfFile.QuadPart = len;
+	if (SetFileInformationByHandle(h, FileEndOfFileInfo, &e, sizeof e))
+		return 0;
+	DWORD err = GetLastError();
+	i64 sz;
+	if (err != ERROR_USER_MAPPED_FILE || file_size(h, &sz) || sz <= len)
+		return ws_err(err);
+	FILE_ZERO_DATA_INFORMATION z;
+	z.FileOffset.QuadPart = len;
+	z.BeyondFinalZero.QuadPart = sz;
+	DWORD got;
+	if (!DeviceIoControl(h, FSCTL_SET_ZERO_DATA, &z, sizeof z, NULL, 0, &got, NULL))
+		return ws_err(GetLastError());
+	return 0;
+}
+
 static i64 sys_ftruncate(int fd, i64 len)
 {
 	if (len < 0)
@@ -829,7 +854,7 @@ static i64 sys_ftruncate(int fd, i64 len)
 	ws_desc *d = ws_fd_get(fd);
 	if (!d)
 		return -L_EBADF;
-	i64 r = d->type == FT_FILE ? set_eof(d->h, len) : -L_EINVAL;
+	i64 r = d->type == FT_FILE ? truncate_handle(d->h, len) : -L_EINVAL;
 	ws_desc_put(d);
 	return r;
 }
@@ -845,7 +870,7 @@ static i64 sys_truncate(const char *path, i64 len)
 	ws_free(w);
 	if (h == INVALID_HANDLE_VALUE)
 		return ws_err(GetLastError());
-	i64 r = set_eof(h, len);
+	i64 r = truncate_handle(h, len);
 	CloseHandle(h);
 	return r;
 }
