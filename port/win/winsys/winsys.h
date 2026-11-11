@@ -85,7 +85,9 @@ typedef struct ws_desc {
 	u64 pair_key;              /* sockets from socketpair: the pair (SCM_RIGHTS escrow key) */
 	int pair_side;             /* ...and which end this is (0/1) */
 	volatile u64 last_rx_ms, last_tx_ms, since_ms;   /* sockets: TCP_INFO's last_data_* */
-	volatile u64 rx_pending_ms;   /* sockets: when unread data was first seen waiting (0 = none) */
+	volatile u64 rx_pending_ms;
+	volatile LONG64 rx_bytes, tx_bytes;
+	volatile LONG peer_fin;     /* sockets: a read saw the peer's end-of-file */   /* sockets: TCP_INFO's byte counts */   /* sockets: when unread data was first seen waiting (0 = none) */
 	u64 memlen;
 	volatile LONG shut;          /* sockets: shutdown() so far, bit 0 SHUT_RD, bit 1 SHUT_WR */
 	volatile LONG reset_seen;   /* sockets: a reset was reported once; reads now see EOF */

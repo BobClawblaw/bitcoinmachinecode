@@ -925,6 +925,19 @@ static i64 rw_stream(ws_desc *d, void *buf, size_t n, int write)
 	if (n > 0x7ffff000)
 		n = 0x7ffff000;
 	DWORD got = 0;
+	if (!write && d->type == FT_PIPE && (d->flags & L_O_NONBLOCK)) {
+		/* O_NONBLOCK: read only what is there; nothing -> EAGAIN, or
+		 * end-of-file once the writer is gone */
+		DWORD avail = 0;
+		if (!PeekNamedPipe(d->h, NULL, 0, NULL, &avail, NULL)) {
+			DWORD e = GetLastError();
+			return (e == ERROR_BROKEN_PIPE || e == ERROR_PIPE_NOT_CONNECTED) ? 0 : ws_err(e);
+		}
+		if (!avail)
+			return -L_EAGAIN;
+		if (n > avail)
+			n = avail;
+	}
 	if (!write)
 		ws_sig_sync_io(1);           /* a signal cancels the read: -EINTR */
 	BOOL ok = write ? WriteFile(d->h, buf, (DWORD)n, &got, NULL) : ReadFile(d->h, buf, (DWORD)n, &got, NULL);

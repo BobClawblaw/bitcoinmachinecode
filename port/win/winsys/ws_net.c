@@ -487,12 +487,16 @@ static i64 sys_name(int fd, void *addr, int *alen, int peer)
  * a write EPIPE. */
 static i64 io_result(ws_desc *d, i64 r, int write)
 {
+	if (r == 0 && !write)
+		d->peer_fin = 1;
 	if (r > 0) {
 		if (write) {
 			d->last_tx_ms = GetTickCount64();
+			InterlockedAdd64(&d->tx_bytes, r);
 		} else {
 			d->last_rx_ms = GetTickCount64();
 			d->rx_pending_ms = 0;
+			InterlockedAdd64(&d->rx_bytes, r);
 		}
 	}
 	if ((r == -L_ECONNRESET || r == -L_ECONNABORTED) && InterlockedExchange(&d->reset_seen, 1))
@@ -518,6 +522,8 @@ static i64 handle_io(ws_desc *d, void *buf, size_t n, int write)
  * readiness again, within its SO_RCVTIMEO/SO_SNDTIMEO */
 static i64 sock_io(ws_desc *d, void *buf, size_t n, int write)
 {
+	if (n == 0)                                /* Linux: at once, without waiting */
+		return 0;
 	ULONG ev = write ? AFD_POLL_SEND : AFD_POLL_RECEIVE | AFD_POLL_DISCONNECT;
 	DWORD timeo = write ? d->sndtimeo : d->rcvtimeo;
 	u64 deadline = timeo ? GetTickCount64() + timeo : 0;
@@ -591,7 +597,7 @@ static i64 sys_sendto(int fd, const void *buf, size_t n, int flags, const void *
 		int len = n > 0x7fffffff ? 0x7fffffff : (int)n;
 		int r = addr ? sendto(d->s, buf, len, wflags(flags), (struct sockaddr *)&a, wl)
 			     : send(d->s, buf, len, wflags(flags));
-		res = r == SOCKET_ERROR ? lasterr() : r;
+		res = io_result(d, r == SOCKET_ERROR ? lasterr() : r, 1);
 	}
 	ws_desc_put(d);
 	return res;
@@ -1024,6 +1030,18 @@ static i64 sys_getsockopt(int fd, int level, int opt, void *val, int *len)
 		__ws_memcpy(ti + 44, &since_tx, 4);     /* tcpi_last_data_sent */
 		__ws_memcpy(ti + 52, &since_rx, 4);     /* tcpi_last_data_recv */
 		__ws_memcpy(ti + 56, &since_rx, 4);     /* tcpi_last_ack_recv */
+		/* bytes through this descriptor: what we sent counts as acked
+		 * (loopback and LAN acknowledge at once; a fair reading elsewhere),
+		 * what we read as received */
+		u64 tx = (u64)d->tx_bytes, rxb = (u64)d->rx_bytes;
+		u_long queued = 0;                      /* arrived, not yet read (Winsock: root only) */
+		if (ws_is_root && ioctlsocket(d->s, FIONREAD, &queued) == 0)
+			rxb += queued;
+		if (d->peer_fin)
+			rxb++;                              /* the FIN's sequence number, as Linux counts */
+		__ws_memcpy(ti + 120, &tx, 8);          /* tcpi_bytes_acked */
+		__ws_memcpy(ti + 128, &rxb, 8);         /* tcpi_bytes_received */
+		__ws_memcpy(ti + 200, &tx, 8);          /* tcpi_bytes_sent */
 		uint32_t mss = 1460;
 		__ws_memcpy(ti + 16, &mss, 4);          /* tcpi_snd_mss */
 		__ws_memcpy(ti + 20, &mss, 4);          /* tcpi_rcv_mss */
