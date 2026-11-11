@@ -458,6 +458,8 @@ static i64 sys_stat_path(int dirfd, const char *path, struct l_stat *st, int fla
 	return r;
 }
 
+static i64 delete_path(const wchar_t *w, int want_dir);
+
 static i64 sys_open(int dirfd, const char *path, int flags, int mode)
 {
 	i64 err;
@@ -533,6 +535,26 @@ static i64 sys_open(int dirfd, const char *path, int flags, int mode)
 	}
 	HANDLE h = CreateFileW(w, acc, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, disp,
 			       FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, NULL);
+	if (h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_USER_MAPPED_FILE && (flags & L_O_TRUNC) && !isdir) {
+		/* O_TRUNC on a file something still maps (a reader's cached view of
+		 * the run this name held): Windows cannot cut it. Unlink it with
+		 * POSIX semantics instead -- the views keep the old contents, the
+		 * name is free -- and create the file afresh. A reader that checks
+		 * what it mapped (the LSM's generation) sees the old file whole
+		 * rather than Linux's truncated one. */
+		if (delete_path(w, 0) == 0) {
+			h = CreateFileW(w, acc, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, CREATE_NEW,
+					FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, NULL);
+			if (h != INVALID_HANDLE_VALUE) {
+				disp = CREATE_NEW;
+				if (!(flags & L_O_CREAT))
+					mode = 0644;
+				flags |= L_O_CREAT;
+			}
+		} else {
+			SetLastError(ERROR_USER_MAPPED_FILE);
+		}
+	}
 	if (h == INVALID_HANDLE_VALUE) {
 		DWORD e = GetLastError();
 		ws_free(w);

@@ -124,9 +124,83 @@ def _cap_external_alignment(lines):
             lines[i] = _OP_ALIGN_RE.sub('align 8', ln)
 
 
+# The SysV ABI leaves the upper half of a register holding an int/u32
+# argument undefined. gcc (the Linux build) in practice hands the assembly a
+# zero-extended register, and the assembly reads the full one (utxo_lsm_put's
+# script length went to write() as 0x02200220_00000016); clang leaves whatever
+# was there. So a direct call to a function this module only declares (the
+# assembly, or libc, where it is harmless) passes each i32 argument widened
+# to i64 by an explicit zext, as gcc effectively does.
+_DECL_NAME_RE = re.compile(r'^declare\b[^@]*(@[\w.$\-]+|@"[^"]+")\(')
+_I32_ARG_RE = re.compile(r'^i32((?:\s+(?:noundef|signext|zeroext|inreg|range\([^)]*\)))*)\s+(.+)$')
+_zext_seq = [0]
+
+
+def _split_args(s):
+    """Split a call's argument list at top-level commas."""
+    out, depth, cur = [], 0, []
+    for ch in s:
+        if ch in '([{<':
+            depth += 1
+        elif ch in ')]}>':
+            depth -= 1
+        if ch == ',' and depth == 0:
+            out.append(''.join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    if cur:
+        out.append(''.join(cur))
+    return out
+
+
+def _widen_i32_args(ln, declared):
+    """ln is one call line; returns [extra lines..., new line]."""
+    s = ln.lstrip()
+    if ' call ' not in ' ' + s or ' invoke ' in ' ' + s or 'asm ' in s:
+        return [ln]
+    m = re.search(r'\bcall (?:x86_64_sysvcc |win64cc )?[^@%(]*?(@[\w.$\-]+|@"[^"]+")\(', ln)
+    if not m or m.group(1) not in declared or m.group(1).startswith('@llvm.'):
+        return [ln]
+    head = ln[:m.end(1)]
+    if '(' in head[head.index('call '):]:      # an explicit function type: varargs, left alone
+        return [ln]
+    i = m.end()                                # just past the "("
+    depth, j = 1, i
+    while j < len(ln) and depth:
+        if ln[j] in '([{':
+            depth += 1
+        elif ln[j] in ')]}':
+            depth -= 1
+        j += 1
+    args = _split_args(ln[i:j - 1])
+    indent = ln[:len(ln) - len(s)]
+    pre, changed = [], False
+    for k, a in enumerate(args):
+        am = _I32_ARG_RE.match(a.strip())
+        if not am:
+            continue
+        _zext_seq[0] += 1
+        name = '%%__bmcz.%d' % _zext_seq[0]
+        pre.append('%s%s = zext i32 %s to i64' % (indent, name, am.group(2).strip()))
+        args[k] = ' i64 noundef ' + name if k else 'i64 noundef ' + name
+        changed = True
+    if not changed:
+        return [ln]
+    return pre + [ln[:i] + ','.join(args) + ln[j - 1:]]
+
+
 def retarget_text(text, triple='x86_64-pc-windows-msvc'):
     lines = text.split('\n')
     _cap_external_alignment(lines)
+    declared = {m.group(1) for m in (_DECL_NAME_RE.match(ln) for ln in lines) if m}
+    widened = []
+    for ln in lines:
+        if ln.startswith(' ') and 'call ' in ln and declared:
+            widened.extend(_code_only(ln, lambda s: '\n'.join(_widen_i32_args(s, declared))).split('\n'))
+        else:
+            widened.append(ln)
+    lines = widened
     text = '\n'.join(lines)
     res = []
     in_masm = False
