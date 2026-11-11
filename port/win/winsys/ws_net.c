@@ -53,6 +53,28 @@ static HANDLE thread_event(void)
 	return io_ev;
 }
 
+/* A failed socket handle operation's Win32 error as -errno */
+static i64 net_err(DWORD e)
+{
+	switch (e) {
+	case ERROR_NETNAME_DELETED: return -L_ECONNRESET;
+	case ERROR_CONNECTION_ABORTED: return -L_ECONNABORTED;
+	case ERROR_GRACEFUL_DISCONNECT: case ERROR_HANDLE_EOF: return 0;
+	case ERROR_PORT_UNREACHABLE: return -L_ECONNREFUSED;
+	case ERROR_OPERATION_ABORTED: return -L_EINTR;
+	}
+	if (e >= 10000)
+		return ws_wsaerr((int)e);
+	if (GetEnvironmentVariableA("BMC_WIN_NETDEBUG", NULL, 0)) {
+		char n1[24];
+		ws_fmt_u64(n1, e);
+		ws_write_stderr("bmc_win: socket I/O failed: err ");
+		ws_write_stderr(n1);
+		ws_write_stderr("\n");
+	}
+	return ws_err(e);
+}
+
 /* Wait for an overlapped operation on h, interruptibly. Returns the byte
  * count, -EINTR / -EAGAIN (timeout) after cancelling it, or -errno. */
 static i64 io_finish(HANDLE h, OVERLAPPED *ov, BOOL started, DWORD ms)
@@ -61,7 +83,7 @@ static i64 io_finish(HANDLE h, OVERLAPPED *ov, BOOL started, DWORD ms)
 	if (!started) {
 		DWORD e = GetLastError();
 		if (e != ERROR_IO_PENDING)
-			return e >= 10000 ? ws_wsaerr((int)e) : ws_err(e);
+			return net_err(e);
 		int w = ws_wait(&ov->hEvent, 1, ms);
 		if (w != 0) {
 			DWORD we = GetLastError();
@@ -82,15 +104,7 @@ static i64 io_finish(HANDLE h, OVERLAPPED *ov, BOOL started, DWORD ms)
 		}
 	}
 	if (!GetOverlappedResult(h, ov, &n, TRUE)) {
-		DWORD e = GetLastError();
-		switch (e) {
-		case ERROR_NETNAME_DELETED: return -L_ECONNRESET;
-		case ERROR_CONNECTION_ABORTED: return -L_ECONNABORTED;
-		case ERROR_GRACEFUL_DISCONNECT: case ERROR_HANDLE_EOF: return 0;
-		case ERROR_PORT_UNREACHABLE: return -L_ECONNREFUSED;
-		case ERROR_OPERATION_ABORTED: return -L_EINTR;
-		default: return e >= 10000 ? ws_wsaerr((int)e) : ws_err(e);
-		}
+		return net_err(GetLastError());
 	}
 	return (i64)n;
 }
@@ -507,6 +521,10 @@ static i64 sock_io(ws_desc *d, void *buf, size_t n, int write)
 				d->last_tx_ms = GetTickCount64();
 			else
 				d->last_rx_ms = GetTickCount64();
+		}
+		if (r == -L_ECONNRESET || r == -L_ECONNABORTED) {
+			if (InterlockedExchange(&d->reset_seen, 1))
+				return write ? -L_EPIPE : 0;
 		}
 		if (r != -L_EAGAIN || (d->flags & L_O_NONBLOCK))
 			return r;
@@ -1092,6 +1110,9 @@ static short other_ready(ws_desc *d, short ev)
 		}
 		break;
 	}
+	case FT_EVENTFD:
+		r = ws_eventfd_ready(d, ev);
+		break;
 	case FT_CONSOLE:
 		if ((ev & (L_POLLIN | L_POLLRDNORM)) && WaitForSingleObject(d->h, 0) == WAIT_OBJECT_0)
 			r |= ev & (L_POLLIN | L_POLLRDNORM);

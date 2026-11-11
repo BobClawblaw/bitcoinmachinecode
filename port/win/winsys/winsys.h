@@ -62,7 +62,7 @@ wchar_t *ws_path(int dirfd, const char *path, i64 *err);
 
 /* ---- ws_fd.c ---- */
 enum { FT_FREE = 0, FT_FILE, FT_DIR, FT_CONSOLE, FT_PIPE, FT_NULL, FT_RANDOM, FT_SOCKET,
-       FT_MEM, FT_MEMDIR };  /* /proc files and directories built at open (ws_procfs.c) */
+       FT_MEM, FT_MEMDIR, FT_EVENTFD };  /* /proc files and directories built at open (ws_procfs.c) */
 typedef struct ws_desc {
 	volatile LONG refs;
 	int type;
@@ -86,12 +86,15 @@ typedef struct ws_desc {
 	int pair_side;             /* ...and which end this is (0/1) */
 	volatile u64 last_rx_ms, last_tx_ms, since_ms;   /* sockets: TCP_INFO's last_data_* */
 	u64 memlen;
+	volatile LONG reset_seen;   /* sockets: a reset was reported once; reads now see EOF */
+	int efd_sem;                /* FT_EVENTFD: EFD_SEMAPHORE (counter in off, event in h) */
 } ws_desc;
 void ws_fd_init(void);
 ws_desc *ws_fd_get(int fd);       /* +1 ref, NULL if not open */
 void ws_desc_put(ws_desc *d);
 int ws_fd_install(ws_desc *d, int cloexec, int min_fd); /* consumes the ref; -EMFILE */
 ws_desc *ws_desc_new(int type);
+short ws_eventfd_ready(ws_desc *d, short ev);
 i64 ws_sys_file(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *handled);
 
 /* ---- ws_mem.c ---- */

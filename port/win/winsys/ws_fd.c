@@ -657,6 +657,89 @@ static i64 rw_stream(ws_desc *d, void *buf, size_t n, int write)
 
 static i64 fill_random(void *buf, size_t n);
 
+/* ---- eventfd: a 64-bit counter in d->off, guarded by d->lock; d->h is a
+ * manual-reset event that is set exactly while the counter is non-zero, so a
+ * blocking read can wait on it. Process-local (a forked child gets a copy). */
+#define EFD_MAX 0xfffffffffffffffeULL
+
+static i64 rw_eventfd(ws_desc *d, void *buf, size_t n, int write)
+{
+	if (n < 8)
+		return -L_EINVAL;
+	u64 v = 0;
+	if (write) {
+		__ws_memcpy(&v, buf, 8);
+		if (v == ~0ULL)
+			return -L_EINVAL;
+		AcquireSRWLockExclusive(&d->lock);
+		u64 c = (u64)d->off;
+		i64 r = 8;
+		if (EFD_MAX - c < v)
+			r = -L_EAGAIN;           /* would overflow; Linux blocks unless O_NONBLOCK */
+		else if (v) {
+			d->off = (i64)(c + v);
+			SetEvent(d->h);
+		}
+		ReleaseSRWLockExclusive(&d->lock);
+		return r;
+	}
+	for (;;) {
+		AcquireSRWLockExclusive(&d->lock);
+		u64 c = (u64)d->off;
+		if (c) {
+			v = d->efd_sem ? 1 : c;
+			d->off = (i64)(c - v);
+			if (!d->off)
+				ResetEvent(d->h);
+		}
+		ReleaseSRWLockExclusive(&d->lock);
+		if (v) {
+			__ws_memcpy(buf, &v, 8);
+			return 8;
+		}
+		if (d->flags & L_O_NONBLOCK)
+			return -L_EAGAIN;
+		int w = ws_wait(&d->h, 1, INFINITE);
+		if (w == WS_WAIT_INTR)
+			return -L_EINTR;
+		if (w == WS_WAIT_FAILED)
+			return ws_err(GetLastError());
+	}
+}
+
+short ws_eventfd_ready(ws_desc *d, short ev)
+{
+	AcquireSRWLockShared(&d->lock);
+	u64 c = (u64)d->off;
+	ReleaseSRWLockShared(&d->lock);
+	short r = 0;
+	if (c)
+		r |= ev & (0x1 | 0x40);          /* POLLIN | POLLRDNORM */
+	if (c < EFD_MAX)
+		r |= ev & (0x4 | 0x100);         /* POLLOUT | POLLWRNORM */
+	return r;
+}
+
+#define L_EFD_SEMAPHORE 1
+static i64 sys_eventfd(unsigned initval, int flags)
+{
+	if (flags & ~(L_EFD_SEMAPHORE | L_O_NONBLOCK | L_O_CLOEXEC))
+		return -L_EINVAL;
+	ws_desc *d = ws_desc_new(FT_EVENTFD);
+	if (!d)
+		return -L_ENOMEM;
+	d->h = CreateEventW(NULL, TRUE, initval != 0, NULL);
+	if (!d->h) {
+		d->h = INVALID_HANDLE_VALUE;
+		ws_desc_put(d);
+		return ws_err(GetLastError());
+	}
+	d->off = initval;
+	d->efd_sem = (flags & L_EFD_SEMAPHORE) != 0;
+	d->flags = 2 | (flags & L_O_NONBLOCK);  /* O_RDWR */
+	return ws_fd_install(d, (flags & L_O_CLOEXEC) != 0, 0);
+}
+
 static i64 do_rw(int fd, void *buf, size_t n, i64 pos, int write, int positioned)
 {
 	ws_desc *d = ws_fd_get(fd);
@@ -701,6 +784,9 @@ static i64 do_rw(int fd, void *buf, size_t n, i64 pos, int write, int positioned
 		break;
 	case FT_SOCKET:
 		r = positioned ? -L_ESPIPE : write ? ws_sock_write(d, buf, n) : ws_sock_read(d, buf, n);
+		break;
+	case FT_EVENTFD:
+		r = positioned ? -L_ESPIPE : rw_eventfd(d, buf, n, write);
 		break;
 	default:
 		r = positioned ? -L_ESPIPE : rw_stream(d, buf, n, write);
@@ -1569,6 +1655,8 @@ i64 ws_sys_file(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *hand
 	case 21: return sys_faccessat(L_AT_FDCWD, (const char *)a1, (int)a2);
 	case 269: case 439: return sys_faccessat((int)a1, (const char *)a2, (int)a3);
 	case 22: return sys_pipe((int *)a1, 0);
+	case 284: return sys_eventfd((unsigned)a1, 0);
+	case 290: return sys_eventfd((unsigned)a1, (int)a2);
 	case 293: return sys_pipe((int *)a1, (int)a2);
 	case 32: return sys_dup((int)a1, 0, 0, 0);
 	case 33: return sys_dup((int)a1, (int)a2, 0, 2);
