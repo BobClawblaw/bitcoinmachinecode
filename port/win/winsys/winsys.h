@@ -183,6 +183,14 @@ i64 ws_kill_other(int pid, int sig);
 void ws_exit_process(UINT code) __attribute__((noreturn));
 int ws_sig_disposition(int sig);
 void ws_exit_signaled(int sig) __attribute__((noreturn));
+i64 ws_sig_seccomp_trap(i64 nr, const i64 *args, unsigned data);
+
+/* ---- ws_seccomp.c ---- */
+extern int ws_seccomp_active;
+i64 ws_seccomp_install(const void *prog);
+int ws_seccomp_check(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, i64 *result);
+char *ws_seccomp_env(void);          /* "BMC_WIN_SECCOMP=..." for an exec, or NULL */
+void ws_seccomp_init_from_env(void);
 
 /* ---- entry points used by the SysV side (ms_abi there) ---- */
 WSAPI i64 __bmc_win_syscall(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6);

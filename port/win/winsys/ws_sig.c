@@ -324,6 +324,41 @@ i64 ws_sig_deliver(i64 r, int *restart)
 	return r;
 }
 
+/* A seccomp filter answered SECCOMP_RET_TRAP: SIGSYS now, on this thread,
+ * with the call's number and arguments; the handler's RAX is the result.
+ * Blocked, ignored or defaulted, it kills the process (Linux forces it). */
+i64 ws_sig_seccomp_trap(i64 nr, const i64 *a, unsigned data)
+{
+	AcquireSRWLockShared(&alock);
+	struct l_sigaction act = actions[31];
+	ReleaseSRWLockShared(&alock);
+	ws_ts *t = self;
+	if (act.handler == NULL || act.handler == (void *)1 || (t && ((u64)t->blocked & BIT(31))))
+		ws_exit_signaled(31);
+	l_siginfo si;
+	l_ucontext uc;
+	__ws_memset(&si, 0, sizeof si);
+	__ws_memset(&uc, 0, sizeof uc);
+	si.signo = 31;
+	si.err = (int)data;
+	si.code = 1;                                   /* SYS_SECCOMP */
+	char *raw = (char *)&si;
+	int sc = (int)nr;
+	uint32_t arch = 0xC000003EU;
+	__ws_memcpy(raw + 24, &sc, 4);                 /* si_syscall (si_call_addr at +16 stays 0) */
+	__ws_memcpy(raw + 28, &arch, 4);               /* si_arch */
+	uc.gregs[8] = a[0];                            /* RDI */
+	uc.gregs[9] = a[1];                            /* RSI */
+	uc.gregs[12] = a[2];                           /* RDX */
+	uc.gregs[2] = a[3];                            /* R10 */
+	uc.gregs[0] = a[4];                            /* R8 */
+	uc.gregs[1] = a[5];                            /* R9 */
+	uc.gregs[13] = -38;                            /* RAX: -ENOSYS unless the handler answers */
+	uc.sigmask = t ? (u64)t->blocked : 0;
+	run_handler(31, &act, &si, &uc);
+	return uc.gregs[13];
+}
+
 /* ---------------------------------------------------------------- faults */
 void ws_crash_report(PEXCEPTION_POINTERS ep, const char *what);
 

@@ -144,6 +144,7 @@ WSAPI void __bmc_win_entry(void)
 	ws_fork_init();
 	ws_fd_init();
 	ws_net_init();
+	ws_seccomp_init_from_env();
 	int argc;
 	char **argv = build_argv(&argc);
 	ws_envp = build_envp();
@@ -158,6 +159,12 @@ static i64 dispatch(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6)
 {
 	int handled = 0;
 	i64 r;
+	if (ws_seccomp_active && ws_seccomp_check(n, a1, a2, a3, a4, a5, a6, &r))
+		return r;
+	if (n == 157 && a1 == 22)                      /* prctl(PR_SET_SECCOMP, mode, prog) */
+		return a2 == 2 ? ws_seccomp_install((const void *)a3) : -22;
+	if (n == 317)                                  /* seccomp(op, flags, prog) */
+		return a1 == 1 ? ws_seccomp_install((const void *)a3) : -22;
 	r = ws_sys_file(n, a1, a2, a3, a4, a5, a6, &handled);
 	if (handled)
 		return r;

@@ -417,6 +417,81 @@ static void exe_alt(wchar_t **w)
 	SetLastError(ERROR_FILE_NOT_FOUND);
 }
 
+/* "/proc/self/fd/N" (or /proc/<our pid>/fd/N): the open fd it names, +1 ref,
+ * or NULL when the path is not one */
+static ws_desc *proc_fd(const char *path)
+{
+	const char *p = path + 6;
+	if (!__ws_memcmp(p, "self/", 5)) {
+		p += 5;
+	} else {
+		u64 pid = 0;
+		const char *q = p;
+		while (*q >= '0' && *q <= '9')
+			pid = pid * 10 + (u64)(*q++ - '0');
+		if (q == p || *q != '/' || pid != GetCurrentProcessId())
+			return NULL;
+		p = q + 1;
+	}
+	if (__ws_memcmp(p, "fd/", 3))
+		return NULL;
+	p += 3;
+	int fd = 0;
+	const char *q = p;
+	while (*q >= '0' && *q <= '9' && fd < 0x1000000)
+		fd = fd * 10 + (*q++ - '0');
+	if (q == p || *q)
+		return NULL;
+	return ws_fd_get(fd);
+}
+
+/* open("/proc/self/fd/N"): Linux opens the file the link names afresh (a new
+ * open file description, its own offset and access mode). A file is reopened
+ * through its handle -- that survives a rename or unlink of its name, as on
+ * Linux -- and anything else shares the existing description. */
+static i64 open_proc_fd(ws_desc *d, int flags, int cloexec)
+{
+	if (d->type != FT_FILE) {
+		if (d->type == FT_DIR || d->type == FT_MEM || d->type == FT_MEMDIR) {
+			ws_desc_put(d);
+			return -L_ENXIO;
+		}
+		return ws_fd_install(d, cloexec, 0);
+	}
+	DWORD acc = (flags & L_O_ACCMODE) == 0 ? GENERIC_READ :
+		    (flags & L_O_ACCMODE) == L_O_WRONLY ? GENERIC_WRITE : GENERIC_READ | GENERIC_WRITE;
+	HANDLE h = ReOpenFile(d->h, acc | FILE_READ_ATTRIBUTES | FILE_READ_EA | SYNCHRONIZE,
+			      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_FLAG_BACKUP_SEMANTICS);
+	if (h == INVALID_HANDLE_VALUE) {
+		i64 e = ws_err(GetLastError());
+		ws_desc_put(d);
+		return e;
+	}
+	ws_desc *n = ws_desc_new(FT_FILE);
+	wchar_t *w = NULL;
+	if (n && d->wpath) {
+		size_t l = ws_wcslen(d->wpath);
+		w = ws_alloc((l + 1) * sizeof(wchar_t));
+		if (w)
+			__ws_memcpy(w, d->wpath, (l + 1) * sizeof(wchar_t));
+	}
+	ws_desc_put(d);
+	if (!n) {
+		CloseHandle(h);
+		ws_free(w);
+		return -L_ENOMEM;
+	}
+	n->h = h;
+	n->wpath = w;
+	n->flags = flags & ~(L_O_CREAT | L_O_EXCL | L_O_TRUNC | L_O_CLOEXEC);
+	if (flags & L_O_TRUNC) {
+		FILE_END_OF_FILE_INFO eof;
+		eof.EndOfFile.QuadPart = 0;
+		SetFileInformationByHandle(h, FileEndOfFileInfo, &eof, sizeof eof);
+	}
+	return ws_fd_install(n, cloexec, 0);
+}
+
 static i64 sys_stat_path(int dirfd, const char *path, struct l_stat *st, int flags)
 {
 	if ((flags & L_AT_EMPTY_PATH) && path && !*path) {
@@ -428,6 +503,16 @@ static i64 sys_stat_path(int dirfd, const char *path, struct l_stat *st, int fla
 			st->st_size = (i64)d->memlen;
 		ws_desc_put(d);
 		return r;
+	}
+	if (is_proc(path) && !(flags & L_AT_SYMLINK_NOFOLLOW)) {
+		ws_desc *pd = proc_fd(path);
+		if (pd) {
+			i64 r = stat_handle(pd->h, pd->type, st);
+			if (!r && pd->type == FT_MEM)
+				st->st_size = (i64)pd->memlen;
+			ws_desc_put(pd);
+			return r;
+		}
 	}
 	if (is_proc(path)) {
 		i64 e2;
@@ -465,6 +550,9 @@ static i64 sys_open(int dirfd, const char *path, int flags, int mode)
 	i64 err;
 	int cloexec = (flags & L_O_CLOEXEC) != 0;
 	if (is_proc(path)) {
+		ws_desc *pd = proc_fd(path);
+		if (pd)
+			return open_proc_fd(pd, flags, cloexec);
 		if ((flags & L_O_ACCMODE) != 0)
 			return -L_EACCES;
 		ws_desc *d = ws_procfs_open(path, &err);
@@ -946,6 +1034,16 @@ static i64 truncate_handle(HANDLE h, i64 len)
 	i64 sz;
 	if (err != ERROR_USER_MAPPED_FILE || file_size(h, &sz) || sz <= len)
 		return ws_err(err);
+	if (GetEnvironmentVariableA("BMC_WIN_FSDEBUG", NULL, 0)) {
+		char a[24], b[24];
+		ws_fmt_u64(a, (u64)len);
+		ws_fmt_u64(b, (u64)sz);
+		ws_write_stderr("bmc_win: truncate of a mapped file: zeroing ");
+		ws_write_stderr(a);
+		ws_write_stderr("..");
+		ws_write_stderr(b);
+		ws_write_stderr(" instead\n");
+	}
 	FILE_ZERO_DATA_INFORMATION z;
 	z.FileOffset.QuadPart = len;
 	z.BeyondFinalZero.QuadPart = sz;
@@ -1567,6 +1665,49 @@ static BOOL make_pipe(HANDLE *r, HANDLE *w)
 	return TRUE;
 }
 
+/* statx: fstatat's answer in struct statx. No birth time (STATX_BTIME
+ * stays clear, stx_btime 0): NTFS's creation time is not one -- file-name
+ * tunneling hands a file renamed over another name (or created where one
+ * was just deleted) that name's old creation time, so it changes under a
+ * rename, which a Linux btime never does. */
+static i64 sys_statx(int dirfd, const char *path, int flags, void *out)
+{
+	struct l_stat st;
+	if (!path || !out)
+		return -L_EFAULT;
+	i64 r = sys_stat_path(dirfd, path, &st, flags & (L_AT_EMPTY_PATH | L_AT_SYMLINK_NOFOLLOW));
+	if (r)
+		return r;
+	unsigned char *x = out;
+	__ws_memset(x, 0, 256);
+	uint32_t mask = 0x7ff;                           /* STATX_BASIC_STATS */
+	uint32_t u32v;
+	u64 u64v;
+	__ws_memcpy(x + 0, &mask, 4);
+	u32v = (uint32_t)st.st_blksize; __ws_memcpy(x + 4, &u32v, 4);
+	u32v = (uint32_t)st.st_nlink; __ws_memcpy(x + 16, &u32v, 4);
+	__ws_memcpy(x + 20, &st.st_uid, 4);
+	__ws_memcpy(x + 24, &st.st_gid, 4);
+	unsigned short mode = (unsigned short)st.st_mode;
+	__ws_memcpy(x + 28, &mode, 2);
+	__ws_memcpy(x + 32, &st.st_ino, 8);
+	__ws_memcpy(x + 40, &st.st_size, 8);
+	__ws_memcpy(x + 48, &st.st_blocks, 8);
+	i64 ts[4][2] = { { st.st_atime_sec, st.st_atime_nsec }, { 0, 0 },
+			 { st.st_ctime_sec, st.st_ctime_nsec }, { st.st_mtime_sec, st.st_mtime_nsec } };
+	for (int i = 0; i < 4; i++) {
+		uint32_t ns = (uint32_t)ts[i][1];
+		__ws_memcpy(x + 64 + 16 * i, &ts[i][0], 8);
+		__ws_memcpy(x + 72 + 16 * i, &ns, 4);
+	}
+	u32v = (uint32_t)(st.st_rdev >> 8); __ws_memcpy(x + 128, &u32v, 4);
+	u32v = (uint32_t)(st.st_rdev & 0xff); __ws_memcpy(x + 132, &u32v, 4);
+	u64v = st.st_dev;
+	u32v = (uint32_t)(u64v >> 8); __ws_memcpy(x + 136, &u32v, 4);
+	u32v = (uint32_t)(u64v & 0xff); __ws_memcpy(x + 140, &u32v, 4);
+	return 0;
+}
+
 static i64 sys_pipe(int *fds, int flags)
 {
 	HANDLE r, w;
@@ -1693,7 +1834,7 @@ i64 ws_sys_file(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *hand
 	case 91: return sys_fchmod((int)a1, (unsigned)a2);
 	case 92: case 93: case 94: case 260: return 0;   /* chown family: one user */
 	case 95: return (i64)InterlockedExchange(&umask_bits, (LONG)(a1 & 0777));   /* umask */
-	case 332: return -L_ENOSYS;            /* statx: musl falls back to fstatat */
+	case 332: return sys_statx((int)a1, (const char *)a2, (int)a3, (void *)a5);
 	case 318: return fill_random((void *)a1, (size_t)a2);   /* getrandom */
 	default:
 		*handled = 0;

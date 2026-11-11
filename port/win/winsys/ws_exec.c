@@ -236,6 +236,16 @@ static wchar_t *env_block(char *const envp[], size_t *chars)
 		wput(&b, 0);
 		ws_free(w);
 	}
+	char *sc = ws_seccomp_env();                   /* seccomp filters survive execve */
+	if (sc) {
+		wchar_t *w = ws_utf8_to_w(sc);
+		if (w) {
+			wputs(&b, w);
+			wput(&b, 0);
+			ws_free(w);
+		}
+		ws_free(sc);
+	}
 	wput(&b, 0);
 	if (b.n == 1)
 		wput(&b, 0);
