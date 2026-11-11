@@ -397,11 +397,9 @@ static i64 sys_fork(void)
 	ws_fd_fork_prepare();
 	ws_mem_fork_prepare();
 	AcquireSRWLockExclusive(&clock_);
-	/* No thread may be mid-start (in its DLL thread-attach, under the
-	 * loader lock): RtlCloneUserProcess waits for those, and they may want
-	 * the heap lock taken below. winsys starts all its threads through
-	 * ws_create_thread, so waiting for that count is enough. The loader
-	 * lock itself must not be held here, for the same reason. */
+	/* No winsys thread may be starting or ending (DLL thread attach/detach)
+	 * while the heap lock below is held: RtlCloneUserProcess waits for such
+	 * threads, and their attach/detach may need the heap (ws_thread.c). */
 	ws_threads_settle();
 	static int heap_cs_tried;
 	if (!heap_cs_tried) {                          /* once, with the lock free */
@@ -439,6 +437,7 @@ static i64 sys_fork(void)
 		else
 			HeapUnlock(GetProcessHeap());
 		ws_heap_reset_child();
+		ws_threads_resume(1);
 		ws_is_root = 0;
 		ws_child *k = children;
 		children = NULL;
@@ -473,6 +472,7 @@ static i64 sys_fork(void)
 
 	HeapUnlock(GetProcessHeap());
 	ws_heap_unlock();
+	ws_threads_resume(0);
 	if (st < 0) {
 		ReleaseSRWLockExclusive(&clock_);
 		ws_mem_fork_done(0);

@@ -195,6 +195,7 @@ int ws_escrow_put(u64 key, int side, HANDLE h, const ws_fd_meta *meta);
 int ws_escrow_take(u64 key, int side, HANDLE *hs, ws_fd_meta *metas, int max);
 HANDLE ws_create_thread(LPTHREAD_START_ROUTINE fn, void *arg, size_t stack, DWORD *tid);
 void ws_threads_settle(void);
+void ws_threads_resume(int child);
 void ws_futex_shared_init(void);
 void ws_robust_release_current_thread(void);
 void ws_futex_wake_any(volatile int *addr, int n);

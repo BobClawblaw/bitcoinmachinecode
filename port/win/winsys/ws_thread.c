@@ -332,6 +332,8 @@ static i64 sys_futex(volatile int *addr, int op, int val, const struct l_timespe
 	}
 }
 
+static void exit_gate(void);
+
 i64 ws_sys_thread(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *handled)
 {
 	*handled = 1;
@@ -355,6 +357,7 @@ i64 ws_sys_thread(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *ha
 	case 60:                                           /* exit (this thread) */
 		ws_robust_release_current_thread();
 		ws_sig_thread_end();
+		exit_gate();
 		ExitThread((DWORD)a1);
 	case 231: ws_exit_process((UINT)a1);              /* exit_group */
 	default:
@@ -372,13 +375,59 @@ static volatile LONG starting;
 
 typedef struct { LPTHREAD_START_ROUTINE fn; void *arg; } starter;
 
+/* ...and ENDING: once its code returns, a thread runs the loader's DLL
+ * thread-detach (LdrShutdownThread), and Winsock's detach frees memory on
+ * the process heap. RtlCloneUserProcess waits for a thread in that state;
+ * with the fork holding the heap lock, neither moved (seen:
+ * test_dlc_header_probe). So a winsys thread passes a gate on its way out,
+ * leaving its handle behind, and fork closes the gate and waits for every
+ * thread that passed it to be gone before it takes the heap lock. The gate
+ * also holds back thread creation for the length of a fork. */
+static SRWLOCK fork_gate = SRWLOCK_INIT;
+static SRWLOCK exit_lock = SRWLOCK_INIT;
+static HANDLE exiting[256];
+static int n_exiting;
+
+static void wait_exited(void)
+{
+	AcquireSRWLockExclusive(&exit_lock);
+	for (int i = 0; i < n_exiting; i += MAXIMUM_WAIT_OBJECTS) {
+		int k = n_exiting - i < MAXIMUM_WAIT_OBJECTS ? n_exiting - i : MAXIMUM_WAIT_OBJECTS;
+		WaitForMultipleObjects((DWORD)k, exiting + i, TRUE, INFINITE);
+	}
+	for (int i = 0; i < n_exiting; i++)
+		CloseHandle(exiting[i]);
+	n_exiting = 0;
+	ReleaseSRWLockExclusive(&exit_lock);
+}
+
 static DWORD WINAPI start_main(LPVOID p)
 {
 	starter s = *(starter *)p;
 	ws_free(p);
 	ws_fpu_linux();
 	InterlockedDecrement(&starting);
-	return s.fn(s.arg);
+	DWORD r = s.fn(s.arg);
+	exit_gate();
+	return r;
+}
+
+/* a thread on its way out, by return or by exit(2) */
+static void exit_gate(void)
+{
+	AcquireSRWLockShared(&fork_gate);          /* not while a fork is under way */
+	HANDLE me = NULL;
+	if (DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &me, SYNCHRONIZE, FALSE, 0)) {
+		AcquireSRWLockExclusive(&exit_lock);
+		if (n_exiting == (int)(sizeof exiting / sizeof exiting[0])) {
+			ReleaseSRWLockExclusive(&exit_lock);
+			wait_exited();                     /* full: the earlier ones are long gone */
+			AcquireSRWLockExclusive(&exit_lock);
+		}
+		exiting[n_exiting++] = me;
+		ReleaseSRWLockExclusive(&exit_lock);
+	}
+	ReleaseSRWLockShared(&fork_gate);
 }
 
 HANDLE ws_create_thread(LPTHREAD_START_ROUTINE fn, void *arg, size_t stack, DWORD *tid)
@@ -388,17 +437,33 @@ HANDLE ws_create_thread(LPTHREAD_START_ROUTINE fn, void *arg, size_t stack, DWOR
 		return NULL;
 	s->fn = fn;
 	s->arg = arg;
+	AcquireSRWLockShared(&fork_gate);
 	InterlockedIncrement(&starting);
 	HANDLE h = CreateThread(NULL, stack, start_main, s, 0, tid);
 	if (!h) {
 		InterlockedDecrement(&starting);
 		ws_free(s);
 	}
+	ReleaseSRWLockShared(&fork_gate);
 	return h;
 }
 
+/* fork: no winsys thread starting or ending from here until ws_threads_resume */
 void ws_threads_settle(void)
 {
+	AcquireSRWLockExclusive(&fork_gate);
 	while (starting)
 		SwitchToThread();
+	wait_exited();
+}
+
+void ws_threads_resume(int child)
+{
+	if (child) {                               /* see ws_fd_fork_done: re-initialized, not released */
+		InitializeSRWLock(&fork_gate);
+		InitializeSRWLock(&exit_lock);
+		n_exiting = 0;                         /* the parent's handles, not ours */
+	} else {
+		ReleaseSRWLockExclusive(&fork_gate);
+	}
 }
