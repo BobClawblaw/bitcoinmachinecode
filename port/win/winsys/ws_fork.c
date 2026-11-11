@@ -411,19 +411,11 @@ static i64 sys_fork(void)
 	}
 	ws_heap_lock();
 	HeapLock(GetProcessHeap());
-	/* The PEB lock too: every Win32 path call (GetFileAttributesW,
-	 * CreateFileW...) takes it, and a child cloned while another thread
-	 * held it inherits it held by a thread it does not have. It is a
-	 * recursive critical section, so the clone's own use of it from this
-	 * thread is fine. */
-	static void (NTAPI *peb_acquire)(void), (NTAPI *peb_release)(void);
-	if (!peb_acquire) {
-		HMODULE nt = GetModuleHandleW(L"ntdll.dll");
-		peb_release = (void (NTAPI *)(void))(void *)GetProcAddress(nt, "RtlReleasePebLock");
-		peb_acquire = (void (NTAPI *)(void))(void *)GetProcAddress(nt, "RtlAcquirePebLock");
-	}
-	if (peb_acquire && peb_release)
-		peb_acquire();
+	/* NOT the PEB lock: ntdll takes the loader lock before it, and the
+	 * clone takes the loader lock -- holding the PEB lock here deadlocked
+	 * against a thread holding the loader lock and wanting the PEB lock
+	 * (seen: test_dlc_header_probe, a fork stuck in NtWaitForSingleObject).
+	 * The child resets both instead (below). */
 
 	rtl_upi info;
 	__ws_memset(&info, 0, sizeof info);
@@ -432,13 +424,16 @@ static i64 sys_fork(void)
 
 	if (st == STATUS_PROCESS_CLONED) {
 		/* ---- the child ----
-		 * The two critical sections held across the clone are reset, not
-		 * released: parent threads that queued on them during the fork
-		 * left ghost waiters in their counts, and a release would hand the
-		 * lock to a ghost (seen: a forked worker's first path call waiting
-		 * forever on the process heap). This thread is the only one here. */
-		if (peb_acquire && peb_release)
-			cs_reset(*(RTL_CRITICAL_SECTION **)((char *)peb_of() + 0x38));   /* PEB.FastPebLock */
+		 * ntdll's process-wide critical sections are reset, not released:
+		 * a parent thread that held one at the clone (the PEB lock, the
+		 * loader lock) left it owned by a thread this process does not
+		 * have, and parent threads that queued on one (the heap lock,
+		 * which the fork holds) left ghost waiters, to which a release
+		 * would hand it (seen: a forked worker's first path call waiting
+		 * forever on the process heap). This thread is the only one here
+		 * and holds none of them, so free is the true state. */
+		cs_reset(*(RTL_CRITICAL_SECTION **)((char *)peb_of() + 0x38));    /* PEB.FastPebLock */
+		cs_reset(*(RTL_CRITICAL_SECTION **)((char *)peb_of() + 0x110));   /* PEB.LoaderLock */
 		if (heap_cs)
 			cs_reset(heap_cs);
 		else
@@ -476,8 +471,6 @@ static i64 sys_fork(void)
 		return 0;
 	}
 
-	if (peb_acquire && peb_release)
-		peb_release();
 	HeapUnlock(GetProcessHeap());
 	ws_heap_unlock();
 	if (st < 0) {

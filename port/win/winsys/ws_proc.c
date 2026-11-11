@@ -38,6 +38,26 @@ static void ft_dur(FILETIME a, FILETIME b, struct l_timespec *ts)
 	ts->nsec = (i64)(t % 10000000) * 100;
 }
 
+/* the TSC's rate (the cycle counters count it), measured once against the
+ * performance counter over ~5 ms */
+static double tsc_hz(void)
+{
+	static volatile double hz;
+	if (hz > 0)
+		return hz;
+	LARGE_INTEGER f, q0, q1;
+	QueryPerformanceFrequency(&f);
+	QueryPerformanceCounter(&q0);
+	unsigned long long t0 = __rdtsc();
+	do {
+		QueryPerformanceCounter(&q1);
+	} while ((q1.QuadPart - q0.QuadPart) * 1000 < f.QuadPart * 5);
+	unsigned long long t1 = __rdtsc();
+	double secs = (double)(q1.QuadPart - q0.QuadPart) / (double)f.QuadPart;
+	hz = secs > 0 ? (double)(t1 - t0) / secs : 0;
+	return hz;
+}
+
 static i64 sys_clock_gettime(int clk, struct l_timespec *ts)
 {
 	FILETIME c, e, k, u;
@@ -48,16 +68,26 @@ static i64 sys_clock_gettime(int clk, struct l_timespec *ts)
 	case 1: case 4: case 6: case 7: case 9: /* MONOTONIC, _RAW, _COARSE, BOOTTIME(_ALARM) */
 		now_monotonic(ts);
 		return 0;
-	case 2:
-		if (!GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u))
+	case 2: case 3: {
+		/* CPU time from the cycle counters: GetThreadTimes/GetProcessTimes
+		 * move only on the scheduler tick (~15.6 ms), so a short interval
+		 * read as 0 (test_scalarmul_ct's constant-time ratio) */
+		ULONG64 cyc = 0;
+		double hz = tsc_hz();
+		BOOL ok = clk == 3 ? QueryThreadCycleTime(GetCurrentThread(), &cyc)
+				   : QueryProcessCycleTime(GetCurrentProcess(), &cyc);
+		if (ok && hz > 0) {
+			double ns = (double)cyc * 1e9 / hz;
+			ts->sec = (i64)(ns / 1e9);
+			ts->nsec = (i64)(ns - (double)ts->sec * 1e9);
+			return 0;
+		}
+		if (clk == 3 ? !GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u)
+			     : !GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u))
 			return ws_err(GetLastError());
 		ft_dur(k, u, ts);
 		return 0;
-	case 3:
-		if (!GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u))
-			return ws_err(GetLastError());
-		ft_dur(k, u, ts);
-		return 0;
+	}
 	default:
 		return -L_EINVAL;
 	}
