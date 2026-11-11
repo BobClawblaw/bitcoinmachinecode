@@ -372,6 +372,8 @@ static i64 sys_listen(int fd, int backlog)
 	if (!d)
 		return err;
 	i64 r = listen(d->s, backlog) == SOCKET_ERROR ? lasterr() : 0;
+	if (r == 0)
+		d->listening = 1;
 	ws_desc_put(d);
 	return r;
 }
@@ -382,10 +384,14 @@ static i64 sys_accept(int fd, void *addr, int *alen, int flags)
 	ws_desc *d = sock_get(fd, &err);
 	if (!d)
 		return err;
-	i64 g = gate(d, AFD_POLL_ACCEPT, 0, d->rcvtimeo);
-	if (g < 0) {
+	if (d->shut & 1) {                         /* Linux: a shut listener accepts nothing */
 		ws_desc_put(d);
-		return g;
+		return -L_EINVAL;
+	}
+	i64 g = gate(d, AFD_POLL_ACCEPT, 0, d->rcvtimeo);
+	if (g < 0 || (d->shut & 1)) {
+		ws_desc_put(d);
+		return (d->shut & 1) ? -L_EINVAL : g;
 	}
 	struct sockaddr_storage a;
 	int wl = sizeof a;
@@ -504,7 +510,7 @@ static i64 io_result(ws_desc *d, i64 r, int write)
 	return r;
 }
 
-static i64 handle_io(ws_desc *d, void *buf, size_t n, int write)
+static i64 handle_io_ms(ws_desc *d, void *buf, size_t n, int write, DWORD ms)
 {
 	if (n > 0x7ffff000)
 		n = 0x7ffff000;
@@ -513,7 +519,46 @@ static i64 handle_io(ws_desc *d, void *buf, size_t n, int write)
 	ov.hEvent = thread_event();
 	BOOL ok = write ? WriteFile((HANDLE)d->s, buf, (DWORD)n, NULL, &ov)
 			: ReadFile((HANDLE)d->s, buf, (DWORD)n, NULL, &ov);
-	return io_result(d, io_finish((HANDLE)d->s, &ov, ok, INFINITE), write);
+	return io_result(d, io_finish((HANDLE)d->s, &ov, ok, ms), write);
+}
+
+static i64 handle_io(ws_desc *d, void *buf, size_t n, int write)
+{
+	return handle_io_ms(d, buf, n, write, INFINITE);
+}
+
+/* a blocking write under SO_SNDTIMEO: in pieces, against the deadline, so a
+ * peer that stops reading costs at most the timeout -- what was sent by
+ * then, or EAGAIN if nothing was (Linux). One overlapped write of the whole
+ * buffer would wait until the peer took all of it. */
+#define SND_CHUNK (256 * 1024)
+static i64 write_timed(ws_desc *d, const char *buf, size_t n, u64 deadline)
+{
+	size_t done = 0;
+	while (done < n) {
+		if (d->shut & 2)
+			return done ? (i64)done : -L_EPIPE;
+		u64 now = GetTickCount64();
+		if (now >= deadline)
+			break;
+		DWORD left = (DWORD)(deadline - now);
+		i64 g = gate(d, AFD_POLL_SEND, 0, left);
+		if (g < 0) {
+			if (g == -L_EAGAIN)
+				break;
+			return done ? (i64)done : g;
+		}
+		size_t c = n - done < SND_CHUNK ? n - done : SND_CHUNK;
+		now = GetTickCount64();
+		left = now >= deadline ? 0 : (DWORD)(deadline - now);
+		i64 r = handle_io_ms(d, (void *)(buf + done), c, 1, left ? left : 1);
+		if (r == -L_EAGAIN)
+			continue;                      /* the deadline check ends it */
+		if (r < 0)
+			return done ? (i64)done : r;
+		done += (size_t)r;
+	}
+	return done ? (i64)done : -L_EAGAIN;
 }
 
 /* gate, then the handle I/O. The socket's mode at the Winsock level is not
@@ -527,6 +572,8 @@ static i64 sock_io(ws_desc *d, void *buf, size_t n, int write)
 	ULONG ev = write ? AFD_POLL_SEND : AFD_POLL_RECEIVE | AFD_POLL_DISCONNECT;
 	DWORD timeo = write ? d->sndtimeo : d->rcvtimeo;
 	u64 deadline = timeo ? GetTickCount64() + timeo : 0;
+	if (write && deadline && !(d->flags & L_O_NONBLOCK))
+		return write_timed(d, buf, n, deadline);
 	for (;;) {
 		if (d->shut & (write ? 2 : 1))
 			return write ? -L_EPIPE : 0;
@@ -884,7 +931,7 @@ static i64 sys_shutdown(int fd, int how)
 	if (!d)
 		return err;
 	i64 r = 0;
-	if (how != 0)
+	if (how != 0 && !d->listening)
 		r = shutdown(d->s, SD_SEND) == SOCKET_ERROR ? lasterr() : 0;
 	if (r == 0) {
 		InterlockedOr(&d->shut, how == 0 ? 1 : how == 1 ? 2 : 3);
@@ -1424,9 +1471,11 @@ i64 ws_sys_net(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *handl
 }
 
 /* fork child: the thread's overlapped event was not inherited */
+void ws_linger_fork_child(void);
 void ws_net_fork_child(void)
 {
 	io_ev = NULL;
+	ws_linger_fork_child();
 }
 
 /* ---------------------------------------------------------------- last close
@@ -1461,10 +1510,141 @@ static ULONG handle_count(HANDLE h)
 	return bi.handles;
 }
 
+/* Data received and never read makes the close of the last handle a RESET
+ * on Windows, and a reset makes the peer's stack throw away what it had not
+ * read yet -- a reply written just before this close (an HTTP server's 503
+ * to a request it refused unread). Linux's peer still reads that reply.
+ * So what is waiting is read and discarded first (bounded): the close is
+ * then a FIN. Returns whether anything was waiting. */
+static int recv_waiting(HANDLE h)
+{
+	afd_poll_info pi;
+	__ws_memset(&pi, 0, sizeof pi);
+	pi.Handles[0].Handle = h;
+	pi.Handles[0].Events = AFD_POLL_RECEIVE;
+	return afd_poll(&pi, 1, 0) > 0 && (pi.Handles[0].Events & AFD_POLL_RECEIVE);
+}
+
+static void drain_unread(HANDLE h)
+{
+	char junk[16384];
+	for (int i = 0; i < 64 && recv_waiting(h); i++) {
+		OVERLAPPED ov;
+		__ws_memset(&ov, 0, sizeof ov);
+		ov.hEvent = thread_event();
+		BOOL ok = ReadFile(h, junk, sizeof junk, NULL, &ov);
+		if (io_finish(h, &ov, ok, 0) <= 0)
+			break;
+	}
+}
+
+/* A lingering close. Draining is not enough when the peer goes on sending
+ * after our close (a client still writing the request we refused): the
+ * closed endpoint answers its next segment with a reset, and the reset makes
+ * the peer's Windows stack discard our reply before it is read -- Linux's
+ * delivers what was queued first. So a socket closed with unread data is
+ * kept open, its send side shut, by a reaper that discards what still
+ * arrives until the peer closes too (or 2 s pass), and only then closed:
+ * Apache's lingering close. */
+#define LINGER_MS 2000
+typedef struct { SOCKET s; u64 until; int root; } linger_ent;
+static linger_ent lg[64];
+static int lg_n;
+static SRWLOCK lg_lock = SRWLOCK_INIT;
+static HANDLE lg_thread;
+
+static void linger_close(linger_ent *e)
+{
+	if (e->root)
+		closesocket(e->s);
+	else
+		CloseHandle((HANDLE)e->s);
+}
+
+static DWORD WINAPI linger_main(LPVOID p)
+{
+	(void)p;
+	for (;;) {
+		Sleep(50);
+		AcquireSRWLockExclusive(&lg_lock);
+		u64 now = GetTickCount64();
+		for (int i = 0; i < lg_n;) {
+			HANDLE h = (HANDLE)lg[i].s;
+			drain_unread(h);
+			afd_poll_info pi;
+			__ws_memset(&pi, 0, sizeof pi);
+			pi.Handles[0].Handle = h;
+			pi.Handles[0].Events = AFD_POLL_DISCONNECT | AFD_POLL_ABORT | AFD_POLL_LOCAL_CLOSE;
+			int done = now >= lg[i].until || afd_poll(&pi, 1, 0) != 0;
+			if (done) {
+				linger_close(&lg[i]);
+				lg[i] = lg[--lg_n];
+			} else {
+				i++;
+			}
+		}
+		ReleaseSRWLockExclusive(&lg_lock);
+	}
+	return 0;
+}
+
+static int linger_add(SOCKET s, int root)
+{
+	int ok = 0;
+	AcquireSRWLockExclusive(&lg_lock);
+	if (!lg_thread)
+		lg_thread = ws_create_thread(linger_main, NULL, 64 * 1024, NULL);
+	if (lg_thread && lg_n < (int)(sizeof lg / sizeof lg[0])) {
+		lg[lg_n].s = s;
+		lg[lg_n].until = GetTickCount64() + LINGER_MS;
+		lg[lg_n].root = root;
+		lg_n++;
+		ok = 1;
+	}
+	ReleaseSRWLockExclusive(&lg_lock);
+	return ok;
+}
+
+/* a forked child: the reaper's sockets are the parent's to finish */
+void ws_linger_fork_child(void)
+{
+	for (int i = 0; i < lg_n; i++)
+		CloseHandle((HANDLE)lg[i].s);
+	lg_n = 0;
+	lg_thread = NULL;
+	InitializeSRWLock(&lg_lock);
+}
+
+/* the root's close (Winsock's own): lingering when it is the last handle
+ * and data was left unread */
+void ws_sock_close_root(SOCKET s, int unread_peer)
+{
+	if (GetEnvironmentVariableA("BMC_WIN_NETDEBUG", NULL, 0)) {
+		char a[24], b[24];
+		ws_fmt_u64(a, handle_count((HANDLE)s));
+		ws_fmt_u64(b, (u64)recv_waiting((HANDLE)s));
+		ws_write_stderr("bmc_win: close: handles ");
+		ws_write_stderr(a);
+		ws_write_stderr(" unread ");
+		ws_write_stderr(b);
+		ws_write_stderr("\n");
+	}
+	if (handle_count((HANDLE)s) == 1 && (unread_peer || recv_waiting((HANDLE)s))) {
+		shutdown(s, SD_SEND);                  /* the reply goes out ahead of the FIN */
+		drain_unread((HANDLE)s);
+		if (linger_add(s, 1))
+			return;
+	}
+	closesocket(s);
+}
+
 void ws_sock_close_last(SOCKET s)
 {
 	HANDLE h = (HANDLE)s;
+	int unread = 0;
 	if (handle_count(h) == 1) {
+		unread = recv_waiting(h);
+		drain_unread(h);
 		afd_disconnect_info di;
 		__ws_memset(&di, 0, sizeof di);
 		di.flags = 1;
@@ -1486,6 +1666,8 @@ void ws_sock_close_last(SOCKET s)
 			ws_write_stderr(b);
 			ws_write_stderr("\n");
 		}
+		if (unread && linger_add(s, 0))
+			return;
 	}
 	CloseHandle(h);
 }

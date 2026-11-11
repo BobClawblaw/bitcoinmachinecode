@@ -89,7 +89,8 @@ typedef struct ws_desc {
 	volatile LONG64 rx_bytes, tx_bytes;
 	volatile LONG peer_fin;     /* sockets: a read saw the peer's end-of-file */   /* sockets: TCP_INFO's byte counts */   /* sockets: when unread data was first seen waiting (0 = none) */
 	u64 memlen;
-	volatile LONG shut;          /* sockets: shutdown() so far, bit 0 SHUT_RD, bit 1 SHUT_WR */
+	volatile LONG shut;
+	int listening;              /* sockets: listen() succeeded */          /* sockets: shutdown() so far, bit 0 SHUT_RD, bit 1 SHUT_WR */
 	volatile LONG reset_seen;   /* sockets: a reset was reported once; reads now see EOF */
 	int efd_sem;
 	char *ppath;                /* FT_MEM / FT_MEMDIR: the /proc path it was opened as */                /* FT_EVENTFD: EFD_SEMAPHORE (counter in off, event in h) */
@@ -168,6 +169,9 @@ HANDLE ws_heap(void);
 /* the sampling profiler (ws_prof.c, BMC_WIN_PROF) */
 void ws_prof_count(i64 nr);
 void ws_sock_close_last(SOCKET s);
+/* unread_peer: a connected peer we never read from and that has not closed
+ * (a request refused unread: more of it may still be on its way) */
+void ws_sock_close_root(SOCKET s, int unread_peer);
 void ws_fd_exit_sockets(void);
 void ws_prof_start(int child);
 void ws_heap_lock(void);

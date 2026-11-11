@@ -377,9 +377,16 @@ static LONG CALLBACK veh(PEXCEPTION_POINTERS ep)
 	case EXCEPTION_BREAKPOINT: case EXCEPTION_SINGLE_STEP: sig = 5; break;
 	default: return EXCEPTION_CONTINUE_SEARCH;   /* stack overflow, C++ ..., debugger events */
 	}
-	AcquireSRWLockShared(&alock);
+	/* a fault while its signal is blocked -- inside its own handler, say --
+	 * kills the process with the default action (the kernel's force_sig):
+	 * running the handler again would fault again, forever */
+	if (self && ((u64)self->blocked & BIT(sig)))
+		ws_exit_signaled(sig);
+	AcquireSRWLockExclusive(&alock);
 	struct l_sigaction a = actions[sig];
-	ReleaseSRWLockShared(&alock);
+	if ((a.flags & L_SA_RESETHAND) && a.handler != NULL && a.handler != (void *)1)
+		actions[sig].handler = NULL;           /* SA_RESETHAND: the next one is fatal */
+	ReleaseSRWLockExclusive(&alock);
 	if (a.handler == NULL || a.handler == (void *)1 || !self)
 		return EXCEPTION_CONTINUE_SEARCH;
 	l_siginfo si;

@@ -429,6 +429,12 @@ static int status_of(DWORD code)
 	case 0xC0000006: return 7;                                        /* SIGBUS */
 	case 0x40010004: case 0xC000013A: return 2;                       /* console kill */
 	}
+	/* a Cygwin/MSYS program (Git's sh) dead by a signal exits with
+	 * signal << 8, e.g. 0xB00 for SIGSEGV; a normal exit is the status
+	 * itself. (A native exit code of exactly that shape reads as a signal;
+	 * Linux would have truncated it to 0 anyway.) */
+	if (code >= 0x100 && code <= 0x4000 && !(code & 0xff))
+		return (int)(code >> 8);                     /* WIFSIGNALED */
 	return (int)((code & 0xff) << 8);                  /* WIFEXITED */
 }
 

@@ -84,7 +84,7 @@ void ws_desc_put(ws_desc *d)
 		return;
 	if (d->type == FT_SOCKET && d->s != INVALID_SOCKET) {
 		if (ws_is_root)
-			closesocket(d->s);
+			ws_sock_close_root(d->s, d->connected && !d->rx_bytes && !d->peer_fin && !(d->shut & 1));
 		else
 			ws_sock_close_last(d->s);   /* no Winsock in a forked process */
 	}
