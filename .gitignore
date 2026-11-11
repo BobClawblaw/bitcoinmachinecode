@@ -474,3 +474,4 @@ asm/gate-*.build
 
 # port/win: the harness installs the daemon tools here as <name>.exe
 asm/daemon/*.exe
+asm/tests/*.exe

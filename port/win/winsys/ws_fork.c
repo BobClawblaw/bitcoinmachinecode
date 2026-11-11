@@ -97,6 +97,125 @@ static void box_post(boxref *b, int sig)
 	SetEvent(b->ev);
 }
 
+/* ---- the public box: signals from processes that are not our parent or
+ * child (a test signalling a daemon's worker; an exec stand-in passing a
+ * signal on to the program it started). A section and an event named after
+ * the pid in the session's BaseNamedObjects, created and opened through the
+ * native API by absolute name: kernel32's cached named-object directory
+ * handle is not inheritable, so in a forked process it is stale (the
+ * CreatePipe trap). */
+typedef struct { USHORT Length, MaximumLength; PWSTR Buffer; } nt_ustr;
+typedef struct { ULONG Length; HANDLE RootDirectory; nt_ustr *ObjectName; ULONG Attributes;
+		 PVOID SecurityDescriptor, SecurityQualityOfService; } nt_oattr;
+typedef LONG (NTAPI *nt_create_section_fn)(HANDLE *, ACCESS_MASK, nt_oattr *, LARGE_INTEGER *, ULONG, ULONG, HANDLE);
+typedef LONG (NTAPI *nt_open_fn)(HANDLE *, ACCESS_MASK, nt_oattr *);
+typedef LONG (NTAPI *nt_create_event_fn)(HANDLE *, ACCESS_MASK, nt_oattr *, int, BOOLEAN);
+static boxref pub_box;
+
+static void pub_name(wchar_t *out, const wchar_t *kind, DWORD pid)
+{
+	DWORD sess = 0;
+	ProcessIdToSessionId(GetCurrentProcessId(), &sess);
+	const wchar_t *parts[4] = { L"\\Sessions\\", NULL, L"\\BaseNamedObjects\\bmc-", kind };
+	char num[24];
+	wchar_t *o = out;
+	for (int i = 0; i < 4; i++) {
+		if (i == 1) {
+			ws_fmt_u64(num, sess);
+			for (char *q = num; *q; q++)
+				*o++ = (wchar_t)*q;
+			continue;
+		}
+		for (const wchar_t *q = parts[i]; *q; q++)
+			*o++ = *q;
+	}
+	*o++ = L'-';
+	ws_fmt_u64(num, pid);
+	for (char *q = num; *q; q++)
+		*o++ = (wchar_t)*q;
+	*o = 0;
+}
+
+static void pub_oa(nt_oattr *oa, nt_ustr *us, wchar_t *name)
+{
+	us->Length = (USHORT)(ws_wcslen(name) * sizeof(wchar_t));
+	us->MaximumLength = (USHORT)(us->Length + sizeof(wchar_t));
+	us->Buffer = name;
+	__ws_memset(oa, 0, sizeof *oa);
+	oa->Length = sizeof *oa;
+	oa->ObjectName = us;
+	oa->Attributes = 0x40;                       /* OBJ_CASE_INSENSITIVE */
+}
+
+static void pub_box_create(void)
+{
+	HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+	nt_create_section_fn cs = (nt_create_section_fn)(void *)GetProcAddress(nt, "NtCreateSection");
+	nt_create_event_fn ce = (nt_create_event_fn)(void *)GetProcAddress(nt, "NtCreateEvent");
+	__ws_memset(&pub_box, 0, sizeof pub_box);
+	if (!cs || !ce)
+		return;
+	wchar_t name[160];
+	nt_ustr us;
+	nt_oattr oa;
+	DWORD pid = GetCurrentProcessId();
+	pub_name(name, L"sig", pid);
+	pub_oa(&oa, &us, name);
+	LARGE_INTEGER sz;
+	sz.QuadPart = 4096;
+	HANDLE sec = NULL, ev = NULL;
+	if (cs(&sec, SECTION_ALL_ACCESS, &oa, &sz, PAGE_READWRITE, SEC_COMMIT, NULL) < 0)
+		return;
+	pub_name(name, L"sigev", pid);
+	pub_oa(&oa, &us, name);
+	if (ce(&ev, EVENT_ALL_ACCESS, &oa, 1 /* SynchronizationEvent */, FALSE) < 0) {
+		CloseHandle(sec);
+		return;
+	}
+	sigbox *b = MapViewOfFile(sec, FILE_MAP_WRITE, 0, 0, 4096);
+	if (!b) {
+		CloseHandle(sec);
+		CloseHandle(ev);
+		return;
+	}
+	b->pid = (LONG)pid;
+	pub_box.sec = sec;
+	pub_box.ev = ev;
+	pub_box.box = b;
+}
+
+/* post sig to process pid's public box: 1 = delivered, 0 = it has none */
+static int pub_post(DWORD pid, int sig)
+{
+	HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+	nt_open_fn os = (nt_open_fn)(void *)GetProcAddress(nt, "NtOpenSection");
+	nt_open_fn oe = (nt_open_fn)(void *)GetProcAddress(nt, "NtOpenEvent");
+	if (!os || !oe)
+		return 0;
+	wchar_t name[160];
+	nt_ustr us;
+	nt_oattr oa;
+	boxref b;
+	__ws_memset(&b, 0, sizeof b);
+	pub_name(name, L"sig", pid);
+	pub_oa(&oa, &us, name);
+	if (os(&b.sec, SECTION_MAP_WRITE | SECTION_MAP_READ, &oa) < 0)
+		return 0;
+	pub_name(name, L"sigev", pid);
+	pub_oa(&oa, &us, name);
+	int ok = 0;
+	if (oe(&b.ev, EVENT_MODIFY_STATE, &oa) >= 0) {
+		b.box = MapViewOfFile(b.sec, FILE_MAP_WRITE, 0, 0, 4096);
+		if (b.box && (DWORD)b.box->pid == pid) {
+			if (sig)
+				box_post(&b, sig);
+			ok = 1;
+		}
+	}
+	box_free(&b);
+	return ok;
+}
+
 /* ---------------------------------------------------------------- listener */
 static DWORD WINAPI listener(LPVOID p)
 {
@@ -107,6 +226,11 @@ static DWORD WINAPI listener(LPVOID p)
 		int n = 0;
 		hs[n++] = self_box.ev;
 		hs[n++] = wake_ev;
+		int pub_at = -1;
+		if (pub_box.ev) {
+			pub_at = n;
+			hs[n++] = pub_box.ev;
+		}
 		int parent_at = -1;
 		if (parent_proc && pdeathsig) {
 			parent_at = n;
@@ -121,8 +245,10 @@ static DWORD WINAPI listener(LPVOID p)
 			}
 		ReleaseSRWLockShared(&clock_);
 		DWORD r = WaitForMultipleObjects((DWORD)n, hs, FALSE, INFINITE);
-		if (r == WAIT_OBJECT_0) {
+		if (r == WAIT_OBJECT_0 || (pub_at >= 0 && r == WAIT_OBJECT_0 + (DWORD)pub_at)) {
 			u64 m = (u64)InterlockedExchange64(&self_box.box->mask, 0);
+			if (pub_box.box)
+				m |= (u64)InterlockedExchange64(&pub_box.box->mask, 0);
 			for (int sig = 1; m; sig++, m >>= 1)
 				if (m & 1) {
 					if (sig == 9)
@@ -163,6 +289,7 @@ void ws_fork_init(void)
 		ws_fatal("cannot create the signal box");
 	ws_futex_shared_init();
 	self_box.box->pid = (LONG)GetCurrentProcessId();
+	pub_box_create();
 	wake_ev = CreateEventW(NULL, FALSE, FALSE, NULL);
 	start_listener();
 	ws_prof_start(0);
@@ -246,6 +373,7 @@ static i64 sys_fork(void)
 		parent_pid = mypid;
 		parent_proc = me;
 		pdeathsig = 0;
+		pub_box_create();              /* the parent's handles are not ours (not inheritable) */
 		wake_ev = CreateEventW(NULL, FALSE, FALSE, NULL);
 		start_listener();
 		ws_prof_start(1);
@@ -369,10 +497,36 @@ static i64 sys_wait4(int pid, int *status, int options, struct l_rusage *ru)
 }
 
 /* ---------------------------------------------------------------- kill */
+/* SIGSTOP / SIGCONT: the whole process suspended or resumed, as the kernel
+ * stops every thread of a stopped process. 1 = done, 0 = no such process. */
+typedef LONG (NTAPI *nt_proc_fn)(HANDLE);
+static int suspend_resume(DWORD pid, int resume)
+{
+	static nt_proc_fn fs, fr;
+	if (!fs) {
+		HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+		fs = (nt_proc_fn)(void *)GetProcAddress(nt, "NtSuspendProcess");
+		fr = (nt_proc_fn)(void *)GetProcAddress(nt, "NtResumeProcess");
+	}
+	HANDLE h = OpenProcess(PROCESS_SUSPEND_RESUME | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+	if (!h)
+		return 0;
+	DWORD code;
+	int alive = GetExitCodeProcess(h, &code) && code == STILL_ACTIVE;
+	if (alive && (resume ? fr : fs))
+		(resume ? fr : fs)(h);
+	CloseHandle(h);
+	return alive;
+}
+
 i64 ws_kill_other(int pid, int sig)
 {
 	if (sig < 0 || sig > 64)
 		return -L_EINVAL;
+	if (sig == 19)                                     /* SIGSTOP: cannot be caught */
+		return suspend_resume((DWORD)pid, 0) ? 0 : -L_ESRCH;
+	if (sig == 18 && !suspend_resume((DWORD)pid, 1))   /* SIGCONT: resume, then deliver */
+		return -L_ESRCH;
 	boxref *b = NULL;
 	HANDLE ph = NULL;
 	AcquireSRWLockShared(&clock_);
@@ -397,7 +551,23 @@ i64 ws_kill_other(int pid, int sig)
 			TerminateProcess(ph, SIG_EXIT_MARK | 9);   /* it did not: as the kernel would */
 		return 0;
 	}
-	/* not related to us: only termination can be delivered */
+	/* not related to us: only termination can be delivered -- or a stop. A
+	 * signal whose default action is to do nothing (SIGCONT once resumed,
+	 * SIGCHLD, SIGURG, SIGWINCH) must not end the process. */
+	if (sig != 9 && pub_post((DWORD)pid, sig))        /* another winsys process: a real signal */
+		return 0;
+	if (sig == 9 && pub_post((DWORD)pid, 9)) {         /* SIGKILL: it cleans up, then ends -- or is ended */
+		HANDLE kh = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, (DWORD)pid);
+		if (kh) {
+			if (WaitForSingleObject(kh, 2000) == WAIT_TIMEOUT)
+				TerminateProcess(kh, SIG_EXIT_MARK | 9);
+			CloseHandle(kh);
+		}
+		return 0;
+	}
+	if (sig >= 20 && sig <= 22)                        /* SIGTSTP / SIGTTIN / SIGTTOU */
+		return suspend_resume((DWORD)pid, 0) ? 0 : -L_ESRCH;
+	int harmless = sig == 18 || sig == 17 || sig == 23 || sig == 28;
 	HANDLE h = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)pid);
 	if (!h)
 		return -L_ESRCH;
@@ -405,18 +575,49 @@ i64 ws_kill_other(int pid, int sig)
 	DWORD code;
 	if (GetExitCodeProcess(h, &code) && code != STILL_ACTIVE)
 		r = -L_ESRCH;
-	else if (sig != 0 && !TerminateProcess(h, SIG_EXIT_MARK | (UINT)sig))
+	else if (sig != 0 && !harmless && !TerminateProcess(h, SIG_EXIT_MARK | (UINT)sig))
 		r = ws_err(GetLastError());
 	CloseHandle(h);
 	return r;
 }
 
+static void exit_note(const char *what)
+{
+	/* BMC_WIN_EXITDEBUG=<file>: appended there (a worker's stderr is a
+	 * pipe whose reader may be gone by now) */
+	wchar_t path[MAX_PATH];
+	if (!GetEnvironmentVariableW(L"BMC_WIN_EXITDEBUG", path, MAX_PATH))
+		return;
+	char line[160], a[24];
+	size_t n = 0;
+	const char *parts[6] = { "exit ", NULL, " ", what, " at ", NULL };
+	for (int i = 0; i < 6; i++) {
+		const char *s = parts[i];
+		if (i == 1 || i == 5) {
+			ws_fmt_u64(a, i == 1 ? GetCurrentProcessId() : GetTickCount64() % 10000000);
+			s = a;
+		}
+		while (*s && n < sizeof line - 2)
+			line[n++] = *s++;
+	}
+	line[n++] = '\n';
+	HANDLE f = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, 0, NULL);
+	if (f != INVALID_HANDLE_VALUE) {
+		DWORD w;
+		WriteFile(f, line, (DWORD)n, &w, NULL);
+		CloseHandle(f);
+	}
+}
+
 void ws_exit_process(UINT code)
 {
+	exit_note("start");
 	ws_robust_release_all();
+	exit_note("robust released");
 	if (ws_is_root)
 		ExitProcess(code);
 	ws_fd_exit_sockets();                          /* graceful where we hold the last handle */
+	exit_note("sockets closed; terminating");
 	TerminateProcess(GetCurrentProcess(), code);   /* a clone must not call into CSRSS */
 	for (;;)
 		Sleep(INFINITE);

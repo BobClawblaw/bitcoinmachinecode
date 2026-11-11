@@ -133,6 +133,7 @@ SV int __bmc_start(int argc, char **argv, char **envp);
 WSAPI void __bmc_win_entry(void)
 {
 	ws_check_tls();
+	ws_fpu_linux();
 	extern uintptr_t __security_cookie;
 	extern i64 ws_getrandom(void *buf, size_t n);
 	uintptr_t ck;
@@ -143,6 +144,7 @@ WSAPI void __bmc_win_entry(void)
 	ws_sig_init();
 	ws_fork_init();
 	ws_fd_init();
+	ws_ns_init();
 	ws_net_init();
 	ws_seccomp_init_from_env();
 	int argc;

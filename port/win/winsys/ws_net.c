@@ -519,8 +519,10 @@ static i64 sock_io(ws_desc *d, void *buf, size_t n, int write)
 		if (r > 0) {
 			if (write)
 				d->last_tx_ms = GetTickCount64();
-			else
+			else {
 				d->last_rx_ms = GetTickCount64();
+				d->rx_pending_ms = 0;
+			}
 		}
 		if (r == -L_ECONNRESET || r == -L_ECONNABORTED) {
 			if (InterlockedExchange(&d->reset_seen, 1))
@@ -963,7 +965,7 @@ static i64 sys_getsockopt(int fd, int level, int opt, void *val, int *len)
 	} else if (level == 6 && opt == 11) {        /* TCP_INFO: Linux struct tcp_info */
 		unsigned char ti[232];
 		__ws_memset(ti, 0, sizeof ti);
-		i64 ev = sock_wait(d, AFD_POLL_DISCONNECT | AFD_POLL_ABORT, 0);
+		i64 ev = sock_wait(d, AFD_POLL_DISCONNECT | AFD_POLL_ABORT | AFD_POLL_RECEIVE, 0);
 		unsigned char state = 7;                 /* TCP_CLOSE */
 		if (d->connected || (d->peerlen && ev >= 0 && !(ev & (AFD_POLL_ABORT | AFD_POLL_CONNECT_FAIL))))
 			state = 1;                           /* TCP_ESTABLISHED */
@@ -975,8 +977,14 @@ static i64 sys_getsockopt(int fd, int level, int opt, void *val, int *len)
 			state = 7;
 		ti[0] = state;
 		u64 now = GetTickCount64(), base = d->since_ms ? d->since_ms : now;
+		/* tcpi_last_data_recv is when data last ARRIVED, read or not. Unread
+		 * data is dated from the first query that found it waiting (the
+		 * daemon asks every pass); a read dates it exactly. */
+		if (ev > 0 && (ev & AFD_POLL_RECEIVE) && !d->rx_pending_ms)
+			d->rx_pending_ms = now;
+		u64 rx = d->last_rx_ms > d->rx_pending_ms ? d->last_rx_ms : d->rx_pending_ms;
 		uint32_t since_tx = (uint32_t)(now - (d->last_tx_ms ? d->last_tx_ms : base));
-		uint32_t since_rx = (uint32_t)(now - (d->last_rx_ms ? d->last_rx_ms : base));
+		uint32_t since_rx = (uint32_t)(now - (rx ? rx : base));
 		__ws_memcpy(ti + 44, &since_tx, 4);     /* tcpi_last_data_sent */
 		__ws_memcpy(ti + 52, &since_rx, 4);     /* tcpi_last_data_recv */
 		__ws_memcpy(ti + 56, &since_rx, 4);     /* tcpi_last_ack_recv */
@@ -1405,8 +1413,20 @@ void ws_sock_close_last(SOCKET s)
 		OVERLAPPED ov;
 		__ws_memset(&ov, 0, sizeof ov);
 		ov.hEvent = thread_event();
+		u64 t0 = GetTickCount64();
 		BOOL ok = DeviceIoControl(h, IOCTL_AFD_PARTIAL_DISCONNECT, &di, sizeof di, NULL, 0, NULL, &ov);
-		io_finish(h, &ov, ok, 2000);
+		i64 r = io_finish(h, &ov, ok, 2000);
+		u64 dt = GetTickCount64() - t0;
+		if (dt > 100 && GetEnvironmentVariableA("BMC_WIN_NETDEBUG", NULL, 0)) {
+			char a[24], b[24];
+			ws_fmt_u64(a, dt);
+			ws_fmt_u64(b, (u64)-r);
+			ws_write_stderr("bmc_win: graceful close took ");
+			ws_write_stderr(a);
+			ws_write_stderr(" ms, -r ");
+			ws_write_stderr(b);
+			ws_write_stderr("\n");
+		}
 	}
 	CloseHandle(h);
 }

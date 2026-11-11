@@ -359,9 +359,12 @@ static i64 sys_execve(const char *path, char *const argv[], char *const envp[])
 		if (w == 0)
 			break;
 		if (w == WS_WAIT_INTR) {
-			int sig = ws_sig_take_pending();
-			if (sig == 9 || sig == 15 || sig == 2 || sig == 1 || sig == 3 || sig == 6)
-				TerminateProcess(proc, 0x4B4D5300u | (UINT)sig);
+			/* we stand in for the program: what is sent to us is meant for
+			 * it -- delivered as a signal (it handles SIGTERM its own way),
+			 * or, for a program without winsys, as termination */
+			int sig;
+			while ((sig = ws_sig_take_pending()) > 0)
+				ws_kill_other((int)GetProcessId(proc), sig);
 		}
 	}
 	DWORD code = 0;

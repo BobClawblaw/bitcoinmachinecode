@@ -38,9 +38,15 @@ def recipe():
     return out
 
 
+# tests that are slow on Windows only from the syscall cost: the bad-object
+# repro of test_lsm_lost_tombstones walks run files in 15- and 37-byte
+# reads, tens of millions of them (~16 min here, against the default 10)
+SLOW = {'test_lsm_lost_tombstones_bad': 1800}
+
 TOOLS = ['daemon/bmcbitcoind', 'daemon/bmc_cli', 'daemon/bmc_wallet_cli', 'daemon/bmc_rpcd',
          'daemon/bmc_build_addr_hist', 'daemon/bmc_build_coinstats_hist',
-         'daemon/bmc_build_txospender_index', 'daemon/bmc_merge_index_runs']
+         'daemon/bmc_build_txospender_index', 'daemon/bmc_merge_index_runs',
+         'tests/verify_p2sh_shim', 'tests/bip30_shim']   # helpers some tests run
 
 
 def main(argv):
@@ -118,7 +124,7 @@ def main(argv):
                 p = subprocess.Popen([exe] + parts[1:], cwd=ASM, stdout=lf, stderr=subprocess.STDOUT,
                                      stdin=subprocess.DEVNULL)
                 try:
-                    rc = p.wait(timeout=timeout)
+                    rc = p.wait(timeout=max(timeout, SLOW.get(name, 0)))
                 except subprocess.TimeoutExpired:
                     subprocess.run(['taskkill', '/F', '/T', '/PID', str(p.pid)], capture_output=True)
                     p.wait()

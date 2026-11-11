@@ -31,9 +31,33 @@
 
 #define MAX_FD (1 << 20)
 
+static int is_proc(const char *path);
+
+/* a relative name under a /proc directory fd -> the whole /proc path in buf */
+static const char *proc_join(int dirfd, const char *path, char *buf, size_t cap)
+{
+	if (!path || path[0] == '/' || !path[0] || dirfd < 0)
+		return path;
+	ws_desc *d = ws_fd_get(dirfd);
+	if (!d)
+		return path;
+	const char *r = path;
+	if (d->type == FT_MEMDIR && d->ppath) {
+		size_t a = ws_strlen(d->ppath), b = ws_strlen(path);
+		if (a + b + 2 <= cap) {
+			__ws_memcpy(buf, d->ppath, a);
+			buf[a] = '/';
+			__ws_memcpy(buf + a + 1, path, b + 1);
+			r = buf;
+		}
+	}
+	ws_desc_put(d);
+	return r;
+}
+
 static int is_proc(const char *path)
 {
-	return path && !__ws_memcmp(path, "/proc/", 6);
+	return path && !__ws_memcmp(path, "/proc", 5) && (path[5] == 0 || path[5] == '/');
 }
 
 typedef struct { ws_desc *d; int cloexec; } ws_slot;
@@ -70,6 +94,7 @@ void ws_desc_put(ws_desc *d)
 		FindClose(d->find);
 	ws_free(d->wpath);
 	ws_free(d->mem);
+	ws_free(d->ppath);
 	ws_free(d);
 }
 
@@ -295,6 +320,7 @@ struct l_stat {
 	i64 unused[3];
 };
 
+static volatile LONG64 *ns_gen;
 static i64 stat_handle(HANDLE h, int type, struct l_stat *st)
 {
 	__ws_memset(st, 0, sizeof *st);
@@ -347,6 +373,8 @@ static i64 stat_handle(HANDLE h, int type, struct l_stat *st)
 		st->st_blocks = (st->st_size + 511) / 512;
 	ft_to_ts(bi.ftLastAccessTime, &st->st_atime_sec, &st->st_atime_nsec);
 	ft_to_ts(bi.ftLastWriteTime, &st->st_mtime_sec, &st->st_mtime_nsec);
+	if (bi.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+		st->st_mtime_nsec += (i64)((u64)*ns_gen % 100);
 	FILE_BASIC_INFO b;
 	if (GetFileInformationByHandleEx(h, FileBasicInfo, &b, sizeof b)) {
 		FILETIME c = { (DWORD)b.ChangeTime.QuadPart, (DWORD)(b.ChangeTime.QuadPart >> 32) };
@@ -356,6 +384,31 @@ static i64 stat_handle(HANDLE h, int type, struct l_stat *st)
 		st->st_ctime_nsec = st->st_mtime_nsec;
 	}
 	return 0;
+}
+
+/* ---- directory mtime granularity ----
+ * NTFS stamps a directory's last-write time from the system tick (~1 ms), so
+ * two changes to its entries within one tick leave it unchanged, and code
+ * that rescans a directory only when its mtime moves (addr_hist.c's ah_scan)
+ * misses the second. Every create, unlink, rename and mkdir made through
+ * winsys bumps a counter shared by all winsys processes, and a directory's
+ * reported mtime carries it in the sub-100 ns digits, which NTFS never sets.
+ * (Every directory's mtime moves on any change anywhere: a spurious rescan
+ * at worst.) The view is mapped at start, so a forked process shares it. */
+static volatile LONG64 ns_gen_local;
+static volatile LONG64 *ns_gen = &ns_gen_local;
+
+void ws_ns_init(void)
+{
+	HANDLE m = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, 4096, L"Local\\bmc-win-nsgen");
+	void *p = m ? MapViewOfFile(m, FILE_MAP_ALL_ACCESS, 0, 0, 8) : NULL;
+	if (p)
+		ns_gen = p;
+}
+
+static void ns_changed(void)
+{
+	InterlockedIncrement64(ns_gen);
 }
 
 static HANDLE open_meta(const wchar_t *w, int nofollow, DWORD access)
@@ -494,6 +547,8 @@ static i64 open_proc_fd(ws_desc *d, int flags, int cloexec)
 
 static i64 sys_stat_path(int dirfd, const char *path, struct l_stat *st, int flags)
 {
+	char pj[256];
+	path = proc_join(dirfd, path, pj, sizeof pj);
 	if ((flags & L_AT_EMPTY_PATH) && path && !*path) {
 		ws_desc *d = ws_fd_get(dirfd);
 		if (!d)
@@ -506,6 +561,11 @@ static i64 sys_stat_path(int dirfd, const char *path, struct l_stat *st, int fla
 	}
 	if (is_proc(path) && !(flags & L_AT_SYMLINK_NOFOLLOW)) {
 		ws_desc *pd = proc_fd(path);
+		if (!pd) {
+			int ofd = ws_procfs_other_fd(path);
+			if (ofd >= 0)
+				pd = ws_fd_get(ofd);
+		}
 		if (pd) {
 			i64 r = stat_handle(pd->h, pd->type, st);
 			if (!r && pd->type == FT_MEM)
@@ -547,6 +607,8 @@ static i64 delete_path(const wchar_t *w, int want_dir);
 
 static i64 sys_open(int dirfd, const char *path, int flags, int mode)
 {
+	char pj[256];
+	path = proc_join(dirfd, path, pj, sizeof pj);
 	i64 err;
 	int cloexec = (flags & L_O_CLOEXEC) != 0;
 	if (is_proc(path)) {
@@ -652,6 +714,7 @@ static i64 sys_open(int dirfd, const char *path, int flags, int mode)
 	}
 	if ((flags & L_O_CREAT) && !isdir &&
 	    (disp == CREATE_NEW || (disp != OPEN_EXISTING && GetLastError() != ERROR_ALREADY_EXISTS))) {
+		ns_changed();
 		/* we created it: its permission bits are mode & ~umask */
 		HANDLE wh = ReOpenFile(h, FILE_WRITE_EA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 0);
 		if (wh != INVALID_HANDLE_VALUE) {
@@ -1457,8 +1520,10 @@ static i64 sys_mkdir(int dirfd, const char *path, int mode)
 		return err;
 	BOOL ok = CreateDirectoryW(w, NULL);
 	DWORD e = GetLastError();
-	if (ok)
+	if (ok) {
 		mode_set_path(w, (unsigned)mode & ~(unsigned)umask_bits & 07777);
+		ns_changed();
+	}
 	ws_free(w);
 	return ok ? 0 : ws_err(e);
 }
@@ -1492,6 +1557,8 @@ static i64 delete_path(const wchar_t *w, int want_dir)
 		e = ok ? 0 : GetLastError();
 	}
 	CloseHandle(h);
+	if (ok)
+		ns_changed();
 	return ok ? 0 : ws_err(e);
 }
 
@@ -1558,6 +1625,8 @@ static i64 sys_renameat(int ofd, const char *op, int nfd, const char *np, unsign
 		}
 		if (!ok)
 			r = (e == ERROR_ALREADY_EXISTS || e == ERROR_FILE_EXISTS) ? -L_EEXIST : ws_err(e);
+		else
+			ns_changed();
 	}
 	ws_free(fn);
 	ws_free(wo);
@@ -1826,8 +1895,17 @@ i64 ws_sys_file(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *hand
 	case 217: return sys_getdents64((int)a1, (void *)a2, (size_t)a3);
 	case 89:                               /* readlink: /proc links; no others are made */
 		return is_proc((const char *)a1) ? ws_procfs_readlink((const char *)a1, (char *)a2, (size_t)a3) : -L_EINVAL;
-	case 267:
-		return is_proc((const char *)a2) ? ws_procfs_readlink((const char *)a2, (char *)a3, (size_t)a4) : -L_EINVAL;
+	case 267: {
+		char pj[256];
+		const char *p = proc_join((int)a1, (const char *)a2, pj, sizeof pj);
+		return is_proc(p) ? ws_procfs_readlink(p, (char *)a3, (size_t)a4) : -L_EINVAL;
+	}
+	case 312:                              /* kcmp(pid1, pid2, KCMP_FILE, fd1, fd2) */
+		if (a3 != 0)
+			return -L_EINVAL;
+		/* another process's fd N, as /proc/<pid>/fd lists it, IS our fd N's
+		 * description (ws_fd_list_shared): the question is ours alone */
+		return ws_fd_same_file((int)a4, (int)a5);
 	case 86: case 265: case 88: case 266: return -L_EPERM;  /* link / symlink */
 	case 90: return sys_chmod(L_AT_FDCWD, (const char *)a1, (unsigned)a2);
 	case 268: return sys_chmod((int)a1, (const char *)a2, (unsigned)a3);   /* fchmodat */
@@ -1902,6 +1980,73 @@ void ws_fd_close_on_exec(void)
 		ReleaseSRWLockExclusive(&fdt_lock);
 		ws_desc_put(d);
 	}
+}
+
+/* CompareObjectHandles (Windows 10 1607+): same kernel object, so for two
+ * file handles the same open file description */
+typedef BOOL (WINAPI *cmp_obj_fn)(HANDLE, HANDLE);
+static int same_object(HANDLE a, HANDLE b)
+{
+	static cmp_obj_fn f;
+	static int tried;
+	if (!tried) {
+		f = (cmp_obj_fn)(void *)GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "CompareObjectHandles");
+		tried = 1;
+	}
+	return f && f(a, b);
+}
+
+/* /proc/<pid>/fd of ANOTHER process: our fds on a file whose open file
+ * description that process also holds -- a forked or exec'd process keeps
+ * the handle values it inherited, so each is looked up by value and
+ * confirmed by object identity. Only that: a process's own opens are not
+ * visible, and only regular files and directories are looked at (a
+ * duplicate of someone's socket handle could end up as its last reference,
+ * and closing that resets the connection). Enough for the question the
+ * daemon asks there -- who else holds this lock's description -- with
+ * kcmp(KCMP_FILE) below. */
+int ws_fd_list_shared(HANDLE proc, void (*emit)(void *ctx, int fd), void *ctx)
+{
+	int cap = 0, n = 0;
+	AcquireSRWLockShared(&fdt_lock);
+	for (int i = 0; i < fdt_cap; i++)
+		if (fdt[i].d && (fdt[i].d->type == FT_FILE || fdt[i].d->type == FT_DIR))
+			cap++;
+	int *fds = cap ? ws_alloc(sizeof(int) * (size_t)cap) : NULL;
+	HANDLE *hs = cap ? ws_alloc(sizeof(HANDLE) * (size_t)cap) : NULL;
+	for (int i = 0; fds && hs && i < fdt_cap && n < cap; i++)
+		if (fdt[i].d && (fdt[i].d->type == FT_FILE || fdt[i].d->type == FT_DIR)) {
+			fds[n] = i;
+			hs[n] = fdt[i].d->h;
+			n++;
+		}
+	ReleaseSRWLockShared(&fdt_lock);
+	int found = 0;
+	for (int k = 0; k < n; k++) {
+		HANDLE dup = NULL;
+		if (!DuplicateHandle(proc, hs[k], GetCurrentProcess(), &dup, 0, FALSE, DUPLICATE_SAME_ACCESS))
+			continue;
+		if (same_object(dup, hs[k])) {
+			emit(ctx, fds[k]);
+			found++;
+		}
+		CloseHandle(dup);
+	}
+	ws_free(fds);
+	ws_free(hs);
+	return found;
+}
+
+/* kcmp(KCMP_FILE): 0 when two of our fds are the same open file description */
+int ws_fd_same_file(int fd1, int fd2)
+{
+	ws_desc *a = ws_fd_get(fd1), *b = ws_fd_get(fd2);
+	int r = -L_EBADF;
+	if (a && b)
+		r = (a == b || (a->h != INVALID_HANDLE_VALUE && same_object(a->h, b->h))) ? 0 : 1;
+	ws_desc_put(a);
+	ws_desc_put(b);
+	return r;
 }
 
 /* /proc/self/fd: the open fd numbers */

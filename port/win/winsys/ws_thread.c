@@ -371,6 +371,7 @@ static DWORD WINAPI start_main(LPVOID p)
 {
 	starter s = *(starter *)p;
 	ws_free(p);
+	ws_fpu_linux();
 	InterlockedDecrement(&starting);
 	return s.fn(s.arg);
 }

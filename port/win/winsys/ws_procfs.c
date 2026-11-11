@@ -274,21 +274,63 @@ static int gen_meminfo(sbuf *b)
 	return 0;
 }
 
-static int gen_task_dir(sbuf *b, DWORD pid)
+/* Another process's threads come from a system-wide snapshot shared for
+ * 250 ms: a walk over /proc/<pid>/task of every process (the daemon's
+ * datadir-lock scan does one per pass) would otherwise take one snapshot per
+ * process, ~50 ms each -- 15 s a pass with 300 processes. Our own threads
+ * are always listed fresh. */
+typedef struct { DWORD pid, tid; } pt_pair;
+static pt_pair *pt_cache;
+static size_t pt_n;
+static u64 pt_at;
+static SRWLOCK pt_lock = SRWLOCK_INIT;
+
+static void pt_refresh(void)
 {
 	HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
 	if (snap == INVALID_HANDLE_VALUE)
-		return -L_ENOENT;
+		return;
+	size_t cap = pt_n > 1024 ? pt_n * 2 : 4096, n = 0;
+	pt_pair *v = ws_alloc(sizeof *v * cap);
 	THREADENTRY32 te;
 	te.dwSize = sizeof te;
+	for (BOOL ok = Thread32First(snap, &te); ok && v; ok = Thread32Next(snap, &te)) {
+		if (n == cap) {
+			pt_pair *w = ws_alloc(sizeof *w * cap * 2);
+			if (!w)
+				break;
+			__ws_memcpy(w, v, sizeof *v * n);
+			ws_free(v);
+			v = w;
+			cap *= 2;
+		}
+		v[n].pid = te.th32OwnerProcessID;
+		v[n].tid = te.th32ThreadID;
+		n++;
+	}
+	CloseHandle(snap);
+	if (v) {
+		ws_free(pt_cache);
+		pt_cache = v;
+		pt_n = n;
+		pt_at = GetTickCount64();
+	}
+}
+
+static int gen_task_dir(sbuf *b, DWORD pid)
+{
 	int any = 0;
-	for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te))
-		if (te.th32OwnerProcessID == pid) {
-			sputu(b, te.th32ThreadID);
-			b->p[b->n++] = 0;          /* NUL-separated names */
+	AcquireSRWLockExclusive(&pt_lock);
+	if (pid == GetCurrentProcessId() || !pt_cache || GetTickCount64() - pt_at > 250)
+		pt_refresh();
+	for (size_t i = 0; i < pt_n; i++)
+		if (pt_cache[i].pid == pid) {
+			sputu(b, pt_cache[i].tid);
+			sput(b, "x");
+			b->p[b->n - 1] = 0;        /* NUL-separated names */
 			any = 1;
 		}
-	CloseHandle(snap);
+	ReleaseSRWLockExclusive(&pt_lock);
 	return any ? 0 : -L_ENOENT;
 }
 
@@ -348,14 +390,37 @@ static int streq(const char *a, const char *b)
 	return *a == *b;
 }
 
+/* /proc itself: every process's pid */
+static int gen_pid_dir(sbuf *b)
+{
+	HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (snap == INVALID_HANDLE_VALUE)
+		return -L_ENOENT;
+	PROCESSENTRY32W pe;
+	pe.dwSize = sizeof pe;
+	for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe))
+		if (pe.th32ProcessID) {
+			sputu(b, pe.th32ProcessID);
+			sput(b, "x");
+			b->p[b->n - 1] = 0;
+		}
+	CloseHandle(snap);
+	return 0;
+}
+
 ws_desc *ws_procfs_open(const char *path, i64 *err)
 {
-	const char *p = path + 6;                  /* after "/proc/" */
+	const char *p = path[5] ? path + 6 : path + 5;   /* after "/proc/" */
 	sbuf b = { 0 };
 	int dir = 0, r = -L_ENOENT;
 	DWORD pid;
 	const char *rest;
-	if (streq(p, "meminfo")) {
+	if (!*p) {
+		sput(&b, "");
+		b.n = 0;
+		r = gen_pid_dir(&b);
+		dir = 1;
+	} else if (streq(p, "meminfo")) {
 		r = gen_meminfo(&b);
 	} else if (split_pid(p, &pid, &rest) && !ws_pid_reaped(pid)) {
 		int self = pid == GetCurrentProcessId();
@@ -410,6 +475,19 @@ ws_desc *ws_procfs_open(const char *path, i64 *err)
 			ws_fd_list(emit_fd, &b);
 			r = 0;
 			dir = 1;
+		} else if (streq(rest, "fd") || streq(rest, "fd/")) {
+			/* another process: the descriptions it shares with us */
+			HANDLE h = OpenProcess(PROCESS_DUP_HANDLE, FALSE, pid);
+			if (h) {
+				sput(&b, "");
+				b.n = 0;
+				ws_fd_list_shared(h, emit_fd, &b);
+				CloseHandle(h);
+				r = 0;
+				dir = 1;
+			} else {
+				r = -L_EACCES;
+			}
 		}
 	}
 	if (r) {
@@ -427,7 +505,47 @@ ws_desc *ws_procfs_open(const char *path, i64 *err)
 		b.p = ws_alloc(1);
 	d->mem = b.p;
 	d->memlen = b.n;
+	size_t pl = ws_strlen(path);
+	while (pl > 1 && path[pl - 1] == '/')
+		pl--;
+	d->ppath = ws_alloc(pl + 1);
+	if (d->ppath) {
+		__ws_memcpy(d->ppath, path, pl);
+		d->ppath[pl] = 0;
+	}
 	return d;
+}
+
+/* does process pid hold our fd's description (as its /proc/<pid>/fd lists)? */
+static void note_fd(void *ctx, int fd)
+{
+	int *want = ctx;
+	if (fd == want[0])
+		want[1] = 1;
+}
+static int other_holds(DWORD pid, int fd)
+{
+	HANDLE h = OpenProcess(PROCESS_DUP_HANDLE, FALSE, pid);
+	if (!h)
+		return 0;
+	int want[2] = { fd, 0 };
+	ws_fd_list_shared(h, note_fd, want);
+	CloseHandle(h);
+	return want[1];
+}
+
+/* the fd an /proc/<pid>/fd/N path of another process stands for (it is our
+ * fd N's description), or -1 */
+int ws_procfs_other_fd(const char *path)
+{
+	DWORD pid;
+	const char *rest;
+	if (!split_pid(path + 6, &pid, &rest) || pid == GetCurrentProcessId())
+		return -1;
+	if (__ws_memcmp(rest, "fd/", 3) || !is_num(rest + 3, rest + ws_strlen(rest)))
+		return -1;
+	int fd = (int)to_u(rest + 3, rest + ws_strlen(rest));
+	return other_holds(pid, fd) ? fd : -1;
 }
 
 /* readlink of /proc/self/exe and /proc/self/fd/N */
@@ -437,8 +555,26 @@ i64 ws_procfs_readlink(const char *path, char *buf, size_t cap)
 	DWORD pid;
 	const char *rest;
 	char *u = NULL;
-	if (!split_pid(p, &pid, &rest) || pid != GetCurrentProcessId())
+	if (!split_pid(p, &pid, &rest))
 		return -L_ENOENT;
+	if (pid != GetCurrentProcessId()) {
+		if (__ws_memcmp(rest, "fd/", 3) || !is_num(rest + 3, rest + ws_strlen(rest)))
+			return -L_ENOENT;
+		int fd = (int)to_u(rest + 3, rest + ws_strlen(rest));
+		if (!other_holds(pid, fd))
+			return -L_ENOENT;
+		char self_path[40] = "/proc/self/fd/";
+		sbuf t = { 0 };
+		sputu(&t, (u64)fd);
+		sput(&t, "x");
+		size_t tl = t.n - 1;
+		if (tl > 20)
+			tl = 20;
+		__ws_memcpy(self_path + 14, t.p, tl);
+		self_path[14 + tl] = 0;
+		ws_free(t.p);
+		return ws_procfs_readlink(self_path, buf, cap);
+	}
 	if (streq(rest, "exe")) {
 		wchar_t w[MAX_PATH];
 		if (GetModuleFileNameW(NULL, w, MAX_PATH))

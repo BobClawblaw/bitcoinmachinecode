@@ -85,16 +85,31 @@ typedef struct ws_desc {
 	u64 pair_key;              /* sockets from socketpair: the pair (SCM_RIGHTS escrow key) */
 	int pair_side;             /* ...and which end this is (0/1) */
 	volatile u64 last_rx_ms, last_tx_ms, since_ms;   /* sockets: TCP_INFO's last_data_* */
+	volatile u64 rx_pending_ms;   /* sockets: when unread data was first seen waiting (0 = none) */
 	u64 memlen;
 	volatile LONG reset_seen;   /* sockets: a reset was reported once; reads now see EOF */
-	int efd_sem;                /* FT_EVENTFD: EFD_SEMAPHORE (counter in off, event in h) */
+	int efd_sem;
+	char *ppath;                /* FT_MEM / FT_MEMDIR: the /proc path it was opened as */                /* FT_EVENTFD: EFD_SEMAPHORE (counter in off, event in h) */
 } ws_desc;
 void ws_fd_init(void);
+int ws_fd_list_shared(HANDLE proc, void (*emit)(void *ctx, int fd), void *ctx);
+int ws_fd_same_file(int fd1, int fd2);
+int ws_procfs_other_fd(const char *path);
+void ws_ns_init(void);
 ws_desc *ws_fd_get(int fd);       /* +1 ref, NULL if not open */
 void ws_desc_put(ws_desc *d);
 int ws_fd_install(ws_desc *d, int cloexec, int min_fd); /* consumes the ref; -EMFILE */
 ws_desc *ws_desc_new(int type);
 short ws_eventfd_ready(ws_desc *d, short ev);
+/* The x87 control word Linux starts every thread with: 64-bit precision
+ * (0x37F). Windows starts threads at 53-bit precision (0x27F), and musl's
+ * long double printf rounding then comes out wrong ("%.2f" of 0.045678 ->
+ * "0.04"). */
+static inline void ws_fpu_linux(void)
+{
+	unsigned short cw = 0x37F;
+	__asm__ volatile("fldcw %0" : : "m"(cw));
+}
 i64 ws_sys_file(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *handled);
 
 /* ---- ws_mem.c ---- */
