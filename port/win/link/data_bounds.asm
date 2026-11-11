@@ -12,3 +12,13 @@ section .bss$zzzz bss
 __bss_start:
 _end:
     resq 1
+
+; etext / _etext: the end of the code. ".text$~~~~" sorts after every other
+; .text piece ('~' is above any name character). __executable_start is
+; __ImageBase, by /alternatename at the link (build.py).
+global etext
+global _etext
+section .text$~~~~ code
+etext:
+_etext:
+    int3

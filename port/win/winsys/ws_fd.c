@@ -215,6 +215,74 @@ static void ft_to_ts(FILETIME ft, i64 *sec, i64 *nsec)
 	}
 }
 
+/* ---- Unix permission bits: an NTFS extended attribute "BMCMODE" (4 bytes,
+ * the low 12 bits of st_mode), set at creation (mode & ~umask) and by
+ * chmod; a file without it reads 0644 (directories 0755). WSL1 kept Linux
+ * metadata in EAs the same way. On a filesystem without EAs the bits are
+ * simply not kept. ---- */
+typedef struct { ULONG next; UCHAR flags; UCHAR namelen; USHORT valuelen; char name[8]; uint32_t value; } mode_ea;
+typedef struct { ULONG next; UCHAR namelen; char name[8]; } mode_ea_get;
+typedef struct { union { LONG status; PVOID p; } u; ULONG_PTR info; } ws_iosb;
+typedef LONG (NTAPI *nt_set_ea_fn)(HANDLE, ws_iosb *, PVOID, ULONG);
+typedef LONG (NTAPI *nt_query_ea_fn)(HANDLE, ws_iosb *, PVOID, ULONG, BOOLEAN, PVOID, ULONG, PULONG, BOOLEAN);
+static nt_set_ea_fn nt_set_ea;
+static nt_query_ea_fn nt_query_ea;
+static volatile LONG umask_bits = 022;
+
+static void ea_init(void)
+{
+	if (nt_set_ea)
+		return;
+	HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+	nt_query_ea = (nt_query_ea_fn)(void *)GetProcAddress(nt, "NtQueryEaFile");
+	nt_set_ea = (nt_set_ea_fn)(void *)GetProcAddress(nt, "NtSetEaFile");
+}
+
+static int mode_set_handle(HANDLE h, unsigned mode)
+{
+	ea_init();
+	if (!nt_set_ea)
+		return -1;
+	mode_ea e;
+	__ws_memset(&e, 0, sizeof e);
+	e.namelen = 7;
+	e.valuelen = 4;
+	__ws_memcpy(e.name, "BMCMODE", 8);
+	e.value = mode & 07777;
+	ws_iosb io;
+	return nt_set_ea(h, &io, &e, sizeof e) >= 0 ? 0 : -1;
+}
+
+/* -1 when the file carries no mode */
+static int mode_get_handle(HANDLE h)
+{
+	ea_init();
+	if (!nt_query_ea)
+		return -1;
+	mode_ea_get q;
+	__ws_memset(&q, 0, sizeof q);
+	q.namelen = 7;
+	__ws_memcpy(q.name, "BMCMODE", 8);
+	mode_ea out;
+	__ws_memset(&out, 0, sizeof out);
+	ws_iosb io;
+	LONG st = nt_query_ea(h, &io, &out, sizeof out, TRUE, &q, sizeof q, NULL, TRUE);
+	if (st < 0 || out.valuelen != 4)
+		return -1;
+	return (int)(out.value & 07777);
+}
+
+static int mode_set_path(const wchar_t *w, unsigned mode)
+{
+	HANDLE h = CreateFileW(w, FILE_WRITE_EA | FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+			       NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+	if (h == INVALID_HANDLE_VALUE)
+		return -1;
+	int r = mode_set_handle(h, mode);
+	CloseHandle(h);
+	return r;
+}
+
 /* Linux x86_64 struct stat (kernel layout, what musl's kstat expects) */
 struct l_stat {
 	u64 st_dev, st_ino, st_nlink;
@@ -263,10 +331,12 @@ static i64 stat_handle(HANDLE h, int type, struct l_stat *st)
 	st->st_dev = bi.dwVolumeSerialNumber;
 	st->st_ino = ((u64)bi.nFileIndexHigh << 32) | bi.nFileIndexLow;
 	st->st_nlink = bi.nNumberOfLinks;
+	int perm = mode_get_handle(h);
 	if (bi.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-		st->st_mode = 0040000 | 0755;
+		st->st_mode = 0040000 | (perm >= 0 ? (unsigned)perm : 0755);
 	else
-		st->st_mode = 0100000 | ((bi.dwFileAttributes & FILE_ATTRIBUTE_READONLY) ? 0444 : 0644);
+		st->st_mode = 0100000 | (perm >= 0 ? (unsigned)perm
+					  : (bi.dwFileAttributes & FILE_ATTRIBUTE_READONLY) ? 0444 : 0644);
 	st->st_size = (i64)(((u64)bi.nFileSizeHigh << 32) | bi.nFileSizeLow);
 	FILE_STANDARD_INFO si;
 	if (GetFileInformationByHandleEx(h, FileStandardInfo, &si, sizeof si))
@@ -330,7 +400,7 @@ static i64 sys_stat_path(int dirfd, const char *path, struct l_stat *st, int fla
 		ws_free(w);
 		return stat_handle(NULL, FT_NULL, st);
 	}
-	HANDLE h = open_meta(w, (flags & L_AT_SYMLINK_NOFOLLOW) != 0, FILE_READ_ATTRIBUTES);
+	HANDLE h = open_meta(w, (flags & L_AT_SYMLINK_NOFOLLOW) != 0, FILE_READ_ATTRIBUTES | FILE_READ_EA);
 	ws_free(w);
 	if (h == INVALID_HANDLE_VALUE)
 		return ws_err(GetLastError());
@@ -375,7 +445,7 @@ static i64 sys_open(int dirfd, const char *path, int flags, int mode)
 	}
 	if (flags & L_O_PATH)
 		acc = FILE_READ_ATTRIBUTES;
-	acc |= FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+	acc |= FILE_READ_ATTRIBUTES | FILE_READ_EA | SYNCHRONIZE;
 	DWORD disp;
 	if ((flags & L_O_CREAT) && (flags & L_O_EXCL))
 		disp = CREATE_NEW;
@@ -403,7 +473,7 @@ static i64 sys_open(int dirfd, const char *path, int flags, int mode)
 		return -L_EISDIR;
 	}
 	if (isdir) {
-		acc = FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY | SYNCHRONIZE;
+		acc = FILE_READ_ATTRIBUTES | FILE_READ_EA | FILE_LIST_DIRECTORY | SYNCHRONIZE;
 		disp = OPEN_EXISTING;
 	}
 	if (acc & GENERIC_WRITE) {
@@ -421,7 +491,15 @@ static i64 sys_open(int dirfd, const char *path, int flags, int mode)
 			return -L_EEXIST;
 		return ws_err(e);
 	}
-	(void)mode;
+	if ((flags & L_O_CREAT) && !isdir &&
+	    (disp == CREATE_NEW || (disp != OPEN_EXISTING && GetLastError() != ERROR_ALREADY_EXISTS))) {
+		/* we created it: its permission bits are mode & ~umask */
+		HANDLE wh = ReOpenFile(h, FILE_WRITE_EA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 0);
+		if (wh != INVALID_HANDLE_VALUE) {
+			mode_set_handle(wh, (unsigned)mode & ~(unsigned)umask_bits & 07777);
+			CloseHandle(wh);
+		}
+	}
 	ws_desc *d = ws_desc_new(isdir ? FT_DIR : FT_FILE);
 	if (!d) {
 		CloseHandle(h);
@@ -1071,12 +1149,13 @@ static i64 sys_getdents64(int fd, void *buf, size_t cnt)
 static i64 sys_mkdir(int dirfd, const char *path, int mode)
 {
 	i64 err;
-	(void)mode;
 	wchar_t *w = ws_path(dirfd, path, &err);
 	if (!w)
 		return err;
 	BOOL ok = CreateDirectoryW(w, NULL);
 	DWORD e = GetLastError();
+	if (ok)
+		mode_set_path(w, (unsigned)mode & ~(unsigned)umask_bits & 07777);
 	ws_free(w);
 	return ok ? 0 : ws_err(e);
 }
@@ -1282,6 +1361,39 @@ static i64 sys_pipe(int *fds, int flags)
 	return 0;
 }
 
+static i64 sys_chmod(int dirfd, const char *path, unsigned mode)
+{
+	i64 err;
+	wchar_t *w = ws_path(dirfd, path, &err);
+	if (!w)
+		return err;
+	DWORD a = GetFileAttributesW(w);
+	i64 r = a == INVALID_FILE_ATTRIBUTES ? ws_err(GetLastError()) : 0;
+	if (!r)
+		mode_set_path(w, mode);
+	ws_free(w);
+	return r;
+}
+
+static i64 sys_fchmod(int fd, unsigned mode)
+{
+	ws_desc *d = ws_fd_get(fd);
+	if (!d)
+		return -L_EBADF;
+	if (d->type == FT_FILE || d->type == FT_DIR) {
+		HANDLE wh = ReOpenFile(d->h, FILE_WRITE_EA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+				       d->type == FT_DIR ? FILE_FLAG_BACKUP_SEMANTICS : 0);
+		if (wh != INVALID_HANDLE_VALUE) {
+			mode_set_handle(wh, mode);
+			CloseHandle(wh);
+		} else if (d->wpath) {
+			mode_set_path(d->wpath, mode);
+		}
+	}
+	ws_desc_put(d);
+	return 0;
+}
+
 i64 ws_sys_file(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *handled)
 {
 	*handled = 1;
@@ -1336,8 +1448,11 @@ i64 ws_sys_file(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *hand
 	case 267:
 		return is_proc((const char *)a2) ? ws_procfs_readlink((const char *)a2, (char *)a3, (size_t)a4) : -L_EINVAL;
 	case 86: case 265: case 88: case 266: return -L_EPERM;  /* link / symlink */
-	case 90: case 91: case 268: case 92: case 93: case 94: case 260: return 0;  /* chmod/chown */
-	case 95: return 022;                   /* umask */
+	case 90: return sys_chmod(L_AT_FDCWD, (const char *)a1, (unsigned)a2);
+	case 268: return sys_chmod((int)a1, (const char *)a2, (unsigned)a3);   /* fchmodat */
+	case 91: return sys_fchmod((int)a1, (unsigned)a2);
+	case 92: case 93: case 94: case 260: return 0;   /* chown family: one user */
+	case 95: return (i64)InterlockedExchange(&umask_bits, (LONG)(a1 & 0777));   /* umask */
 	case 332: return -L_ENOSYS;            /* statx: musl falls back to fstatat */
 	case 318: return fill_random((void *)a1, (size_t)a2);   /* getrandom */
 	default:

@@ -41,11 +41,81 @@ void __init_tls(size_t *aux)
 
 int main(int, char **, char **);
 
+/* "C:\x\y" / "C:/x/y" -> "/c/x/y": absolute paths reach bmc in the form
+ * getcwd gives (POSIX code tests path[0] == '/'), and winsys maps them back */
+static int drive_path(const char *s)
+{
+	return ((s[0] >= 'A' && s[0] <= 'Z') || (s[0] >= 'a' && s[0] <= 'z')) && s[1] == ':' &&
+	       (s[2] == '\\' || s[2] == '/' || s[2] == 0);
+}
+
+static char *posix_path(const char *prefix, size_t plen, const char *path)
+{
+	size_t l = strlen(path);
+	char *o = malloc(plen + l + 2);
+	if (!o)
+		return NULL;
+	memcpy(o, prefix, plen);
+	char *d = o + plen;
+	*d++ = '/';
+	*d++ = (char)(path[0] | 0x20);
+	for (const char *s = path + 2; *s; s++)
+		*d++ = *s == '\\' ? '/' : *s;
+	*d = 0;
+	return o;
+}
+
+/* each argument that is a drive path, or "-opt=<drive path>" */
+static void posix_args(int argc, char **argv)
+{
+	for (int i = 1; i < argc; i++) {
+		char *a = argv[i], *n = NULL;
+		if (drive_path(a)) {
+			n = posix_path("", 0, a);
+		} else if (a[0] == '-') {
+			char *eq = strchr(a, '=');
+			if (eq && drive_path(eq + 1))
+				n = posix_path(a, (size_t)(eq + 1 - a), eq + 1);
+		}
+		if (n)
+			argv[i] = n;
+	}
+}
+
+/* HOME, the base of default datadirs: the user profile, in POSIX form */
+static char **posix_env(char **envp, size_t *n)
+{
+	const char *home = NULL, *profile = NULL;
+	for (size_t i = 0; envp[i]; i++) {
+		if (!strncmp(envp[i], "HOME=", 5))
+			home = envp[i] + 5;
+		if (!strncmp(envp[i], "USERPROFILE=", 12))
+			profile = envp[i] + 12;
+	}
+	const char *src = home && drive_path(home) ? home : !home ? profile : NULL;
+	if (!src || !drive_path(src))
+		return envp;
+	char *h = posix_path("HOME=", 5, src);
+	char **out = malloc((*n + 2) * sizeof(char *));
+	if (!h || !out)
+		return envp;
+	size_t k = 0;
+	for (size_t i = 0; envp[i]; i++)
+		if (strncmp(envp[i], "HOME=", 5))
+			out[k++] = envp[i];
+	out[k++] = h;
+	out[k] = NULL;
+	*n = k;
+	return out;
+}
+
 int __bmc_start(int argc, char **argv, char **envp)
 {
 	size_t n = 0;
 	while (envp[n])
 		n++;
+	envp = posix_env(envp, &n);
+	posix_args(argc, argv);
 	/* envp, NULL, then the auxv __init_libc expects right behind it */
 	static unsigned char rnd[16];
 	__syscall(SYS_getrandom, rnd, sizeof rnd, 0);

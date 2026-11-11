@@ -546,8 +546,8 @@ def link(exe, objs, base='0x10000000', wraps=()):
     os.makedirs(os.path.dirname(exe), exist_ok=True)
     cmd = [LLD, '/nologo', '/lldmingw', '/out:' + exe, '/entry:__bmc_win_entry', '/subsystem:console',
            '/nodefaultlib', '/libpath:' + _winsdk_lib(), '/base:' + base, '/fixed',
-           '/dynamicbase:no', '/largeaddressaware:no', '/stack:0x1000000,0x1000000',
-           '/opt:ref', '/debug:none', '/map:' + exe[:-4] + '.map', '/pdbaltpath:%_PDB%', '/Brepro']
+           '/dynamicbase:no', '/largeaddressaware', '/stack:0x1000000,0x1000000',
+           '/alternatename:__executable_start=__ImageBase', '/opt:ref', '/debug:none', '/map:' + exe[:-4] + '.map', '/pdbaltpath:%_PDB%', '/Brepro']
     builtins = os.path.join(os.path.dirname(_clang_resource_inc()), 'lib', 'windows',
                             'clang_rt.builtins-x86_64.lib')
     cmd += ['-wrap:' + w for w in wraps]

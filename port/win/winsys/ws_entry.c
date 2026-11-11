@@ -270,9 +270,13 @@ static void strace_line(i64 n, i64 a1, i64 a2, i64 a3, i64 r)
  * an interrupted call whose handlers all have SA_RESTART runs again. */
 WSAPI i64 __bmc_win_syscall(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6)
 {
-	if (strace_on < 0)
-		strace_on = GetEnvironmentVariableA("BMC_WIN_STRACE", NULL, 0) ? 1 : 0;
+	if (strace_on < 0) {
+		char v[4] = "";
+		strace_on = GetEnvironmentVariableA("BMC_WIN_STRACE", v, sizeof v) ? (v[0] == '2' ? 2 : 1) : 0;
+	}
 	for (;;) {
+		if (strace_on == 2)                 /* BMC_WIN_STRACE=2: calls as they start, too */
+			strace_line(n, a1, a2, a3, -4095);
 		i64 r = dispatch(n, a1, a2, a3, a4, a5, a6);
 		if (strace_on)                  /* the trace itself writes with WriteFile, not a syscall */
 			strace_line(n, a1, a2, a3, r);

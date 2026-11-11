@@ -82,6 +82,9 @@ typedef struct ws_desc {
 	int peerlen;
 	volatile LONG connected;   /* sockets: the connection is known to be up */
 	char *mem;                 /* FT_MEM: the content; FT_MEMDIR: NUL-separated names */
+	u64 pair_key;              /* sockets from socketpair: the pair (SCM_RIGHTS escrow key) */
+	int pair_side;             /* ...and which end this is (0/1) */
+	volatile u64 last_rx_ms, last_tx_ms, since_ms;   /* sockets: TCP_INFO's last_data_* */
 	u64 memlen;
 } ws_desc;
 void ws_fd_init(void);
@@ -138,6 +141,18 @@ extern int ws_is_root;             /* 0 in a forked (cloned) process */
 void ws_fork_init(void);
 void ws_broker_start(void);
 void ws_broker_child(void);
+/* SCM_RIGHTS escrow (ws_broker.c): what a passed descriptor carries */
+typedef struct {
+	int type, flags;
+	DWORD rcvtimeo, sndtimeo;
+	int peerlen, connected;
+	struct sockaddr_storage peer;
+	u64 pair_key;
+	int pair_side;
+	wchar_t path[300];
+} ws_fd_meta;
+int ws_escrow_put(u64 key, int side, HANDLE h, const ws_fd_meta *meta);
+int ws_escrow_take(u64 key, int side, HANDLE *hs, ws_fd_meta *metas, int max);
 HANDLE ws_create_thread(LPTHREAD_START_ROUTINE fn, void *arg, size_t stack, DWORD *tid);
 void ws_threads_settle(void);
 void ws_futex_shared_init(void);

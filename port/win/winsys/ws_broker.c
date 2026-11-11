@@ -18,7 +18,7 @@
 #include <stddef.h>
 
 enum { OP_SOCKET = 1, OP_CONNECT, OP_BIND, OP_LISTEN, OP_ACCEPT, OP_PEERNAME, OP_SOCKNAME, OP_SEND, OP_RECV,
-       OP_SENDTO, OP_RECVFROM, OP_SHUTDOWN, OP_SETSOCKOPT, OP_GETSOCKOPT, OP_IOCTL, OP_GETADDRINFO, OP_SPAWN };
+       OP_SENDTO, OP_RECVFROM, OP_SHUTDOWN, OP_SETSOCKOPT, OP_GETSOCKOPT, OP_IOCTL, OP_GETADDRINFO, OP_SPAWN, OP_ESCROW_PUT, OP_ESCROW_TAKE };
 
 #define BR_DATA 65536
 typedef struct {
@@ -60,6 +60,7 @@ static u64 move_out(HANDLE proc, SOCKET s)
 }
 
 static void serve_spawn(br_req *q, br_rep *p, HANDLE proc);
+static void serve_escrow(br_req *q, br_rep *p, HANDLE proc);
 
 static void serve(br_req *q, br_rep *p)
 {
@@ -72,6 +73,11 @@ static void serve(br_req *q, br_rep *p)
 	}
 	if (q->op == OP_SPAWN) {
 		serve_spawn(q, p, proc);
+		CloseHandle(proc);
+		return;
+	}
+	if (q->op == OP_ESCROW_PUT || q->op == OP_ESCROW_TAKE) {
+		serve_escrow(q, p, proc);
 		CloseHandle(proc);
 		return;
 	}
@@ -778,4 +784,159 @@ HANDLE ws_broker_spawn(const wchar_t *app, const wchar_t *cmdline, const wchar_t
 	ws_free(q);
 	ws_free(p);
 	return ph;
+}
+
+/* ---------------------------------------------------------------- SCM_RIGHTS
+ * A socketpair is a loopback TCP pair here, which cannot carry descriptors.
+ * sendmsg with SCM_RIGHTS deposits each passed handle (and what its
+ * descriptor carries) in the root's escrow, queued for the pair's other end
+ * (key, side); a recvmsg with a control buffer on that end collects them.
+ * The deposit happens before the data is sent, so it is there when the data
+ * arrives. Unclaimed deposits are dropped after 10 minutes. */
+typedef struct escrow {
+	struct escrow *next;
+	u64 key;
+	int side;
+	HANDLE h;              /* in the root */
+	ws_fd_meta meta;
+	u64 t;
+} escrow;
+static escrow *escrows;
+static SRWLOCK escrow_lock = SRWLOCK_INIT;
+
+static void escrow_store(u64 key, int side, HANDLE h, const ws_fd_meta *m)
+{
+	escrow *e = ws_alloc(sizeof *e);
+	if (!e) {
+		CloseHandle(h);
+		return;
+	}
+	e->key = key;
+	e->side = side;
+	e->h = h;
+	e->meta = *m;
+	e->t = GetTickCount64();
+	AcquireSRWLockExclusive(&escrow_lock);
+	escrow **pp = &escrows;
+	while (*pp)
+		pp = &(*pp)->next;     /* FIFO: descriptors arrive in the order sent */
+	*pp = e;
+	/* reap the unclaimed */
+	for (escrow **qq = &escrows; *qq;) {
+		escrow *x = *qq;
+		if (GetTickCount64() - x->t > 600000) {
+			*qq = x->next;
+			CloseHandle(x->h);
+			ws_free(x);
+		} else {
+			qq = &x->next;
+		}
+	}
+	ReleaseSRWLockExclusive(&escrow_lock);
+}
+
+/* up to max entries for (key, side), handles still the root's */
+static int escrow_pop(u64 key, int side, HANDLE *hs, ws_fd_meta *ms, int max)
+{
+	int n = 0;
+	AcquireSRWLockExclusive(&escrow_lock);
+	for (escrow **pp = &escrows; *pp && n < max;) {
+		escrow *e = *pp;
+		if (e->key == key && e->side == side) {
+			*pp = e->next;
+			hs[n] = e->h;
+			ms[n] = e->meta;
+			n++;
+			ws_free(e);
+		} else {
+			pp = &e->next;
+		}
+	}
+	ReleaseSRWLockExclusive(&escrow_lock);
+	return n;
+}
+
+static void serve_escrow(br_req *q, br_rep *p, HANDLE proc)
+{
+	if (q->op == OP_ESCROW_PUT) {
+		HANDLE h = dup_in(proc, q->h);
+		if (!h || q->n1 != sizeof(ws_fd_meta)) {
+			if (h)
+				CloseHandle(h);
+			p->ret = -1;
+			p->err = WSAEBADF;
+			return;
+		}
+		escrow_store((u64)q->a[0], (int)q->a[1], h, (const ws_fd_meta *)q->data);
+		p->ret = 0;
+		return;
+	}
+	HANDLE hs[16];
+	ws_fd_meta *ms = (ws_fd_meta *)p->data;
+	int max = (int)q->a[2];
+	if (max > 16)
+		max = 16;
+	if (max > (int)(BR_DATA / sizeof(ws_fd_meta)))
+		max = (int)(BR_DATA / sizeof(ws_fd_meta));
+	int n = escrow_pop((u64)q->a[0], (int)q->a[1], hs, ms, max);
+	for (int i = 0; i < n; i++) {
+		HANDLE out = NULL;
+		DuplicateHandle(GetCurrentProcess(), hs[i], proc, &out, 0, TRUE, DUPLICATE_SAME_ACCESS);
+		CloseHandle(hs[i]);
+		p->v[i < 4 ? i : 0] = 0;
+		((u64 *)(p->data + sizeof(ws_fd_meta) * 16))[i] = (u64)out;
+	}
+	p->n1 = (uint32_t)(sizeof(ws_fd_meta) * 16 + sizeof(u64) * 16);
+	p->ret = n;
+}
+
+int ws_escrow_put(u64 key, int side, HANDLE h, const ws_fd_meta *meta)
+{
+	if (ws_is_root) {
+		HANDLE d = NULL;
+		if (!DuplicateHandle(GetCurrentProcess(), h, GetCurrentProcess(), &d, 0, FALSE, DUPLICATE_SAME_ACCESS))
+			return -1;
+		escrow_store(key, side, d, meta);
+		return 0;
+	}
+	br_req *q = req(OP_ESCROW_PUT, (u64)h);
+	br_rep *p = ws_alloc(sizeof *p);
+	if (!q || !p) {
+		ws_free(q);
+		ws_free(p);
+		return -1;
+	}
+	q->a[0] = (i64)key;
+	q->a[1] = side;
+	put1(q, meta, sizeof *meta);
+	int r = call(q, p) ? -1 : (int)p->ret;
+	ws_free(q);
+	ws_free(p);
+	return r;
+}
+
+int ws_escrow_take(u64 key, int side, HANDLE *hs, ws_fd_meta *metas, int max)
+{
+	if (max > 16)
+		max = 16;
+	if (ws_is_root)
+		return escrow_pop(key, side, hs, metas, max);
+	br_req *q = req(OP_ESCROW_TAKE, 0);
+	br_rep *p = ws_alloc(sizeof *p);
+	if (!q || !p) {
+		ws_free(q);
+		ws_free(p);
+		return 0;
+	}
+	q->a[0] = (i64)key;
+	q->a[1] = side;
+	q->a[2] = max;
+	int n = call(q, p) ? 0 : (int)p->ret;
+	for (int i = 0; i < n; i++) {
+		metas[i] = ((ws_fd_meta *)p->data)[i];
+		hs[i] = (HANDLE)((u64 *)(p->data + sizeof(ws_fd_meta) * 16))[i];
+	}
+	ws_free(q);
+	ws_free(p);
+	return n;
 }

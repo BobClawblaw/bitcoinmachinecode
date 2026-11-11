@@ -64,9 +64,20 @@ static i64 io_finish(HANDLE h, OVERLAPPED *ov, BOOL started, DWORD ms)
 			return e >= 10000 ? ws_wsaerr((int)e) : ws_err(e);
 		int w = ws_wait(&ov->hEvent, 1, ms);
 		if (w != 0) {
+			DWORD we = GetLastError();
 			CancelIoEx(h, ov);
 			if (GetOverlappedResult(h, ov, &n, TRUE))
 				return (i64)n;          /* it completed after all */
+			if (w == WS_WAIT_FAILED) {
+				if (GetEnvironmentVariableA("BMC_WIN_NETDEBUG", NULL, 0)) {
+					char n1[24];
+					ws_fmt_u64(n1, we);
+					ws_write_stderr("bmc_win: overlapped wait failed: err ");
+					ws_write_stderr(n1);
+					ws_write_stderr("\n");
+				}
+				return ws_err(we);
+			}
 			return w == WS_WAIT_INTR ? -L_EINTR : -L_EAGAIN;
 		}
 	}
@@ -97,25 +108,69 @@ static i64 afd_poll(afd_poll_info *info, int n, DWORD ms)
 	ov.hEvent = thread_event();
 	HANDLE h = info->Handles[0].Handle;
 	BOOL ok = DeviceIoControl(h, IOCTL_AFD_POLL, info, size, info, size, NULL, &ov);
+	DWORD e0 = ok ? 0 : GetLastError();
 	i64 r = io_finish(h, &ov, ok, INFINITE);   /* AFD itself applies the timeout */
-	if (r < 0)
+	if (r < 0) {
+		if (GetEnvironmentVariableA("BMC_WIN_NETDEBUG", NULL, 0)) {
+			char n1[24], n2[24], n3[24];
+			ws_fmt_u64(n1, e0);
+			ws_fmt_u64(n2, (u64)-r);
+			ws_fmt_u64(n3, (u64)(uintptr_t)h);
+			ws_write_stderr("bmc_win: AFD poll failed: ioctl err ");
+			ws_write_stderr(n1);
+			ws_write_stderr(" -> errno ");
+			ws_write_stderr(n2);
+			ws_write_stderr(" handle ");
+			ws_write_stderr(n3);
+			ws_write_stderr("\n");
+		}
 		return r;
+	}
 	return (i64)info->NumberOfHandles;
 }
 
 /* wait until one of `events` is reported for d (or an error event) */
 static i64 sock_wait(ws_desc *d, ULONG events, DWORD ms)
 {
-	afd_poll_info pi;
-	__ws_memset(&pi, 0, sizeof pi);
-	pi.Handles[0].Handle = (HANDLE)d->s;
-	pi.Handles[0].Events = events | AFD_POLL_ERRORS;
-	i64 r = afd_poll(&pi, 1, ms);
-	if (r < 0)
-		return r;
-	if (r == 0 || !(pi.Handles[0].Events & (events | AFD_POLL_ERRORS)))
-		return -L_EAGAIN;
-	return (i64)pi.Handles[0].Events;
+	u64 deadline = ms == INFINITE ? 0 : GetTickCount64() + ms;
+	for (;;) {
+		afd_poll_info pi;
+		__ws_memset(&pi, 0, sizeof pi);
+		pi.Handles[0].Handle = (HANDLE)d->s;
+		pi.Handles[0].Events = events | AFD_POLL_ERRORS;
+		DWORD left = ms;
+		if (deadline) {
+			u64 now = GetTickCount64();
+			left = now >= deadline ? 0 : (DWORD)(deadline - now);
+		}
+		i64 r = afd_poll(&pi, 1, left);
+		if (r < 0)
+			return r;
+		if (r > 0 && (pi.Handles[0].Events & (events | AFD_POLL_ERRORS)))
+			return (i64)pi.Handles[0].Events;
+		/* nothing, or only events nobody asked for (AFD can wake a poll
+		 * early, e.g. on a connect's completion): poll again until the
+		 * deadline */
+		if (left == 0 || (deadline && GetTickCount64() >= deadline)) {
+			if (GetEnvironmentVariableA("BMC_WIN_NETDEBUG", NULL, 0) && ms) {
+				char n1[24], n2[24], n3[24], n4[24];
+				ws_fmt_u64(n1, (u64)r);
+				ws_fmt_u64(n2, pi.Handles[0].Events);
+				ws_fmt_u64(n3, events);
+				ws_fmt_u64(n4, ms);
+				ws_write_stderr("bmc_win: sock_wait EAGAIN: r ");
+				ws_write_stderr(n1);
+				ws_write_stderr(" got ");
+				ws_write_stderr(n2);
+				ws_write_stderr(" want ");
+				ws_write_stderr(n3);
+				ws_write_stderr(" ms ");
+				ws_write_stderr(n4);
+				ws_write_stderr("\n");
+			}
+			return -L_EAGAIN;
+		}
+	}
 }
 
 /* readiness gate before an operation: O_NONBLOCK / MSG_DONTWAIT check once,
@@ -229,10 +284,31 @@ static i64 sys_connect(int fd, const void *addr, int len)
 	d->peer = a;
 	d->peerlen = wl;
 	d->connected = 0;
+	d->since_ms = GetTickCount64();
 	u_long on = 1, off = 0;
 	ioctlsocket(d->s, FIONBIO, &on);
 	int c = connect(d->s, (struct sockaddr *)&a, wl);
 	int e = c == SOCKET_ERROR ? WSAGetLastError() : 0;
+	if (e && e != WSAEWOULDBLOCK && GetEnvironmentVariableA("BMC_WIN_NETDEBUG", NULL, 0)) {
+		char n1[24], n2[24], n3[24];
+		ws_fmt_u64(n1, (u64)e);
+		ws_fmt_u64(n2, (u64)wl);
+		ws_fmt_u64(n3, (u64)a.ss_family);
+		ws_write_stderr("bmc_win: connect failed: WSA ");
+		ws_write_stderr(n1);
+		ws_write_stderr(" len ");
+		ws_write_stderr(n2);
+		ws_write_stderr(" family ");
+		ws_write_stderr(n3);
+		const unsigned char *ab = (const unsigned char *)&a;
+		ws_fmt_u64(n1, (u64)((ab[2] << 8) | ab[3]));
+		ws_write_stderr(" port ");
+		ws_write_stderr(n1);
+		ws_fmt_u64(n1, ((u64)ab[4] << 24) | ((u64)ab[5] << 16) | ((u64)ab[6] << 8) | ab[7]);
+		ws_write_stderr(" addr32 ");
+		ws_write_stderr(n1);
+		ws_write_stderr("\n");
+	}
 	ioctlsocket(d->s, FIONBIO, &off);
 	if (c == 0) {
 		r = 0;
@@ -254,6 +330,7 @@ static i64 sys_connect(int fd, const void *addr, int len)
 			r = so ? ws_wsaerr(so) : -L_ECONNREFUSED;
 		} else {
 			refresh_connected(d->s);
+			ioctlsocket(d->s, FIONBIO, &off);   /* once more: the first came mid-connect */
 			d->connected = 1;
 		}
 	}
@@ -402,24 +479,48 @@ static i64 handle_io(ws_desc *d, void *buf, size_t n, int write)
 	return io_finish((HANDLE)d->s, &ov, ok, INFINITE);
 }
 
+/* gate, then the handle I/O. The socket's mode at the Winsock level is not
+ * ours to trust (a connect left it non-blocking, or another process holds
+ * the endpoint): a blocking descriptor whose I/O comes back EAGAIN waits for
+ * readiness again, within its SO_RCVTIMEO/SO_SNDTIMEO */
+static i64 sock_io(ws_desc *d, void *buf, size_t n, int write)
+{
+	ULONG ev = write ? AFD_POLL_SEND : AFD_POLL_RECEIVE | AFD_POLL_DISCONNECT;
+	DWORD timeo = write ? d->sndtimeo : d->rcvtimeo;
+	u64 deadline = timeo ? GetTickCount64() + timeo : 0;
+	for (;;) {
+		DWORD left = timeo;
+		if (deadline) {
+			u64 now = GetTickCount64();
+			if (now >= deadline)
+				return -L_EAGAIN;
+			left = (DWORD)(deadline - now);
+		}
+		i64 g = gate(d, ev, 0, left);
+		if (g < 0)
+			return g;
+		if (n == 0)
+			return 0;
+		i64 r = handle_io(d, buf, n, write);
+		if (r > 0) {
+			if (write)
+				d->last_tx_ms = GetTickCount64();
+			else
+				d->last_rx_ms = GetTickCount64();
+		}
+		if (r != -L_EAGAIN || (d->flags & L_O_NONBLOCK))
+			return r;
+	}
+}
+
 i64 ws_sock_read(ws_desc *d, void *buf, size_t n)
 {
-	i64 g = gate(d, AFD_POLL_RECEIVE | AFD_POLL_DISCONNECT, 0, d->rcvtimeo);
-	if (g < 0)
-		return g;
-	if (n == 0)
-		return 0;
-	return handle_io(d, buf, n, 0);
+	return sock_io(d, buf, n, 0);
 }
 
 i64 ws_sock_write(ws_desc *d, const void *buf, size_t n)
 {
-	i64 g = gate(d, AFD_POLL_SEND, 0, d->sndtimeo);
-	if (g < 0)
-		return g;
-	if (n == 0)
-		return 0;
-	i64 r = handle_io(d, (void *)buf, n, 1);
+	i64 r = sock_io(d, (void *)buf, n, 1);
 	return r == -L_ECONNRESET || r == -L_ECONNABORTED ? -L_EPIPE : r;
 }
 
@@ -506,6 +607,170 @@ struct l_msghdr {
 	int flags, pad1;
 };
 
+struct l_cmsghdr { u64 len; int level, type; };
+#define L_SOL_SOCKET 1
+#define L_SCM_RIGHTS 1
+#define L_MSG_CTRUNC 0x8
+#define L_MSG_CMSG_CLOEXEC 0x40000000
+#define CMSG_ALIGN8(x) (((x) + 7) & ~(u64)7)
+
+static void meta_of(ws_desc *d, ws_fd_meta *m)
+{
+	__ws_memset(m, 0, sizeof *m);
+	m->type = d->type;
+	m->flags = d->flags;
+	m->rcvtimeo = d->rcvtimeo;
+	m->sndtimeo = d->sndtimeo;
+	m->peerlen = d->peerlen;
+	m->connected = d->connected;
+	m->peer = d->peer;
+	m->pair_key = d->pair_key;
+	m->pair_side = d->pair_side;
+	if (d->wpath) {
+		size_t l = ws_wcslen(d->wpath);
+		if (l < 299)
+			__ws_memcpy(m->path, d->wpath, (l + 1) * sizeof(wchar_t));
+	}
+}
+
+/* deposit the SCM_RIGHTS descriptors of a sendmsg; -errno on failure */
+static i64 send_rights(ws_desc *d, struct l_msghdr *m)
+{
+	if (!m->control || m->controllen < sizeof(struct l_cmsghdr))
+		return 0;
+	unsigned char *c = m->control, *end = c + m->controllen;
+	while (c + sizeof(struct l_cmsghdr) <= end) {
+		struct l_cmsghdr *h = (struct l_cmsghdr *)c;
+		if (h->len < sizeof *h || c + h->len > end)
+			return -L_EINVAL;
+		if (h->level == L_SOL_SOCKET && h->type == L_SCM_RIGHTS) {
+			if (!d->pair_key)
+				return -L_EOPNOTSUPP;           /* only our socketpairs carry descriptors */
+			int nfd = (int)((h->len - sizeof *h) / sizeof(int));
+			const int *fds = (const int *)(c + sizeof *h);
+			for (int i = 0; i < nfd; i++) {
+				ws_desc *x = ws_fd_get(fds[i]);
+				if (!x)
+					return -L_EBADF;
+				ws_fd_meta meta;
+				meta_of(x, &meta);
+				HANDLE hh = x->type == FT_SOCKET ? (HANDLE)x->s : x->h;
+				int r = ws_escrow_put(d->pair_key, 1 - d->pair_side, hh, &meta);
+				ws_desc_put(x);
+				if (r < 0)
+					return -L_ENOBUFS;
+			}
+		}
+		c += CMSG_ALIGN8(h->len);
+	}
+	return 0;
+}
+
+/* collect descriptors waiting for this end into m->control */
+static void recv_rights(ws_desc *d, struct l_msghdr *m, int flags)
+{
+	u64 cap = m->control ? m->controllen : 0;
+	m->controllen = 0;
+	if (!d->pair_key || cap < sizeof(struct l_cmsghdr) + sizeof(int))
+		return;
+	int max = (int)((cap - sizeof(struct l_cmsghdr)) / sizeof(int));
+	HANDLE hs[16];
+	ws_fd_meta *metas = ws_alloc(sizeof(ws_fd_meta) * 16);
+	if (!metas)
+		return;
+	int n = ws_escrow_take(d->pair_key, d->pair_side, hs, metas, max > 16 ? 16 : max);
+	if (n <= 0) {
+		ws_free(metas);
+		return;
+	}
+	struct l_cmsghdr *h = (struct l_cmsghdr *)m->control;
+	int *fds = (int *)((unsigned char *)m->control + sizeof *h);
+	int got = 0;
+	for (int i = 0; i < n; i++) {
+		ws_desc *x = ws_desc_new(metas[i].type);
+		if (!x) {
+			CloseHandle(hs[i]);
+			continue;
+		}
+		if (metas[i].type == FT_SOCKET)
+			x->s = (SOCKET)hs[i];
+		else
+			x->h = hs[i];
+		x->flags = metas[i].flags;
+		x->rcvtimeo = metas[i].rcvtimeo;
+		x->sndtimeo = metas[i].sndtimeo;
+		x->peerlen = metas[i].peerlen;
+		x->connected = metas[i].connected;
+		x->peer = metas[i].peer;
+		x->pair_key = metas[i].pair_key;
+		x->pair_side = metas[i].pair_side;
+		if (metas[i].path[0]) {
+			size_t l = ws_wcslen(metas[i].path);
+			x->wpath = ws_alloc((l + 1) * sizeof(wchar_t));
+			if (x->wpath)
+				__ws_memcpy(x->wpath, metas[i].path, (l + 1) * sizeof(wchar_t));
+		}
+		int fd = ws_fd_install(x, (flags & L_MSG_CMSG_CLOEXEC) != 0, 0);
+		if (fd >= 0)
+			fds[got++] = fd;
+	}
+	ws_free(metas);
+	if (!got)
+		return;
+	h->len = sizeof *h + sizeof(int) * (u64)got;
+	h->level = L_SOL_SOCKET;
+	h->type = L_SCM_RIGHTS;
+	m->controllen = CMSG_ALIGN8(h->len);
+}
+
+/* sendmsg/recvmsg without an address: the handle path (no Winsock, so a
+ * forked process does it itself), the iovec flattened */
+static i64 msg_plain(ws_desc *d, struct l_msghdr *m, int flags, int out)
+{
+	u64 total = 0;
+	for (u64 i = 0; i < m->iovlen; i++)
+		total += m->iov[i].len;
+	if (total > 0x7ffff000)
+		total = 0x7ffff000;
+	char *flat = ws_alloc(total ? (size_t)total : 1);
+	if (!flat)
+		return -L_ENOMEM;
+	i64 r;
+	int was_nb = d->flags & L_O_NONBLOCK;
+	if (flags & L_MSG_DONTWAIT)
+		d->flags |= L_O_NONBLOCK;
+	if (out) {
+		u64 at = 0;
+		for (u64 i = 0; i < m->iovlen && at < total; i++) {
+			u64 c = m->iov[i].len < total - at ? m->iov[i].len : total - at;
+			__ws_memcpy(flat + at, m->iov[i].base, (size_t)c);
+			at += c;
+		}
+		r = send_rights(d, m);
+		if (r == 0)
+			r = ws_sock_write(d, flat, (size_t)total);
+	} else {
+		r = ws_sock_read(d, flat, (size_t)total);
+		if (r > 0) {
+			u64 at = 0;
+			for (u64 i = 0; i < m->iovlen && at < (u64)r; i++) {
+				u64 c = m->iov[i].len < (u64)r - at ? m->iov[i].len : (u64)r - at;
+				__ws_memcpy(m->iov[i].base, flat + at, (size_t)c);
+				at += c;
+			}
+		}
+		m->flags = 0;
+		if (r >= 0)
+			recv_rights(d, m, flags);
+		else
+			m->controllen = 0;
+	}
+	if (!was_nb)
+		d->flags &= ~L_O_NONBLOCK;
+	ws_free(flat);
+	return r;
+}
+
 static i64 sys_msg(int fd, struct l_msghdr *m, int flags, int out)
 {
 	i64 err;
@@ -515,6 +780,11 @@ static i64 sys_msg(int fd, struct l_msghdr *m, int flags, int out)
 	if (m->iovlen > 64) {
 		ws_desc_put(d);
 		return -L_EMSGSIZE;
+	}
+	if (!m->name && !(flags & (L_MSG_PEEK | L_MSG_OOB | L_MSG_WAITALL))) {
+		i64 r = msg_plain(d, m, flags, out);
+		ws_desc_put(d);
+		return r;
 	}
 	i64 res = gate(d, out ? AFD_POLL_SEND : AFD_POLL_RECEIVE | AFD_POLL_DISCONNECT,
 		       (flags & L_MSG_DONTWAIT) != 0, out ? d->sndtimeo : d->rcvtimeo);
@@ -672,6 +942,34 @@ static i64 sys_getsockopt(int fd, int level, int opt, void *val, int *len)
 		}
 		ws_desc_put(d);
 		return r;
+	} else if (level == 6 && opt == 11) {        /* TCP_INFO: Linux struct tcp_info */
+		unsigned char ti[232];
+		__ws_memset(ti, 0, sizeof ti);
+		i64 ev = sock_wait(d, AFD_POLL_DISCONNECT | AFD_POLL_ABORT, 0);
+		unsigned char state = 7;                 /* TCP_CLOSE */
+		if (d->connected || (d->peerlen && ev >= 0 && !(ev & (AFD_POLL_ABORT | AFD_POLL_CONNECT_FAIL))))
+			state = 1;                           /* TCP_ESTABLISHED */
+		else if (d->peerlen)
+			state = 2;                           /* TCP_SYN_SENT */
+		if (ev > 0 && (ev & AFD_POLL_DISCONNECT))
+			state = 8;                           /* TCP_CLOSE_WAIT: the peer sent FIN */
+		if (ev > 0 && (ev & AFD_POLL_ABORT))
+			state = 7;
+		ti[0] = state;
+		u64 now = GetTickCount64(), base = d->since_ms ? d->since_ms : now;
+		uint32_t since_tx = (uint32_t)(now - (d->last_tx_ms ? d->last_tx_ms : base));
+		uint32_t since_rx = (uint32_t)(now - (d->last_rx_ms ? d->last_rx_ms : base));
+		__ws_memcpy(ti + 44, &since_tx, 4);     /* tcpi_last_data_sent */
+		__ws_memcpy(ti + 52, &since_rx, 4);     /* tcpi_last_data_recv */
+		__ws_memcpy(ti + 56, &since_rx, 4);     /* tcpi_last_ack_recv */
+		uint32_t mss = 1460;
+		__ws_memcpy(ti + 16, &mss, 4);          /* tcpi_snd_mss */
+		__ws_memcpy(ti + 20, &mss, 4);          /* tcpi_rcv_mss */
+		int l = *len < (int)sizeof ti ? *len : (int)sizeof ti;
+		__ws_memcpy(val, ti, (size_t)l);
+		*len = l;
+		ws_desc_put(d);
+		return 0;
 	} else if (level == 6 && opt == 1) {
 		if (getsockopt(d->s, IPPROTO_TCP, TCP_NODELAY, (char *)&iv, &wl) == SOCKET_ERROR)
 			r = lasterr();
@@ -741,6 +1039,19 @@ static i64 sys_socketpair(int fam, int type, int proto, int *sv)
 	}
 	sv[0] = (int)f0;
 	sv[1] = (int)f1;
+	{
+		extern i64 ws_getrandom(void *buf, size_t n);
+		u64 key = 0;
+		ws_getrandom(&key, sizeof key);
+		for (int side = 0; side < 2; side++) {
+			ws_desc *pd = ws_fd_get(sv[side]);
+			if (pd) {
+				pd->pair_key = key | 1;
+				pd->pair_side = side;
+				ws_desc_put(pd);
+			}
+		}
+	}
 out:
 	if (l != INVALID_SOCKET)
 		closesocket(l);
