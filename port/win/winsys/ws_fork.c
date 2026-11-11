@@ -305,6 +305,73 @@ void ws_sig_fork_done(int child);
 void ws_net_fork_child(void);
 void ws_proc_fork_child(void);
 
+static void *peb_of(void)
+{
+	return (void *)__readgsqword(0x60);            /* TEB.ProcessEnvironmentBlock */
+}
+
+/* The process heap's lock, a critical section in its header page. The
+ * layout is not published, so it is found by behaviour, once: the place
+ * that says "owned by this thread, once" while we hold HeapLock and stops
+ * saying it when we let go. Exactly one such place, or NULL (the caller
+ * then releases instead of resetting, as before). Call with the lock free. */
+static RTL_CRITICAL_SECTION *heap_lock_cs(HANDLE heap)
+{
+	HANDLE me = (HANDLE)(ULONG_PTR)GetCurrentThreadId();
+	char *b = (char *)heap;
+	MEMORY_BASIC_INFORMATION mi;               /* only what is committed and readable */
+	if (!VirtualQuery(b, &mi, sizeof mi) || mi.State != MEM_COMMIT || (mi.Protect & PAGE_GUARD) ||
+	    !(mi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)))
+		return NULL;
+	size_t span = (size_t)((char *)mi.BaseAddress + mi.RegionSize - b);
+	if (span > 0x1000)
+		span = 0x1000;
+	size_t cand[16];
+	int n = 0;
+	HeapLock(heap);
+	for (size_t o = 0; o + sizeof(RTL_CRITICAL_SECTION) <= span && n < 16; o += 8) {
+		RTL_CRITICAL_SECTION *cs = (RTL_CRITICAL_SECTION *)(b + o);
+		if (cs->OwningThread == me && cs->RecursionCount == 1)
+			cand[n++] = o;
+	}
+	HeapUnlock(heap);
+	RTL_CRITICAL_SECTION *found = NULL;
+	int hits = 0;
+	for (int i = 0; i < n; i++) {
+		RTL_CRITICAL_SECTION *cs = (RTL_CRITICAL_SECTION *)(b + cand[i]);
+		if (cs->OwningThread != me && cs->RecursionCount == 0) {
+			found = cs;
+			hits++;
+		}
+	}
+	return hits == 1 ? found : NULL;
+}
+
+/* Purge the waiters inherited at the fork on an address. Critical sections
+ * (Windows 10+) and WaitOnAddress share one address-keyed waiter table in
+ * process memory: the clone inherits entries for parent threads blocked at
+ * the fork, and a wake can go to one of those ghosts instead of a real
+ * waiter. Waking everyone on the address unlinks them all; the child has no
+ * other thread yet, so nothing real is disturbed. */
+static void purge_waiters(volatile void *p, size_t len)
+{
+	for (size_t o = 0; o < len; o += sizeof(LONG))
+		WakeByAddressAll((PVOID)((char *)p + o));
+}
+
+/* a critical section back to free with nobody waiting */
+static void cs_reset(RTL_CRITICAL_SECTION *cs)
+{
+	cs->OwningThread = NULL;
+	cs->RecursionCount = 0;
+	cs->LockCount = -1;
+	purge_waiters(cs, sizeof *cs);
+}
+
+static RTL_CRITICAL_SECTION *heap_cs;
+static int heap_cs_report;
+#define LINE_END "\n"
+
 static i64 sys_fork(void)
 {
 	if (!clone_proc)
@@ -336,8 +403,27 @@ static i64 sys_fork(void)
 	 * ws_create_thread, so waiting for that count is enough. The loader
 	 * lock itself must not be held here, for the same reason. */
 	ws_threads_settle();
+	static int heap_cs_tried;
+	if (!heap_cs_tried) {                          /* once, with the lock free */
+		heap_cs_tried = 1;
+		heap_cs = heap_lock_cs(GetProcessHeap());
+		heap_cs_report = GetEnvironmentVariableA("BMC_WIN_FORKDEBUG", NULL, 0) != 0;
+	}
 	ws_heap_lock();
 	HeapLock(GetProcessHeap());
+	/* The PEB lock too: every Win32 path call (GetFileAttributesW,
+	 * CreateFileW...) takes it, and a child cloned while another thread
+	 * held it inherits it held by a thread it does not have. It is a
+	 * recursive critical section, so the clone's own use of it from this
+	 * thread is fine. */
+	static void (NTAPI *peb_acquire)(void), (NTAPI *peb_release)(void);
+	if (!peb_acquire) {
+		HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+		peb_release = (void (NTAPI *)(void))(void *)GetProcAddress(nt, "RtlReleasePebLock");
+		peb_acquire = (void (NTAPI *)(void))(void *)GetProcAddress(nt, "RtlAcquirePebLock");
+	}
+	if (peb_acquire && peb_release)
+		peb_acquire();
 
 	rtl_upi info;
 	__ws_memset(&info, 0, sizeof info);
@@ -345,13 +431,23 @@ static i64 sys_fork(void)
 	LONG st = clone_proc(RTL_CLONE_INHERIT_HANDLES, NULL, NULL, NULL, &info);
 
 	if (st == STATUS_PROCESS_CLONED) {
-		/* ---- the child ---- */
-		HeapUnlock(GetProcessHeap());
+		/* ---- the child ----
+		 * The two critical sections held across the clone are reset, not
+		 * released: parent threads that queued on them during the fork
+		 * left ghost waiters in their counts, and a release would hand the
+		 * lock to a ghost (seen: a forked worker's first path call waiting
+		 * forever on the process heap). This thread is the only one here. */
+		if (peb_acquire && peb_release)
+			cs_reset(*(RTL_CRITICAL_SECTION **)((char *)peb_of() + 0x38));   /* PEB.FastPebLock */
+		if (heap_cs)
+			cs_reset(heap_cs);
+		else
+			HeapUnlock(GetProcessHeap());
 		ws_heap_reset_child();
 		ws_is_root = 0;
 		ws_child *k = children;
 		children = NULL;
-		ReleaseSRWLockExclusive(&clock_);
+		InitializeSRWLock(&clock_);    /* not released: see ws_fd_fork_done */
 		while (k) {                    /* the parent's children are not ours */
 			ws_child *nx = k->next;
 			ws_free(k);
@@ -380,6 +476,8 @@ static i64 sys_fork(void)
 		return 0;
 	}
 
+	if (peb_acquire && peb_release)
+		peb_release();
 	HeapUnlock(GetProcessHeap());
 	ws_heap_unlock();
 	if (st < 0) {
@@ -413,6 +511,15 @@ static i64 sys_fork(void)
 	if (me)
 		CloseHandle(me);
 	SetEvent(wake_ev);
+	if (heap_cs_report) {                          /* BMC_WIN_FORKDEBUG, once, locks released */
+		heap_cs_report = 0;
+		char a[24];
+		ws_fmt_u64(a, heap_cs ? (u64)((char *)heap_cs - (char *)GetProcessHeap()) : ~0ULL);
+		ws_write_stderr("bmc_win: process heap lock found at heap+");
+		ws_write_stderr(a);
+		ws_write_stderr(heap_cs ? " (reset in the child)" : " (not found: released in the child)");
+		ws_write_stderr(LINE_END);
+	}
 	return (i64)c->pid;
 }
 

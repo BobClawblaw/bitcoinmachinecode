@@ -311,7 +311,12 @@ static i64 sys_futex(volatile int *addr, int op, int val, const struct l_timespe
 	case 1: case 10:                      /* FUTEX_WAKE(_BITSET) */
 		if (val <= 0)
 			return 0;
-		if (val == 1)
+		/* in a forked process, wake them all: WaitOnAddress keeps its
+		 * waiter lists in process memory, so a clone inherits entries for
+		 * parent threads that were waiting at the fork and do not exist
+		 * here, and a single wake can land on one of those ghosts while
+		 * the real waiter sleeps on (musl re-checks after every wake) */
+		if (val == 1 && ws_is_root)
 			WakeByAddressSingle((PVOID)addr);
 		else
 			WakeByAddressAll((PVOID)addr);

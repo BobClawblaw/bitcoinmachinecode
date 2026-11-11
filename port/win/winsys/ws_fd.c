@@ -2115,7 +2115,13 @@ void ws_fd_fork_done(int child)
 			}
 		}
 	}
-	ReleaseSRWLockExclusive(&fdt_lock);
+	/* the child re-initializes rather than releases: a parent thread waiting
+	 * on it at the fork left a ghost in its waiter list, and a release could
+	 * hand it to that ghost */
+	if (child)
+		InitializeSRWLock(&fdt_lock);
+	else
+		ReleaseSRWLockExclusive(&fdt_lock);
 }
 
 /* execve: the fds the new image would not have inherited */

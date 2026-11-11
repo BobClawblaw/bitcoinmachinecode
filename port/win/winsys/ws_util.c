@@ -96,15 +96,25 @@ void ws_heap_lock(void)
 
 void ws_heap_unlock(void)
 {
-	if (InterlockedExchange(&heap_word, 0) == 2)
-		WakeByAddressSingle((PVOID)&heap_word);
+	/* a forked process wakes every waiter: it may have inherited
+	 * WaitOnAddress entries for parent threads that were waiting on this
+	 * lock during the fork (the fork itself holds it), and a single wake
+	 * can go to one of those ghosts (ws_thread.c's FUTEX_WAKE) */
+	if (InterlockedExchange(&heap_word, 0) == 2) {
+		if (ws_is_root)
+			WakeByAddressSingle((PVOID)&heap_word);
+		else
+			WakeByAddressAll((PVOID)&heap_word);
+	}
 }
 
 /* the forked child: the lock was held by the forking thread (the child's
- * only one), and nobody waits on it here */
+ * only one). Parent threads waiting on it at the fork left entries in the
+ * inherited WaitOnAddress table; waking all on the word unlinks them. */
 void ws_heap_reset_child(void)
 {
 	heap_word = 0;
+	WakeByAddressAll((PVOID)&heap_word);
 }
 
 void *ws_heap_alloc(size_t n, int zero)

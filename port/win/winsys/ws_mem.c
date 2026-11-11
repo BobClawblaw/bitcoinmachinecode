@@ -58,6 +58,8 @@ typedef struct region {
 	char name[64];       /* anonymous: the PR_SET_VMA_ANON_NAME name */
 	int locked;          /* mlock'd (smaps Locked:) */
 	int dontdump;        /* MADV_DONTDUMP (smaps VmFlags dd) */
+	u64 df_lo, df_hi;    /* MADV_DONTFORK: [lo, hi) offsets a forked child does not get */
+	int df_dropped;      /* the child: that range is gone (mincore says ENOMEM) */
 } region;
 
 static region *regions;
@@ -443,8 +445,18 @@ static i64 mark_regions(char *addr, u64 len, int field, int val)
 		if (!len || (r->user < addr + len && r->user + r->len > addr)) {
 			if (field == 0)
 				r->locked = val;
-			else
+			else if (field == 1)
 				r->dontdump = val;
+			else {                     /* MADV_DONTFORK / MADV_DOFORK: the overlap */
+				char *lo = addr > r->user ? addr : r->user;
+				char *hi = addr + len < r->user + r->len ? addr + len : r->user + r->len;
+				if (val) {
+					r->df_lo = (u64)(lo - r->user);
+					r->df_hi = (u64)(hi - r->user);
+				} else {
+					r->df_lo = r->df_hi = 0;
+				}
+			}
 			hit = 1;
 		}
 	ReleaseSRWLockExclusive(&reg_lock);
@@ -459,6 +471,8 @@ static i64 sys_madvise(char *addr, u64 len, int advice)
 {
 	if (advice == 16 || advice == 17)    /* MADV_DONTDUMP / MADV_DODUMP */
 		return mark_regions(addr, len, 1, advice == 16);
+	if (advice == 10 || advice == 11)    /* MADV_DONTFORK / MADV_DOFORK */
+		return mark_regions(addr, len, 2, advice == 10);
 	if (advice != 4)                     /* only MADV_DONTNEED changes contents */
 		return 0;
 	AcquireSRWLockShared(&reg_lock);
@@ -471,6 +485,37 @@ static i64 sys_madvise(char *addr, u64 len, int advice)
 		len = (len + PAGE - 1) & ~(PAGE - 1);
 		VirtualFree(addr, (SIZE_T)len, MEM_DECOMMIT);
 		VirtualAlloc(addr, (SIZE_T)len, MEM_COMMIT, page_prot(prot, 0));
+	}
+	return 0;
+}
+
+/* mincore: one byte per page, bit 0 = resident. Windows does not say
+ * which pages of a mapping are in memory without walking the working set,
+ * so a committed page counts as resident; ENOMEM when any page of the
+ * range is not mapped at all (a child without a MADV_DONTFORK region). */
+static i64 sys_mincore(char *addr, u64 len, unsigned char *vec)
+{
+	if ((u64)addr & (PAGE - 1))
+		return -L_EINVAL;
+	u64 pages = (len + PAGE - 1) / PAGE;
+	char *p = addr, *end = addr + pages * PAGE;
+	u64 i = 0;
+	while (p < end) {
+		MEMORY_BASIC_INFORMATION mi;
+		if (!VirtualQuery(p, &mi, sizeof mi) || mi.State == MEM_FREE)
+			return -L_ENOMEM;
+		char *re = (char *)mi.BaseAddress + mi.RegionSize;
+		unsigned char v = mi.State == MEM_COMMIT ? 1 : 0;
+		if (mi.State == MEM_RESERVE) {       /* reserved: not ours, or dropped by DONTFORK */
+			AcquireSRWLockShared(&reg_lock);
+			region *r = find_region(p);
+			int gone = !r || (r->df_dropped && (u64)(p - r->user) >= r->df_lo && (u64)(p - r->user) < r->df_hi);
+			ReleaseSRWLockShared(&reg_lock);
+			if (gone)
+				return -L_ENOMEM;
+		}
+		for (; p < re && p < end; p += PAGE)
+			vec[i++] = v;
 	}
 	return 0;
 }
@@ -501,6 +546,7 @@ i64 ws_sys_mem(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *handl
 	case 25: return sys_mremap((char *)a1, (u64)a2, (u64)a3, (int)a4);
 	case 10: return sys_mprotect((char *)a1, (u64)a2, (int)a3);
 	case 28: return sys_madvise((char *)a1, (u64)a2, (int)a3);
+	case 27: return sys_mincore((char *)a1, (u64)a2, (unsigned char *)a3);
 	case 26: return sys_msync((char *)a1, (u64)a2, (int)a3);
 	case 12: return 0;                   /* brk: no program break; malloc is the heap */
 	case 157:                            /* prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, a, len, name) */
@@ -537,8 +583,34 @@ void ws_mem_fork_prepare(void)
 
 void ws_mem_fork_done(int child)
 {
-	(void)child;
-	ReleaseSRWLockExclusive(&reg_lock);
+	if (child) {
+		/* MADV_DONTFORK: the child goes without those pages -- the whole
+		 * mapping unmapped, or private pages decommitted; part of a file
+		 * view stays (a view cannot be split) */
+		region **pp = &regions;
+		while (*pp) {
+			region *r = *pp;
+			/* within a page of either end counts as the whole mapping: the
+			 * caller rounds its range inward, and a file view cannot be split */
+			if (r->df_hi > r->df_lo && r->df_lo <= PAGE && r->df_hi + PAGE >= r->len) {
+				*pp = r->next;
+				free_region(r);
+				continue;
+			}
+			if (r->df_hi > r->df_lo && r->kind == R_VA) {
+				VirtualFree(r->user + r->df_lo, (SIZE_T)(r->df_hi - r->df_lo), MEM_DECOMMIT);
+				r->df_dropped = 1;
+			}
+			pp = &r->next;
+		}
+	}
+	/* the child re-initializes rather than releases: a parent thread waiting
+	 * on it at the fork left a ghost in its waiter list, and a release could
+	 * hand it to that ghost */
+	if (child)
+		InitializeSRWLock(&reg_lock);
+	else
+		ReleaseSRWLockExclusive(&reg_lock);
 }
 
 WSAPI void __bmc_win_heap_stats(size_t *committed, size_t *allocated)

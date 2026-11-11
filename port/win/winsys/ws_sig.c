@@ -773,6 +773,15 @@ void ws_sig_fork_done(int child)
 		it_due_ms = 0;
 		it_interval_ms = 0;
 	}
+	/* the child re-initializes rather than releases: a parent thread waiting
+	 * on it at the fork left a ghost in its waiter list, and a release could
+	 * hand it to that ghost */
+	if (child) {
+		InitializeSRWLock(&tlock);
+		InitializeSRWLock(&itlock);
+		InitializeSRWLock(&alock);
+		return;
+	}
 	ReleaseSRWLockExclusive(&tlock);
 	ReleaseSRWLockExclusive(&itlock);
 	ReleaseSRWLockExclusive(&alock);

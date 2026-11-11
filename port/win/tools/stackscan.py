@@ -36,6 +36,8 @@ def main(argv):
     cmds = []
     for t in range(1, nthreads + 1):
         cmds += ['-o', 'script print("@@THREAD %d")' % t, '-o', 'thread select %d' % t,
+                 '-o', 'register read rip',
+                 '-o', 'script print("@@SYM")', '-o', 'image lookup -a $rip', '-o', 'script print("@@ENDSYM")',
                  '-o', 'memory read --force -fx -s8 -c%d $rsp' % words]
     rr = subprocess.run([LLDB, '-b', '-p', pid] + cmds, capture_output=True, text=True)
     text = rr.stdout + rr.stderr
@@ -44,6 +46,16 @@ def main(argv):
         if 'invalid thread' in part.lower():
             continue
         print('--- thread #%s' % tid)
+        m = re.search(r'rip = 0x([0-9a-f]{16})', part)
+        if m:
+            a = int(m.group(1), 16)
+            if lo <= a < hi:
+                i = bisect.bisect_right(addrs, a) - 1
+                print('   rip %s %s+0x%x (%s)' % (hex(a), syms[i][1], a - syms[i][0], syms[i][2]))
+            else:
+                sm = re.search(r'@@SYM(.*?)@@ENDSYM', part, re.S)
+                where = ' '.join(l.strip() for l in sm.group(1).splitlines() if 'Summary' in l or 'Address' in l) if sm else ''
+                print('   rip %s (system DLL) %s' % (hex(a), where[:160]))
         seen = 0
         for v in re.findall(r'0x([0-9a-f]{16})', part):
             a = int(v, 16)
