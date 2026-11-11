@@ -389,6 +389,7 @@ static i64 sys_munmap(char *addr, u64 len)
 		pp = &r->next;
 	}
 	ReleaseSRWLockExclusive(&reg_lock);
+	ws_lsize_retry();                          /* a shrink refused while it was mapped */
 	return 0;
 }
 
@@ -579,7 +580,7 @@ char *ws_mem_maps_text(u64 *len, int smaps)
 {
 	struct { char *p; u64 n, cap; } b = { 0 };
 	AcquireSRWLockShared(&reg_lock);
-	u64 total = 0, n = 0;
+	u64 total = 0, n = 0, t_anon = 0, t_file = 0, t_shmem = 0;
 	for (region *r = regions; r; r = r->next)
 		n++;
 	region **v = ws_alloc(sizeof(region *) * (size_t)(n ? n : 1));
@@ -592,6 +593,14 @@ char *ws_mem_maps_text(u64 *len, int smaps)
 			v[j] = v[j - 1];
 			v[j - 1] = t;
 		}
+	for (u64 i = 0; i < n && smaps == 2; i++) {        /* the rollup's split */
+		if (v[i]->path)
+			t_file += v[i]->len;
+		else if (v[i]->shared)
+			t_shmem += v[i]->len;
+		else
+			t_anon += v[i]->len;
+	}
 	for (u64 i = 0; i < n && smaps != 2; i++) {
 		region *r = v[i];
 		ws_sbuf_hex(&b, (u64)r->user, 8);
@@ -626,6 +635,10 @@ char *ws_mem_maps_text(u64 *len, int smaps)
 			ws_sbuf_dec(&b, r->len / 1024);
 			ws_sbuf_str(&b, " kB\nRss:            ");
 			ws_sbuf_dec(&b, r->len / 1024);
+			ws_sbuf_str(&b, " kB\nPss:            ");   /* as Rss: the mapped size */
+			ws_sbuf_dec(&b, r->len / 1024);
+			ws_sbuf_str(&b, " kB\nAnonymous:      ");
+			ws_sbuf_dec(&b, (!r->path && !r->shared) ? r->len / 1024 : 0);
 			ws_sbuf_str(&b, " kB\nLocked:         ");
 			ws_sbuf_dec(&b, r->locked ? r->len / 1024 : 0);
 			ws_sbuf_str(&b, " kB\nVmFlags:");
@@ -643,6 +656,12 @@ char *ws_mem_maps_text(u64 *len, int smaps)
 			ws_sbuf_str(&b, "\n");
 		}
 		total += r->len;
+		if (r->path)
+			t_file += r->len;
+		else if (r->shared)
+			t_shmem += r->len;
+		else
+			t_anon += r->len;
 	}
 	ReleaseSRWLockShared(&reg_lock);
 	ws_free(v);
@@ -657,6 +676,12 @@ char *ws_mem_maps_text(u64 *len, int smaps)
 		ws_sbuf_dec(&b, pm.WorkingSetSize / 1024);
 		ws_sbuf_str(&b, " kB\nAnonymous:      ");
 		ws_sbuf_dec(&b, pm.PagefileUsage / 1024);
+		ws_sbuf_str(&b, " kB\nPss_Anon:       ");      /* the split of our own mappings */
+		ws_sbuf_dec(&b, t_anon / 1024);
+		ws_sbuf_str(&b, " kB\nPss_File:       ");
+		ws_sbuf_dec(&b, t_file / 1024);
+		ws_sbuf_str(&b, " kB\nPss_Shmem:      ");
+		ws_sbuf_dec(&b, t_shmem / 1024);
 		ws_sbuf_str(&b, " kB\n");
 	}
 	(void)total;

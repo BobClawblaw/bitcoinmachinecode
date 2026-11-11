@@ -87,6 +87,7 @@ typedef struct ws_desc {
 	volatile u64 last_rx_ms, last_tx_ms, since_ms;   /* sockets: TCP_INFO's last_data_* */
 	volatile u64 rx_pending_ms;   /* sockets: when unread data was first seen waiting (0 = none) */
 	u64 memlen;
+	volatile LONG shut;          /* sockets: shutdown() so far, bit 0 SHUT_RD, bit 1 SHUT_WR */
 	volatile LONG reset_seen;   /* sockets: a reset was reported once; reads now see EOF */
 	int efd_sem;
 	char *ppath;                /* FT_MEM / FT_MEMDIR: the /proc path it was opened as */                /* FT_EVENTFD: EFD_SEMAPHORE (counter in off, event in h) */
@@ -96,6 +97,7 @@ int ws_fd_list_shared(HANDLE proc, void (*emit)(void *ctx, int fd), void *ctx);
 int ws_fd_same_file(int fd1, int fd2);
 int ws_procfs_other_fd(const char *path);
 void ws_ns_init(void);
+void ws_lsize_retry(void);
 ws_desc *ws_fd_get(int fd);       /* +1 ref, NULL if not open */
 void ws_desc_put(ws_desc *d);
 int ws_fd_install(ws_desc *d, int cloexec, int min_fd); /* consumes the ref; -EMFILE */

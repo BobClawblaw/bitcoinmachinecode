@@ -90,6 +90,8 @@ void ws_desc_put(ws_desc *d)
 	}
 	if (d->h != INVALID_HANDLE_VALUE && d->h != NULL)
 		CloseHandle(d->h);
+	if (d->type == FT_FILE)
+		ws_lsize_retry();
 	if (d->find && d->find != INVALID_HANDLE_VALUE)
 		FindClose(d->find);
 	ws_free(d->wpath);
@@ -321,6 +323,7 @@ struct l_stat {
 };
 
 static volatile LONG64 *ns_gen;
+static int lsize_get(HANDLE h, i64 *size);
 static i64 stat_handle(HANDLE h, int type, struct l_stat *st)
 {
 	__ws_memset(st, 0, sizeof *st);
@@ -366,6 +369,7 @@ static i64 stat_handle(HANDLE h, int type, struct l_stat *st)
 		st->st_mode = 0100000 | (perm >= 0 ? (unsigned)perm
 					  : (bi.dwFileAttributes & FILE_ATTRIBUTE_READONLY) ? 0444 : 0644);
 	st->st_size = (i64)(((u64)bi.nFileSizeHigh << 32) | bi.nFileSizeLow);
+	lsize_get(h, &st->st_size);
 	FILE_STANDARD_INFO si;
 	if (GetFileInformationByHandleEx(h, FileStandardInfo, &si, sizeof si))
 		st->st_blocks = si.AllocationSize.QuadPart / 512;
@@ -734,12 +738,128 @@ static i64 sys_open(int dirfd, const char *path, int flags, int mode)
 	return ws_fd_install(d, cloexec, 0);
 }
 
+/* ---- logical sizes: a shrink Windows refused ----
+ * ftruncate to a smaller size fails while any view of the file is mapped
+ * (ERROR_USER_MAPPED_FILE); Linux truncates and lets the mapping fault past
+ * the new end. The cut range is zeroed (truncate_handle) and the size the
+ * caller asked for is kept here, by volume + file id, as the file's logical
+ * end: sizes (fstat, SEEK_END), O_APPEND positions and reads use it, and
+ * writes past it extend it. The real truncate is retried whenever a view
+ * is unmapped or a descriptor closed, and the entry goes once it lands.
+ * Per process (a forked child inherits the table and its handles). */
+typedef struct { DWORD vol; u64 id; i64 size; HANDLE h; } lsize_ent;
+#define LSIZE_MAX 64
+static lsize_ent lsz[LSIZE_MAX];
+static volatile LONG lsz_n;
+static SRWLOCK lsz_lock = SRWLOCK_INIT;
+
+static int file_key(HANDLE h, DWORD *vol, u64 *id)
+{
+	BY_HANDLE_FILE_INFORMATION bi;
+	if (!GetFileInformationByHandle(h, &bi))
+		return 0;
+	*vol = bi.dwVolumeSerialNumber;
+	*id = ((u64)bi.nFileIndexHigh << 32) | bi.nFileIndexLow;
+	return 1;
+}
+
+/* the logical size of h's file, if it has one */
+static int lsize_get(HANDLE h, i64 *size)
+{
+	if (!lsz_n)
+		return 0;
+	DWORD vol;
+	u64 id;
+	if (!file_key(h, &vol, &id))
+		return 0;
+	int found = 0;
+	AcquireSRWLockShared(&lsz_lock);
+	for (int i = 0; i < lsz_n; i++)
+		if (lsz[i].vol == vol && lsz[i].id == id) {
+			*size = lsz[i].size;
+			found = 1;
+			break;
+		}
+	ReleaseSRWLockShared(&lsz_lock);
+	return found;
+}
+
+/* set (mode 0), or extend to at least `size` (mode 1, only an existing entry) */
+static int lsize_put(HANDLE h, i64 size, int mode)
+{
+	if (mode == 1 && !lsz_n)
+		return 0;
+	DWORD vol;
+	u64 id;
+	if (!file_key(h, &vol, &id))
+		return 0;
+	int ok = 0;
+	AcquireSRWLockExclusive(&lsz_lock);
+	int i;
+	for (i = 0; i < lsz_n; i++)
+		if (lsz[i].vol == vol && lsz[i].id == id)
+			break;
+	if (i < lsz_n) {
+		if (mode == 0 || size > lsz[i].size)
+			lsz[i].size = size;
+		ok = 1;
+	} else if (mode == 0 && lsz_n < LSIZE_MAX) {
+		HANDLE dup = NULL;
+		if (DuplicateHandle(GetCurrentProcess(), h, GetCurrentProcess(), &dup, 0, TRUE, DUPLICATE_SAME_ACCESS)) {
+			lsz[lsz_n].vol = vol;
+			lsz[lsz_n].id = id;
+			lsz[lsz_n].size = size;
+			lsz[lsz_n].h = dup;
+			lsz_n++;
+			ok = 1;
+		}
+	}
+	ReleaseSRWLockExclusive(&lsz_lock);
+	return ok;
+}
+
+static void lsize_drop(HANDLE h)
+{
+	DWORD vol;
+	u64 id;
+	if (!lsz_n || !file_key(h, &vol, &id))
+		return;
+	AcquireSRWLockExclusive(&lsz_lock);
+	for (int i = 0; i < lsz_n; i++)
+		if (lsz[i].vol == vol && lsz[i].id == id) {
+			CloseHandle(lsz[i].h);
+			lsz[i] = lsz[--lsz_n];
+			break;
+		}
+	ReleaseSRWLockExclusive(&lsz_lock);
+}
+
+/* a view went away or a descriptor closed: the shrinks that can land now */
+void ws_lsize_retry(void)
+{
+	if (!lsz_n)
+		return;
+	AcquireSRWLockExclusive(&lsz_lock);
+	for (int i = 0; i < lsz_n;) {
+		FILE_END_OF_FILE_INFO e;
+		e.EndOfFile.QuadPart = lsz[i].size;
+		if (SetFileInformationByHandle(lsz[i].h, FileEndOfFileInfo, &e, sizeof e)) {
+			CloseHandle(lsz[i].h);
+			lsz[i] = lsz[--lsz_n];
+		} else {
+			i++;
+		}
+	}
+	ReleaseSRWLockExclusive(&lsz_lock);
+}
+
 static i64 file_size(HANDLE h, i64 *sz)
 {
 	LARGE_INTEGER li;
 	if (!GetFileSizeEx(h, &li))
 		return ws_err(GetLastError());
 	*sz = li.QuadPart;
+	lsize_get(h, sz);
 	return 0;
 }
 
@@ -754,6 +874,18 @@ static i64 rw_file(ws_desc *d, void *buf, size_t n, i64 pos, int write, int posi
 		AcquireSRWLockExclusive(&d->lock);
 	i64 at = positioned ? pos : d->off;
 	int append = write && (d->flags & L_O_APPEND);
+	i64 lsize;
+	int has_l = lsz_n && lsize_get(d->h, &lsize);
+	if (has_l && append) {                 /* the logical end, not the physical one */
+		at = lsize;
+		append = 0;
+	}
+	if (has_l && !write) {
+		if (at >= lsize)
+			n = 0;
+		else if ((u64)n > (u64)(lsize - at))
+			n = (size_t)(lsize - at);
+	}
 	if (append) {
 		ov.Offset = 0xFFFFFFFF;
 		ov.OffsetHigh = 0xFFFFFFFF;
@@ -762,7 +894,8 @@ static i64 rw_file(ws_desc *d, void *buf, size_t n, i64 pos, int write, int posi
 		ov.OffsetHigh = (DWORD)((u64)at >> 32);
 	}
 	DWORD got = 0;
-	BOOL ok = write ? WriteFile(d->h, buf, (DWORD)n, &got, &ov) : ReadFile(d->h, buf, (DWORD)n, &got, &ov);
+	BOOL ok = (!write && n == 0) ? TRUE
+		  : write ? WriteFile(d->h, buf, (DWORD)n, &got, &ov) : ReadFile(d->h, buf, (DWORD)n, &got, &ov);
 	i64 r;
 	if (!ok) {
 		DWORD e = GetLastError();
@@ -770,6 +903,8 @@ static i64 rw_file(ws_desc *d, void *buf, size_t n, i64 pos, int write, int posi
 	} else {
 		r = (i64)got;
 	}
+	if (has_l && write && r > 0)
+		lsize_put(d->h, at + r, 1);
 	if (lock) {
 		if (r >= 0) {
 			if (append) {
@@ -1091,12 +1226,18 @@ static i64 truncate_handle(HANDLE h, i64 len)
 {
 	FILE_END_OF_FILE_INFO e;
 	e.EndOfFile.QuadPart = len;
-	if (SetFileInformationByHandle(h, FileEndOfFileInfo, &e, sizeof e))
+	if (SetFileInformationByHandle(h, FileEndOfFileInfo, &e, sizeof e)) {
+		lsize_drop(h);
 		return 0;
+	}
 	DWORD err = GetLastError();
 	i64 sz;
-	if (err != ERROR_USER_MAPPED_FILE || file_size(h, &sz) || sz <= len)
+	LARGE_INTEGER li;
+	if (err != ERROR_USER_MAPPED_FILE || !GetFileSizeEx(h, &li) || (sz = li.QuadPart) <= len) {
+		if (err == ERROR_USER_MAPPED_FILE && lsize_put(h, len, 1))
+			return 0;                      /* inside the zeroed tail: a logical change only */
 		return ws_err(err);
+	}
 	if (GetEnvironmentVariableA("BMC_WIN_FSDEBUG", NULL, 0)) {
 		char a[24], b[24];
 		ws_fmt_u64(a, (u64)len);
@@ -1113,6 +1254,7 @@ static i64 truncate_handle(HANDLE h, i64 len)
 	DWORD got;
 	if (!DeviceIoControl(h, FSCTL_SET_ZERO_DATA, &z, sizeof z, NULL, 0, &got, NULL))
 		return ws_err(GetLastError());
+	lsize_put(h, len, 0);                      /* the size the caller asked for */
 	return 0;
 }
 

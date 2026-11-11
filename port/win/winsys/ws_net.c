@@ -481,6 +481,25 @@ static i64 sys_name(int fd, void *addr, int *alen, int peer)
 }
 
 /* ---- data ---- */
+/* Every transfer's result passes through here, whichever path made it:
+ * TCP_INFO's last_data_* times, and Linux's reset semantics -- a reset is
+ * reported to one read (ECONNRESET) and every later read sees end-of-file,
+ * a write EPIPE. */
+static i64 io_result(ws_desc *d, i64 r, int write)
+{
+	if (r > 0) {
+		if (write) {
+			d->last_tx_ms = GetTickCount64();
+		} else {
+			d->last_rx_ms = GetTickCount64();
+			d->rx_pending_ms = 0;
+		}
+	}
+	if ((r == -L_ECONNRESET || r == -L_ECONNABORTED) && InterlockedExchange(&d->reset_seen, 1))
+		return write ? -L_EPIPE : 0;
+	return r;
+}
+
 static i64 handle_io(ws_desc *d, void *buf, size_t n, int write)
 {
 	if (n > 0x7ffff000)
@@ -490,7 +509,7 @@ static i64 handle_io(ws_desc *d, void *buf, size_t n, int write)
 	ov.hEvent = thread_event();
 	BOOL ok = write ? WriteFile((HANDLE)d->s, buf, (DWORD)n, NULL, &ov)
 			: ReadFile((HANDLE)d->s, buf, (DWORD)n, NULL, &ov);
-	return io_finish((HANDLE)d->s, &ov, ok, INFINITE);
+	return io_result(d, io_finish((HANDLE)d->s, &ov, ok, INFINITE), write);
 }
 
 /* gate, then the handle I/O. The socket's mode at the Winsock level is not
@@ -503,6 +522,8 @@ static i64 sock_io(ws_desc *d, void *buf, size_t n, int write)
 	DWORD timeo = write ? d->sndtimeo : d->rcvtimeo;
 	u64 deadline = timeo ? GetTickCount64() + timeo : 0;
 	for (;;) {
+		if (d->shut & (write ? 2 : 1))
+			return write ? -L_EPIPE : 0;
 		DWORD left = timeo;
 		if (deadline) {
 			u64 now = GetTickCount64();
@@ -512,22 +533,12 @@ static i64 sock_io(ws_desc *d, void *buf, size_t n, int write)
 		}
 		i64 g = gate(d, ev, 0, left);
 		if (g < 0)
-			return g;
+			return (g == -L_EINTR && (d->shut & (write ? 2 : 1))) ? (write ? -L_EPIPE : 0) : g;
 		if (n == 0)
 			return 0;
 		i64 r = handle_io(d, buf, n, write);
-		if (r > 0) {
-			if (write)
-				d->last_tx_ms = GetTickCount64();
-			else {
-				d->last_rx_ms = GetTickCount64();
-				d->rx_pending_ms = 0;
-			}
-		}
-		if (r == -L_ECONNRESET || r == -L_ECONNABORTED) {
-			if (InterlockedExchange(&d->reset_seen, 1))
-				return write ? -L_EPIPE : 0;
-		}
+		if (r == -L_EINTR && (d->shut & (write ? 2 : 1)))
+			return write ? -L_EPIPE : 0;
 		if (r != -L_EAGAIN || (d->flags & L_O_NONBLOCK))
 			return r;
 	}
@@ -592,7 +603,15 @@ static i64 sys_recvfrom(int fd, void *buf, size_t n, int flags, void *addr, int 
 	ws_desc *d = sock_get(fd, &err);
 	if (!d)
 		return err;
+	if (d->shut & 1) {                         /* SHUT_RD: end-of-file */
+		ws_desc_put(d);
+		return 0;
+	}
 	i64 res = gate(d, AFD_POLL_RECEIVE | AFD_POLL_DISCONNECT, (flags & L_MSG_DONTWAIT) != 0, d->rcvtimeo);
+	if (d->shut & 1) {                         /* shut while we waited */
+		ws_desc_put(d);
+		return 0;
+	}
 	if (res == 0) {
 		if (!addr && !(flags & (L_MSG_PEEK | L_MSG_OOB | L_MSG_WAITALL))) {
 			res = n ? handle_io(d, buf, n, 0) : 0;
@@ -610,6 +629,8 @@ static i64 sys_recvfrom(int fd, void *buf, size_t n, int flags, void *addr, int 
 				if (addr)
 					addr_out(&a, wl, addr, alen);
 			}
+			if (!(flags & L_MSG_PEEK))
+				res = io_result(d, res, 0);
 		}
 	}
 	ws_desc_put(d);
@@ -842,13 +863,28 @@ static i64 sys_msg(int fd, struct l_msghdr *m, int flags, int out)
 	return res;
 }
 
+/* shutdown: Linux's SHUT_RD sends nothing and makes every later read (a
+ * blocked one too) see end-of-file while the peer may go on sending; Windows'
+ * SD_RECEIVE does neither, and resets the connection when more data comes.
+ * So the read side is emulated here -- the flag, and the socket's pending
+ * I/O cancelled so a blocked reader wakes and finds it -- and only the write
+ * side (a FIN) goes to Winsock. */
 static i64 sys_shutdown(int fd, int how)
 {
 	i64 err;
+	if (how < 0 || how > 2)
+		return -L_EINVAL;
 	ws_desc *d = sock_get(fd, &err);
 	if (!d)
 		return err;
-	i64 r = shutdown(d->s, how) == SOCKET_ERROR ? lasterr() : 0;
+	i64 r = 0;
+	if (how != 0)
+		r = shutdown(d->s, SD_SEND) == SOCKET_ERROR ? lasterr() : 0;
+	if (r == 0) {
+		InterlockedOr(&d->shut, how == 0 ? 1 : how == 1 ? 2 : 3);
+		if (how != 1)
+			CancelIoEx((HANDLE)d->s, NULL);
+	}
 	ws_desc_put(d);
 	return r;
 }
@@ -1121,6 +1157,11 @@ static short other_ready(ws_desc *d, short ev)
 	case FT_EVENTFD:
 		r = ws_eventfd_ready(d, ev);
 		break;
+	case FT_SOCKET:                        /* shut for reading: end-of-file now */
+		r |= ev & (L_POLLIN | L_POLLRDNORM | L_POLLRDHUP);
+		if (!(d->shut & 2))
+			r |= ev & (L_POLLOUT | L_POLLWRNORM);
+		break;
 	case FT_CONSOLE:
 		if ((ev & (L_POLLIN | L_POLLRDNORM)) && WaitForSingleObject(d->h, 0) == WAIT_OBJECT_0)
 			r |= ev & (L_POLLIN | L_POLLRDNORM);
@@ -1187,7 +1228,7 @@ static i64 sys_poll(struct l_pollfd *fds, u64 n, int timeout)
 		ds[i] = ws_fd_get(fds[i].fd);
 		if (!ds[i])
 			fds[i].revents = L_POLLNVAL;
-		else if (ds[i]->type == FT_SOCKET)
+		else if (ds[i]->type == FT_SOCKET && !(ds[i]->shut & 1))
 			map[ns++] = (int)i;
 		else
 			others = 1;
