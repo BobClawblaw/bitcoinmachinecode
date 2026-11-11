@@ -50,6 +50,19 @@ typedef struct ws_child {
 } ws_child;
 
 static ws_child *children;
+
+/* pids this process has reaped: gone, as on Linux, even while Windows keeps
+ * the process object alive for some other holder (/proc reports them absent) */
+static volatile LONG reaped_pid[256];
+static volatile LONG reaped_at;
+
+int ws_pid_reaped(DWORD pid)
+{
+	for (int i = 0; i < 256; i++)
+		if ((DWORD)reaped_pid[i] == pid)
+			return 1;
+	return 0;
+}
 static SRWLOCK clock_ = SRWLOCK_INIT;
 static boxref self_box, parent_box;
 static DWORD parent_pid;
@@ -148,6 +161,7 @@ void ws_fork_init(void)
 
 	if (box_new(&self_box))
 		ws_fatal("cannot create the signal box");
+	ws_futex_shared_init();
 	self_box.box->pid = (LONG)GetCurrentProcessId();
 	wake_ev = CreateEventW(NULL, FALSE, FALSE, NULL);
 	start_listener();
@@ -213,6 +227,9 @@ static i64 sys_fork(void)
 			ws_free(k);
 			k = nx;
 		}
+		/* the PEB's current-directory handle is not inheritable, so it is
+		 * stale here; ws_path resolves relative paths from the PEB's path
+		 * string instead (touching the handle in a clone can hang) */
 		ws_mem_fork_done(1);
 		ws_fd_fork_done(1);
 		ws_sig_fork_done(1);
@@ -246,6 +263,12 @@ static i64 sys_fork(void)
 	/* ---- the parent ---- */
 	c->pid = (DWORD)(uintptr_t)info.ClientId.UniqueProcess;
 	c->proc = info.Process;
+	/* this child's handles were inheritable for its own clone only: a later
+	 * fork must not hand them on (an inherited process handle would keep an
+	 * exited child alive after it is reaped) */
+	SetHandleInformation(c->proc, HANDLE_FLAG_INHERIT, 0);
+	SetHandleInformation(c->box.sec, HANDLE_FLAG_INHERIT, 0);
+	SetHandleInformation(c->box.ev, HANDLE_FLAG_INHERIT, 0);
 	c->next = children;
 	children = c;
 	ReleaseSRWLockExclusive(&clock_);
@@ -304,11 +327,27 @@ static i64 sys_wait4(int pid, int *status, int options, struct l_rusage *ru)
 		ws_child *c = who[w];
 		DWORD code = 0;
 		GetExitCodeProcess(c->proc, &code);
+		if (code > 255 && (code & 0xFFFFFF00u) != SIG_EXIT_MARK && GetEnvironmentVariableA("BMC_WIN_CRASHLOG", NULL, 0)) {
+			char num[24], hx[24];
+			int k = 0;
+			u64 v = code;
+			do {
+				hx[k++] = "0123456789abcdef"[v & 15];
+				v >>= 4;
+			} while (v);
+			for (int i = 0; i < k; i++)
+				num[i] = hx[k - 1 - i];
+			num[k] = 0;
+			ws_write_stderr("bmc_win: child exited with Windows status 0x");
+			ws_write_stderr(num);
+			ws_write_stderr("\n");
+		}
 		if (status)
 			*status = status_of(code);
 		if (ru)
 			__ws_memset(ru, 0, sizeof *ru);
 		DWORD cpid = c->pid;
+		reaped_pid[(InterlockedIncrement(&reaped_at) - 1) & 255] = (LONG)cpid;
 		AcquireSRWLockExclusive(&clock_);
 		for (ws_child **pp = &children; *pp; pp = &(*pp)->next)
 			if (*pp == c) {
@@ -347,10 +386,10 @@ i64 ws_kill_other(int pid, int sig)
 			if (GetExitCodeProcess(ph, &code) && code != STILL_ACTIVE)
 				return sig ? 0 : 0;      /* a zombie: signals are discarded */
 		}
-		if (sig == 9 && ph)
-			return TerminateProcess(ph, SIG_EXIT_MARK | 9) ? 0 : ws_err(GetLastError());
 		if (sig)
-			box_post(b, sig);
+			box_post(b, sig);           /* SIGKILL too: the target cleans up, then ends */
+		if (sig == 9 && ph && WaitForSingleObject(ph, 2000) == WAIT_TIMEOUT)
+			TerminateProcess(ph, SIG_EXIT_MARK | 9);   /* it did not: as the kernel would */
 		return 0;
 	}
 	/* not related to us: only termination can be delivered */
@@ -369,6 +408,7 @@ i64 ws_kill_other(int pid, int sig)
 
 void ws_exit_process(UINT code)
 {
+	ws_robust_release_all();
 	if (ws_is_root)
 		ExitProcess(code);
 	TerminateProcess(GetCurrentProcess(), code);   /* a clone must not call into CSRSS */

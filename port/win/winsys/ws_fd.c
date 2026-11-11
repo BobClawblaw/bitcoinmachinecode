@@ -9,6 +9,7 @@
  * shadow byte range far beyond any real data (Windows locks are mandatory
  * and would otherwise block other processes' reads of the locked bytes). */
 #include "winsys.h"
+#include <winioctl.h>
 
 #define L_O_ACCMODE 3
 #define L_O_WRONLY 1
@@ -707,6 +708,29 @@ static i64 sys_fallocate(int fd, int mode, i64 off, i64 len)
 	i64 r = 0;
 	if (d->type != FT_FILE) {
 		r = -L_ENODEV;
+	} else if (mode == 3 || mode == 0x10 || mode == 0x11) {
+		/* FALLOC_FL_PUNCH_HOLE|KEEP_SIZE (3), FALLOC_FL_ZERO_RANGE (0x10,
+		 * |KEEP_SIZE 0x11): the range reads as zeros; on a sparse NTFS file
+		 * SET_ZERO_DATA also gives its clusters back, which is what a hole
+		 * punch is for */
+		DWORD got;
+		FILE_SET_SPARSE_BUFFER sp = { TRUE };
+		if (mode == 3)
+			DeviceIoControl(d->h, FSCTL_SET_SPARSE, &sp, sizeof sp, NULL, 0, &got, NULL);
+		i64 sz;
+		r = file_size(d->h, &sz);
+		i64 end = off + len;
+		if (!r && (mode & 1) && end > sz)
+			end = sz;                     /* KEEP_SIZE: nothing past EOF */
+		if (!r && end > off) {
+			FILE_ZERO_DATA_INFORMATION z;
+			z.FileOffset.QuadPart = off;
+			z.BeyondFinalZero.QuadPart = end;
+			if (!DeviceIoControl(d->h, FSCTL_SET_ZERO_DATA, &z, sizeof z, NULL, 0, &got, NULL))
+				r = ws_err(GetLastError());
+		}
+		if (!r && !(mode & 1) && off + len > sz)
+			r = set_eof(d->h, off + len);
 	} else if (mode & ~1) {
 		r = -L_EOPNOTSUPP;
 	} else {

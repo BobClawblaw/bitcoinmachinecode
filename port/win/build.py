@@ -536,7 +536,7 @@ def build_portlib():
 
 # Only libraries whose exports cannot collide with C names: Winsock (POSIX
 # names) is bound at run time (winsys/ws_ws2.c); ntdll (a C runtime) is not linked.
-SYSLIBS = ['kernel32.lib', 'synchronization.lib', 'shell32.lib']
+SYSLIBS = ['kernel32.lib', 'synchronization.lib']
 
 
 def link(exe, objs, base='0x10000000', wraps=()):

@@ -67,8 +67,28 @@ wchar_t *ws_path(int dirfd, const char *path, i64 *err)
 		w = (d && rest) ? wcat3(d, L"", rest) : NULL;
 		ws_free(d);
 		ws_free(rest);
-	} else if (path[0] == '/' || (path[0] && path[1] == ':') || dirfd == L_AT_FDCWD) {
+	} else if (path[0] == '/' || (path[0] && path[1] == ':')) {
 		w = ws_utf8_to_w(path);
+	} else if (dirfd == L_AT_FDCWD) {
+		/* relative to the cwd: made absolute here from the path the PEB
+		 * holds, so nothing depends on the cwd *handle* (not inherited by
+		 * a forked process) */
+		wchar_t *rel = ws_utf8_to_w(path);
+		w = NULL;
+		if (rel) {
+			for (wchar_t *q = rel; *q; q++)
+				if (*q == L'/')
+					*q = L'\\';
+			DWORD n = GetFullPathNameW(rel, 0, NULL, NULL);
+			if (n) {
+				w = ws_alloc((size_t)(n + 1) * sizeof(wchar_t));
+				if (w && !GetFullPathNameW(rel, n + 1, w, NULL)) {
+					ws_free(w);
+					w = NULL;
+				}
+			}
+			ws_free(rel);
+		}
 	} else {
 		ws_desc *d = ws_fd_get(dirfd);
 		if (!d) {

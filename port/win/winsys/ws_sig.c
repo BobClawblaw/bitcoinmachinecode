@@ -325,9 +325,13 @@ i64 ws_sig_deliver(i64 r, int *restart)
 }
 
 /* ---------------------------------------------------------------- faults */
+void ws_crash_report(PEXCEPTION_POINTERS ep, const char *what);
+
 static LONG CALLBACK veh(PEXCEPTION_POINTERS ep)
 {
 	DWORD code = ep->ExceptionRecord->ExceptionCode;
+	if (code == EXCEPTION_ACCESS_VIOLATION && GetEnvironmentVariableA("BMC_WIN_CRASHLOG", NULL, 0))
+		ws_crash_report(ep, "bmc_win first-chance AV:");
 	int sig;
 	switch (code) {
 	case EXCEPTION_ACCESS_VIOLATION: case EXCEPTION_ARRAY_BOUNDS_EXCEEDED: sig = 11; break;
@@ -622,10 +626,77 @@ i64 ws_sig_kill_self(int sig)
 	return ws_sig_raise_process(sig, 0 /* SI_USER */);
 }
 
+/* a crash nobody handles: robust locks the process holds become OWNER_DIED
+ * before it goes, as the kernel would make them */
+static void put_hex(const char *label, u64 v)
+{
+	char b[48];
+	int i = 0, k = 0;
+	char t[17];
+	do {
+		t[k++] = "0123456789abcdef"[v & 15];
+		v >>= 4;
+	} while (v);
+	b[i++] = ' ';
+	while (*label)
+		b[i++] = *label++;
+	b[i++] = '=';
+	while (k)
+		b[i++] = t[--k];
+	b[i] = 0;
+	ws_write_stderr(b);
+}
+
+/* BMC_WIN_CRASHLOG=1: where a process died (symbolize rip with the linker
+ * map); works in a forked process too, where no debugger can attach */
+void ws_crash_report(PEXCEPTION_POINTERS ep, const char *what)
+{
+	{
+		PCONTEXT c = ep->ContextRecord;
+		ws_write_stderr(what);
+		put_hex("pid", GetCurrentProcessId());
+		put_hex("tid", GetCurrentThreadId());
+		put_hex("code", ep->ExceptionRecord->ExceptionCode);
+		put_hex("rip", c->Rip);
+		put_hex("addr", ep->ExceptionRecord->NumberParameters > 1 ? ep->ExceptionRecord->ExceptionInformation[1] : 0);
+		put_hex("rsp", c->Rsp);
+		put_hex("rax", c->Rax);
+		put_hex("rcx", c->Rcx);
+		put_hex("rdx", c->Rdx);
+		put_hex("rdi", c->Rdi);
+		put_hex("rsi", c->Rsi);
+		HMODULE mod = NULL;
+		wchar_t mname[MAX_PATH];
+		if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+				       (LPCWSTR)c->Rip, &mod) && GetModuleFileNameW(mod, mname, MAX_PATH)) {
+			char *u = ws_w_to_utf8(mname);
+			ws_write_stderr(" module=");
+			ws_write_stderr(u ? u : "?");
+			put_hex("base", (u64)mod);
+			ws_free(u);
+		}
+		ws_write_stderr("\nstack:");
+		u64 *sp = (u64 *)c->Rsp;
+		for (int i = 0; i < 64; i++)
+			if (sp[i] >= 0x10000000 && sp[i] < 0x20000000)
+				put_hex("", sp[i]);
+		ws_write_stderr("\n");
+	}
+}
+
+static LONG WINAPI last_chance(PEXCEPTION_POINTERS ep)
+{
+	if (GetEnvironmentVariableA("BMC_WIN_CRASHLOG", NULL, 0))
+		ws_crash_report(ep, "bmc_win crash:");
+	ws_robust_release_all();
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+
 void ws_sig_init(void)
 {
 	ws_sig_thread_start(1);
 	AddVectoredExceptionHandler(1, veh);
+	SetUnhandledExceptionFilter(last_chance);
 	SetConsoleCtrlHandler(ctrl_handler, TRUE);
 }
 

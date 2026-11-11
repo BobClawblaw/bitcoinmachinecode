@@ -172,10 +172,21 @@ i64 ws_wsaerr(int e)
 	}
 }
 
+/* to fd 2 when it is open (a forked process's PEB stderr handle is not
+ * inherited), else the standard handle */
 void ws_write_stderr(const char *s)
 {
 	DWORD w;
-	WriteFile(GetStdHandle(STD_ERROR_HANDLE), s, (DWORD)ws_strlen(s), &w, NULL);
+	HANDLE h = NULL;
+	ws_desc *d = ws_fd_get(2);
+	if (d) {
+		if (d->type == FT_CONSOLE || d->type == FT_PIPE || d->type == FT_FILE)
+			h = d->h;
+		ws_desc_put(d);
+	}
+	if (!h)
+		h = GetStdHandle(STD_ERROR_HANDLE);
+	WriteFile(h, s, (DWORD)ws_strlen(s), &w, NULL);
 }
 
 void ws_fatal(const char *msg)

@@ -144,8 +144,12 @@ static DWORD thread_count(DWORD pid)
 extern DWORD ws_parent_pid_of_self(void);
 
 /* /proc/<pid>/stat (52 fields; the ones bmc reads are real) */
+int ws_pid_reaped(DWORD pid);
+
 static int gen_stat(sbuf *b, DWORD pid, DWORD tid)
 {
+	if (ws_pid_reaped(pid))
+		return -L_ENOENT;
 	HANDLE h = pid == GetCurrentProcessId() ? GetCurrentProcess()
 		 : OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, pid);
 	if (!h)
@@ -353,7 +357,7 @@ ws_desc *ws_procfs_open(const char *path, i64 *err)
 	const char *rest;
 	if (streq(p, "meminfo")) {
 		r = gen_meminfo(&b);
-	} else if (split_pid(p, &pid, &rest)) {
+	} else if (split_pid(p, &pid, &rest) && !ws_pid_reaped(pid)) {
 		int self = pid == GetCurrentProcessId();
 		if (!*rest) {
 			HANDLE h = self ? GetCurrentProcess() : OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);

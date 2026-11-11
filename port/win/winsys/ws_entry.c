@@ -1,7 +1,6 @@
 /* ws_entry.c -- process entry, PE TLS directory, constructors and the syscall
  * dispatcher (bmc_win). */
 #include "winsys.h"
-#include <shellapi.h>
 
 /* ---- PE TLS directory (what the MSVC CRT's tlssup.obj would provide) ----
  * The loader copies [_tls_start, _tls_end) into each new thread's block.
@@ -33,15 +32,72 @@ WSAPI void __bmc_win_run_ctors(void)
 char **ws_envp;
 
 /* argv from the UTF-16 command line, as UTF-8 */
+/* The command line split as CommandLineToArgvW does (the MSVC rules: the
+ * program name ends at the first space or its closing quote; then 2n
+ * backslashes + quote -> n backslashes and a quote toggle, 2n+1 -> n and a
+ * literal quote, "" inside quotes -> a literal quote). Done here because
+ * CommandLineToArgvW lives in shell32, which loads user32 and imm32, whose
+ * thread-attach code faults in a forked (cloned) process. */
 static char **build_argv(int *argc_out)
 {
+	const wchar_t *cl = GetCommandLineW();
+	size_t len = ws_wcslen(cl);
+	wchar_t *buf = ws_alloc((len + 2) * sizeof(wchar_t));
+	char **argv = ws_alloc(sizeof(char *) * (len / 2 + 2));
 	int argc = 0;
-	wchar_t **wargv = CommandLineToArgvW(GetCommandLineW(), &argc);
-	char **argv = ws_alloc(sizeof(char *) * (size_t)(argc + 1));
-	for (int i = 0; i < argc; i++)
-		argv[i] = ws_w_to_utf8(wargv[i]);
+	const wchar_t *p = cl;
+	/* argv[0] */
+	wchar_t *o = buf;
+	if (*p == L'"') {
+		p++;
+		while (*p && *p != L'"')
+			*o++ = *p++;
+		if (*p == L'"')
+			p++;
+	} else {
+		while (*p && *p != L' ' && *p != L'\t')
+			*o++ = *p++;
+	}
+	*o = 0;
+	argv[argc++] = ws_w_to_utf8(buf);
+	for (;;) {
+		while (*p == L' ' || *p == L'\t')
+			p++;
+		if (!*p)
+			break;
+		o = buf;
+		int inq = 0;
+		while (*p && (inq || (*p != L' ' && *p != L'\t'))) {
+			size_t bs = 0;
+			while (*p == L'\\') {
+				bs++;
+				p++;
+			}
+			if (*p == L'"') {
+				for (size_t i = 0; i < bs / 2; i++)
+					*o++ = L'\\';
+				if (bs & 1) {
+					*o++ = L'"';
+					p++;
+				} else if (inq && p[1] == L'"') {
+					*o++ = L'"';
+					p += 2;
+				} else {
+					inq = !inq;
+					p++;
+				}
+			} else {
+				for (size_t i = 0; i < bs; i++)
+					*o++ = L'\\';
+				if (*p && (inq || (*p != L' ' && *p != L'\t')))
+					*o++ = *p++;
+			}
+		}
+		*o = 0;
+		argv[argc++] = ws_w_to_utf8(buf);
+	}
 	argv[argc] = NULL;
-	LocalFree(wargv);
+	ws_free(buf);
 	*argc_out = argc;
 	return argv;
 }
