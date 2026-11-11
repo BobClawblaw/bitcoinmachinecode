@@ -145,6 +145,8 @@ void ws_broker_child(void);
 HANDLE ws_heap(void);
 /* the sampling profiler (ws_prof.c, BMC_WIN_PROF) */
 void ws_prof_count(i64 nr);
+void ws_sock_close_last(SOCKET s);
+void ws_fd_exit_sockets(void);
 void ws_prof_start(int child);
 void ws_heap_lock(void);
 void ws_heap_unlock(void);

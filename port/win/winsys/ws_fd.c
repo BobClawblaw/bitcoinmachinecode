@@ -62,7 +62,7 @@ void ws_desc_put(ws_desc *d)
 		if (ws_is_root)
 			closesocket(d->s);
 		else
-			CloseHandle((HANDLE)d->s);   /* no Winsock in a forked process */
+			ws_sock_close_last(d->s);   /* no Winsock in a forked process */
 	}
 	if (d->h != INVALID_HANDLE_VALUE && d->h != NULL)
 		CloseHandle(d->h);
@@ -1687,4 +1687,19 @@ int ws_fd_list(void (*emit)(void *ctx, int fd), void *ctx)
 		}
 	ReleaseSRWLockShared(&fdt_lock);
 	return n;
+}
+
+/* a forked process on its way out: its sockets are closed as close() would
+ * (the descriptors themselves die with the process) */
+void ws_fd_exit_sockets(void)
+{
+	AcquireSRWLockExclusive(&fdt_lock);
+	for (int fd = 0; fd < fdt_cap; fd++) {
+		ws_desc *d = fdt[fd].d;
+		if (d && d->type == FT_SOCKET && d->s != INVALID_SOCKET) {   /* a dup shares d: closed once */
+			ws_sock_close_last(d->s);
+			d->s = INVALID_SOCKET;
+		}
+	}
+	ReleaseSRWLockExclusive(&fdt_lock);
 }

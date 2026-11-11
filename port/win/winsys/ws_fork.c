@@ -416,6 +416,7 @@ void ws_exit_process(UINT code)
 	ws_robust_release_all();
 	if (ws_is_root)
 		ExitProcess(code);
+	ws_fd_exit_sockets();                          /* graceful where we hold the last handle */
 	TerminateProcess(GetCurrentProcess(), code);   /* a clone must not call into CSRSS */
 	for (;;)
 		Sleep(INFINITE);

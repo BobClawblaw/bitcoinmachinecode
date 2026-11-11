@@ -1340,3 +1340,52 @@ void ws_net_fork_child(void)
 {
 	io_ev = NULL;
 }
+
+/* ---------------------------------------------------------------- last close
+ * A forked process cannot closesocket, and the last handle of an AFD
+ * endpoint closed without it is an ABORTIVE close: a reset, which throws
+ * away whatever the peer has not read yet (a dial helper's result, written
+ * just before it exits, was lost: "helper exited without a result"). Linux
+ * delivers the data and then EOF. So when ours is the endpoint's only
+ * handle left, the send side is shut down gracefully first (AFD partial
+ * disconnect, as shutdown(SD_SEND) does), then the handle closed. */
+#define IOCTL_AFD_PARTIAL_DISCONNECT 0x0001202B
+typedef struct {
+	ULONG flags;                /* 1 = send */
+	ULONG reserved;
+	LARGE_INTEGER timeout;
+} afd_disconnect_info;
+typedef struct {
+	ULONG attributes, access, handles, pointers, paged, nonpaged, reserved[3], name_len, type_len, sd_len;
+	LARGE_INTEGER created;
+} obj_basic_info;
+typedef LONG(NTAPI *ntqueryobject_fn)(HANDLE, int, void *, ULONG, ULONG *);
+
+static ULONG handle_count(HANDLE h)
+{
+	static ntqueryobject_fn q;
+	if (!q)
+		q = (ntqueryobject_fn)(void *)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryObject");
+	obj_basic_info bi;
+	__ws_memset(&bi, 0, sizeof bi);
+	if (!q || q(h, 0 /* ObjectBasicInformation */, &bi, sizeof bi, NULL) < 0)
+		return 0;
+	return bi.handles;
+}
+
+void ws_sock_close_last(SOCKET s)
+{
+	HANDLE h = (HANDLE)s;
+	if (handle_count(h) == 1) {
+		afd_disconnect_info di;
+		__ws_memset(&di, 0, sizeof di);
+		di.flags = 1;
+		di.timeout.QuadPart = -1;
+		OVERLAPPED ov;
+		__ws_memset(&ov, 0, sizeof ov);
+		ov.hEvent = thread_event();
+		BOOL ok = DeviceIoControl(h, IOCTL_AFD_PARTIAL_DISCONNECT, &di, sizeof di, NULL, 0, NULL, &ov);
+		io_finish(h, &ov, ok, 2000);
+	}
+	CloseHandle(h);
+}
