@@ -57,15 +57,101 @@ size_t ws_wcslen(const wchar_t *s)
 	return n;
 }
 
+/* ---- the heap malloc and winsys allocate from ----
+ * A private heap created HEAP_NO_SERIALIZE (so Windows never turns on its
+ * low-fragmentation front end, whose small-block paths take no heap lock)
+ * and serialized by ws_heap_lock. fork holds that lock across the clone, so
+ * the child's copy is never caught mid-update; with the process heap,
+ * HeapLock left the LFH paths open and a forked child could hang in malloc. */
+static HANDLE bmc_heap;
+static volatile LONG heap_word;          /* 0 free, 1 held, 2 held + waiters */
+
+HANDLE ws_heap(void)
+{
+	HANDLE h = bmc_heap;
+	if (!h) {
+		h = HeapCreate(HEAP_NO_SERIALIZE, 0, 0);
+		HANDLE prev = InterlockedCompareExchangePointer((PVOID volatile *)&bmc_heap, h, NULL);
+		if (prev) {
+			HeapDestroy(h);
+			h = prev;
+		}
+	}
+	return h;
+}
+
+void ws_heap_lock(void)
+{
+	if (InterlockedCompareExchange(&heap_word, 1, 0) == 0)
+		return;
+	for (int i = 0; i < 100; i++) {
+		YieldProcessor();
+		if (heap_word == 0 && InterlockedCompareExchange(&heap_word, 1, 0) == 0)
+			return;
+	}
+	LONG two = 2;
+	while (InterlockedExchange(&heap_word, 2) != 0)
+		WaitOnAddress(&heap_word, &two, sizeof two, INFINITE);
+}
+
+void ws_heap_unlock(void)
+{
+	if (InterlockedExchange(&heap_word, 0) == 2)
+		WakeByAddressSingle((PVOID)&heap_word);
+}
+
+/* the forked child: the lock was held by the forking thread (the child's
+ * only one), and nobody waits on it here */
+void ws_heap_reset_child(void)
+{
+	heap_word = 0;
+}
+
+void *ws_heap_alloc(size_t n, int zero)
+{
+	HANDLE h = ws_heap();
+	ws_heap_lock();
+	void *p = HeapAlloc(h, zero ? HEAP_ZERO_MEMORY : 0, n ? n : 1);
+	ws_heap_unlock();
+	return p;
+}
+
+void *ws_heap_realloc(void *p, size_t n)
+{
+	HANDLE h = ws_heap();
+	ws_heap_lock();
+	void *r = HeapReAlloc(h, 0, p, n ? n : 1);
+	ws_heap_unlock();
+	return r;
+}
+
+void ws_heap_free(void *p)
+{
+	if (!p)
+		return;
+	HANDLE h = ws_heap();
+	ws_heap_lock();
+	HeapFree(h, 0, p);
+	ws_heap_unlock();
+}
+
+size_t ws_heap_size(void *p)
+{
+	HANDLE h = ws_heap();
+	ws_heap_lock();
+	SIZE_T n = HeapSize(h, 0, p);
+	ws_heap_unlock();
+	return n;
+}
+
 void *ws_alloc(size_t n)
 {
-	return HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, n ? n : 1);
+	return ws_heap_alloc(n, 1);
 }
 
 void ws_free(void *p)
 {
-	if (p)
-		HeapFree(GetProcessHeap(), 0, p);
+	ws_heap_free(p);
 }
 
 wchar_t *ws_utf8_to_w(const char *s)

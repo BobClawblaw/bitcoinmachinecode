@@ -7,7 +7,9 @@
 #define _GNU_SOURCE
 #include <elf.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include "pthread_impl.h"
 #include "libc.h"
 
@@ -139,6 +141,15 @@ int __bmc_start(int argc, char **argv, char **envp)
 			if (*p == '\\')
 				*p = '/';
 	__init_libc(ev, argv[0]);
+	/* glibc's stdout: line-buffered on a terminal, fully buffered otherwise,
+	 * decided up front. musl's stays line-buffered until its first write,
+	 * so a printf of several lines into a pipe went out as two
+	 * writes, and a reader taking one read() saw half of it */
+	{
+		struct winsize wsz;
+		if (ioctl(1, TIOCGWINSZ, &wsz) != 0)
+			setvbuf(stdout, NULL, _IOFBF, BUFSIZ);
+	}
 	__bmc_win_run_ctors();
 	exit(main(argc, argv, ev));
 }

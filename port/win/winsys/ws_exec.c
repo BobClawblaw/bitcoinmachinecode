@@ -85,8 +85,56 @@ static int is_shell(const char *path)
 }
 
 /* the program to run and its command line; NULL + *err on failure */
+/* BMC_WIN_SH=<a POSIX sh.exe> (Git for Windows' bin\sh.exe, say): /bin/sh
+ * and #! scripts run under it, with their arguments as given. Unset, a
+ * "sh -c" command goes to cmd.exe (an operator's -*notify line on Windows) */
+static wchar_t *posix_sh(void)
+{
+	wchar_t p[MAX_PATH];
+	DWORD l = GetEnvironmentVariableW(L"BMC_WIN_SH", p, MAX_PATH);
+	if (!l || l >= MAX_PATH)
+		return NULL;
+	wchar_t *r = ws_alloc((l + 1) * sizeof(wchar_t));
+	if (r)
+		__ws_memcpy(r, p, (l + 1) * sizeof(wchar_t));
+	return r;
+}
+
+static void args_tail(wbuf *cmd, char *const argv[], int from)
+{
+	for (int i = from; argv[i]; i++) {
+		wchar_t *aw = ws_utf8_to_w(argv[i]);
+		if (!aw)
+			continue;
+		wput(cmd, L' ');
+		quote_arg(cmd, aw);
+		ws_free(aw);
+	}
+}
+
+static int has_shebang(const wchar_t *w)
+{
+	HANDLE h = CreateFileW(w, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+			       OPEN_EXISTING, 0, NULL);
+	if (h == INVALID_HANDLE_VALUE)
+		return 0;
+	char b[2] = { 0, 0 };
+	DWORD got = 0;
+	ReadFile(h, b, 2, &got, NULL);
+	CloseHandle(h);
+	return got == 2 && b[0] == '#' && b[1] == '!';
+}
+
 static wchar_t *resolve(const char *path, char *const argv[], wbuf *cmd, i64 *err)
 {
+	if (is_shell(path)) {
+		wchar_t *sh = posix_sh();
+		if (sh) {
+			wputs(cmd, L"sh");
+			args_tail(cmd, argv, 1);
+			return sh;
+		}
+	}
 	if (is_shell(path) && argv[0] && argv[1] && argv[1][0] == '-' && argv[1][1] == 'c' && !argv[1][2] && argv[2]) {
 		wchar_t comspec[MAX_PATH];
 		if (!GetEnvironmentVariableW(L"ComSpec", comspec, MAX_PATH))
@@ -118,10 +166,50 @@ static wchar_t *resolve(const char *path, char *const argv[], wbuf *cmd, i64 *er
 		w = x;
 		a = GetFileAttributesW(w);
 		if (a == INVALID_FILE_ATTRIBUTES || (a & FILE_ATTRIBUTE_DIRECTORY)) {
+			/* BMC_WIN_BINDIR: the port's binaries live in its out/bin, not
+			 * beside the sources the tests name (daemon/bmc_cli); a missing
+			 * program is looked up there by its base name */
+			wchar_t dir[MAX_PATH];
+			DWORD dl = GetEnvironmentVariableW(L"BMC_WIN_BINDIR", dir, MAX_PATH);
+			const wchar_t *base = x + l;
+			while (base > x && base[-1] != L'\\' && base[-1] != L'/')
+				base--;
+			size_t bl = ws_wcslen(base);
+			if (dl && dl < MAX_PATH && dl + bl + 2 < MAX_PATH) {
+				wchar_t *y = ws_alloc((dl + bl + 2) * sizeof(wchar_t));
+				__ws_memcpy(y, dir, dl * sizeof(wchar_t));
+				y[dl] = L'\\';
+				__ws_memcpy(y + dl + 1, base, (bl + 1) * sizeof(wchar_t));
+				DWORD b = GetFileAttributesW(y);
+				if (b != INVALID_FILE_ATTRIBUTES && !(b & FILE_ATTRIBUTE_DIRECTORY)) {
+					ws_free(w);
+					w = y;
+					a = b;
+				} else {
+					ws_free(y);
+				}
+			}
+		}
+		if (a == INVALID_FILE_ATTRIBUTES || (a & FILE_ATTRIBUTE_DIRECTORY)) {
 			ws_free(w);
 			*err = a == INVALID_FILE_ATTRIBUTES ? -L_ENOENT : -L_EACCES;
 			return NULL;
 		}
+	}
+	if (has_shebang(w)) {                  /* a script: the POSIX shell runs it, or nothing can */
+		wchar_t *sh = posix_sh();
+		if (!sh) {
+			ws_free(w);
+			*err = -L_ENOEXEC;
+			return NULL;
+		}
+		wchar_t *pw = ws_utf8_to_w(path);
+		wputs(cmd, L"sh ");
+		quote_arg(cmd, pw ? pw : w);
+		ws_free(pw);
+		args_tail(cmd, argv, 1);
+		ws_free(w);
+		return sh;
 	}
 	for (int i = 0; argv[i]; i++) {
 		wchar_t *aw = ws_utf8_to_w(argv[i]);

@@ -11,6 +11,7 @@ Usage: python port/win/run_tests.py [--only name,name] [--from name] [--timeout 
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -37,6 +38,11 @@ def recipe():
     return out
 
 
+TOOLS = ['daemon/bmcbitcoind', 'daemon/bmc_cli', 'daemon/bmc_wallet_cli', 'daemon/bmc_rpcd',
+         'daemon/bmc_build_addr_hist', 'daemon/bmc_build_coinstats_hist',
+         'daemon/bmc_build_txospender_index', 'daemon/bmc_merge_index_runs']
+
+
 def main(argv):
     only = None
     frm = None
@@ -57,6 +63,25 @@ def main(argv):
     cmds = recipe()
     results = []
     built = {}
+    # the tests exec the daemon's tools by their source-tree names
+    # (daemon/bmc_cli), directly or through sh: they are installed where the
+    # Linux build puts them, as <name>.exe (gitignored), and winsys's stat,
+    # access and exec find "<name>.exe" for "<name>"; BMC_WIN_BINDIR covers
+    # the rest
+    for tool in TOOLS:
+        try:
+            exe = build.build_target(tool)
+            shutil.copy2(exe, os.path.join(ASM, tool.replace('/', os.sep) + '.exe'))
+        except Exception as e:  # noqa: BLE001
+            print('tool %s did not build: %s' % (tool, str(e).strip().split('\n')[-1][:200]), flush=True)
+    os.environ['BMC_WIN_BINDIR'] = os.path.join(build.OUT, 'bin')
+    # the tests' system()/popen() lines and #! scripts are POSIX shell: with
+    # Git for Windows installed, its sh runs them (winsys: BMC_WIN_SH)
+    if 'BMC_WIN_SH' not in os.environ:
+        for cand in (os.path.join(os.environ.get('ProgramFiles', r'C:\Program Files'), 'Git', 'bin', 'sh.exe'),):
+            if os.path.exists(cand):
+                os.environ['BMC_WIN_SH'] = cand
+                break
     started = frm is None
     for cmd in cmds:
         parts = shlex.split(cmd)

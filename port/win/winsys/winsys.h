@@ -141,6 +141,15 @@ extern int ws_is_root;             /* 0 in a forked (cloned) process */
 void ws_fork_init(void);
 void ws_broker_start(void);
 void ws_broker_child(void);
+/* the private heap (ws_util.c) */
+HANDLE ws_heap(void);
+void ws_heap_lock(void);
+void ws_heap_unlock(void);
+void ws_heap_reset_child(void);
+void *ws_heap_alloc(size_t n, int zero);
+void *ws_heap_realloc(void *p, size_t n);
+void ws_heap_free(void *p);
+size_t ws_heap_size(void *p);
 /* SCM_RIGHTS escrow (ws_broker.c): what a passed descriptor carries */
 typedef struct {
 	int type, flags;

@@ -24,23 +24,22 @@
 
 WSAPI void *__bmc_win_heap_alloc(size_t n, int zero)
 {
-	return HeapAlloc(GetProcessHeap(), zero ? HEAP_ZERO_MEMORY : 0, n ? n : 1);
+	return ws_heap_alloc(n, zero);
 }
 
 WSAPI void *__bmc_win_heap_realloc(void *p, size_t n)
 {
-	return HeapReAlloc(GetProcessHeap(), 0, p, n ? n : 1);
+	return ws_heap_realloc(p, n);
 }
 
 WSAPI void __bmc_win_heap_free(void *p)
 {
-	if (p)
-		HeapFree(GetProcessHeap(), 0, p);
+	ws_heap_free(p);
 }
 
 WSAPI size_t __bmc_win_heap_size(void *p)
 {
-	return HeapSize(GetProcessHeap(), 0, p);
+	return ws_heap_size(p);
 }
 
 enum { R_VA = 1, R_VIEW = 2 };
@@ -546,7 +545,10 @@ WSAPI void __bmc_win_heap_stats(size_t *committed, size_t *allocated)
 	HEAP_SUMMARY hs;
 	__ws_memset(&hs, 0, sizeof hs);
 	hs.cb = sizeof hs;
-	if (HeapSummary(GetProcessHeap(), 0, &hs)) {
+	ws_heap_lock();
+	BOOL hs_ok = HeapSummary(ws_heap(), 0, &hs);
+	ws_heap_unlock();
+	if (hs_ok) {
 		*committed = hs.cbCommitted;
 		*allocated = hs.cbAllocated;
 	} else {

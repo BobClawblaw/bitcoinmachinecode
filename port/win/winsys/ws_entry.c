@@ -263,7 +263,21 @@ static void strace_line(i64 n, i64 a1, i64 a2, i64 a3, i64 r)
 	PUT("\n");
 #undef PUT
 	line[k] = 0;
-	ws_write_stderr(line);
+	/* BMC_WIN_STRACE_LOG=<file>: append there instead of to stderr (whose
+	 * fd 2 may be the very pipe under study) */
+	static HANDLE logh;
+	if (!logh) {
+		wchar_t p[MAX_PATH];
+		DWORD l = GetEnvironmentVariableW(L"BMC_WIN_STRACE_LOG", p, MAX_PATH);
+		logh = l && l < MAX_PATH ? CreateFileW(p, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+						      OPEN_ALWAYS, 0, NULL) : INVALID_HANDLE_VALUE;
+	}
+	if (logh != INVALID_HANDLE_VALUE) {
+		DWORD w;
+		WriteFile(logh, line, (DWORD)k, &w, NULL);
+	} else {
+		ws_write_stderr(line);
+	}
 }
 
 /* Signals pending for this thread are handled on the way out of a syscall;

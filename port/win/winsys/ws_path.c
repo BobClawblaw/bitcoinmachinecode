@@ -48,8 +48,27 @@ wchar_t *ws_path(int dirfd, const char *path, i64 *err)
 		return NULL;
 	}
 	wchar_t *w;
+	wchar_t shp[MAX_PATH];
+	DWORD shl;
 	if (starts(path, "/dev/null") && (path[9] == 0)) {
 		w = ws_utf8_to_w("NUL");
+	} else if ((starts(path, "/bin/") || starts(path, "/usr/bin/")) &&
+		   (shl = GetEnvironmentVariableW(L"BMC_WIN_SH", shp, MAX_PATH)) && shl < MAX_PATH) {
+		/* with a POSIX tool set configured (BMC_WIN_SH = <root>\bin\sh.exe,
+		 * Git for Windows' layout), /bin and /usr/bin are <root>\usr\bin */
+		int up = 0;
+		for (DWORD i = shl; i-- > 0 && up < 2;)
+			if (shp[i] == L'\\' || shp[i] == L'/') {
+				shp[i] = 0;
+				up++;
+			}
+		wchar_t *rest = ws_utf8_to_w(path + (path[1] == 'b' ? 5 : 9));
+		w = rest && up == 2 ? wcat3(shp, L"\\usr\\bin\\", rest) : NULL;
+		ws_free(rest);
+		if (w)
+			for (wchar_t *q = w; *q; q++)
+				if (*q == L'/')
+					*q = L'\\';
 	} else if (starts(path, "/tmp") && (path[4] == 0 || path[4] == '/')) {
 		wchar_t tmp[MAX_PATH + 1];
 		DWORD n = GetTempPathW(MAX_PATH + 1, tmp);

@@ -208,6 +208,7 @@ static i64 sys_fork(void)
 	 * ws_create_thread, so waiting for that count is enough. The loader
 	 * lock itself must not be held here, for the same reason. */
 	ws_threads_settle();
+	ws_heap_lock();
 	HeapLock(GetProcessHeap());
 
 	rtl_upi info;
@@ -218,6 +219,7 @@ static i64 sys_fork(void)
 	if (st == STATUS_PROCESS_CLONED) {
 		/* ---- the child ---- */
 		HeapUnlock(GetProcessHeap());
+		ws_heap_reset_child();
 		ws_is_root = 0;
 		ws_child *k = children;
 		children = NULL;
@@ -249,6 +251,7 @@ static i64 sys_fork(void)
 	}
 
 	HeapUnlock(GetProcessHeap());
+	ws_heap_unlock();
 	if (st < 0) {
 		ReleaseSRWLockExclusive(&clock_);
 		ws_mem_fork_done(0);

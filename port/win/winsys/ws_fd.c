@@ -371,6 +371,52 @@ static int is_nul(const wchar_t *w)
 	       (w[2] == L'L' || w[2] == L'l') && w[3] == 0;
 }
 
+/* a program named without ".exe" (daemon/bmc_cli, <exe dir>/bmc_build_...):
+ * stat and access find "<path>.exe" when "<path>" itself does not exist, as
+ * Cygwin does, so the checks before an exec agree with the exec */
+static void exe_alt(wchar_t **w)
+{
+	if (GetFileAttributesW(*w) != INVALID_FILE_ATTRIBUTES)
+		return;
+	size_t l = ws_wcslen(*w);
+	wchar_t *x = ws_alloc((l + 5) * sizeof(wchar_t));
+	if (!x)
+		return;
+	__ws_memcpy(x, *w, l * sizeof(wchar_t));
+	__ws_memcpy(x + l, L".exe", 5 * sizeof(wchar_t));
+	DWORD a = GetFileAttributesW(x);
+	if (a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY)) {
+		ws_free(*w);
+		*w = x;
+		return;
+	}
+	/* ...and in BMC_WIN_BINDIR by base name, as exec looks (ws_exec.c) */
+	wchar_t dir[MAX_PATH];
+	DWORD dl = GetEnvironmentVariableW(L"BMC_WIN_BINDIR", dir, MAX_PATH);
+	const wchar_t *base = x + l;
+	while (base > x && base[-1] != L'\\' && base[-1] != L'/')
+		base--;
+	size_t bl = ws_wcslen(base);
+	if (dl && dl < MAX_PATH) {
+		wchar_t *y = ws_alloc((dl + bl + 2) * sizeof(wchar_t));
+		if (y) {
+			__ws_memcpy(y, dir, dl * sizeof(wchar_t));
+			y[dl] = L'\\';
+			__ws_memcpy(y + dl + 1, base, (bl + 1) * sizeof(wchar_t));
+			a = GetFileAttributesW(y);
+			if (a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY)) {
+				ws_free(x);
+				ws_free(*w);
+				*w = y;
+				return;
+			}
+			ws_free(y);
+		}
+	}
+	ws_free(x);
+	SetLastError(ERROR_FILE_NOT_FOUND);
+}
+
 static i64 sys_stat_path(int dirfd, const char *path, struct l_stat *st, int flags)
 {
 	if ((flags & L_AT_EMPTY_PATH) && path && !*path) {
@@ -402,6 +448,7 @@ static i64 sys_stat_path(int dirfd, const char *path, struct l_stat *st, int fla
 		ws_free(w);
 		return stat_handle(NULL, FT_NULL, st);
 	}
+	exe_alt(&w);
 	HANDLE h = open_meta(w, (flags & L_AT_SYMLINK_NOFOLLOW) != 0, FILE_READ_ATTRIBUTES | FILE_READ_EA);
 	ws_free(w);
 	if (h == INVALID_HANDLE_VALUE)
@@ -648,6 +695,29 @@ static i64 do_rwv(int fd, const struct l_iovec *iov, int cnt, i64 pos, int write
 	i64 total = 0;
 	if (cnt < 0 || cnt > 1024)
 		return -L_EINVAL;
+	/* a gathered write goes out as ONE write, as writev does: a pipe reader
+	 * (or an O_APPEND writer next door) must not see it split per iovec --
+	 * musl's printf("%s\n") is a two-iovec writev */
+	if (write && cnt > 1) {
+		u64 sum = 0;
+		for (int i = 0; i < cnt; i++)
+			sum += iov[i].len;
+		if (sum <= (1u << 20)) {
+			char stackbuf[4096];
+			char *g = sum <= sizeof stackbuf ? stackbuf : ws_alloc((size_t)sum);
+			if (g) {
+				u64 at = 0;
+				for (int i = 0; i < cnt; i++) {
+					__ws_memcpy(g + at, iov[i].base, (size_t)iov[i].len);
+					at += iov[i].len;
+				}
+				i64 r = do_rw(fd, g, (size_t)sum, pos, write, positioned);
+				if (g != stackbuf)
+					ws_free(g);
+				return r;
+			}
+		}
+	}
 	for (int i = 0; i < cnt; i++) {
 		if (!iov[i].len)
 			continue;
@@ -1270,6 +1340,8 @@ static i64 sys_faccessat(int dirfd, const char *path, int mode)
 	wchar_t *w = ws_path(dirfd, path, &err);
 	if (!w)
 		return err;
+	if (!is_nul(w))
+		exe_alt(&w);
 	DWORD a = GetFileAttributesW(w);
 	DWORD e = GetLastError();
 	int nul = is_nul(w);
