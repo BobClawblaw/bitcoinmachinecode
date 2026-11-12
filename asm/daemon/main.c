@@ -2862,6 +2862,14 @@ static int shutdown_wait_lock_released(int max_s, const char* who){
             fprintf(stderr, "[%s] datadir lock held by no other process (waited %.1fs) -- exiting releases it\n", who, (mono_now_ms() - t0) / 1000.0);
             return 0;
         }
+        /* "The worker is gone" is read BEFORE the scan: SIGCHLD can reap it
+         * while the scan runs (the handler sets g_dl_worker_exited), and the
+         * scan's list -- taken while the worker lived, so naming it and its
+         * children -- must not then be treated as orphans left behind it.
+         * The next pass rescans with the worker gone. (Seen on Windows, where
+         * the /proc walk takes ~70 ms: the stopping parent SIGTERMed its own
+         * exiting fold worker, test_stop_waits_for_worker ~1 run in 12.) */
+        int worker_gone = g_dl_worker_pid <= 0 || g_dl_worker_exited;
         int n = lock_holders_scan(datadir_lock_fd, 1, h, LOCK_HOLDERS_MAX);
         long long now = mono_now_ms();
         for (int i = 0; i < n && i < LOCK_HOLDERS_MAX; i++){
@@ -2907,7 +2915,7 @@ static int shutdown_wait_lock_released(int max_s, const char* who){
             continue;
         }
         lock_holders_fmt(h, n, desc, sizeof desc);
-        if ((g_dl_worker_pid <= 0 || g_dl_worker_exited) && !orphans_termed){
+        if (worker_gone && !orphans_termed){
             orphans_termed = 1;
             fprintf(stderr, "[%s] %d process(es) still hold the datadir lock with the download worker gone: %s -- SIGTERM\n", who, n, desc);
             for (int i = 0; i < n && i < LOCK_HOLDERS_MAX; i++) kill(h[i].pid, SIGTERM);
