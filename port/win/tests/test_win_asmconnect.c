@@ -1,6 +1,7 @@
 /* test_win_asmconnect.c -- bitcoin_net.asm's tcp_connect_ip (SO_RCVTIMEO and
  * SO_SNDTIMEO set, connect through winsys) after a fork, then a read that
- * must WAIT for the peer's late reply rather than fail at once. */
+ * must WAIT for the peer's late reply rather than fail at once.
+ * port-link: bitcoin_net.asm bitcoin_hash.asm sha256.asm */
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>

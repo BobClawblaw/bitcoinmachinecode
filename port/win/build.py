@@ -607,7 +607,12 @@ def build_port_test(name):
     src = os.path.join(HERE, 'tests', name + '.c')
     obj = os.path.join(OUT, 'porttests', name + '.obj')
     o = cc_sysv(src, obj, user_inc() + BMC_CFLAGS)
-    return link(os.path.join(OUT, 'bin', name + '.exe'), [o])
+    # a line "port-link: a.asm b.c" in the source names the asm/ inputs it links
+    extra = []
+    for line in open(src, encoding='utf-8'):
+        if 'port-link:' in line:
+            extra += line.split('port-link:', 1)[1].replace('*/', '').split()
+    return link(os.path.join(OUT, 'bin', name + '.exe'), [o] + [bmc_obj(x) for x in extra])
 
 
 def main(argv):
