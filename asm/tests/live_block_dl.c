@@ -1,5 +1,5 @@
 /* live_block_dl.c -- MANUAL/live. Download a REAL mainnet block body from the
- * cooperative local node (192.168.5.69) using the ASSEMBLY node primitives end
+ * cooperative local node (127.0.0.1 by default) using the ASSEMBLY node primitives end
  * to end:
  *   - tcp_connect_ip + asm p2p framing (bitcoin_net.asm)
  *   - version/verack handshake + getheaders (bitcoin_p2p.asm)
@@ -36,7 +36,7 @@ static void put_u16be(unsigned char*p,unsigned v){p[0]=v>>8;p[1]=v&0xff;}
 
 int main(int argc,char**argv){
     setbuf(stdout,NULL);
-    const char* ipstr = argc>1? argv[1] : "192.168.5.69";
+    const char* ipstr = argc>1? argv[1] : "127.0.0.1";
     int back = argc>2? atoi(argv[2]) : 0;   /* offset back from tip (0=tip) */
     unsigned ip; inet_pton(AF_INET, ipstr, &ip);
     int fd = tcp_connect_ip(ip, PORT_BE);

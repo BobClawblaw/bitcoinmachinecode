@@ -1461,7 +1461,7 @@ ANNCLAIMSRCS := $(patsubst tests/test_dial_budget.c,tests/test_announce_claim.c,
 tests/test_announce_claim: addrbook.a $(ANNCLAIMSRCS) daemon/main.c daemon/inflight.h daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c $(TEST_TMPDIR_H) $(MAIN_C_HDRS)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ $(ANNCLAIMSRCS) $(DAEMONOBJS) $(DAEMON_RPCOBJS) wallet_core.c addrbook.a -lpthread
 
-# test_dlc_stop_sigign -- the 2026-09-24 m5ultra worker wedge: under the
+# test_dlc_stop_sigign -- the 2026-09-24 Mac Studio worker wedge: under the
 # download worker's SIGCHLD = SIG_IGN a blocking waitpid on a live child
 # sleeps until EVERY child exits, so dlc_stop_workers hung on its first
 # SIGKILLed helper after a mid-download reject and the worker never saw
@@ -1472,7 +1472,7 @@ STOPSIGIGNSRCS := $(patsubst tests/test_dial_budget.c,tests/test_dlc_stop_sigign
 tests/test_dlc_stop_sigign: addrbook.a $(STOPSIGIGNSRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c $(MAIN_C_HDRS)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ $(STOPSIGIGNSRCS) $(DAEMONOBJS) $(DAEMON_RPCOBJS) wallet_core.c addrbook.a -lpthread
 
-# test_txoq_shutdown -- the 2026-09-24 m5ultra 10-minute stop: the worker's
+# test_txoq_shutdown -- the 2026-09-24 Mac Studio 10-minute stop: the worker's
 # gettxout service point answered with a blocking send on a Darwin 8 KB
 # channel, and replies nobody read could hold it there until the serve
 # parent exited. The real txoq_service against a parent that never reads

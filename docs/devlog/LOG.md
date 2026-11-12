@@ -7574,7 +7574,7 @@ MALFORMED -- real Bitcoin nodes silently ignore it. That malformed encoding, not
 (only) seed serving policy, is why live block-body getdata "hung/dropped". With
 the getdata fixed to the canonical form, a real node COOPERATIVELY serves block
 bodies, and the assembly receive path downloads + cons_verify-validates + stores
-REAL mainnet blocks. This was proven live against 192.168.5.69:8333 (a local
+REAL mainnet blocks. This was proven live against a LAN node on port 8333 (a local
 full node): 2000 real headers learned to tip (height ~790999), then real block
 bodies at heights 790999/790998/790997/790994 downloaded, validated VALID by asm
 cons_verify, and persisted. The "download the entire blockchain" receive tail is

@@ -1,10 +1,10 @@
 /* tests/test_lsm_mm_collide.c -- two live runs whose run_no collide in the
- * mm cache must not thrash it (2026-09-24, m5ultra).
+ * mm cache must not thrash it (2026-09-24, Mac Studio).
  *
  * utxo_lsm_mm.c's per-thread cache was direct-mapped, slot = run_no % 64, on
  * the premise that ~12 live runs make collisions "essentially absent". A
  * mid-catchup manifest holds up to 24 runs with scattered numbers, and on
- * the m5ultra the 15 GB base run (9040) shared slot 16 with a fresh 6.7 MB
+ * the Mac Studio the 15 GB base run (9040) shared slot 16 with a fresh 6.7 MB
  * run (9232): a lookup checks the newer run first and finds an old coin in
  * the base, so every lookup unmapped and re-mapped both. Sampled, the apply
  * thread spent about half its time in munmap/open/mmap under

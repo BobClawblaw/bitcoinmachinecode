@@ -5016,7 +5016,7 @@ void utxo_live_test_set_halted(int h){ g_halted = h ? 1 : 0; }
  *
  * A HALT is not that degraded mode. The halt path turns tracking off too,
  * but the set was live up to a known height and every block past it is
- * unvalidated -- so the tip freezes at the applied height. m5ultra mainnet,
+ * unvalidated -- so the tip freezes at the applied height. Mac Studio mainnet,
  * 2026-09-24: the h=274443 store-inconsistency halt switched tracking off
  * and the public tip jumped 274442 -> 968338 in one step; getblockcount /
  * getbestblockhash / announces / header serving all spoke for ~694k blocks

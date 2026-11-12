@@ -1,5 +1,5 @@
 /* test_txoq_shutdown.c -- the gettxout channel must never hold the download
- * worker in send() (2026-09-24, the 10-minute m5ultra stop).
+ * worker in send() (2026-09-24, the 10-minute Mac Studio stop).
  *
  * The worker answers queued gettxout queries at its between-block service
  * point (txoq_service) with a blocking send. Replies to queries the RPC side

@@ -337,7 +337,7 @@ extern long archive_repair_bad_bodies(long nblocks, int level);  /* STO-11 */
  * hashes) blanked into holes. Both repairs rely on the boot catch-up to
  * re-fetch them, so a nonzero count runs it even under bmc.bootcatchup=0 --
  * the worker's far-behind trigger never fires for a hole of a few blocks
- * below the stored tip (testnet4 node B, m5ultra: stuck at 153,876 for an
+ * below the stored tip (testnet4 node B, Mac Studio: stuck at 153,876 for an
  * hour below two blanked heights). */
 static long g_boot_repaired_holes = 0;
 extern long archive_drop_utxo_state(void);                /* daemon/archive_verify.c */
@@ -2369,7 +2369,7 @@ out:
  * channel without room for a whole reply.
  *
  * The replies go out with a blocking send(). Replies to queries the RPC side
- * timed out on are never read, and on the m5ultra the channel was Darwin's
+ * timed out on are never read, and on the Mac Studio the channel was Darwin's
  * 8 KB: a burst of gettxout queries could fill it and leave the worker in
  * send() until the parent read again -- or, at a stop, until the parent
  * EXITED, since a shutdown() of the parent's end does not wake a Darwin
@@ -4284,7 +4284,7 @@ static int leg_is_anon_net(int net){ return net == BMC_NET_TORV3 || net == BMC_N
 static int dh_inflight_net(int net){ for(int i = 0; i < DH_MAX; i++) if(g_dh[i].pid > 0 && g_dh[i].net == net) return 1; return 0; }
 static int dh_inflight_count(void){ int n = 0; for(int i = 0; i < DH_MAX; i++) if(g_dh[i].pid > 0) n++; return n; }
 static long long dh_now_ms(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec*1000LL + ts.tv_nsec/1000000; }
-/* [dial-handoff] probe (2026-09-24). The m5ultra serve-mode storm installed
+/* [dial-handoff] probe (2026-09-24). The Mac Studio serve-mode storm installed
  * helper-dialed legs that were ALREADY dead -- "closed theirs (revents 0x11)
  * after 0s; unread: (nothing)" in the same millisecond as the install -- so
  * the socket died somewhere between the helper's handshake and the worker's
@@ -4421,7 +4421,7 @@ static int dh_start_slot(const char* host, int out_port, int want_slot){
          * SCM_RIGHTS arrives DEAD (EOF + HUP, its buffered bytes discarded)
          * when the sender exits before the receiver's recvmsg; the worker
          * collects results once per rotation, so exiting right after the
-         * sendmsg delivered nearly every v1 leg dead -- the m5ultra serve
+         * sendmsg delivered nearly every v1 leg dead -- the Mac Studio serve
          * storm (2026-09-24): "closed theirs (revents 0x11) after 0s" in the
          * install's own millisecond, each dead leg a dial-memory backoff,
          * the pool drained ("no dial candidate is free" x5866). v2 legs
@@ -8268,7 +8268,7 @@ static void dl_publish_peer_table(void* store_buf, int with_tip){
                  * and since this failure became the liveness test (run 26) every
                  * live leg was retired on every sweep: getpeerinfo,
                  * getconnectioncount and getnetworkinfo all answered 0 on the
-                 * m5ultra while the worker held 11 legs and followed the tip.
+                 * Mac Studio while the worker held 11 legs and followed the tip.
                  * TCP_CONNECTION_INFO is Darwin's equivalent (dh_tcp_state uses it
                  * too): the liveness test and the byte meters. */
                 struct tcp_connection_info ci; socklen_t cil = sizeof ci;
@@ -9883,7 +9883,7 @@ static int dl_claim_believed(int i, long long now_s){
  * and the legs only fetch past the tip: nothing re-fetched it. Holes like
  * this come from a boot repair (STO-11 bad bodies, duplicate hashes) whose
  * re-fetch was the boot catch-up that bmc.bootcatchup=0 skips, or from a
- * repair on an earlier boot. testnet4 node B (m5ultra) sat at 153,876 for an
+ * repair on an earlier boot. testnet4 node B (Mac Studio) sat at 153,876 for an
  * hour below two blanked heights with 11 peers connected. */
 static int dl_hole_blocks_apply(long archive_tip, long first_hole, long applied){
     return applied >= 0 && first_hole >= 0 && first_hole <= archive_tip && applied == first_hole - 1;

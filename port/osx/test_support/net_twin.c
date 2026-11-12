@@ -127,7 +127,7 @@ void fd_close(int fd) { close(fd); }
  * blocking connect() itself (2026-08-31 / 2026-09-01 dial-wedge findings)
  * on Linux -- but Darwin does NOT apply SO_SNDTIMEO to connect(): a silent
  * peer blocked the dial until main.c's 20 s SIGALRM budget interrupted it,
- * reported as "connect: Interrupted system call" (m5ultra, 2026-09-24).
+ * reported as "connect: Interrupted system call" (Mac Studio, 2026-09-24).
  * So the 10 s bound is explicit here: a non-blocking connect() waited on
  * with poll(), the socket back to blocking before it is returned, and an
  * expiry reported as -ETIMEDOUT (main.c's dial_fail_errno: "timed out").

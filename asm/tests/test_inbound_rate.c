@@ -80,7 +80,7 @@ int main(void){
     int served = 0, refused = 0;
     for (int sec = 0; sec < 60; sec++){
         g_now = 1000 + sec;
-        for (int k = 0; k < 9; k++){ if (inbound_rate_ok("192.168.5.76", &lg)) served++; else refused++; }
+        for (int k = 0; k < 9; k++){ if (inbound_rate_ok("10.0.0.76", &lg)) served++; else refused++; }
     }
     /* 12 burst + 59 refills = 71 served; the rest refused. Asserted against the
      * model rather than a round number, so the figure cannot drift unnoticed. */

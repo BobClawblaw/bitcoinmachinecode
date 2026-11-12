@@ -1,5 +1,5 @@
 /* test_dlc_stop_sigign.c -- the download worker's helper stop must not
- * block under SIGCHLD = SIG_IGN (the 2026-09-24 m5ultra wedge).
+ * block under SIGCHLD = SIG_IGN (the 2026-09-24 Mac Studio wedge).
  *
  * The worker runs with SIGCHLD ignored, and there a blocking
  * waitpid(pid, .., 0) on a child that is still alive sleeps until EVERY

@@ -28,7 +28,7 @@
  * Resumable: rerun with the same <dir> and start_h >= persisted tip to continue.
  *
  * Usage: paribd <dir> <num_workers> <start_h> <end_h> [peer host ...]
- *   peers default to <dir>/../seeds.txt then the cooperative local node.
+ *   peers default to <dir>/../seeds.txt.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -282,10 +282,6 @@ int main(int argc, char** argv){
     else {
         char sf[512]; snprintf(sf,sizeof sf,"%s/../seeds.txt",dir);
         np=load_peers(sf,peers,MAXPEERS);
-        if(np==0){ /* fallback cooperative node */ strcpy(peers[0],"192.168.5.69"); np=1; }
-        /* ensure the cooperative node is first */
-        /* move any exact '192.168.5.69' to front */
-        for(int i=0;i<np;i++) if(!strcmp(peers[i],"192.168.5.69")&&i!=0){ char t[128];strcpy(t,peers[0]);strcpy(peers[0],peers[i]);strcpy(peers[i],t);break; }
     }
     if(np==0){ fprintf(stderr,"no peers\n"); return 2; }
     printf("peers: %d\n", np); for(int i=0;i<np;i++) printf("  [%d] %s\n",i,peers[i]);
