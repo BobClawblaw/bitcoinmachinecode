@@ -59,6 +59,10 @@ void ws_fmt_u64(char *buf, u64 v);
 /* Linux path (UTF-8, relative to dirfd) -> Windows path (UTF-16, ws_alloc'd).
  * Returns NULL and sets *err on failure. */
 wchar_t *ws_path(int dirfd, const char *path, i64 *err);
+wchar_t *ws_path_nf(int dirfd, const char *path, i64 *err);    /* a symlink at the end not followed */
+i64 ws_lx_readlink_h(HANDLE h, char *buf, size_t cap);
+i64 ws_lx_readlink(const wchar_t *w, char *buf, size_t cap);
+i64 ws_lx_symlink(const char *target, const wchar_t *w);
 
 /* ---- ws_fd.c ---- */
 enum { FT_FREE = 0, FT_FILE, FT_DIR, FT_CONSOLE, FT_PIPE, FT_NULL, FT_RANDOM, FT_SOCKET,
@@ -68,6 +72,7 @@ typedef struct ws_desc {
 	int type;
 	int flags;            /* Linux O_* status flags (O_APPEND, O_NONBLOCK, access mode) */
 	HANDLE h;
+	HANDLE hout;          /* FT_CONSOLE opened as /dev/tty: CONOUT$, writes go here (h is CONIN$) */
 	SOCKET s;
 	i64 off;              /* file offset (we always do positioned I/O) */
 	SRWLOCK lock;

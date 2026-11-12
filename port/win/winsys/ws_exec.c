@@ -314,7 +314,7 @@ static HANDLE fd_handle(int fd, HANDLE *tmp)
 		h = *tmp = CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
 				       OPEN_EXISTING, 0, NULL);
 	else
-		h = d->h;
+		h = fd > 0 && d->hout ? d->hout : d->h;   /* /dev/tty as stdout/stderr: its CONOUT$ */
 	ws_desc_put(d);
 	return h;
 }

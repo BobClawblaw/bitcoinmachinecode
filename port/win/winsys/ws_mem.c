@@ -647,6 +647,32 @@ static i64 name_regions(char *a, u64 len, const char *name)
 	return hit ? 0 : -L_EINVAL;
 }
 
+/* the bytes of [p, p+len) in our working set: Linux's Rss for a mapping
+ * (a file page read with pread sits in the cache, not here; one touched
+ * through the view is here until trimmed) */
+static u64 ws_resident(char *p, u64 len)
+{
+	enum { BATCH = 2048 };
+	PSAPI_WORKING_SET_EX_INFORMATION *w = ws_alloc(sizeof *w * BATCH);
+	if (!w)
+		return len;
+	u64 pages = len / PAGE, res = 0;
+	for (u64 i = 0; i < pages; i += BATCH) {
+		u64 k = pages - i < BATCH ? pages - i : BATCH;
+		for (u64 j = 0; j < k; j++)
+			w[j].VirtualAddress = p + (i + j) * PAGE;
+		if (!K32QueryWorkingSetEx(GetCurrentProcess(), w, (DWORD)(sizeof *w * k))) {
+			res += k * PAGE;                   /* unknown: count it, as before */
+			continue;
+		}
+		for (u64 j = 0; j < k; j++)
+			if (w[j].VirtualAttributes.Valid)
+				res += PAGE;
+	}
+	ws_free(w);
+	return res;
+}
+
 /* /proc/self/maps (smaps: 1 adds Size/Rss per region; smaps_rollup: 2) */
 char *ws_mem_maps_text(u64 *len, int smaps)
 {
@@ -705,10 +731,11 @@ char *ws_mem_maps_text(u64 *len, int smaps)
 		if (smaps == 1) {
 			ws_sbuf_str(&b, "Size:           ");
 			ws_sbuf_dec(&b, r->len / 1024);
+			u64 rss = ws_resident(r->user, r->len);
 			ws_sbuf_str(&b, " kB\nRss:            ");
-			ws_sbuf_dec(&b, r->len / 1024);
-			ws_sbuf_str(&b, " kB\nPss:            ");   /* as Rss: the mapped size */
-			ws_sbuf_dec(&b, r->len / 1024);
+			ws_sbuf_dec(&b, rss / 1024);
+			ws_sbuf_str(&b, " kB\nPss:            ");   /* as Rss: sharing is not counted */
+			ws_sbuf_dec(&b, rss / 1024);
 			ws_sbuf_str(&b, " kB\nAnonymous:      ");
 			ws_sbuf_dec(&b, (!r->path && !r->shared) ? r->len / 1024 : 0);
 			ws_sbuf_str(&b, " kB\nLocked:         ");

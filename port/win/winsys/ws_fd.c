@@ -90,6 +90,8 @@ void ws_desc_put(ws_desc *d)
 	}
 	if (d->h != INVALID_HANDLE_VALUE && d->h != NULL)
 		CloseHandle(d->h);
+	if (d->hout)
+		CloseHandle(d->hout);
 	if (d->type == FT_FILE)
 		ws_lsize_retry();
 	if (d->find && d->find != INVALID_HANDLE_VALUE)
@@ -370,6 +372,13 @@ static i64 stat_handle(HANDLE h, int type, struct l_stat *st)
 					  : (bi.dwFileAttributes & FILE_ATTRIBUTE_READONLY) ? 0444 : 0644);
 	st->st_size = (i64)(((u64)bi.nFileSizeHigh << 32) | bi.nFileSizeLow);
 	lsize_get(h, &st->st_size);
+	if (bi.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+		i64 tl = ws_lx_readlink_h(h, NULL, 0);   /* lstat of a WSL symlink */
+		if (tl >= 0) {
+			st->st_mode = 0120777;
+			st->st_size = tl;
+		}
+	}
 	FILE_STANDARD_INFO si;
 	if (GetFileInformationByHandleEx(h, FileStandardInfo, &si, sizeof si))
 		st->st_blocks = si.AllocationSize.QuadPart / 512;
@@ -590,7 +599,7 @@ static i64 sys_stat_path(int dirfd, const char *path, struct l_stat *st, int fla
 		return r;
 	}
 	i64 err;
-	wchar_t *w = ws_path(dirfd, path, &err);
+	wchar_t *w = (flags & L_AT_SYMLINK_NOFOLLOW) ? ws_path_nf(dirfd, path, &err) : ws_path(dirfd, path, &err);
 	if (!w)
 		return err;
 	if (is_nul(w)) {
@@ -627,13 +636,50 @@ static i64 sys_open(int dirfd, const char *path, int flags, int mode)
 		d->flags = flags & L_O_ACCMODE;
 		return ws_fd_install(d, cloexec, 0);
 	}
+	if (path && !__ws_memcmp(path, "/dev/tty", 9)) {
+		/* the controlling terminal: the console this process is attached
+		 * to (ENXIO without one, as Linux says with no controlling tty) */
+		HANDLE in = CreateFileW(L"CONIN$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+					NULL, OPEN_EXISTING, 0, NULL);
+		if (in == INVALID_HANDLE_VALUE)
+			return -L_ENXIO;
+		HANDLE out = CreateFileW(L"CONOUT$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+					 NULL, OPEN_EXISTING, 0, NULL);
+		ws_desc *d = ws_desc_new(FT_CONSOLE);
+		if (!d) {
+			CloseHandle(in);
+			if (out != INVALID_HANDLE_VALUE)
+				CloseHandle(out);
+			return -L_ENOMEM;
+		}
+		d->h = in;
+		d->hout = out != INVALID_HANDLE_VALUE ? out : NULL;
+		d->flags = flags & L_O_ACCMODE;
+		return ws_fd_install(d, cloexec, 0);
+	}
 	if (path && (!__ws_memcmp(path, "/dev/urandom", 13) || !__ws_memcmp(path, "/dev/random", 12))) {
 		ws_desc *d = ws_desc_new(FT_RANDOM);
 		return d ? ws_fd_install(d, cloexec, 0) : -L_ENOMEM;
 	}
-	wchar_t *w = ws_path(dirfd, path, &err);
+	int nofollow = (flags & L_O_NOFOLLOW) || ((flags & L_O_CREAT) && (flags & L_O_EXCL));
+	wchar_t *w = nofollow ? ws_path_nf(dirfd, path, &err) : ws_path(dirfd, path, &err);
 	if (!w)
 		return err;
+	DWORD lnk = 0;                                 /* O_PATH|O_NOFOLLOW: the link itself */
+	if (nofollow) {
+		DWORD a = GetFileAttributesW(w);
+		if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_REPARSE_POINT) && ws_lx_readlink(w, NULL, 0) >= 0) {
+			if ((flags & L_O_CREAT) && (flags & L_O_EXCL)) {
+				ws_free(w);
+				return -L_EEXIST;
+			}
+			if (!(flags & L_O_PATH)) {
+				ws_free(w);
+				return -L_ELOOP;
+			}
+			lnk = FILE_FLAG_OPEN_REPARSE_POINT;
+		}
+	}
 	if (is_nul(w)) {
 		ws_free(w);
 		ws_desc *d = ws_desc_new(FT_NULL);
@@ -688,7 +734,7 @@ static i64 sys_open(int dirfd, const char *path, int flags, int mode)
 			SetFileAttributesW(w, attrs & ~FILE_ATTRIBUTE_READONLY);
 	}
 	HANDLE h = CreateFileW(w, acc, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, disp,
-			       FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, NULL);
+			       FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS | lnk, NULL);
 	if (h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_USER_MAPPED_FILE && (flags & L_O_TRUNC) && !isdir) {
 		/* O_TRUNC on a file something still maps (a reader's cached view of
 		 * the run this name held): Windows cannot cut it. Unlink it with
@@ -940,7 +986,8 @@ static i64 rw_stream(ws_desc *d, void *buf, size_t n, int write)
 	}
 	if (!write)
 		ws_sig_sync_io(1);           /* a signal cancels the read: -EINTR */
-	BOOL ok = write ? WriteFile(d->h, buf, (DWORD)n, &got, NULL) : ReadFile(d->h, buf, (DWORD)n, &got, NULL);
+	HANDLE io = write && d->hout ? d->hout : d->h;
+	BOOL ok = write ? WriteFile(io, buf, (DWORD)n, &got, NULL) : ReadFile(io, buf, (DWORD)n, &got, NULL);
 	if (!write)
 		ws_sig_sync_io(0);
 	if (!ok) {
@@ -1536,6 +1583,54 @@ static i64 sys_dup(int fd, int newfd, int flags, int mode)
 	return install_at(d, newfd, (flags & L_O_CLOEXEC) != 0);
 }
 
+/* ---- termios on a console ----
+ * The console's input mode carries what matters: ENABLE_ECHO_INPUT is ECHO,
+ * ENABLE_LINE_INPUT ICANON, ENABLE_PROCESSED_INPUT ISIG. The rest of the
+ * termios is the fixed picture of a cooked terminal. CONIN$ is opened for
+ * the call, so it works whichever of the console's handles fd names. */
+struct l_termios { uint32_t c_iflag, c_oflag, c_cflag, c_lflag; unsigned char c_line, c_cc[19]; };
+#define L_ISIG 01
+#define L_ICANON 02
+#define L_ECHO 010
+
+static i64 console_termios(u64 req, struct l_termios *t)
+{
+	HANDLE in = CreateFileW(L"CONIN$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+				NULL, OPEN_EXISTING, 0, NULL);
+	if (in == INVALID_HANDLE_VALUE)
+		return -L_ENOTTY;
+	DWORD mode = 0;
+	i64 r = 0;
+	if (!GetConsoleMode(in, &mode)) {
+		r = -L_ENOTTY;
+	} else if (req == 0x5401) {                    /* TCGETS */
+		__ws_memset(t, 0, sizeof *t);
+		t->c_iflag = 0400 | 02000;                 /* ICRNL IXON */
+		t->c_oflag = 01 | 04;                      /* OPOST ONLCR */
+		t->c_cflag = 017 | 060 | 0200;             /* B38400 CS8 CREAD */
+		t->c_lflag = 020 | 040 | 0100000 |         /* ECHOE ECHOK IEXTEN */
+			     ((mode & ENABLE_ECHO_INPUT) ? L_ECHO : 0) |
+			     ((mode & ENABLE_LINE_INPUT) ? L_ICANON : 0) |
+			     ((mode & ENABLE_PROCESSED_INPUT) ? L_ISIG : 0);
+		const unsigned char cc[] = { 3, 034, 0177, 025, 4, 0, 1, 0, 021, 023, 032, 0, 022, 017, 027, 026 };
+		__ws_memcpy(t->c_cc, cc, sizeof cc);
+	} else {                                       /* TCSETS, TCSETSW, TCSETSF */
+		DWORD m = mode & ~(DWORD)(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT);
+		if (t->c_lflag & L_ICANON)
+			m |= ENABLE_LINE_INPUT;
+		if ((t->c_lflag & L_ECHO) && (t->c_lflag & L_ICANON))
+			m |= ENABLE_ECHO_INPUT;            /* the console echoes only in line mode */
+		if (t->c_lflag & L_ISIG)
+			m |= ENABLE_PROCESSED_INPUT;
+		if (req == 0x5404)
+			FlushConsoleInputBuffer(in);
+		if (!SetConsoleMode(in, m))
+			r = ws_err(GetLastError());
+	}
+	CloseHandle(in);
+	return r;
+}
+
 /* ---- ioctl ---- */
 static i64 sys_ioctl(int fd, u64 req, i64 arg)
 {
@@ -1547,7 +1642,7 @@ static i64 sys_ioctl(int fd, u64 req, i64 arg)
 		CONSOLE_SCREEN_BUFFER_INFO ci;
 		unsigned short *ws = (unsigned short *)arg;
 		__ws_memset(ws, 0, 8);
-		if (GetConsoleScreenBufferInfo(d->h, &ci)) {
+		if (GetConsoleScreenBufferInfo(d->hout ? d->hout : d->h, &ci)) {
 			ws[0] = (unsigned short)(ci.srWindow.Bottom - ci.srWindow.Top + 1);
 			ws[1] = (unsigned short)(ci.srWindow.Right - ci.srWindow.Left + 1);
 		} else {
@@ -1555,9 +1650,8 @@ static i64 sys_ioctl(int fd, u64 req, i64 arg)
 			ws[1] = 80;
 		}
 		r = 0;
-	} else if (req == 0x5401 && d->type == FT_CONSOLE) {  /* TCGETS */
-		__ws_memset((void *)arg, 0, 60);
-		r = 0;
+	} else if ((req == 0x5401 || req == 0x5402 || req == 0x5403 || req == 0x5404) && d->type == FT_CONSOLE) {
+		r = console_termios(req, (struct l_termios *)arg);   /* TCGETS, TCSETS[WF] */
 	} else if (req == 0x5421 && d->type == FT_SOCKET) {   /* FIONBIO: emulated flag */
 		d->flags = *(int *)arg ? (d->flags | L_O_NONBLOCK) : (d->flags & ~L_O_NONBLOCK);
 		r = 0;
@@ -1652,7 +1746,8 @@ static i64 sys_getdents64(int fd, void *buf, size_t cnt)
 		e->d_ino = (u64)(d->dir_pos + 1);
 		e->d_off = d->dir_pos + 1;
 		e->d_reclen = (unsigned short)rec;
-		e->d_type = (d->fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 4 : 8;
+		e->d_type = (d->fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) && d->fd.dwReserved0 == 0xA000001Du ? 10 :
+			    (d->fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 4 : 8;
 		__ws_memcpy(e->d_name, name ? name : "", nl + 1);
 		ws_free(name);
 		used += rec;
@@ -1670,7 +1765,7 @@ static i64 sys_getdents64(int fd, void *buf, size_t cnt)
 static i64 sys_mkdir(int dirfd, const char *path, int mode)
 {
 	i64 err;
-	wchar_t *w = ws_path(dirfd, path, &err);
+	wchar_t *w = ws_path_nf(dirfd, path, &err);
 	if (!w)
 		return err;
 	BOOL ok = CreateDirectoryW(w, NULL);
@@ -1720,7 +1815,7 @@ static i64 delete_path(const wchar_t *w, int want_dir)
 static i64 sys_unlinkat(int dirfd, const char *path, int flags)
 {
 	i64 err;
-	wchar_t *w = ws_path(dirfd, path, &err);
+	wchar_t *w = ws_path_nf(dirfd, path, &err);
 	if (!w)
 		return err;
 	i64 r = delete_path(w, (flags & L_AT_REMOVEDIR) != 0);
@@ -1746,10 +1841,10 @@ static i64 sys_renameat(int ofd, const char *op, int nfd, const char *np, unsign
 	i64 err;
 	if (flags & ~1u)              /* only RENAME_NOREPLACE */
 		return -L_EINVAL;
-	wchar_t *wo = ws_path(ofd, op, &err);
+	wchar_t *wo = ws_path_nf(ofd, op, &err);
 	if (!wo)
 		return err;
-	wchar_t *wn = ws_path(nfd, np, &err);
+	wchar_t *wn = ws_path_nf(nfd, np, &err);
 	if (!wn) {
 		ws_free(wo);
 		return err;
@@ -1894,6 +1989,62 @@ static BOOL make_pipe(HANDLE *r, HANDLE *w)
  * tunneling hands a file renamed over another name (or created where one
  * was just deleted) that name's old creation time, so it changes under a
  * rename, which a Linux btime never does. */
+static i64 sys_readlinkat(int dirfd, const char *path, char *buf, size_t cap)
+{
+	char pj[256];
+	path = proc_join(dirfd, path, pj, sizeof pj);
+	if (is_proc(path))
+		return ws_procfs_readlink(path, buf, cap);
+	if (!buf || !cap)
+		return -L_EINVAL;
+	i64 err;
+	wchar_t *w = ws_path_nf(dirfd, path, &err);
+	if (!w)
+		return err;
+	i64 n = ws_lx_readlink(w, buf, cap);
+	ws_free(w);
+	return n < 0 ? n : n < (i64)cap ? n : (i64)cap;
+}
+
+static i64 sys_symlinkat(const char *target, int dirfd, const char *path)
+{
+	if (!target)
+		return -L_EFAULT;
+	i64 err;
+	wchar_t *w = ws_path_nf(dirfd, path, &err);
+	if (!w)
+		return err;
+	i64 r = ws_lx_symlink(target, w);
+	ws_free(w);
+	if (!r)
+		ns_changed();
+	return r;
+}
+
+#define L_AT_SYMLINK_FOLLOW 0x400
+static i64 sys_linkat(int ofd, const char *op, int nfd, const char *np, int flags)
+{
+	i64 err;
+	wchar_t *wo = (flags & L_AT_SYMLINK_FOLLOW) ? ws_path(ofd, op, &err) : ws_path_nf(ofd, op, &err);
+	if (!wo)
+		return err;
+	wchar_t *wn = ws_path_nf(nfd, np, &err);
+	if (!wn) {
+		ws_free(wo);
+		return err;
+	}
+	i64 r = 0;
+	if (!CreateHardLinkW(wn, wo, NULL)) {
+		DWORD e = GetLastError();
+		r = e == ERROR_ALREADY_EXISTS || e == ERROR_FILE_EXISTS ? -L_EEXIST : ws_err(e);
+	} else {
+		ns_changed();
+	}
+	ws_free(wo);
+	ws_free(wn);
+	return r;
+}
+
 static i64 sys_statx(int dirfd, const char *path, int flags, void *out)
 {
 	struct l_stat st;
@@ -2048,20 +2199,20 @@ i64 ws_sys_file(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *hand
 	case 257: return sys_open((int)a1, (const char *)a2, (int)a3, (int)a4);
 	case 262: return sys_stat_path((int)a1, (const char *)a2, (struct l_stat *)a3, (int)a4);
 	case 217: return sys_getdents64((int)a1, (void *)a2, (size_t)a3);
-	case 89:                               /* readlink: /proc links; no others are made */
-		return is_proc((const char *)a1) ? ws_procfs_readlink((const char *)a1, (char *)a2, (size_t)a3) : -L_EINVAL;
-	case 267: {
-		char pj[256];
-		const char *p = proc_join((int)a1, (const char *)a2, pj, sizeof pj);
-		return is_proc(p) ? ws_procfs_readlink(p, (char *)a3, (size_t)a4) : -L_EINVAL;
-	}
+	case 89:                               /* readlink */
+		return sys_readlinkat(L_AT_FDCWD, (const char *)a1, (char *)a2, (size_t)a3);
+	case 267:
+		return sys_readlinkat((int)a1, (const char *)a2, (char *)a3, (size_t)a4);
 	case 312:                              /* kcmp(pid1, pid2, KCMP_FILE, fd1, fd2) */
 		if (a3 != 0)
 			return -L_EINVAL;
 		/* another process's fd N, as /proc/<pid>/fd lists it, IS our fd N's
 		 * description (ws_fd_list_shared): the question is ours alone */
 		return ws_fd_same_file((int)a4, (int)a5);
-	case 86: case 265: case 88: case 266: return -L_EPERM;  /* link / symlink */
+	case 88: return sys_symlinkat((const char *)a1, L_AT_FDCWD, (const char *)a2);
+	case 266: return sys_symlinkat((const char *)a1, (int)a2, (const char *)a3);
+	case 86: return sys_linkat(L_AT_FDCWD, (const char *)a1, L_AT_FDCWD, (const char *)a2, 0);
+	case 265: return sys_linkat((int)a1, (const char *)a2, (int)a3, (const char *)a4, (int)a5);
 	case 90: return sys_chmod(L_AT_FDCWD, (const char *)a1, (unsigned)a2);
 	case 268: return sys_chmod((int)a1, (const char *)a2, (unsigned)a3);   /* fchmodat */
 	case 91: return sys_fchmod((int)a1, (unsigned)a2);
@@ -2092,6 +2243,7 @@ void ws_fd_fork_prepare(void)
 		if (!d)
 			continue;
 		inherit(d->h);
+		inherit(d->hout);
 		if (d->type == FT_SOCKET)
 			inherit((HANDLE)d->s);
 		if (d->find && d->find != INVALID_HANDLE_VALUE) {
