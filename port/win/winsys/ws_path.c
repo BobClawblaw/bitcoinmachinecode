@@ -12,8 +12,13 @@
  * NTFS symlinks (those need Developer Mode or admin), and WSL and Cygwin
  * read them as symlinks. Windows itself refuses to open one
  * (ERROR_CANT_ACCESS_FILE), so nothing reads through one by accident.
- * ws_path follows a link at the LAST component (to 40 hops, then ELOOP);
- * ws_path_nf does not. A link in the middle of a path is not followed.
+ * ws_path maps the name and does not look at the file. ws_path_follow
+ * resolves a link at the LAST component (to 40 hops, then ELOOP); callers
+ * call it only when Windows says the name is a reparse point (its
+ * attributes, or an open refused with ERROR_CANT_ACCESS_FILE), so a path
+ * that is no link costs nothing extra (a GetFileAttributesW is ~20 us, and
+ * an eager check on every path doubled getindexinfo's CPU). A link in the
+ * middle of a path is not followed.
  */
 #include "winsys.h"
 
@@ -40,7 +45,7 @@ static int starts(const char *s, const char *p)
 	return 1;
 }
 
-wchar_t *ws_path_nf(int dirfd, const char *path, i64 *err)
+wchar_t *ws_path(int dirfd, const char *path, i64 *err)
 {
 	*err = 0;
 	if (!path) {
@@ -232,10 +237,10 @@ i64 ws_lx_symlink(const char *target, const wchar_t *w)
 	return r;
 }
 
-/* the path with a symlink at its last component followed */
-wchar_t *ws_path(int dirfd, const char *path, i64 *err)
+/* w (taken over) with a symlink at its last component followed: w itself
+ * when it is none, NULL with *err set when the chain is too long */
+wchar_t *ws_path_follow(wchar_t *w, i64 *err)
 {
-	wchar_t *w = ws_path_nf(dirfd, path, err);
 	for (int hops = 0; w; hops++) {
 		DWORD a = GetFileAttributesW(w);
 		if (a == INVALID_FILE_ATTRIBUTES || !(a & FILE_ATTRIBUTE_REPARSE_POINT))
@@ -252,7 +257,7 @@ wchar_t *ws_path(int dirfd, const char *path, i64 *err)
 		t[n] = 0;
 		wchar_t *nw;
 		if (t[0] == '/' || (t[0] && t[1] == ':')) {
-			nw = ws_path_nf(L_AT_FDCWD, t, err);
+			nw = ws_path(L_AT_FDCWD, t, err);
 		} else {                                   /* relative to the link's directory */
 			size_t l = ws_wcslen(w);
 			while (l && w[l - 1] != L'\\')

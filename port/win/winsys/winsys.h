@@ -59,7 +59,7 @@ void ws_fmt_u64(char *buf, u64 v);
 /* Linux path (UTF-8, relative to dirfd) -> Windows path (UTF-16, ws_alloc'd).
  * Returns NULL and sets *err on failure. */
 wchar_t *ws_path(int dirfd, const char *path, i64 *err);
-wchar_t *ws_path_nf(int dirfd, const char *path, i64 *err);    /* a symlink at the end not followed */
+wchar_t *ws_path_follow(wchar_t *w, i64 *err);    /* resolve a symlink at the end (ws_path.c) */
 i64 ws_lx_readlink_h(HANDLE h, char *buf, size_t cap);
 i64 ws_lx_readlink(const wchar_t *w, char *buf, size_t cap);
 i64 ws_lx_symlink(const char *target, const wchar_t *w);

@@ -157,6 +157,11 @@ static wchar_t *resolve(const char *path, char *const argv[], wbuf *cmd, i64 *er
 	if (!w)
 		return NULL;
 	DWORD a = GetFileAttributesW(w);
+	if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_REPARSE_POINT)) {
+		if (!(w = ws_path_follow(w, err)))      /* a WSL symlink: its target */
+			return NULL;
+		a = GetFileAttributesW(w);
+	}
 	if (a == INVALID_FILE_ATTRIBUTES || (a & FILE_ATTRIBUTE_DIRECTORY)) {
 		size_t l = ws_wcslen(w);
 		wchar_t *x = ws_alloc((l + 5) * sizeof(wchar_t));

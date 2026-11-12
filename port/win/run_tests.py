@@ -4,10 +4,16 @@ Windows (bmc_win).
 
 Every `./tests/<name> [args]` line of the Makefile's test recipe is built
 from its own Makefile rule (build.py) and run from asm/, as `make test`
-does. Results are written to port/win/out/test-results.txt.
+does, then the port's own tests (port/win/tests/test_win_*.c). Results
+are written to <out>/test-results.txt.
 
-Usage: python port/win/run_tests.py [--only name,name] [--from name] [--timeout s]
+It is the Windows gate: the exit status is 0 only when every test passed
+or is a known Windows limit (KNOWN below, reported N/A, as the Mac reports
+the x86-only tests). A FAIL, TIMEOUT, BUILD or ERROR anywhere exits 1.
+
+Usage: python port/win/run_tests.py [--only name,name] [--from name] [--timeout s] [--no-port]
 """
+import glob
 import os
 import re
 import shlex
@@ -43,6 +49,30 @@ def recipe():
 # reads, tens of millions of them (~16 min here, against the default 10)
 SLOW = {'test_lsm_lost_tombstones_bad': 1800}
 
+# tests that cannot pass on Windows, and why: reported N/A, not FAIL. A test
+# here that passes is reported PASS (and should come off the list).
+KNOWN = {
+    'test_cli_prompt': 'its terminal cases need a pty (forkpty), which winsys does not emulate, and one '
+                       'case passes a 40,000-byte argument through sh, past the 32,767-character '
+                       'Windows command line',
+    'test_sd_watchdog': "systemd's watchdog datagram: AF_UNIX SOCK_DGRAM and the abstract namespace "
+                        "do not exist on Windows (nor does systemd)",
+    'test_drop_appends': "measures a file's page-cache residency through mincore on a fresh mapping; "
+                         "Windows has no unprivileged per-file cache residency query",
+    'test_mpool_get_once': 'needs ptrace',
+}
+
+# timing checks whose bound was set on Linux and that Windows meets with
+# little room: a failure is run again, up to RETRY_MAX attempts in all, as
+# port/osx does for its timing tests. A pass on a later attempt is a PASS,
+# with the attempt in the detail; failing every attempt is a FAIL.
+RETRY = {
+    # getindexinfo's "< 0.5 ms CPU per call" is ~0.4 ms here: two
+    # CreateFileW a call at tens of us each (~0.025 ms on Linux and the Mac)
+    'test_rpc_responsive': 'a 0.5 ms CPU bound; Windows file opens use ~0.4 ms of it',
+}
+RETRY_MAX = 3
+
 TOOLS = ['daemon/bmcbitcoind', 'daemon/bmc_cli', 'daemon/bmc_wallet_cli', 'daemon/bmc_rpcd',
          'daemon/bmc_build_addr_hist', 'daemon/bmc_build_coinstats_hist',
          'daemon/bmc_build_txospender_index', 'daemon/bmc_merge_index_runs',
@@ -53,6 +83,7 @@ def main(argv):
     only = None
     frm = None
     timeout = 600
+    port_tests = True
     i = 1
     while i < len(argv):
         if argv[i] == '--only':
@@ -64,6 +95,9 @@ def main(argv):
         elif argv[i] == '--timeout':
             timeout = int(argv[i + 1])
             i += 2
+        elif argv[i] == '--no-port':
+            port_tests = False
+            i += 1
         else:
             sys.exit('unknown arg ' + argv[i])
     cmds = recipe()
@@ -79,7 +113,11 @@ def main(argv):
             exe = build.build_target(tool)
             shutil.copy2(exe, os.path.join(ASM, tool.replace('/', os.sep) + '.exe'))
         except Exception as e:  # noqa: BLE001
-            print('tool %s did not build: %s' % (tool, str(e).strip().split('\n')[-1][:200]), flush=True)
+            # a stale copy (an orphan still holding the old exe) makes the
+            # tests that run it fail for no reason of theirs: an error
+            results.append((tool, 'ERROR', 'tool did not build or install: ' +
+                            str(e).strip().split('\n')[-1][:200]))
+            print('ERROR tool %s did not build or install' % tool, flush=True)
     os.environ['BMC_WIN_BINDIR'] = os.path.join(build.OUT, 'bin')
     # the tests' system()/popen() lines and #! scripts are POSIX shell: with
     # Git for Windows installed, its sh runs them (winsys: BMC_WIN_SH)
@@ -89,9 +127,13 @@ def main(argv):
                 os.environ['BMC_WIN_SH'] = cand
                 break
     started = frm is None
+    if port_tests and not frm:
+        for src in sorted(glob.glob(os.path.join(HERE, 'tests', 'test_win_*.c'))):
+            cmds.append('port:' + os.path.splitext(os.path.basename(src))[0])
     for cmd in cmds:
-        parts = shlex.split(cmd)
-        name = parts[0][len('./tests/'):]
+        port = cmd.startswith('port:')
+        parts = [cmd] if port else shlex.split(cmd)
+        name = cmd[5:] if port else parts[0][len('./tests/'):]
         if not started:
             if name != frm:
                 continue
@@ -103,7 +145,7 @@ def main(argv):
             continue
         if name not in built:
             try:
-                built[name] = build.build_test(name)
+                built[name] = build.build_port_test(name) if port else build.build_test(name)
             except Exception as e:  # noqa: BLE001
                 built[name] = None
                 msg = str(e).strip().split('\n')
@@ -114,25 +156,36 @@ def main(argv):
         exe = built[name]
         if exe is None:
             continue
-        t0 = time.time()
         try:
             # output to a file, not a pipe: a grandchild holding the pipe open
             # must not stall the run; on timeout the whole tree is killed
             logp = os.path.join(build.OUT, 'logs', name + '.log')
             os.makedirs(os.path.dirname(logp), exist_ok=True)
-            with open(logp, 'wb') as lf:
-                p = subprocess.Popen([exe] + parts[1:], cwd=ASM, stdout=lf, stderr=subprocess.STDOUT,
-                                     stdin=subprocess.DEVNULL)
-                try:
-                    rc = p.wait(timeout=max(timeout, SLOW.get(name, 0)))
-                except subprocess.TimeoutExpired:
-                    subprocess.run(['taskkill', '/F', '/T', '/PID', str(p.pid)], capture_output=True)
-                    p.wait()
-                    rc = None
+            attempt = 0
+            while True:
+                attempt += 1
+                t0 = time.time()
+                with open(logp, 'wb') as lf:
+                    p = subprocess.Popen([exe] + parts[1:], cwd=ASM, stdout=lf, stderr=subprocess.STDOUT,
+                                         stdin=subprocess.DEVNULL)
+                    try:
+                        rc = p.wait(timeout=max(timeout, SLOW.get(name, 0)))
+                    except subprocess.TimeoutExpired:
+                        subprocess.run(['taskkill', '/F', '/T', '/PID', str(p.pid)], capture_output=True)
+                        p.wait()
+                        rc = None
+                if rc != 0 and name in RETRY and attempt < RETRY_MAX:
+                    continue
+                break
             dt = time.time() - t0
             tail = open(logp, 'rb').read().decode('utf-8', 'replace').strip().split('\n')[-3:]
             status = 'TIMEOUT' if rc is None else 'PASS' if rc == 0 else 'FAIL(%d)' % rc
-            results.append((name, status, '%.1fs %s' % (dt, ' | '.join(tail)[:400])))
+            detail = '%.1fs %s' % (dt, ' | '.join(tail)[:400])
+            if attempt > 1:
+                detail = 'attempt %d of %d (%s) -- %s' % (attempt, RETRY_MAX, RETRY[name], detail)
+            if status != 'PASS' and name in KNOWN:
+                status, detail = 'N/A', KNOWN[name] + ' -- ' + detail
+            results.append((name, status, detail))
         except OSError as e:
             results.append((name, 'ERROR', str(e)))
         print(results[-1][1], cmd, flush=True)
@@ -146,7 +199,10 @@ def main(argv):
         counts[k] = counts.get(k, 0) + 1
     print(counts)
     print('results:', path)
+    bad = sum(v for k, v in counts.items() if k not in ('PASS', 'SKIP', 'N/A'))
+    print('GATE:', 'PASS' if not bad else 'FAIL (%d)' % bad)
+    return 1 if bad else 0
 
 
 if __name__ == '__main__':
-    main(sys.argv)
+    sys.exit(main(sys.argv))

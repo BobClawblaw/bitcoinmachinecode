@@ -599,7 +599,7 @@ static i64 sys_stat_path(int dirfd, const char *path, struct l_stat *st, int fla
 		return r;
 	}
 	i64 err;
-	wchar_t *w = (flags & L_AT_SYMLINK_NOFOLLOW) ? ws_path_nf(dirfd, path, &err) : ws_path(dirfd, path, &err);
+	wchar_t *w = ws_path(dirfd, path, &err);
 	if (!w)
 		return err;
 	if (is_nul(w)) {
@@ -608,6 +608,11 @@ static i64 sys_stat_path(int dirfd, const char *path, struct l_stat *st, int fla
 	}
 	exe_alt(&w);
 	HANDLE h = open_meta(w, (flags & L_AT_SYMLINK_NOFOLLOW) != 0, FILE_READ_ATTRIBUTES | FILE_READ_EA);
+	if (h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_CANT_ACCESS_FILE) {   /* a WSL symlink */
+		if (!(w = ws_path_follow(w, &err)))
+			return err;
+		h = open_meta(w, 0, FILE_READ_ATTRIBUTES | FILE_READ_EA);
+	}
 	ws_free(w);
 	if (h == INVALID_HANDLE_VALUE)
 		return ws_err(GetLastError());
@@ -662,24 +667,10 @@ static i64 sys_open(int dirfd, const char *path, int flags, int mode)
 		return d ? ws_fd_install(d, cloexec, 0) : -L_ENOMEM;
 	}
 	int nofollow = (flags & L_O_NOFOLLOW) || ((flags & L_O_CREAT) && (flags & L_O_EXCL));
-	wchar_t *w = nofollow ? ws_path_nf(dirfd, path, &err) : ws_path(dirfd, path, &err);
+	wchar_t *w = nofollow ? ws_path(dirfd, path, &err) : ws_path(dirfd, path, &err);
 	if (!w)
 		return err;
 	DWORD lnk = 0;                                 /* O_PATH|O_NOFOLLOW: the link itself */
-	if (nofollow) {
-		DWORD a = GetFileAttributesW(w);
-		if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_REPARSE_POINT) && ws_lx_readlink(w, NULL, 0) >= 0) {
-			if ((flags & L_O_CREAT) && (flags & L_O_EXCL)) {
-				ws_free(w);
-				return -L_EEXIST;
-			}
-			if (!(flags & L_O_PATH)) {
-				ws_free(w);
-				return -L_ELOOP;
-			}
-			lnk = FILE_FLAG_OPEN_REPARSE_POINT;
-		}
-	}
 	if (is_nul(w)) {
 		ws_free(w);
 		ws_desc *d = ws_desc_new(FT_NULL);
@@ -709,6 +700,21 @@ static i64 sys_open(int dirfd, const char *path, int flags, int mode)
 	else
 		disp = OPEN_EXISTING;
 	DWORD attrs = GetFileAttributesW(w);
+	if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_REPARSE_POINT) && ws_lx_readlink(w, NULL, 0) >= 0) {
+		if (!nofollow) {                           /* a WSL symlink: open its target */
+			if (!(w = ws_path_follow(w, &err)))
+				return err;
+			attrs = GetFileAttributesW(w);
+		} else if ((flags & L_O_CREAT) && (flags & L_O_EXCL)) {
+			ws_free(w);
+			return -L_EEXIST;
+		} else if (!(flags & L_O_PATH)) {
+			ws_free(w);
+			return -L_ELOOP;
+		} else {
+			lnk = FILE_FLAG_OPEN_REPARSE_POINT;
+		}
+	}
 	int isdir = attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY);
 	if ((flags & L_O_DIRECTORY) && attrs != INVALID_FILE_ATTRIBUTES && !isdir) {
 		ws_free(w);
@@ -1338,6 +1344,12 @@ static i64 sys_truncate(const char *path, i64 len)
 		return err;
 	HANDLE h = CreateFileW(w, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
 			       OPEN_EXISTING, 0, NULL);
+	if (h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_CANT_ACCESS_FILE) {   /* a WSL symlink */
+		if (!(w = ws_path_follow(w, &err)))
+			return err;
+		h = CreateFileW(w, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+				OPEN_EXISTING, 0, NULL);
+	}
 	ws_free(w);
 	if (h == INVALID_HANDLE_VALUE)
 		return ws_err(GetLastError());
@@ -1765,7 +1777,7 @@ static i64 sys_getdents64(int fd, void *buf, size_t cnt)
 static i64 sys_mkdir(int dirfd, const char *path, int mode)
 {
 	i64 err;
-	wchar_t *w = ws_path_nf(dirfd, path, &err);
+	wchar_t *w = ws_path(dirfd, path, &err);
 	if (!w)
 		return err;
 	BOOL ok = CreateDirectoryW(w, NULL);
@@ -1815,7 +1827,7 @@ static i64 delete_path(const wchar_t *w, int want_dir)
 static i64 sys_unlinkat(int dirfd, const char *path, int flags)
 {
 	i64 err;
-	wchar_t *w = ws_path_nf(dirfd, path, &err);
+	wchar_t *w = ws_path(dirfd, path, &err);
 	if (!w)
 		return err;
 	i64 r = delete_path(w, (flags & L_AT_REMOVEDIR) != 0);
@@ -1841,10 +1853,10 @@ static i64 sys_renameat(int ofd, const char *op, int nfd, const char *np, unsign
 	i64 err;
 	if (flags & ~1u)              /* only RENAME_NOREPLACE */
 		return -L_EINVAL;
-	wchar_t *wo = ws_path_nf(ofd, op, &err);
+	wchar_t *wo = ws_path(ofd, op, &err);
 	if (!wo)
 		return err;
-	wchar_t *wn = ws_path_nf(nfd, np, &err);
+	wchar_t *wn = ws_path(nfd, np, &err);
 	if (!wn) {
 		ws_free(wo);
 		return err;
@@ -1893,6 +1905,11 @@ static i64 sys_faccessat(int dirfd, const char *path, int mode)
 	if (!is_nul(w))
 		exe_alt(&w);
 	DWORD a = GetFileAttributesW(w);
+	if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_REPARSE_POINT)) {
+		if (!(w = ws_path_follow(w, &err)))      /* a WSL symlink: its target */
+			return err;
+		a = GetFileAttributesW(w);
+	}
 	DWORD e = GetLastError();
 	int nul = is_nul(w);
 	ws_free(w);
@@ -1949,6 +1966,15 @@ static i64 sys_chdir(const char *path)
 		return err;
 	BOOL ok = SetCurrentDirectoryW(w);
 	DWORD e = GetLastError();
+	if (!ok) {                                     /* through a WSL symlink? */
+		DWORD a = GetFileAttributesW(w);
+		if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_REPARSE_POINT)) {
+			if (!(w = ws_path_follow(w, &err)))
+				return err;
+			ok = SetCurrentDirectoryW(w);
+			e = GetLastError();
+		}
+	}
 	ws_free(w);
 	return ok ? 0 : ws_err(e);
 }
@@ -1998,7 +2024,7 @@ static i64 sys_readlinkat(int dirfd, const char *path, char *buf, size_t cap)
 	if (!buf || !cap)
 		return -L_EINVAL;
 	i64 err;
-	wchar_t *w = ws_path_nf(dirfd, path, &err);
+	wchar_t *w = ws_path(dirfd, path, &err);
 	if (!w)
 		return err;
 	i64 n = ws_lx_readlink(w, buf, cap);
@@ -2011,7 +2037,7 @@ static i64 sys_symlinkat(const char *target, int dirfd, const char *path)
 	if (!target)
 		return -L_EFAULT;
 	i64 err;
-	wchar_t *w = ws_path_nf(dirfd, path, &err);
+	wchar_t *w = ws_path(dirfd, path, &err);
 	if (!w)
 		return err;
 	i64 r = ws_lx_symlink(target, w);
@@ -2025,10 +2051,12 @@ static i64 sys_symlinkat(const char *target, int dirfd, const char *path)
 static i64 sys_linkat(int ofd, const char *op, int nfd, const char *np, int flags)
 {
 	i64 err;
-	wchar_t *wo = (flags & L_AT_SYMLINK_FOLLOW) ? ws_path(ofd, op, &err) : ws_path_nf(ofd, op, &err);
+	wchar_t *wo = ws_path(ofd, op, &err);
+	if (wo && (flags & L_AT_SYMLINK_FOLLOW))
+		wo = ws_path_follow(wo, &err);
 	if (!wo)
 		return err;
-	wchar_t *wn = ws_path_nf(nfd, np, &err);
+	wchar_t *wn = ws_path(nfd, np, &err);
 	if (!wn) {
 		ws_free(wo);
 		return err;
@@ -2122,6 +2150,11 @@ static i64 sys_chmod(int dirfd, const char *path, unsigned mode)
 	if (!w)
 		return err;
 	DWORD a = GetFileAttributesW(w);
+	if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_REPARSE_POINT)) {
+		if (!(w = ws_path_follow(w, &err)))      /* a WSL symlink: its target */
+			return err;
+		a = GetFileAttributesW(w);
+	}
 	i64 r = a == INVALID_FILE_ATTRIBUTES ? ws_err(GetLastError()) : 0;
 	if (!r)
 		mode_set_path(w, mode);
