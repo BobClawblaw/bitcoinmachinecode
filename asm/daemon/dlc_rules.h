@@ -126,7 +126,7 @@ static inline int dlc_tail_stalled(int window_full, long tail_age_ms, long timeo
 /* the stall clock restarts on every block the holder delivers. Core clears
  * m_stalling_since in RemoveBlockRequest, so its 2 s is a gap BETWEEN
  * blocks, not a budget for everything in flight. Ours timed the whole
- * 40-block chunk from the moment it became the tail (2026-09-24, m5ultra
+ * 40-block chunk from the moment it became the tail (2026-09-24, Mac Studio
  * at h=823,243): ~60 MB of recent blocks against 2-8 s, so a peer sending
  * 855 KB/s was dropped with "0 block(s)" and banned, three in a row, and
  * the tail never landed. */

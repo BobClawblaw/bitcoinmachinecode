@@ -24,7 +24,7 @@ static void u16(unsigned char*p,unsigned v){p[0]=v>>8;p[1]=v&0xff;}
 
 int main(int argc,char**argv){
     setbuf(stdout,NULL);
-    const char* ipstr=argc>1?argv[1]:"192.168.5.69";
+    const char* ipstr=argc>1?argv[1]:"127.0.0.1";
     int N=argc>2?atoi(argv[2]):8;
     unsigned ip; inet_pton(AF_INET,ipstr,&ip);
     int fds[16];

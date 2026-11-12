@@ -1107,7 +1107,7 @@ long reorg_execute(void* st, long fork_height, long nblocks,
      * above the connected tip nothing was disconnected, and this call used to
      * set -- and persist -- the applied height to the fork, marking every
      * block between as connected without applying one (testnet4 node B,
-     * m5ultra: 153,876 -> the fork, 153,877..887 never applied). */
+     * Mac Studio: 153,876 -> the fork, 153,877..887 never applied). */
     { long ap_after = utxo_live_applied_height();
       if (ap_after < 0 || fork_height <= ap_after){
           if (!utxo_live_rewind_to(fork_height)){
@@ -1168,7 +1168,7 @@ long reorg_execute(void* st, long fork_height, long nblocks,
          * the fork ABOVE it (the archive ran ahead of a held apply) nothing
          * was disconnected, and applying here put block fork+1 onto the set
          * at `applied`, then persisted it as connected: testnet4 node B
-         * (m5ultra) went from applied 153,876 to 153,892 with 153,877..887
+         * (Mac Studio) went from applied 153,876 to 153,892 with 153,877..887
          * never applied. Such blocks are only STORED; the catch-up connects
          * [applied+1 .. new tip] in order. (applied < 0: no UTXO engine in
          * this process -- unchanged.) */

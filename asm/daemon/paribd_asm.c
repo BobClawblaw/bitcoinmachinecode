@@ -276,16 +276,12 @@ int main(int argc,char**argv){
     static unsigned char zp[32];  /* genesis locator = 0 */
     memset(zp,0,32);
     static unsigned char hdrbuf[2<<20];
-    /* header phase: try the reliable local node first, then each pool peer
+    /* header phase: try each pool peer
      * (distinct by IP), forking each attempt with a hard timeout so a peer that
      * connects but never serves headers can't hang the run. */
     long nhdr=0; int hpeer_index=-1;
     unsigned hseen[MAXPEERS]; int hseen_n=0;
     char* htry[MAXPEERS]; long htryn=0;
-    /* local node first if present */
-    int have_local=0;
-    for(int i=0;i<np;i++){ char* col=strstr(peers[i],"192.168.5.69"); if(col){ htry[htryn++]=peers[i]; have_local=1; } }
-    if(!have_local){ static char localhost[]="192.168.5.69"; htry[htryn++]=(char*)localhost; }
     for(int i=0;i<np;i++){ int d=0; for(int k=0;k<htryn;k++) if(!strcmp(htry[k],peers[i])){d=1;break;} if(!d) htry[htryn++]=peers[i]; }
     for(int i=0;i<htryn && nhdr<=0;i++){
         char hb[128]; snprintf(hb,sizeof hb,"%s",htry[i]); char* col=strchr(hb,':'); if(col)*col=0;

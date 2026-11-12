@@ -152,7 +152,7 @@ int main(void){
     close(mux_out_fd[mux_n_out - 1]); mux_out_fd[mux_n_out - 1] = -1;
 
     printf("== 1b. the handed-over socket is still alive when the worker gets to it late ==\n");
-    /* Darwin (m5ultra, 2026-09-24): a socket passed with SCM_RIGHTS arrived
+    /* Darwin (Mac Studio, 2026-09-24): a socket passed with SCM_RIGHTS arrived
      * DEAD -- EOF + HUP, its buffered bytes gone -- whenever the helper
      * _exit()ed before the worker's recvmsg, and the worker collects once per
      * rotation. The helper now waits for dh_poll to close its end. Linux

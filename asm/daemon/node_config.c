@@ -830,7 +830,7 @@ long node_config_load(const char* path){
         /* DMN-9: bounded, not atoi -- and parsed only when a key's branch
          * actually reads it. It used to be parsed for EVERY key before the
          * dispatch, so every string-valued key logged "is not a usable
-         * number -- reading it as 0" (production: bind=192.168.5.242 and all
+         * number -- reading it as 0" (production: bind=10.0.0.2 and all
          * four zmqpub* addresses) although its value was applied correctly;
          * a monitor parses these lines. IV parses on first use and memoises,
          * so a numeric key still warns exactly once on a bad value. */

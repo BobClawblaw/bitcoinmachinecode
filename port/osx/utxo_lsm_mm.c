@@ -307,7 +307,7 @@ static lsm_run_t *slot_get(u64 run_no, u64 gen){
      * cache was direct-mapped (slot = run_no % 64) on the premise, in the
      * header above, that ~12 live runs make collisions essentially absent.
      * A mid-catchup manifest holds up to 24 runs with scattered numbers --
-     * 24 into 64 slots collide ~99% of the time -- and on the m5ultra the
+     * 24 into 64 slots collide ~99% of the time -- and on the Mac Studio the
      * 15 GB base run (9040) shared slot 16 with a fresh run (9232). A
      * lookup checks the newer run, then finds an old coin in the base, so
      * EVERY lookup unmapped and re-mapped both: about half the apply

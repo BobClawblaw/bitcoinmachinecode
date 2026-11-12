@@ -593,7 +593,7 @@ The ABI audits, `test_abi_stack_align`, `test_elf_hardening` (Mach-O) and `test_
 
 ## 2026-09-24 — mainnet at the tip in production; ad4f0d9b reverted; the reorg gap and the int/long twin returns fixed
 
-- **Production (m5ultra, `~/bmc_osx_deploy`):** mainnet IBD finished.
+- **Production (Mac Studio, `~/bmc_osx_deploy`):** mainnet IBD finished.
   The UTXO set was rebuilt from the archive after the sorter fix
   (f9368f9e: a u32 index wrapped on a 71M-entry flush, halting at
   274,443). The node reached the tip, 968,463 with IBD false, and
@@ -852,7 +852,7 @@ commits pending on this Mac -- origin publickey still blocked).
 - The native bmcbitcoind (M1 Max, macOS 26.6) is doing a real mainnet IBD
   right now: 966,400 headers stored (headers.dat 108,236,800 B, ~29 min),
   then blocks from genesis via the boot catch-up against the x86 reference
-  node (`connect=192.168.5.242:8332`, which is itself mid-IBD -- the osx
+  node (`connect=<x86-host>:8332`, which is itself mid-IBD -- the osx
   node follows its tail live). 115,401/966,400 stored (11.9%) at elapsed
   5:01, ~460 blk/s, zero consensus failures. No debugger was usable on
   this machine (lldb attach/launch permission-gated); the crash backtraces
@@ -1052,7 +1052,7 @@ commits pending on this Mac -- origin publickey still blocked).
 - `port/osx/bitcoin_hash.S` (7 public symbols) gated three ways: upstream
   test_pow_check 13/13 native, 6,485-vector Python-oracle differential 0
   failures, and byte-identical results vs the x86 bitcoin_hash.o/sha256.o run
-  on the 9950X3D (192.168.5.242). Driver pair committed (dvh.c /
+  on the 9950X3D. Driver pair committed (dvh.c /
   gen_bhash_vecs.py) — batched file-based oracles, no popen.
 - Driver bug caught by cross-arch diff: sha256d64 out stride is 32B per 64B
   input (Core SHA256D64 shape); assuming 64B out stride silently compared

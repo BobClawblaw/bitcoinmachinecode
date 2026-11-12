@@ -23,7 +23,7 @@
  * only cover the zero/missing heights after it; index pre-size grows to end_h.
  *
  * Usage: unified_ibd <dir> <num_workers> <start_h> <end_h>
- *   peers auto-load from good_internet_peers.txt; header peer = local node.
+ *   peers auto-load from good_internet_peers.txt; header peer = the first that serves headers.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -281,9 +281,7 @@ int main(int argc,char**argv){
     static unsigned char zp[32]; memset(zp,0,32);
     static unsigned char hdrbuf[2<<20];
     long nhdr=hst_count(mhst);
-    char* htry[MAXPEERS]; long htryn=0; int hl=0;
-    for(int i=0;i<np;i++) if(strstr(peers[i],"192.168.5.69")){ htry[htryn++]=peers[i]; hl=1; }
-    if(!hl){ static char lo[]="192.168.5.69"; htry[htryn++]=(char*)lo; }
+    char* htry[MAXPEERS]; long htryn=0;
     for(int i=0;i<np;i++){ int d=0; for(int k=0;k<htryn;k++) if(!strcmp(htry[k],peers[i])){d=1;break;} if(!d) htry[htryn++]=peers[i]; }
     for(int i=0;i<htryn && nhdr<=0;i++){
         pid_t hp=fork();
