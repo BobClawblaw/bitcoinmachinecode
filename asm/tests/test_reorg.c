@@ -1457,6 +1457,113 @@ static void case_mempool_ghosts(void){
 }
 
 /* ======================================================================== */
+/* CASE (CVE-2025-62861): a disconnected block restores a TRUC shape the     */
+/*       mempool could never have formed.                                    */
+/*                                                                           */
+/* BIP431's one-parent/one-child limits are policy, so a valid block may     */
+/* hold a version=3 parent P with TWO children C1 and C2, and a grandchild G */
+/* of C1. Core 28.0-29.1 re-added a disconnected block's transactions with   */
+/* the limits bypassed -- but not sibling eviction: C2 evicted C1 alone (a   */
+/* TRUC child "cannot" have descendants) and G stayed, spending an output    */
+/* that no longer existed. Block templates built from that pool were         */
+/* invalid until a restart.                                                  */
+/*                                                                           */
+/* The reconcile here offers everything back through the ordinary            */
+/* mpool_policy_add, so the limits hold during a reorg as well. This case    */
+/* pins the result: after the reconcile no pool entry spends an output that  */
+/* is neither confirmed nor created by another pool entry. Standardness is   */
+/* ON, unlike the other mempool cases -- -acceptnonstdtxn switches TRUC off. */
+/*                                                                           */
+/* Run twice: C2 outbidding C1 (sibling eviction fires inside the reconcile) */
+/* and C2 underbidding it (the eviction is refused on fee).                  */
+/* ======================================================================== */
+/* a standard-shaped version=3 tx: one input, empty scriptSig, P2WPKH outputs */
+static void mk_truc(tx_t* t, const u8 prev[32], u32 idx, int n_out, u64 value, u8 tag){
+    u8* q = t->raw;
+    put32(q,3); q+=4;
+    *q++ = 1;
+    memcpy(q, prev, 32); q+=32;
+    put32(q, idx); q+=4;
+    *q++ = 0;
+    put32(q,0xfffffffdu); q+=4;
+    *q++ = (u8)n_out;
+    for (int i=0;i<n_out;i++){
+        put64(q, value); q+=8;
+        *q++ = 22; *q++ = 0x00; *q++ = 0x14;
+        for (int k=0;k<20;k++) *q++ = (u8)(k + i + tag);
+    }
+    put32(q,0); q+=4;
+    t->len = q - t->raw;
+    t->is_coinbase = 0;
+    t->out_value = value;
+    memcpy(t->spend_txid, prev, 32); t->spend_idx = idx;
+    if (!tx_txid(t->txid, t->raw, t->len, g_txid_scratch, sizeof g_txid_scratch)) { printf("FAIL tx_txid\n"); failures++; }
+}
+
+static void do_truc_reorg_case(int c2_outbids){
+    const long nbase = 4;
+    build_base(nbase, 0x207fffffu);
+    harness_open();
+    store_chain(nbase, 0);
+
+    static u8 mp[40 + 1024*80 + 8];
+    static u8 mpblob[1<<20];
+    mpool_init(mp, 1024, mpblob, sizeof mpblob);
+    static u8 pol[128];
+    mpool_policy_init(pol, 1000 /* sat/kvB */, 25, 101000, 25, 101000, 1);
+    unsigned pol_n = 512;
+    void* pol_state = malloc(mpool_policy_state_size(pol_n));
+    mpool_policy_state_init(pol_state, pol_n);
+
+    /* The disconnected block. P spends the base tip's spend output (49000000,
+     * non-coinbase, unspent at the tip); fees: P 1000000, C1 100000, G 100000,
+     * C2 101000 (outbids C1 by more than its own incremental relay cost) or
+     * 50000 (does not). Block order P, C1, G, C2 puts G in front of the
+     * sibling that would evict its parent -- the order Core's bug needed. */
+    static blk_t blk; memset(&blk,0,sizeof blk);
+    blk.bits = 0x207fffffu; blk.ntx = 5;
+    mk_coinbase(&blk.tx[0], 0x71000000u, 50000000ULL);
+    tx_t *P = &blk.tx[1], *C1 = &blk.tx[2], *G = &blk.tx[3], *C2 = &blk.tx[4];
+    mk_truc(P,  base[nbase-1].tx[1].txid, 0, 2, 24000000ULL, 1);
+    mk_truc(C1, P->txid,  0, 1, 23900000ULL, 2);
+    mk_truc(G,  C1->txid, 0, 1, 23800000ULL, 3);
+    mk_truc(C2, P->txid,  1, 1, c2_outbids ? 23899000ULL : 23950000ULL, 4);
+    mk_block(&blk, base[nbase-1].hash, 1900000001u);
+
+    reorg_mempool_t rm = { mp, pol, pol_state, pol_n, (void*)1 };
+    const u8* d[1] = { blk.raw }; uint32_t dl[1] = { (uint32_t)blk.len };
+    long after = reorg_mempool_reconcile(&rm, d, dl, 1);
+    ckm("TRUC reorg: reconcile returned a count", after >= 0);
+
+    unsigned long l;
+    int in_p  = mpool_get(mp, P->txid,  &l) != NULL;
+    int in_c1 = mpool_get(mp, C1->txid, &l) != NULL;
+    int in_g  = mpool_get(mp, G->txid,  &l) != NULL;
+    int in_c2 = mpool_get(mp, C2->txid, &l) != NULL;
+    printf("      (pool after the reconcile: P=%d C1=%d G=%d C2=%d, count %ld)\n",
+           in_p, in_c1, in_g, in_c2, mpool_count(mp));
+
+    /* THE INVARIANT: every entry's input resolves. P's is confirmed; the
+     * others spend an output of another transaction of this block. */
+    ckm("TRUC reorg: the parent is restored", in_p);
+    ckm("TRUC reorg: no child is held without its parent", (!in_c1 && !in_c2) || in_p);
+    ckm("TRUC reorg: the grandchild is NOT held without the child it spends", !in_g || in_c1);
+    ck("TRUC reorg: the pool holds nothing but this block's transactions",
+       mpool_count(mp), in_p + in_c1 + in_g + in_c2);
+
+    /* ...and the shape is one the policy would have accepted from relay */
+    ckm("TRUC reorg: the grandchild does not re-enter (one unconfirmed ancestor)", !in_g);
+    ck("TRUC reorg: the parent keeps exactly one child", in_c1 + in_c2, 1);
+    if (c2_outbids) ckm("TRUC reorg: the better-paying sibling took the slot", in_c2 && !in_c1);
+    else            ckm("TRUC reorg: the underbidding sibling is refused, the first child stays", in_c1 && !in_c2);
+
+    free(pol_state);
+    utxo_live_close();
+}
+static void case_truc_reorg_sibling_outbids(void){ do_truc_reorg_case(1); }
+static void case_truc_reorg_sibling_underbids(void){ do_truc_reorg_case(0); }
+
+/* ======================================================================== */
 /* CASE (STO-7): reorg_execute reconciles the mempool BY ITSELF once one is  */
 /*       registered -- no manual reorg_mempool_reconcile call.               */
 /*                                                                          */
@@ -2058,6 +2165,8 @@ int main(void){
     total += run_case("mempool reconciliation",         case_mempool);
     total += run_case("mempool reconcile is WIRED (STO-7)", case_mempool_wired);
     total += run_case("reconcile leaves no ghosts (MEM-8)", case_mempool_ghosts);
+    total += run_case("TRUC shape from a disconnected block, sibling outbids (CVE-2025-62861)", case_truc_reorg_sibling_outbids);
+    total += run_case("TRUC shape from a disconnected block, sibling underbids (CVE-2025-62861)", case_truc_reorg_sibling_underbids);
     total += run_case("reorg header rules (VAL-5 rest)", case_reorg_header_rules);
     total += run_case("reorg short-window MTP (CON-13)", case_reorg_short_window_mtp);
     total += run_case("fake peer locator + reorg",      case_fakepeer_locator_and_reorg);

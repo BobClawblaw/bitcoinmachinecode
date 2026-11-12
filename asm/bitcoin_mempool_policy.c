@@ -3292,8 +3292,14 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
                      * because anything wider needs a rule for CHOOSING which
                      * descendant dies and Core deliberately has none: the
                      * parent must have exactly itself and one child, and that
-                     * child exactly itself and the parent. Reorgs can leave
-                     * wider shapes behind and those are still refused. Package
+                     * child exactly itself and the parent. A wider shape cannot
+                     * form in this pool: the reorg reconcile (daemon/reorg.c)
+                     * offers a disconnected block's transactions back through
+                     * this same function, limits included. Core 28.0-29.1
+                     * bypassed the limits there and evicted a sibling that had
+                     * a descendant (CVE-2025-62861; tests/test_reorg.c holds
+                     * that shape). The test stays regardless: it is what
+                     * guarantees an evicted sibling leaves nothing behind. Package
                      * contexts are excluded as well -- Core allows this only
                      * for a single transaction (m_allow_sibling_eviction), and
                      * the in-package sibling case is caught by the walk below. */
