@@ -44,6 +44,74 @@ def recipe():
     return out
 
 
+class Unexpandable(Exception):
+    pass
+
+
+def make_vars():
+    """The Makefile's variable assignments, NAME -> (op, raw value), with
+    backslash continuations joined. Later assignments win, as in make
+    (`+=` appends, `?=` only sets an unset name)."""
+    text = open(os.path.join(ASM, 'Makefile'), encoding='utf-8').read().replace('\\\n', ' ')
+    vs = {}
+    for l in text.split('\n'):
+        if l.startswith('\t'):
+            continue
+        m = re.match(r'^([A-Za-z_][A-Za-z0-9_]*)\s*(:=|\?=|\+=|=)\s*(.*)$', l)
+        if not m:
+            continue
+        name, op, val = m.groups()
+        if op == '+=' and name in vs:
+            vs[name] = (vs[name][0], vs[name][1] + ' ' + val)
+        elif op == '?=' and name in vs:
+            continue
+        else:
+            vs[name] = (op, val)
+    return vs
+
+
+def expand(s, vs, depth=0):
+    """Expand the make syntax a recipe line uses: $(VAR), $(shell seq a b)
+    and $(wildcard pattern). Anything else raises Unexpandable."""
+    if depth > 20:
+        raise Unexpandable('recursive variable')
+    out = ''
+    i = 0
+    while i < len(s):
+        if s.startswith('$(', i):
+            lvl, j = 1, i + 2
+            while j < len(s) and lvl:
+                lvl += {'(': 1, ')': -1}.get(s[j], 0)
+                j += 1
+            if lvl:
+                raise Unexpandable('unbalanced $(')
+            body = expand(s[i + 2:j - 1], vs, depth + 1)
+            fn, _, arg = body.partition(' ')
+            if fn == 'shell':
+                a = arg.split()
+                if len(a) != 3 or a[0] != 'seq':
+                    raise Unexpandable('$(shell %s)' % arg)
+                out += ' '.join(str(n) for n in range(int(a[1]), int(a[2]) + 1))
+            elif fn == 'wildcard':
+                # absolute POSIX paths (/storage/...) have no Windows match
+                out += ' '.join(p for pat in arg.split() if not pat.startswith('/')
+                                for p in sorted(glob.glob(os.path.join(ASM, pat))))
+            elif re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', body):
+                if body in os.environ:
+                    out += os.environ[body]
+                elif body in vs:
+                    out += expand(vs[body][1], vs, depth + 1)
+            else:
+                raise Unexpandable('$(%s)' % body)
+            i = j
+        elif s[i] == '$':
+            raise Unexpandable('$ outside $(...)')
+        else:
+            out += s[i]
+            i += 1
+    return out
+
+
 # tests that are slow on Windows only from the syscall cost: the bad-object
 # repro of test_lsm_lost_tombstones walks run files in 15- and 37-byte
 # reads, tens of millions of them (~16 min here, against the default 10)
@@ -60,6 +128,7 @@ KNOWN = {
     'test_drop_appends': "measures a file's page-cache residency through mincore on a fresh mapping; "
                          "Windows has no unprivileged per-file cache residency query",
     'test_mpool_get_once': 'needs ptrace',
+    'test_elf_hardening': 'checks PIE, RELRO and NX in ELF headers; the Windows binaries are PE',
 }
 
 # timing checks whose bound was set on Linux and that Windows meets with
@@ -101,6 +170,7 @@ def main(argv):
         else:
             sys.exit('unknown arg ' + argv[i])
     cmds = recipe()
+    mvars = make_vars()
     results = []
     built = {}
     # the tests exec the daemon's tools by their source-tree names
@@ -140,6 +210,19 @@ def main(argv):
             started = True
         if only and name not in only:
             continue
+        if not port:
+            # the recipe's make variables, and `< /dev/null` (stdin is
+            # always /dev/null here); any other shell syntax is a SKIP
+            args = parts[1:]
+            if args[-2:] == ['<', '/dev/null']:
+                args = args[:-2]
+            try:
+                if any('$' in a for a in args):
+                    args = shlex.split(expand(' '.join(args), mvars))
+            except Unexpandable as e:
+                results.append((name, 'SKIP', 'make syntax the harness does not expand: %s' % e))
+                continue
+            parts = parts[:1] + args
         if any(re.search(r'[|><;&$`]', p) for p in parts[1:]):
             results.append((name, 'SKIP', 'shell syntax in recipe line'))
             continue
