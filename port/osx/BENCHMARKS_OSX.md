@@ -3,7 +3,7 @@
 Purpose: measure the macOS AArch64 port against the x86-64 original on the
 same repo harnesses, same shapes, same measurement discipline
 (CLOCK_THREAD_CPUTIME_ID, min-of-N). No emulation anywhere:
-- x86 side: bare metal AMD Ryzen 9 9950X3D (192.168.5.242, Ubuntu 24.04,
+- x86 side: bare metal AMD Ryzen 9 9950X3D (Ubuntu 24.04,
   gcc 13.3, NASM 2.16.01), benches pinned with `taskset -c 16-19`.
 - osx side: Apple M1 Max (this Mac, macOS 26.6.2, Apple clang 21, arm64).
 - METHODOLOGY NOTE: the M1 Max also hosts parallel compile/agent workloads.

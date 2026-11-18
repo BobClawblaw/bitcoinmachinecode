@@ -7,7 +7,7 @@
  *   sha256d/block_hash (bitcoin_hash.asm), cons_verify (bitcoin_cons.asm),
  *   store_init/store_append (bitcoin_store.asm).
  *
- * Usage: SEED=<host> ./live_five   (default SEED=192.168.5.69)
+ * Usage: SEED=<host> ./live_five   (default SEED=127.0.0.1)
  * Prints, per stored block: real height, block bytes, and its index record
  * (file_no, data_pos, data_size); then lists the resulting blk*.dat files.
  */
@@ -51,7 +51,7 @@ int main(void){
     unlink("blk00000.dat"); unlink("index.dat");
 
     struct addrinfo h,*res=0; memset(&h,0,sizeof h); h.ai_family=AF_INET; h.ai_socktype=SOCK_STREAM;
-    const char* host = getenv("SEED")? getenv("SEED") : "192.168.5.69";
+    const char* host = getenv("SEED")? getenv("SEED") : "127.0.0.1";
     if (getaddrinfo(host,NULL,&h,&res)!=0){ printf("FAIL getaddrinfo %s\n", host); return 1; }
     unsigned ip = ((struct sockaddr_in*)res->ai_addr)->sin_addr.s_addr;
     freeaddrinfo(res);

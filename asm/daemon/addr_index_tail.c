@@ -361,7 +361,7 @@ void axt_boot(void* store_buf){
      * the base does not (every record it has is at or below its coverage,
      * which is below the base's), so it is superseded: set it aside and take
      * the fresh-journal path below, which adopts the base and backfills only
-     * the rest. m5ultra mainnet: the journal stopped at 274442 with the UTXO
+     * the rest. Mac Studio mainnet: the journal stopped at 274442 with the UTXO
      * engine's halt, the rebuild rebuilt the base to 799999 from the new
      * undo, and the gap rule below disabled the index for 539k blocks it
      * could close in 13.6k. Renamed, not deleted (one fixed name, the next

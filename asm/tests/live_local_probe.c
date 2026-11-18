@@ -27,7 +27,7 @@ static void put_u16be(unsigned char*p,unsigned v){p[0]=v>>8;p[1]=v&0xff;}
 
 int main(int argc,char**argv){
     setbuf(stdout,NULL);
-    const char* ipstr = argc>1? argv[1] : "192.168.5.69";
+    const char* ipstr = argc>1? argv[1] : "127.0.0.1";
     unsigned ip; inet_pton(AF_INET, ipstr, &ip);
     int fd = tcp_connect_ip(ip, PORT_BE);
     if(fd<0){ printf("connect fail fd=%d\n", fd); return 2; }

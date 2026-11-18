@@ -268,7 +268,7 @@ int main(void){
       ck("the history base is visible", ah_available());
       axt_boot(store);
       ck("a fresh journal with a history base to height 1 adopts it and backfills to the tip", axt_active() && axt_covered() == (long)(*(int*)((u8*)store + 24)));
-      /* 2026-09-24: a journal BEHIND the base (m5ultra: journal 274442, base
+      /* 2026-09-24: a journal BEHIND the base (Mac Studio: journal 274442, base
        * rebuilt to 799999) is superseded -- set aside, a fresh journal adopts
        * the base -- where the gap rule used to disable the index. Here: the
        * journal just built covers 1, the base now reaches 2, the tip is 2. */

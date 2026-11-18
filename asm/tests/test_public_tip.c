@@ -148,7 +148,7 @@ int main(void){
     ck("store 10 / applied 7 -> public tip 10 with live tracking OFF (negative control)",
        utxo_live_public_tip(store_buf, 0), 10);
     /* a HALT also turns tracking off, but must NOT hand out the stored tip:
-     * the node froze at its last connected height (m5ultra 2026-09-24: the
+     * the node froze at its last connected height (Mac Studio 2026-09-24: the
      * 274443 halt made the public tip jump to the ~968k archive tip) */
     utxo_live_test_set_halted(1);
     ck("HALTED, tracking off: store 10 / applied 7 -> public tip 7 (frozen at the last connected height)",

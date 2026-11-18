@@ -418,7 +418,7 @@ extern int  cons_verify(const void* block, long len, void* scratch, unsigned cap
  * testnet4/signet/regtest archive carries BOTH, and a check that accepted
  * only 0xd9b4bef9 flagged every committer-written block as "bad frame
  * magic". STO-11's repair then zeroed those valid records and, with
- * bmc.bootcatchup=0, nothing re-fetched them: testnet4 node B (m5ultra)
+ * bmc.bootcatchup=0, nothing re-fetched them: testnet4 node B (Mac Studio)
  * stuck at 153,876 below two blanked heights. Both values are accepted; the
  * daemon names the chain's via archive_set_chain_magic once
  * chainparams_select has run (a tool that never calls it checks the

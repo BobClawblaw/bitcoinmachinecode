@@ -12,11 +12,8 @@
 # block-body getdata" wall was root-caused to OUR OWN malformed getdata (a
 # 34-byte msg real nodes ignore) -- now fixed to the canonical 37-byte form.
 # Real mainnet block bodies have since been downloaded + cons_verify-validated
-# from the cooperative local node below. Public seeds reliably serve the real
+# from a cooperative local node. Public seeds reliably serve the real
 # header chain; block-body serving to an unproven peer is still intermittent.
-
-# --- KNOWN COOPERATIVE NODE (serves header chain AND block bodies; best boot) ---
-192.168.5.69
 
 # --- TIER 1: served the real header chain in live probing (preferred boot order) ---
 dnsseed.bluematt.me

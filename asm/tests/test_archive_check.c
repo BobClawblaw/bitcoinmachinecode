@@ -205,7 +205,7 @@ int main(void){
      *      frame with the CHAIN's wire magic, so a testnet4 archive carries
      *      0x283f161c frames beside 0xd9b4bef9 ones. Checked against the
      *      mainnet constant alone, every such block was "bad frame magic" --
-     *      and STO-11 blanked valid records (testnet4 node B, m5ultra). The
+     *      and STO-11 blanked valid records (testnet4 node B, Mac Studio). The
      *      daemon names the chain's magic; both then pass, and a frame with
      *      neither is still caught. */
     {

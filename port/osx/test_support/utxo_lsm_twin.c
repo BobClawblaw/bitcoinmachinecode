@@ -169,7 +169,7 @@ static long mac_fl_drain(int fd)
  * functions, so utxo_lsm_compact_range wrote every record straight to the
  * fd: key+type, value/slen/height/cb and the script as three write(2)s --
  * ~370M syscalls per full compaction of a 122M-coin mainnet set, a
- * many-minute pre-catchup compaction at boot (m5ultra, 2026-09-24: the
+ * many-minute pre-catchup compaction at boot (Mac Studio, 2026-09-24: the
  * worker's samples were all write()). The sparse index's record offsets
  * are fd offset + bytes still buffered, as on x86. */
 static long mac_out_flush(void)

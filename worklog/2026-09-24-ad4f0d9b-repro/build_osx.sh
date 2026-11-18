@@ -6,7 +6,7 @@
 # The objects go into an archive, minus main.o, tx_verify.o and utxo_live.o
 # (the harness includes utxo_live.c itself), so the harness's own
 # definitions win; -undefined dynamic_lookup covers what nothing calls.
-# 2026-09-24 on the m5ultra: main's tx_verify.c 18/18 in 3 of 3 runs,
+# 2026-09-24 on the Mac Studio: main's tx_verify.c 18/18 in 3 of 3 runs,
 # ad4f0d9b SIGSEGV at 124,864 in 2 of 2.
 set -u
 cd "$(dirname "$0")/../../asm"

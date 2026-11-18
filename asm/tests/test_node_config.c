@@ -663,14 +663,14 @@ int main(void){
 
     /* ---- 2026-09-19: the number warning fired for every STRING key ----
      * The value was parsed as an integer before the key was dispatched, so
-     * production logged "bind=192.168.5.242 is not a usable number -- reading
+     * production logged "bind=10.0.0.2 is not a usable number -- reading
      * it as 0" and the same for all four zmqpub* addresses, while applying
      * each value correctly. A monitor parses these lines. The warning must
      * be absent for string keys AND still present for a bad numeric one --
      * a fix that silenced the parse everywhere would pass the first half. */
     { node_config_load("/nonexistent/reset.conf");
       wr("strkeys.conf",
-         "bind=192.168.5.242\n"
+         "bind=10.0.0.2\n"
          "zmqpubrawblock=tcp://127.0.0.1:28332\n"
          "zmqpubhashtx=tcp://127.0.0.1:28333\n"
          "maxconnections=lots\n"

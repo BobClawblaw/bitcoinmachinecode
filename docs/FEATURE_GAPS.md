@@ -2722,7 +2722,7 @@ quoted.
 
 The entry above ("Outbound leg slots churn about nine times an hour and almost
 no departure is logged") counted 42 handshakes and read them as one boot's
-worth of churn. They are not. `/home/xian/bmc-run26/main/debug.log` holds
+worth of churn. They are not. `~/bmc-run26/main/debug.log` holds
 **nine `[boot] logging to` lines** between 21:10Z and 00:04Z — another session
 was redeploying the bench binary — and the 42 handshakes are those nine boots'
 initial fills:
