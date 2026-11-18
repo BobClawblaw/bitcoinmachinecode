@@ -331,8 +331,8 @@ libraries (Visual Studio Build Tools or a standalone SDK), Python 3, and Git
 for Windows for the gate's shell-script tests. The gate runs the
 `./tests/...` lines of `asm/Makefile`'s `test:` recipe, so a test added on
 `main` is in the Windows gate without a change. Four tests are N/A on
-Windows, each for a reason the platform imposes (a pty, systemd's
-datagram socket, page-cache residency, ptrace; listed in
+Windows, each for a reason the platform imposes (a pty, page-cache
+residency, ptrace, ELF headers; listed in
 [`port/WIN_PORT.md`](port/WIN_PORT.md)). A signet node runs from
 `windows-port` natively on Windows, synced to the tip.
 

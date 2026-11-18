@@ -66,7 +66,7 @@ i64 ws_lx_symlink(const char *target, const wchar_t *w);
 
 /* ---- ws_fd.c ---- */
 enum { FT_FREE = 0, FT_FILE, FT_DIR, FT_CONSOLE, FT_PIPE, FT_NULL, FT_RANDOM, FT_SOCKET,
-       FT_MEM, FT_MEMDIR, FT_EVENTFD };  /* /proc files and directories built at open (ws_procfs.c) */
+       FT_MEM, FT_MEMDIR, FT_EVENTFD, FT_UXDGRAM };  /* /proc files and directories built at open (ws_procfs.c) */
 typedef struct ws_desc {
 	volatile LONG refs;
 	int type;
@@ -110,6 +110,10 @@ ws_desc *ws_fd_get(int fd);       /* +1 ref, NULL if not open */
 void ws_desc_put(ws_desc *d);
 int ws_fd_install(ws_desc *d, int cloexec, int min_fd); /* consumes the ref; -EMFILE */
 ws_desc *ws_desc_new(int type);
+/* ---- ws_uxdgram.c: AF_UNIX SOCK_DGRAM on mailslots ---- */
+i64 ws_uxd_sys(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *handled);
+i64 ws_uxd_rw(ws_desc *d, void *buf, size_t n, int write);
+short ws_uxd_ready(ws_desc *d, short ev);
 short ws_eventfd_ready(ws_desc *d, short ev);
 /* The x87 control word Linux starts every thread with: 64-bit precision
  * (0x37F). Windows starts threads at 53-bit precision (0x27F), and musl's

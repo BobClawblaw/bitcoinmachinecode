@@ -4,6 +4,36 @@ Updated whenever the status materially changes. The newest section is at
 the top. Companion to [`WIN_PORT.md`](WIN_PORT.md), which covers the design,
 the build, the gate and the branch model.
 
+## 2026-11-18: no SKIP rows, AF_UNIX datagrams
+
+PRs: #498 (the shared shutdown fix) and #499 (this branch), merged with
+main through #497.
+
+**Gate run 18: 503 PASS, 0 SKIP, 4 N/A, 0 FAIL, 0 TIMEOUT** over 507
+commands (482 recipe lines plus 25 port tests), with `CORE_BENCH_BLOCK` set.
+- *The 8 SKIP rows run.* `run_tests.py` expands the recipe's make variables
+  (`$(VAR)`, `$(shell seq ...)`, `$(wildcard ...)`) and drops
+  `< /dev/null`. Seven pass. `test_elf_hardening` is N/A, because it reads
+  ELF headers and these binaries are PE. With Core's `block413567.raw` as
+  `CORE_BENCH_BLOCK`, the four `*_diff` parsers compare 1,557 real
+  transactions each with 0 mismatches, and `bench_abi_audit` reports 16
+  functions clean. `test_taproot_block_diff` runs, but skips its 36 heights:
+  their fixtures come from the x86 side's Core oracle.
+- *`AF_UNIX` `SOCK_DGRAM`* is emulated on mailslots (`ws_uxdgram.c`), for
+  path and abstract names. It keeps message boundaries, truncates a long
+  message, and gives EADDRINUSE, ENOENT and ECONNREFUSED as Linux does. It
+  honours SO_RCVTIMEO, O_NONBLOCK and poll, and works across processes.
+  `test_sd_watchdog` passes (26 checks) and is off the N/A list. Pinned by
+  `test_win_uxdgram` (30 checks).
+- The N/A rows that remain:
+  - `test_cli_prompt`: a pty, plus a 40,000-byte argument through `sh`;
+  - `test_drop_appends`: page-cache residency;
+  - `test_mpool_get_once`: ptrace;
+  - `test_elf_hardening`: ELF headers.
+
+The node was rebuilt from this branch and restarted. It is at the tip with
+about 10 peers.
+
 ## 2026-11-12: into the pipeline
 
 The port now follows the Mac's model. `windows-port` is the working

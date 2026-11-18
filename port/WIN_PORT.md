@@ -28,7 +28,8 @@ Linux syscall numbers, musl's libc):
   Win32/NT: files, mappings, sockets (AFD), pipes, futexes, signals, `/proc`,
   `fork` (`RtlCloneUserProcess`, with the clone hazards written down in
   `ws_fork.c`), `exec`, seccomp, eventfd, symlinks (WSL-style reparse points,
-  so no privilege is needed), and more.
+  so no privilege is needed), `AF_UNIX` datagram sockets (mailslots, path
+  and abstract names; `ws_uxdgram.c`), and more.
 - **rt** (`port/win/rt/`) holds the few libc pieces musl's Linux build
   cannot supply on Windows: thread start, malloc over the private heap,
   `posix_spawn`, the resolver and `backtrace`.
@@ -77,18 +78,30 @@ without any change here. It builds and installs the daemon tools the tests
 exec (`asm/daemon/*.exe`, gitignored) and then runs the port's own tests
 (`port/win/tests/test_win_*.c`). The exit status is 0 only when every test
 passes or is a known Windows limit (`KNOWN` in `run_tests.py`, reported
-N/A, the way the Mac reports its x86-only tests). Lines whose recipe uses
-shell syntax are reported SKIP.
+N/A, the way the Mac reports its x86-only tests).
+
+The harness expands the recipe's make variables (`$(VAR)`,
+`$(shell seq a b)`, `$(wildcard ...)`, with the environment taking
+precedence, as in make) and drops a `< /dev/null`, since the tests run with
+stdin on `/dev/null` anyway. A line with any other shell syntax is reported
+SKIP; today there are none. Two inputs live outside the repo, as on Linux:
+- `CORE_BENCH_BLOCK`, Bitcoin Core's `src/bench/data/block413567.raw`. Set
+  it to the file's path to add the real-block cases to the four `*_diff`
+  parsers and `bench_abi_audit`. Without it they run their synthetic cases
+  and say so.
+- The taproot fixtures of `test_taproot_block_diff`, which `make fixtures`
+  fetches from the x86 side's Core oracle. Without them the test skips its
+  36 heights, loudly.
 
 The known limits, the only N/A rows:
 - `test_cli_prompt` needs a pty (`forkpty`). One of its cases also passes a
   40,000-byte argument through `sh`, longer than the 32,767-character
   Windows command line.
-- `test_sd_watchdog` uses systemd's watchdog datagram: `AF_UNIX`
-  `SOCK_DGRAM` in the abstract namespace.
 - `test_drop_appends` measures page-cache residency through `mincore` on a
   fresh mapping. Windows has no unprivileged query for that.
 - `test_mpool_get_once` uses ptrace.
+- `test_elf_hardening` checks PIE, RELRO and NX in ELF headers. The
+  Windows binaries are PE.
 
 ## Branch model (the same as the Mac's)
 

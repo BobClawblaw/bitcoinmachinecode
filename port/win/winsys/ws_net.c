@@ -1222,6 +1222,9 @@ static short other_ready(ws_desc *d, short ev)
 	case FT_EVENTFD:
 		r = ws_eventfd_ready(d, ev);
 		break;
+	case FT_UXDGRAM:
+		r = ws_uxd_ready(d, ev);
+		break;
 	case FT_SOCKET:                        /* shut for reading: end-of-file now */
 		r |= ev & (L_POLLIN | L_POLLRDNORM | L_POLLRDHUP);
 		if (!(d->shut & 2))
@@ -1437,6 +1440,9 @@ static i64 sys_select(int nfds, u64 *rd, u64 *wr, u64 *ex, int timeout)
 
 i64 ws_sys_net(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *handled)
 {
+	i64 ur = ws_uxd_sys(n, a1, a2, a3, a4, a5, a6, handled);   /* AF_UNIX datagram sockets */
+	if (*handled)
+		return ur;
 	*handled = 1;
 	struct l_timeval *tv;
 	switch (n) {

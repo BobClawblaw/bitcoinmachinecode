@@ -586,7 +586,7 @@ i64 ws_procfs_readlink(const char *path, char *buf, size_t cap)
 			return -L_ENOENT;
 		if (d->wpath)
 			u = ws_path_to_posix(d->wpath);
-		else if (d->type == FT_SOCKET)
+		else if (d->type == FT_SOCKET || d->type == FT_UXDGRAM)
 			u = ws_w_to_utf8(L"socket:[0]");
 		else if (d->type == FT_PIPE)
 			u = ws_w_to_utf8(L"pipe:[0]");

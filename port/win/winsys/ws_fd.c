@@ -348,7 +348,7 @@ static i64 stat_handle(HANDLE h, int type, struct l_stat *st)
 		st->st_mode = 0040000 | 0555;
 		return 0;
 	}
-	if (type == FT_SOCKET) {
+	if (type == FT_SOCKET || type == FT_UXDGRAM) {
 		st->st_mode = 0140000 | 0777;
 		return 0;
 	}
@@ -1140,6 +1140,9 @@ static i64 do_rw(int fd, void *buf, size_t n, i64 pos, int write, int positioned
 	case FT_EVENTFD:
 		r = positioned ? -L_ESPIPE : rw_eventfd(d, buf, n, write);
 		break;
+	case FT_UXDGRAM:
+		r = positioned ? -L_ESPIPE : ws_uxd_rw(d, buf, n, write);
+		break;
 	default:
 		r = positioned ? -L_ESPIPE : rw_stream(d, buf, n, write);
 		break;
@@ -1664,7 +1667,7 @@ static i64 sys_ioctl(int fd, u64 req, i64 arg)
 		r = 0;
 	} else if ((req == 0x5401 || req == 0x5402 || req == 0x5403 || req == 0x5404) && d->type == FT_CONSOLE) {
 		r = console_termios(req, (struct l_termios *)arg);   /* TCGETS, TCSETS[WF] */
-	} else if (req == 0x5421 && d->type == FT_SOCKET) {   /* FIONBIO: emulated flag */
+	} else if (req == 0x5421 && (d->type == FT_SOCKET || d->type == FT_UXDGRAM)) {   /* FIONBIO: emulated flag */
 		d->flags = *(int *)arg ? (d->flags | L_O_NONBLOCK) : (d->flags & ~L_O_NONBLOCK);
 		r = 0;
 	} else if (req == 0x541B) {                            /* FIONREAD */

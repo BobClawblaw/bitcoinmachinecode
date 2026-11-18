@@ -123,8 +123,6 @@ KNOWN = {
     'test_cli_prompt': 'its terminal cases need a pty (forkpty), which winsys does not emulate, and one '
                        'case passes a 40,000-byte argument through sh, past the 32,767-character '
                        'Windows command line',
-    'test_sd_watchdog': "systemd's watchdog datagram: AF_UNIX SOCK_DGRAM and the abstract namespace "
-                        "do not exist on Windows (nor does systemd)",
     'test_drop_appends': "measures a file's page-cache residency through mincore on a fresh mapping; "
                          "Windows has no unprivileged per-file cache residency query",
     'test_mpool_get_once': 'needs ptrace',
