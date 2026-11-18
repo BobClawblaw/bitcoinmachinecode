@@ -2940,3 +2940,48 @@ were still on disk. Nothing in them is new measurement.
 - **Lesson:** a descriptor-exhaustion episode is now a reason to run the
   header scan afterwards. A header check does not prove block bodies; a
   full body scan of this archive is about 700 GB of reads and was not run.
+
+## 2026-11-18 18:51Z — `deploy-20261118a`: shutdown decides "the download worker is gone" before the lock scan, not after (PR #498)
+
+- **What:** `main` at `7267b494`. #498 (from the Windows port):
+  `shutdown_wait_lock_released` scanned for processes holding the datadir
+  lock, then, if the download worker had exited, SIGTERMed what the scan
+  found as orphans. SIGCHLD can reap the worker during the scan, so a list
+  taken while the worker was alive (the worker and its own exiting
+  children, such as the coinstats fold worker) could be SIGTERMed as
+  orphans. The flag is now read before the scan, and the next pass
+  rescans. The other changes since `deploy-20261108a` (#495 a test, #496
+  a comment, #497 comments and the hard-coded fallback peer of two
+  standalone IBD programs) change no code linked into `bmcbitcoind`.
+- **Checked before the deploy:** the x86 gate (`make -j8 test`) on the PR
+  head passed with 0 failures. On Linux the window is under a millisecond,
+  so two scratch builds added a 70 ms delay right after the scan call:
+  `test_stop_waits_for_worker` failed 12 of 12 runs without the fix
+  ("the stopping parent never counted it as a holder") and passed 12 of 12
+  with it.
+- Built from clean (`make -B daemon/bmcbitcoind` and the helpers by name) in
+  a clean worktree at the merge commit, with no warnings. All five exec'd
+  helpers were byte-identical; none was replaced. Wallet files were copied
+  first. `MALLOC_ARENA_MAX=4` and `70-watchdog.conf` stay in place.
+- **Before the restart:** `deploy-20261108a`, up since 12:00:54Z on 11-14
+  (the machine rebooted at 12:00Z and the unit came back by itself,
+  `NRestarts=0`), tip 976,465 = the Core v31.1 oracle. The main process
+  held 259 descriptors after four days: 25 `index.dat` handles and 216 blk
+  files in their read caches (at most 8 per handle), bounded, not a leak.
+- **Stopped and started:** SIGTERM at 18:51:14Z; the worker exited with
+  status 0 and the parent logged `datadir lock held by no other process
+  (waited 0.0s)` at 18:51:15.092Z. The new process started at 18:51:15Z;
+  archive loaded at tip 976,465 by 18:52:29Z, integrity OK (976,466
+  entries, 0 duplicates); RPC answered at 18:52:33Z; `mempool.dat`
+  reloaded 82,941 of 82,945 by 18:55:43Z.
+- **Verified live:**
+  - New block 976,466 stored at 19:14:40.996Z (compact block, 3,808 of
+    4,025 transactions from the mempool) and applied at 19:14:41.035Z with
+    the oracle's hash
+    (`00000000000000000002119f50b81632142f592ff778b9dad38282605cf8c706`).
+  - `NRestarts=0` and `active` at 23 minutes, `WatchdogTimestamp`
+    advancing (19:15:01Z); no `[crash]`, `FATAL` or tip-watch line; 64
+    open descriptors in the main process; 9 peers; clients back on the RPC
+    and facade ports.
+- **Rollback:** relink to `deploy-20261108a` and restart
+  (`70-watchdog.conf` stays). No on-disk format changed.
