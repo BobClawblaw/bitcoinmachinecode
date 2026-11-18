@@ -671,6 +671,75 @@ static void case_chainwork_pruned_range(void){
     ckm("work delta above the prune point matches an independent sum", memcmp(delta, expect, 16)==0);
 }
 
+/* ======================================================================== */
+/* CASE: chainwork.dat spot check at open (2026-11-18)                      */
+/* A chainwork.dat that does not match the archive's headers (a build that  */
+/* computed work wrongly, as an early Windows-port build did; that node     */
+/* refused a valid reorg) is detected when it is opened, emptied, and       */
+/* rebuilt by the sync.                                                     */
+/* A correct file is left alone, and so is one beside a corrupt stored      */
+/* header: a header that does not hash to its index record is not evidence.*/
+/* ======================================================================== */
+static long slurp(const char* path, u8* out, long cap){
+    int fd = open(path, O_RDONLY); if (fd < 0) return -1;
+    long n = read(fd, out, cap); close(fd); return n;
+}
+static void spew(const char* path, const u8* in, long n){
+    int fd = open(path, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+    if (fd < 0 || write(fd, in, n) != n) printf("FAIL spew %s\n", path);
+    if (fd >= 0) close(fd);
+}
+static long fsize_of(const char* path){ struct stat sb; return stat(path, &sb) == 0 ? (long)sb.st_size : -1; }
+
+static void case_chainwork_spot_check(void){
+    const long n = 60;
+    build_base(n, 0x207fffffu);
+    memset(store_buf,0,sizeof store_buf);
+    ck("store_init", store_init(store_buf), 1);
+    ck("chainwork_open on an empty file", reorg_chainwork_open(store_buf), 1);
+    for (long h=0;h<n;h++) ckm("append block", store_append(store_buf, base[h].hash, base[h].raw, base[h].len) == h);
+    ck("backfill", reorg_chainwork_sync(store_buf, 0), n);
+    static u8 good[60*16], now[60*16];
+    ck("good file read", slurp("chainwork.dat", good, sizeof good), n*16);
+
+    /* 1. a correct file is not touched */
+    ck("reopen with a correct file", reorg_chainwork_open(store_buf), 1);
+    ck("correct file: same size", fsize_of("chainwork.dat"), n*16);
+    ckm("correct file: same bytes", slurp("chainwork.dat", now, sizeof now) == n*16 && memcmp(now, good, n*16) == 0);
+
+    /* 2. every record built from wrong per-header work (twice the real
+     *    work, as a wrong work computation writes it): emptied at open,
+     *    rebuilt to the correct bytes by the sync that follows */
+    { static u8 wrong[60*16]; u8 cum[16]; memset(cum, 0, 16);
+      for (long h=0;h<n;h++){ u8 w[16]; u32 bits; memcpy(&bits, base[h].raw+72, 4); block_work(w, bits);
+                              chainwork_add(cum, cum, w); chainwork_add(cum, cum, w); memcpy(wrong+h*16, cum, 16); }
+      spew("chainwork.dat", wrong, n*16); }
+    ck("reopen with a wrong file", reorg_chainwork_open(store_buf), 1);
+    ck("wrong file: emptied at open", fsize_of("chainwork.dat"), 0);
+    ck("wrong file: the sync rebuilds every record", reorg_chainwork_sync(store_buf, 0), n);
+    ckm("wrong file: rebuilt to the correct bytes", slurp("chainwork.dat", now, sizeof now) == n*16 && memcmp(now, good, n*16) == 0);
+
+    /* 3. only the newest record wrong (one unit too much) */
+    { static u8 tail[60*16]; memcpy(tail, good, n*16); tail[(n-1)*16] ^= 1; spew("chainwork.dat", tail, n*16); }
+    ck("reopen with a wrong tail record", reorg_chainwork_open(store_buf), 1);
+    ck("wrong tail: emptied at open", fsize_of("chainwork.dat"), 0);
+    ck("wrong tail: rebuilt", reorg_chainwork_sync(store_buf, 0), n);
+    ckm("wrong tail: rebuilt to the correct bytes", slurp("chainwork.dat", now, sizeof now) == n*16 && memcmp(now, good, n*16) == 0);
+
+    /* 4. a correct file beside a corrupt stored header: the newest block's
+     *    nBits changed on disk, so the header no longer hashes to its index
+     *    record. Its recomputed work would disagree with the (correct)
+     *    record; the check must skip it, not empty the file. */
+    { u64 meta[3]; ck("meta of the newest block", store_get_at(store_buf, n-1, meta), 1);
+      char name[16]; snprintf(name, sizeof name, "blk%05u.dat", (unsigned)meta[2]);
+      int bf = open(name, O_RDWR); u8 bits[4] = {0xff, 0xff, 0x7f, 0x1f};   /* 0x1f7fffff: far less work */
+      ckm("corrupt the stored nBits", bf >= 0 && pwrite(bf, bits, 4, (off_t)meta[0] + 8 + 72) == 4);
+      if (bf >= 0) close(bf); }
+    ck("reopen beside a corrupt header", reorg_chainwork_open(store_buf), 1);
+    ck("corrupt header: file kept", fsize_of("chainwork.dat"), n*16);
+    ckm("corrupt header: same bytes", slurp("chainwork.dat", now, sizeof now) == n*16 && memcmp(now, good, n*16) == 0);
+}
+
 /* Store base + lose, i.e. bring the node to the state it is in before the
  * competing chain shows up. */
 static void store_chain(long nbase, long nlose){
@@ -2152,6 +2221,7 @@ int main(void){
     int total = 0;
     total += run_case("chainwork primitives",           case_chainwork_primitives);
     total += run_case("chainwork over a pruned range",  case_chainwork_pruned_range);
+    total += run_case("chainwork.dat spot check at open", case_chainwork_spot_check);
     total += run_case("reorg depth 1",                  case_reorg_depth1);
     total += run_case("reorg depth 3",                  case_reorg_depth3);
     total += run_case("reorg depth 12 (undo window)",   case_reorg_depth12);
