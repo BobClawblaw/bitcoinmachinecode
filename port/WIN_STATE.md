@@ -36,6 +36,10 @@ built only after the rest of the run: port tests can now name the `asm/`
 modules they link, with a `port-link:` line. It was re-run on its own and
 passes.
 
+**Gate run 16 (2026-11-18, merged with main through #497, a3f5989e):**
+the same, 494 PASS, 8 SKIP, 4 N/A, 0 FAIL over 506 commands, with every
+port test built in the run. The shared fix below is PR #498.
+
 **Fixed since run 13 (2026-11-11: 464 PASS, 8 SKIP, 10 FAIL):**
 - *Symlinks* are WSL-style reparse points (`IO_REPARSE_TAG_LX_SYMLINK`).
   An unprivileged user can create them; NTFS symlinks need Developer Mode
