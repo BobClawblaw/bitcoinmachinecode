@@ -2985,3 +2985,56 @@ were still on disk. Nothing in them is new measurement.
     and facade ports.
 - **Rollback:** relink to `deploy-20261108a` and restart
   (`70-watchdog.conf` stays). No on-disk format changed.
+
+## 2026-11-18 20:04Z — `deploy-20261118b`: chainwork.dat is spot-checked against the stored headers at open (PR #501)
+
+- **What:** `main` at `f6e750c6`. #501: `reorg_chainwork_open` checks a
+  sample of `chainwork.dat` records (the last 8 and 32 spread from height
+  0) before fork choice uses the file. The work each record adds over the
+  one below it must equal `block_work()` of that height's stored header,
+  and a header is used only when it hashes to its own index record. On a
+  disagreement the file is emptied and the boot's
+  `reorg_chainwork_sync` rebuilds it from the headers. Suggested by the
+  Windows port, where a build wrote wrong per-header work and the node
+  refused a valid reorg as below `-minimumchainwork`.
+- **Checked before the deploy:** the x86 gate passed with 0 failures; the
+  new `test_reorg` case fails with the check reverted, and its
+  corrupt-header part fails with only the hash gate removed. A read-only
+  scan of all 976,471 production records against their hash-verified
+  headers found 0 mismatches (167 s, about what a rebuild at boot would
+  cost), and the file's chainwork equalled the oracle's at heights
+  100,000, 500,000, 800,000 and 976,466.
+- Built from clean (`make -B daemon/bmcbitcoind` and the helpers by name) in
+  a clean worktree at the merge commit, with no warnings. All five exec'd
+  helpers were byte-identical; none was replaced. Wallet files and a copy
+  of `chainwork.dat` were saved first. `MALLOC_ARENA_MAX=4` and
+  `70-watchdog.conf` stay in place.
+- **Before the restart:** `deploy-20261118a`, up since 18:51Z, tip 976,476
+  = the Core v31.1 oracle.
+- **Stopped and started:** SIGTERM at 20:04:49Z, the first stop on #498's
+  build. The worker exited with status 0 and the parent logged `datadir
+  lock held by no other process (waited 0.1s)` at 20:04:49.252Z. Archive
+  loaded at tip 976,476 by 20:05:28Z, integrity OK; RPC answered at
+  20:05:33Z. At 20:05:43.657Z: `[chainwork] spot check: 40 of 976477
+  record(s) agree with their headers`, nothing backfilled, and the file's
+  existing records byte-identical to the saved copy.
+- **Verified live:**
+  - New block 976,477 stored at 20:05:49Z and applied at 20:05:51.620Z with
+    the oracle's hash
+    (`00000000000000000001b4dd5c0614901b4f97bebaaaa04302d115366e847a14`)
+    and the oracle's chainwork
+    (`000000000000000000000000000000000000000159860955f115ed58cfe780e8`).
+  - `NRestarts=0` and `active` at 11 minutes, `WatchdogTimestamp`
+    advancing (20:15:30Z); no `[crash]`, `FATAL` or tip-watch line; 60
+    open descriptors in the main process; 10 peers; clients back on the RPC
+    and facade ports.
+- **Mempool reload:** 60,087 of 67,621 by 20:07:03Z; 7,534 refused. Block
+  976,477 arrived during the reload with 7,682 transactions, of which
+  7,537 were not yet in the pool, so the refusals are most likely that
+  block's own transactions, whose inputs it had just spent. The line's
+  per-reason counts all read 0: entries refused on a retry pass are added
+  to the total without a reason (`rpc_node.c`, `mpd_retry_passes`), a
+  reporting gap that predates this deploy (the 2026-10-12 reload shows 850
+  the same way). Not fixed here.
+- **Rollback:** relink to `deploy-20261118a` and restart
+  (`70-watchdog.conf` stays). No on-disk format changed.
