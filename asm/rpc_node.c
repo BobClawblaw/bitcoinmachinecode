@@ -3212,7 +3212,6 @@ static long mpd_retry_passes(mpd_import_ctx* c){
         long n = c->nretry, before = c->accepted;
         unsigned char** list = c->retry; unsigned long* lens = c->retry_len;
         c->retry = 0; c->retry_len = 0; c->nretry = c->retry_cap = 0; c->collecting = 1;
-        long rej0 = c->rejected;
         /* the persisted time travels with the deferred entry: a child held back
          * for its parent is exactly as old as the file says, and dropping the
          * time here would leave a subset of the pool silently re-aged */
@@ -3221,7 +3220,13 @@ static long mpd_retry_passes(mpd_import_ctx* c){
         free(list); free(lens); free(tms);
         passes++; gained += c->accepted - before;
         c->collecting = 0;
-        if (c->accepted == before){ c->rejected = rej0 + c->nretry; break; }   /* no progress: the rest are real rejects */
+        /* No progress: the entries still deferred are real refusals, for the
+         * reason they were deferred -- missing inputs. ADD them: this pass has
+         * already counted its other refusals (total and reason both), and
+         * resetting the total to "before the pass + still deferred" dropped
+         * those from it and gave the deferred ones no reason. On 2026-11-18 a
+         * production reload logged "7534 refused" over a histogram of zeros. */
+        if (c->accepted == before){ c->rejected += c->nretry; c->rej_missing += c->nretry; break; }
     }
     for (long i = 0; i < c->nretry; i++) free(c->retry[i]);
     free(c->retry); free(c->retry_len); free(c->retry_time);
