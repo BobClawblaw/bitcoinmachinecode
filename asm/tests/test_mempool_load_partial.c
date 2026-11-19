@@ -68,13 +68,25 @@ static unsigned long mk_tx(u8* out, u8 tag){
 static node_status_t* g_st;
 static volatile int g_stop;
 static int g_seen; static u8 g_tags[64];
+/* g_refuse: 0 accepts everything. 1 is the retry-pass case: tag 0x11 is
+ * accepted, 0x22 and 0x33 are refused for missing inputs on every attempt,
+ * and 0x44 is refused for missing inputs the first time and on policy when
+ * it is re-offered. */
+static volatile int g_refuse;
+static int g_tries[256];
 static void* worker(void* a){
     (void)a;
     while (!g_stop){
         if (g_st->tx_submit_seq != g_st->tx_submit_ack){
-            if (g_seen < 64) g_tags[g_seen] = g_st->tx_submit_buf[5];   /* the prevout's first byte: the tag */
+            u8 tag = g_st->tx_submit_buf[5];                             /* the prevout's first byte: the tag */
+            if (g_seen < 64) g_tags[g_seen] = tag;
             g_seen++;
-            g_st->tx_submit_result = 1;
+            int tries = g_tries[tag]++;
+            const char* why = NULL;
+            if (g_refuse && (tag == 0x22 || tag == 0x33 || (tag == 0x44 && tries == 0))) why = "missing-inputs";
+            else if (g_refuse && tag == 0x44) why = "min relay fee not met";
+            if (why) strcpy((char*)g_st->tx_submit_reason, why);
+            g_st->tx_submit_result = why ? 0 : 1;
             __sync_synchronize();
             g_st->tx_submit_ack = g_st->tx_submit_seq;
         }
@@ -146,6 +158,40 @@ int main(void){
        em && !strcmp(em, "Unable to import mempool file, see debug.log for details."), 1);
     ck("importmempool, torn dump: the 3 read before the fault were still handed over", g_seen, 3);
     rj_free(params);
+
+    /* A retry pass that admits nothing ended with "rejected = (count before
+     * the pass) + (entries still deferred)": the still-deferred entries went
+     * into the total with no reason, and an entry the pass refused for another
+     * reason dropped out of the total while its reason stayed counted. On
+     * 2026-11-18 production logged "7534 refused" with every reason 0. */
+    if (mempool_dump_write("mempool.dat", txs, lens, times, deltas, 4, 0, 0, 0) != 4){ printf("FAIL write\n"); return 1; }
+    g_refuse = 1; memset(g_tries, 0, sizeof g_tries);
+    char logp[] = "load-stderr.log";
+    fflush(stderr);
+    int saved = dup(2);
+    FILE* lf = fopen(logp, "w");
+    if (!lf || saved < 0){ printf("FAIL redirect\n"); return 1; }
+    dup2(fileno(lf), 2);
+    long acc = load("mempool.dat", &seen);
+    fflush(stderr); dup2(saved, 2); close(saved); fclose(lf);
+    g_refuse = 0;
+    ck("retry pass: 1 of 4 accepted", acc, 1);
+    ck("retry pass: 0x44 was re-offered", g_tries[0x44], 2);
+    static char buf[4096]; buf[0] = 0;
+    FILE* rf = fopen(logp, "r");
+    size_t nb = rf ? fread(buf, 1, sizeof buf - 1, rf) : 0; buf[nb] = 0;
+    if (rf) fclose(rf);
+    long rej = -1, miss = -1, conf = -1, pol = -1, noack = -1, oth = -1, reoff = -1, then = -1;
+    const char* q = strstr(buf, "already there); ");
+    if (q) sscanf(q + strlen("already there); "),
+                  "%ld refused: %ld missing-inputs, %ld conflicting, %ld policy, %ld no-ack, %ld other (%ld re-offered, %ld then accepted)",
+                  &rej, &miss, &conf, &pol, &noack, &oth, &reoff, &then);
+    if (!q) printf("load line not found in: %s\n", buf);
+    ck("retry pass: 3 refused", rej, 3);
+    ck("retry pass: 2 of them for missing inputs", miss, 2);
+    ck("retry pass: 1 of them on policy", pol, 1);
+    ck("retry pass: the reasons sum to the total", miss + conf + pol + noack + oth, rej);
+    ck("retry pass: 3 re-offered, 0 then accepted", reoff * 10 + then, 30);
 
     g_stop = 1; pthread_join(th, 0);
     printf("\n%s (%d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);

@@ -2940,3 +2940,101 @@ were still on disk. Nothing in them is new measurement.
 - **Lesson:** a descriptor-exhaustion episode is now a reason to run the
   header scan afterwards. A header check does not prove block bodies; a
   full body scan of this archive is about 700 GB of reads and was not run.
+
+## 2026-11-18 18:51Z — `deploy-20261118a`: shutdown decides "the download worker is gone" before the lock scan, not after (PR #498)
+
+- **What:** `main` at `7267b494`. #498 (from the Windows port):
+  `shutdown_wait_lock_released` scanned for processes holding the datadir
+  lock, then, if the download worker had exited, SIGTERMed what the scan
+  found as orphans. SIGCHLD can reap the worker during the scan, so a list
+  taken while the worker was alive (the worker and its own exiting
+  children, such as the coinstats fold worker) could be SIGTERMed as
+  orphans. The flag is now read before the scan, and the next pass
+  rescans. The other changes since `deploy-20261108a` (#495 a test, #496
+  a comment, #497 comments and the hard-coded fallback peer of two
+  standalone IBD programs) change no code linked into `bmcbitcoind`.
+- **Checked before the deploy:** the x86 gate (`make -j8 test`) on the PR
+  head passed with 0 failures. On Linux the window is under a millisecond,
+  so two scratch builds added a 70 ms delay right after the scan call:
+  `test_stop_waits_for_worker` failed 12 of 12 runs without the fix
+  ("the stopping parent never counted it as a holder") and passed 12 of 12
+  with it.
+- Built from clean (`make -B daemon/bmcbitcoind` and the helpers by name) in
+  a clean worktree at the merge commit, with no warnings. All five exec'd
+  helpers were byte-identical; none was replaced. Wallet files were copied
+  first. `MALLOC_ARENA_MAX=4` and `70-watchdog.conf` stay in place.
+- **Before the restart:** `deploy-20261108a`, up since 12:00:54Z on 11-14
+  (the machine rebooted at 12:00Z and the unit came back by itself,
+  `NRestarts=0`), tip 976,465 = the Core v31.1 oracle. The main process
+  held 259 descriptors after four days: 25 `index.dat` handles and 216 blk
+  files in their read caches (at most 8 per handle), bounded, not a leak.
+- **Stopped and started:** SIGTERM at 18:51:14Z; the worker exited with
+  status 0 and the parent logged `datadir lock held by no other process
+  (waited 0.0s)` at 18:51:15.092Z. The new process started at 18:51:15Z;
+  archive loaded at tip 976,465 by 18:52:29Z, integrity OK (976,466
+  entries, 0 duplicates); RPC answered at 18:52:33Z; `mempool.dat`
+  reloaded 82,941 of 82,945 by 18:55:43Z.
+- **Verified live:**
+  - New block 976,466 stored at 19:14:40.996Z (compact block, 3,808 of
+    4,025 transactions from the mempool) and applied at 19:14:41.035Z with
+    the oracle's hash
+    (`00000000000000000002119f50b81632142f592ff778b9dad38282605cf8c706`).
+  - `NRestarts=0` and `active` at 23 minutes, `WatchdogTimestamp`
+    advancing (19:15:01Z); no `[crash]`, `FATAL` or tip-watch line; 64
+    open descriptors in the main process; 9 peers; clients back on the RPC
+    and facade ports.
+- **Rollback:** relink to `deploy-20261108a` and restart
+  (`70-watchdog.conf` stays). No on-disk format changed.
+
+## 2026-11-18 20:04Z — `deploy-20261118b`: chainwork.dat is spot-checked against the stored headers at open (PR #501)
+
+- **What:** `main` at `f6e750c6`. #501: `reorg_chainwork_open` checks a
+  sample of `chainwork.dat` records (the last 8 and 32 spread from height
+  0) before fork choice uses the file. The work each record adds over the
+  one below it must equal `block_work()` of that height's stored header,
+  and a header is used only when it hashes to its own index record. On a
+  disagreement the file is emptied and the boot's
+  `reorg_chainwork_sync` rebuilds it from the headers. Suggested by the
+  Windows port, where a build wrote wrong per-header work and the node
+  refused a valid reorg as below `-minimumchainwork`.
+- **Checked before the deploy:** the x86 gate passed with 0 failures; the
+  new `test_reorg` case fails with the check reverted, and its
+  corrupt-header part fails with only the hash gate removed. A read-only
+  scan of all 976,471 production records against their hash-verified
+  headers found 0 mismatches (167 s, about what a rebuild at boot would
+  cost), and the file's chainwork equalled the oracle's at heights
+  100,000, 500,000, 800,000 and 976,466.
+- Built from clean (`make -B daemon/bmcbitcoind` and the helpers by name) in
+  a clean worktree at the merge commit, with no warnings. All five exec'd
+  helpers were byte-identical; none was replaced. Wallet files and a copy
+  of `chainwork.dat` were saved first. `MALLOC_ARENA_MAX=4` and
+  `70-watchdog.conf` stay in place.
+- **Before the restart:** `deploy-20261118a`, up since 18:51Z, tip 976,476
+  = the Core v31.1 oracle.
+- **Stopped and started:** SIGTERM at 20:04:49Z, the first stop on #498's
+  build. The worker exited with status 0 and the parent logged `datadir
+  lock held by no other process (waited 0.1s)` at 20:04:49.252Z. Archive
+  loaded at tip 976,476 by 20:05:28Z, integrity OK; RPC answered at
+  20:05:33Z. At 20:05:43.657Z: `[chainwork] spot check: 40 of 976477
+  record(s) agree with their headers`, nothing backfilled, and the file's
+  existing records byte-identical to the saved copy.
+- **Verified live:**
+  - New block 976,477 stored at 20:05:49Z and applied at 20:05:51.620Z with
+    the oracle's hash
+    (`00000000000000000001b4dd5c0614901b4f97bebaaaa04302d115366e847a14`)
+    and the oracle's chainwork
+    (`000000000000000000000000000000000000000159860955f115ed58cfe780e8`).
+  - `NRestarts=0` and `active` at 11 minutes, `WatchdogTimestamp`
+    advancing (20:15:30Z); no `[crash]`, `FATAL` or tip-watch line; 60
+    open descriptors in the main process; 10 peers; clients back on the RPC
+    and facade ports.
+- **Mempool reload:** 60,087 of 67,621 by 20:07:03Z; 7,534 refused. Block
+  976,477 arrived during the reload with 7,682 transactions, of which
+  7,537 were not yet in the pool, so the refusals are most likely that
+  block's own transactions, whose inputs it had just spent. The line's
+  per-reason counts all read 0: entries refused on a retry pass are added
+  to the total without a reason (`rpc_node.c`, `mpd_retry_passes`), a
+  reporting gap that predates this deploy (the 2026-10-12 reload shows 850
+  the same way). Not fixed here.
+- **Rollback:** relink to `deploy-20261118a` and restart
+  (`70-watchdog.conf` stays). No on-disk format changed.

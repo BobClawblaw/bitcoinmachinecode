@@ -417,13 +417,91 @@ static unsigned hdr_bits(const unsigned char hdr[80]){
  * has exactly one cumulative record per index.dat height, always.
  * ======================================================================== */
 
+/* ---- chainwork.dat spot check (2026-11-18) -------------------------------
+ * chainwork.dat is only as good as the build that wrote it, and nothing else
+ * checks it: a wrong file makes fork choice refuse a valid reorg (or accept
+ * a lighter chain) while every other part of the node looks healthy. An
+ * early Windows-port build wrote wrong per-header work, and that node refused
+ * a valid reorg as "below -minimumchainwork". (This node's own file once
+ * diverged from Core above segwit activation, 481,824, and was rewritten by
+ * daemon/chainwork_build.c; block_work was not at fault there.)
+ *
+ * At open, a sample of records is checked: the work a record adds over the
+ * one below it must equal block_work() of that height's stored header. The
+ * sample is the last CW_SPOT_TAIL records and CW_SPOT_SPREAD heights spread
+ * evenly from 0 to the end, so a file written by a wrong work computation is
+ * caught at once. A few wrong records between samples are not; this is a
+ * spot check, a few dozen header reads, not a scan.
+ *
+ * A header is used only when it hashes to its own index record: a corrupt
+ * blk frame (block 970,357 carried our own HTTP replies over its header from
+ * 2026-10-07 to 11-08) would otherwise condemn a correct file. Pruned and
+ * unreadable heights are skipped; a pruned height's record may hold zero or
+ * real work depending on when it was written (reorg_chainwork_sync).
+ *
+ * Returns the number of records checked, or -1 with *bad_h, got and want set
+ * at the first record that disagrees. */
+#define CW_SPOT_TAIL   8
+#define CW_SPOT_SPREAD 32
+static void cw_sub(unsigned char out[16], const unsigned char a[16], const unsigned char b[16]){
+    uint64_t alo, ahi, blo, bhi;
+    memcpy(&alo, a, 8); memcpy(&ahi, a+8, 8); memcpy(&blo, b, 8); memcpy(&bhi, b+8, 8);
+    uint64_t lo = alo - blo, hi = ahi - bhi - (alo < blo);
+    memcpy(out, &lo, 8); memcpy(out+8, &hi, 8);
+}
+static long chainwork_spot_check(void* st, long nrec, long* bad_h,
+                                 unsigned char got[16], unsigned char want[16]){
+    long last = nrec - 1, tip = store_tip(st), checked = 0;
+    if (last > tip) last = tip;               /* records past the archive tip have no header to check */
+    if (last < 0) return 0;
+    long hs[CW_SPOT_TAIL + CW_SPOT_SPREAD]; int nh = 0;
+    for (int i = 0; i < CW_SPOT_TAIL && last - i >= 0; i++) hs[nh++] = last - i;
+    for (int i = 0; i < CW_SPOT_SPREAD; i++){
+        long h = last * i / CW_SPOT_SPREAD;
+        if (h < last - (CW_SPOT_TAIL - 1)) hs[nh++] = h;   /* the tail is already in */
+    }
+    for (int i = 0; i < nh; i++){
+        long h = hs[i];
+        unsigned char hdr[80], bh[32], ih[32], cum[16], below[16];
+        if (read_stored_header(st, h, hdr) != 1) continue;
+        block_hash(bh, hdr);
+        if (!our_hash_at(st, h, ih) || memcmp(bh, ih, 32) != 0) continue;
+        if (store_chainwork_get_at(st, h, cum) != 1) continue;
+        if (h == 0) memset(below, 0, 16);
+        else if (store_chainwork_get_at(st, h - 1, below) != 1) continue;
+        cw_sub(got, cum, below);
+        block_work(want, hdr_bits(hdr));
+        checked++;
+        if (memcmp(got, want, 16) != 0){ *bad_h = h; hdr_fd_close(); return -1; }
+    }
+    hdr_fd_close();
+    return checked;
+}
+
 long reorg_chainwork_open(void* st){
     g_cw_open = 0;
     if (store_chainwork_init(st) != 1) return -1;
     /* store_chainwork_init zeroes the cache even when the file already has
      * records. Without this reload our own tip would look weightless and
      * EVERY candidate chain would compare as heavier. */
-    if (store_chainwork_reload(st) < 0) return -1;
+    long nrec = store_chainwork_reload(st);
+    if (nrec < 0) return -1;
+    long bad_h = -1; unsigned char got[16], want[16];
+    long checked = chainwork_spot_check(st, nrec, &bad_h, got, want);
+    if (checked < 0){
+        /* Every cumulative record from bad_h up is wrong, and the records
+         * below it cannot be trusted either: the file was written by
+         * something that computed work wrongly. Empty it; the caller's
+         * reorg_chainwork_sync rebuilds it from the stored headers, the same
+         * path that backfilled it the first time. */
+        char gs[40], ws[40]; work_str(gs, got); work_str(ws, want);
+        fprintf(stderr, "[chainwork] record %ld adds %s over the one below it, but its header's nBits give %s -- "
+                        "chainwork.dat does not match this archive's headers; emptied it (%ld record(s)) to rebuild\n",
+                bad_h, gs, ws, nrec);
+        if (store_chainwork_truncate(st, -1) != 1) return -1;
+    } else if (nrec > 0){
+        fprintf(stderr, "[chainwork] spot check: %ld of %ld record(s) agree with their headers\n", checked, nrec);
+    }
     g_cw_open = 1;
     return 1;
 }
