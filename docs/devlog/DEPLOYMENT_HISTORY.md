@@ -3038,3 +3038,46 @@ were still on disk. Nothing in them is new measurement.
   the same way). Not fixed here.
 - **Rollback:** relink to `deploy-20261118a` and restart
   (`70-watchdog.conf` stays). No on-disk format changed.
+
+## 2026-11-19 23:24Z — `deploy-20261119a`: a mempool reload's refusals carry their reasons (PR #503)
+
+- **What:** `main` at `86eac291`. #503: when a reload's retry pass admits
+  nothing, `mpd_retry_passes` adds the entries still deferred to the
+  refused total and to `missing-inputs`, the reason they were deferred
+  for. It used to reset the total to "before the pass + still deferred",
+  which gave those entries no reason and dropped any other refusal made
+  during the pass from the total. That is the gap the 20261118b entry
+  above left open.
+- **Checked before the deploy:** the x86 gate passed with 0 failures. The
+  new `test_mempool_load_partial` case (1 accepted, 2 refused for missing
+  inputs on every attempt, 1 refused for missing inputs and then on policy)
+  fails 3 of its 7 checks without the fix: 2 refused, 0 missing, 1 policy.
+- Built from clean (`make -B daemon/bmcbitcoind` and the helpers by name) in
+  a clean worktree at the merge commit, with no warnings. All five exec'd
+  helpers were byte-identical; none was replaced. Wallet files were saved
+  first. `MALLOC_ARENA_MAX=4` and `70-watchdog.conf` stay in place.
+- **Before the restart:** `deploy-20261118b`, up since 2026-11-18 20:04Z
+  (27 h), tip 976,652 = the Core v31.1 oracle.
+- **Stopped and started:** SIGTERM at 23:24:06Z. 56,876 transactions were
+  saved to `mempool.dat`; the worker exited with status 0 and the lock was
+  released in 0.1 s. Archive loaded at tip 976,652; RPC answered by
+  23:24:41Z. At 23:25:00Z: `[chainwork] spot check: 40 of 976653 record(s)
+  agree with their headers`.
+- **Mempool reload, the line this deploy fixes:** `49682 of 56876 in the
+  pool ...; 7194 refused: 7194 missing-inputs, 0 conflicting, 0 policy, 0
+  no-ack, 0 other (7194 re-offered, 0 then accepted)` at 23:25:59Z. The
+  reasons now sum to the total. Blocks 976,653 (6,339 transactions) and
+  976,654 (7,831) both arrived during the reload.
+- **Verified live:**
+  - New block 976,653 applied at 23:25:07Z and 976,654 at 23:25:36Z, each
+    with the oracle's hash and chainwork
+    (`00000000000000000000e9d32d6536df8e9052a8c08085c714c068458e9f5ac5`,
+    `00000000000000000001ff15f370ddea4c1f7c63050e569919e2a3b7c031ae61`).
+  - `NRestarts=0` and `active` at 10 minutes (23:34:32Z),
+    `WatchdogTimestamp` advancing (23:32:12Z); no `[crash]` or `FATAL`
+    line; 71 open descriptors in the main process; 10 peers; tip 976,654 =
+    the oracle.
+- **Note:** the boot line `checklevel=3 over 6 block(s) ...: 1 problem(s)`
+  also appeared at the 2026-11-18 boot; it predates this deploy.
+- **Rollback:** relink to `deploy-20261118b` and restart
+  (`70-watchdog.conf` stays). No on-disk format changed.
