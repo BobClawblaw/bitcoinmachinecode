@@ -3,7 +3,9 @@
 Bitcoin Machine Code (`bmc`) is a full validating Bitcoin node for Linux on
 x86-64 and macOS on Apple silicon (Darwin, arm64), written in hand-authored
 assembly (NASM for x86-64, AArch64 for Apple silicon) with a C orchestration
-layer shared by both. Both build from `main`.
+layer shared by both. Both build from `main`. The same x86-64 code also runs
+natively on Windows through a Linux syscall emulation layer (`port/win/`,
+see [Windows](#windows-x86-64)).
 Every line of assembly and C in the tree is AI-authored. It downloads and
 verifies the chain from genesis (with Core's `assumevalid` default;
 `assumevalid=0` evaluates every script), maintains a chain-scale UTXO set that matches Bitcoin Core's
@@ -228,6 +230,10 @@ testnet4, signet (public or custom) and regtest.
   AArch64 / Mach-O counterpart in `port/osx/`, built with Apple clang and
   `python3` only (no NASM, no GNU toolchain). See
   [macOS / Apple silicon](#macos--apple-silicon) below.
+- **Windows 10/11 on x86-64:** the x86-64 assembly and the shared C, built
+  with LLVM/clang, NASM and the Windows SDK import libraries, over the Linux
+  syscall emulation in `port/win/winsys/`. See [Windows](#windows-x86-64)
+  below.
 - Disk: about 1 TB for a full mainnet archive plus the UTXO store. A pruned
   node fits in a few GB.
 - Memory: several GB. The UTXO memtable (`dbcache`, default 450 MiB, Core's) grows
@@ -302,6 +308,39 @@ UTXO set identical to Core's on every `gettxoutsetinfo` field
 | [`port/OSX_STRATEGY.md`](port/OSX_STRATEGY.md) | the plan of record, written before the port began |
 | [`port/osx/BENCHMARKS_OSX.md`](port/osx/BENCHMARKS_OSX.md) | timings on Apple silicon |
 | `worklog/*-osx.md`, `worklog/*-note-for-x86*.md` | the Mac side's daily trail and its notes to the x86 side |
+
+## Windows (x86-64)
+
+The node also builds and runs natively on Windows 10/11 x86-64, with no
+WSL, no Cygwin and no MSVC runtime. The x86-64 assembly and the shared C
+are the code Linux runs. The C is compiled for Linux to LLVM IR and
+retargeted to Windows, the NASM modules are assembled `-f win64`, and
+`port/win/winsys/` emulates the Linux syscalls they make on Win32/NT,
+`fork` included. So a change to `main` needs no Windows counterpart; it
+builds on Windows as it is. The Windows work happens on the `windows-port`
+branch and reaches `main` through PRs, the same model as the Mac's.
+
+```bat
+python port\win\build.py daemon:bmcbitcoind daemon:bmc_cli daemon:bmc_wallet_cli
+python port\win\run_tests.py         :: the Windows gate: asm/Makefile's test list + the port's tests
+port\win\out\bin\bmcbitcoind.exe serve C:\bmc-data
+```
+
+Requirements: LLVM/clang (with `lld-link`), NASM, the Windows SDK import
+libraries (Visual Studio Build Tools or a standalone SDK), Python 3, and Git
+for Windows for the gate's shell-script tests. The gate runs the
+`./tests/...` lines of `asm/Makefile`'s `test:` recipe, so a test added on
+`main` is in the Windows gate without a change. Four tests are N/A on
+Windows, each for a reason the platform imposes (a pty, page-cache
+residency, ptrace, ELF headers; listed in
+[`port/WIN_PORT.md`](port/WIN_PORT.md)). A signet node runs from
+`windows-port` natively on Windows, synced to the tip.
+
+| document | contents |
+|---|---|
+| [`port/WIN_STATE.md`](port/WIN_STATE.md) | the port's dated state: what landed, how it was proven, the numbers (read first) |
+| [`port/WIN_PORT.md`](port/WIN_PORT.md) | the design, the build, the gate, the branch model |
+| `worklog/*-win.md` | the Windows side's daily trail |
 
 ## Quick start
 
@@ -643,8 +682,9 @@ in [`docs/FEATURE_GAPS.md`](docs/FEATURE_GAPS.md):
 | [`docs/audits/`](docs/audits/) | security audits and reviews, and the project's responses |
 | [`docs/history/`](docs/history/) | long-form accounts of the larger pieces of work, each with a PDF edition |
 | [`docs/devlog/`](docs/devlog/) | development log: incident log, plans, benchmarks, assessments |
-| `worklog/` | dated development action logs (`*-osx.md` the Mac side's; `*-note-for-osx*.md` / `*-note-for-x86*.md` the two sides' notes to each other) |
+| `worklog/` | dated development action logs (`*-osx.md` the Mac side's, `*-win.md` the Windows side's; `*-note-for-osx*.md` / `*-note-for-x86*.md` / `*-note-for-win*.md` the sides' notes to each other) |
 | [`port/OSX_STATE.md`](port/OSX_STATE.md) | the macOS / Apple silicon port: state, roadmap and branch model under `port/` |
+| [`port/WIN_STATE.md`](port/WIN_STATE.md) | the Windows x86-64 port: state, design and branch model under `port/` |
 | [`config/bitcoin.sample.conf`](config/bitcoin.sample.conf) | every configuration key at its default |
 | [`validation/`](validation/) | differential test corpus and oracle scripts against Bitcoin Core |
 
