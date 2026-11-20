@@ -4,6 +4,25 @@ Updated whenever the status materially changes. The newest section is at
 the top. Companion to [`WIN_PORT.md`](WIN_PORT.md), which covers the design,
 the build, the gate and the branch model.
 
+## 2026-11-20: owner-only DACLs, no WER dumps
+
+#499 is merged. The two security findings from its review came back as
+`fix/2026-11-20-win-security` (#505), written on the x86 side without a
+Windows toolchain, and were built, gated and merged into `windows-port`
+here (with `main` through #504).
+- *Owner-only files.* A file or directory whose mode gives group and other
+  nothing gets a protected DACL (this user and SYSTEM), at creation and by
+  `chmod`/`fchmod`; giving group or other bits back restores the inherited
+  DACL. `test_win_owner_only`: 23 checks. Revert check: with the DACL calls
+  disabled, its 6 owner-only checks fail.
+- *No WER dump.* An unhandled fault ends with `TerminateProcess` and the
+  exception code, so `wait4` still reads SIGSEGV. `test_win_crash_exit`:
+  5 checks. The manual `LocalDumps` check (administrator) is in
+  `worklog/2026-11-20-note-for-win.md`.
+
+**Gate run 22: 505 PASS, 0 SKIP, 4 N/A, 0 FAIL, 0 TIMEOUT** over 509
+commands. Nothing else needed changing for the 0700 `mkdtemp` directories.
+
 ## 2026-11-19: merged main through #503
 
 #498 (the shared shutdown fix) is merged. The x86 gate passed on it, and a
