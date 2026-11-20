@@ -4,6 +4,17 @@ Updated whenever the status materially changes. The newest section is at
 the top. Companion to [`WIN_PORT.md`](WIN_PORT.md), which covers the design,
 the build, the gate and the branch model.
 
+## 2026-11-19: merged main through #503
+
+#498 (the shared shutdown fix) is merged. The x86 gate passed on it, and a
+70 ms delay after the lock scan made the unfixed build fail 12 of 12 and
+the fixed one pass 12 of 12 on Linux. `windows-port` merged `origin/main`
+through #503 (no conflicts; shared C in `daemon/main.c`, `reorg.c` and
+`rpc_node.c`, plus their tests).
+
+**Gate run 21: 503 PASS, 0 SKIP, 4 N/A, 0 FAIL, 0 TIMEOUT** over 507
+commands, the same as runs 18 to 20.
+
 ## 2026-11-18: no SKIP rows, AF_UNIX datagrams
 
 PRs: #498 (the shared shutdown fix) and #499 (this branch), merged with
