@@ -3094,10 +3094,23 @@ test, and the bug was in the measurement.
   records, 0, the block invalidated. `validation/zmq_sequence_core_diff.py`
   against v31.1: 51 passed, 0 failed (before: aborted at its invalidate
   phase on -5).
-- **Observed, not yet measured further:** right after a reorg,
+- ~~**Observed, not yet measured further:** right after a reorg,
   `getbestblockhash` names the new tip about 0.3 s before the hash index can
   resolve it (`[idx] fold` lands after `[reorg] complete`); a
-  `getblockheader` of the new tip in that window answers -5.
+  `getblockheader` of the new tip in that window answers -5.~~
+  **Not reproduced (2026-11-20).** `validation/tip_header_window.py` polls
+  bmc with no pause from four connections through Core-made reorgs one and
+  three blocks deep, passing each tip hash (from `getbestblockhash`, or
+  `getblockcount` then `getblockhash`) straight to `getblockheader`. On main
+  6f514345: 10 of 10 rounds reorged, 1,631,147 polls, 0 misses. The build
+  this entry was written on (b004bb27) gave 0 misses in 3,171,449 polls over
+  18 reorgs. The code agrees: every chain RPC calls `refresh()` first, which
+  rewinds the hash index past rewritten records and folds every stored height
+  up to the tip before the lookup. The log order quoted above is not evidence
+  of a window: an `[idx] fold` pass that adds blocks within 5 s of the last
+  logged one is not logged. The -5 seen on 11-04 is unexplained; nothing
+  since has been found to fix it, and the 11-04 test (the Lightning run) was
+  not repeated.
 - ~~**OPEN: LND runs against this node in its pre-0.19 compatibility
   mode.**~~ **CLOSED 2026-11-04 (decided with the operator).** LND's RPC
   client (btcd `rpcclient/backend_version.go`) does not read `version`; it
