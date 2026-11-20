@@ -213,6 +213,8 @@ static ws_desc *std_desc(DWORD which)
 	return d;
 }
 
+static void owner_only_init(void);
+
 void ws_fd_init(void)
 {
 	grow(3);
@@ -226,6 +228,7 @@ void ws_fd_init(void)
 		}
 		install_at(d, i, 0);
 	}
+	owner_only_init();                         /* after fd 2 exists: it may say it failed */
 }
 
 /* ---- time conversion ---- */
@@ -312,6 +315,172 @@ static int mode_set_path(const wchar_t *w, unsigned mode)
 	int r = mode_set_handle(h, mode);
 	CloseHandle(h);
 	return r;
+}
+
+/* -1 when the file carries no mode or cannot be opened */
+static int mode_get_path(const wchar_t *w)
+{
+	HANDLE h = CreateFileW(w, FILE_READ_EA | FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+			       NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+	if (h == INVALID_HANDLE_VALUE)
+		return -1;
+	int r = mode_get_handle(h);
+	CloseHandle(h);
+	return r;
+}
+
+/* ---- owner-only access: the DACL behind mode bits that give group and
+ * other nothing.
+ *
+ * Linux enforces mode bits; Windows enforces the DACL, and BMCMODE above
+ * only records the bits. A file created 0600 -- the I2P key, the wallet's
+ * .pass file, the RPC cookie, the address book -- kept the DACL it
+ * inherited from its directory, readable by any local user the directory
+ * let read, while stat() said 0600. Now a file or directory whose mode has
+ * no group/other bits gets a protected DACL: full access for this process's
+ * user and for SYSTEM (root's counterpart), nothing inherited. A directory's
+ * ACEs are inheritable, so what is created inside it is owner-only too
+ * (stricter than Linux, where the directory alone keeps others out).
+ *
+ * At creation the DACL goes in through the security attributes of
+ * CreateFileW / CreateDirectoryW, so the file never exists readable. chmod
+ * and fchmod to owner-only bits put it on; chmod giving group or other bits
+ * back to a file that was owner-only restores the inherited DACL. A file
+ * that was not owner-only keeps whatever DACL it has, including one set by
+ * hand.
+ *
+ * advapi32 is bound once at start (ws_fd_init), before any fork, so a clone
+ * inherits it and never loads a DLL. If binding fails, the start says so on
+ * stderr and files get their directory's DACL, as before. ---- */
+#define OO_SE_FILE_OBJECT 1                    /* SE_OBJECT_TYPE (accctrl.h) */
+typedef BOOL (WINAPI *oo_opt_fn)(HANDLE, DWORD, PHANDLE);
+typedef BOOL (WINAPI *oo_gti_fn)(HANDLE, TOKEN_INFORMATION_CLASS, LPVOID, DWORD, PDWORD);
+typedef BOOL (WINAPI *oo_cwks_fn)(WELL_KNOWN_SID_TYPE, PSID, PSID, DWORD *);
+typedef DWORD (WINAPI *oo_gls_fn)(PSID);
+typedef BOOL (WINAPI *oo_ia_fn)(PACL, DWORD, DWORD);
+typedef BOOL (WINAPI *oo_aaae_fn)(PACL, DWORD, DWORD, DWORD, PSID);
+typedef BOOL (WINAPI *oo_isd_fn)(PSECURITY_DESCRIPTOR, DWORD);
+typedef BOOL (WINAPI *oo_ssdd_fn)(PSECURITY_DESCRIPTOR, BOOL, PACL, BOOL);
+typedef BOOL (WINAPI *oo_ssdc_fn)(PSECURITY_DESCRIPTOR, SECURITY_DESCRIPTOR_CONTROL, SECURITY_DESCRIPTOR_CONTROL);
+typedef DWORD (WINAPI *oo_ssi_fn)(HANDLE, int, SECURITY_INFORMATION, PSID, PSID, PACL, PACL);
+typedef DWORD (WINAPI *oo_snsi_fn)(LPWSTR, int, SECURITY_INFORMATION, PSID, PSID, PACL, PACL);
+
+static int oo_ready;
+static DWORD oo_acl_file[64], oo_acl_dir[64];  /* 256 bytes each; two ACEs need at most 160 */
+static DWORD oo_acl_empty[2];                  /* no ACEs: with UNPROTECTED, "inherited only" */
+static SECURITY_DESCRIPTOR oo_sd_file, oo_sd_dir;
+static oo_ssi_fn oo_set_security_info;
+static oo_snsi_fn oo_set_named_security_info;
+
+static int owner_only_mode(unsigned mode) { return (mode & 077) == 0; }
+
+/* NULL when ready, else what failed */
+static const char *owner_only_bind(void)
+{
+	HMODULE m = LoadLibraryW(L"advapi32.dll");
+	if (!m)
+		return "advapi32.dll did not load";
+#define OO_BIND(T, v, name) T v = (T)(void *)GetProcAddress(m, name); if (!v) return name " is missing"
+	OO_BIND(oo_opt_fn, opt, "OpenProcessToken");
+	OO_BIND(oo_gti_fn, gti, "GetTokenInformation");
+	OO_BIND(oo_cwks_fn, cwks, "CreateWellKnownSid");
+	OO_BIND(oo_gls_fn, gls, "GetLengthSid");
+	OO_BIND(oo_ia_fn, ia, "InitializeAcl");
+	OO_BIND(oo_aaae_fn, aaae, "AddAccessAllowedAceEx");
+	OO_BIND(oo_isd_fn, isd, "InitializeSecurityDescriptor");
+	OO_BIND(oo_ssdd_fn, ssdd, "SetSecurityDescriptorDacl");
+	OO_BIND(oo_ssdc_fn, ssdc, "SetSecurityDescriptorControl");
+	OO_BIND(oo_ssi_fn, ssi, "SetSecurityInfo");
+	OO_BIND(oo_snsi_fn, snsi, "SetNamedSecurityInfoW");
+#undef OO_BIND
+	HANDLE tok;
+	if (!opt(GetCurrentProcess(), TOKEN_QUERY, &tok))
+		return "OpenProcessToken failed";
+	u64 tu[(sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE) / sizeof(u64) + 1];   /* u64: TOKEN_USER starts with a pointer */
+	DWORD got = 0;
+	BOOL ok = gti(tok, TokenUser, tu, sizeof tu, &got);
+	CloseHandle(tok);
+	if (!ok)
+		return "GetTokenInformation(TokenUser) failed";
+	PSID user = ((TOKEN_USER *)tu)->User.Sid;
+	DWORD sys[SECURITY_MAX_SID_SIZE / sizeof(DWORD) + 1], sl = sizeof sys;
+	if (!cwks(WinLocalSystemSid, NULL, (PSID)sys, &sl))
+		return "CreateWellKnownSid(LocalSystem) failed";
+	DWORD need = (DWORD)sizeof(ACL) + 2 * (DWORD)(sizeof(ACCESS_ALLOWED_ACE) - sizeof(DWORD)) + gls(user) + gls((PSID)sys);
+	if (need > sizeof oo_acl_file)
+		return "the owner-only ACL does not fit";
+	for (int dir = 0; dir < 2; dir++) {
+		PACL acl = (PACL)(dir ? oo_acl_dir : oo_acl_file);
+		SECURITY_DESCRIPTOR *sd = dir ? &oo_sd_dir : &oo_sd_file;
+		DWORD inh = dir ? (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) : 0;
+		if (!ia(acl, sizeof oo_acl_file, ACL_REVISION) ||
+		    !aaae(acl, ACL_REVISION, inh, FILE_ALL_ACCESS, user) ||
+		    !aaae(acl, ACL_REVISION, inh, FILE_ALL_ACCESS, (PSID)sys) ||
+		    !isd(sd, SECURITY_DESCRIPTOR_REVISION) ||
+		    !ssdd(sd, TRUE, acl, FALSE) ||
+		    !ssdc(sd, SE_DACL_PROTECTED, SE_DACL_PROTECTED))
+			return "building the owner-only DACL failed";
+	}
+	if (!ia((PACL)oo_acl_empty, sizeof oo_acl_empty, ACL_REVISION))
+		return "building the empty DACL failed";
+	oo_set_security_info = ssi;
+	oo_set_named_security_info = snsi;
+	oo_ready = 1;
+	return NULL;
+}
+
+static void owner_only_init(void)
+{
+	const char *why = owner_only_bind();
+	if (why) {
+		ws_write_stderr("[win] owner-only access unavailable (");
+		ws_write_stderr(why);
+		ws_write_stderr("): files created 0600 keep their directory's permissions\n");
+	}
+}
+
+/* security attributes for creating a file or directory with mode bits
+ * `mode` (umask applied): owner-only, or NULL for the inherited DACL */
+static SECURITY_ATTRIBUTES *owner_only_sa(SECURITY_ATTRIBUTES *sa, unsigned mode, int dir)
+{
+	if (!oo_ready || !owner_only_mode(mode))
+		return NULL;
+	sa->nLength = sizeof *sa;
+	sa->lpSecurityDescriptor = dir ? &oo_sd_dir : &oo_sd_file;
+	sa->bInheritHandle = FALSE;
+	return sa;
+}
+
+/* chmod / fchmod from `oldmode` (-1: none recorded) to `mode`. `h`, when
+ * not NULL, is open with WRITE_DAC; the path is used otherwise, and always
+ * to restore inheritance (SetNamedSecurityInfoW recomputes the inherited
+ * ACEs from the parent). 0 or -errno. */
+static i64 owner_only_chmod(HANDLE h, const wchar_t *path, int dir, int oldmode, unsigned mode)
+{
+	if (!oo_ready)
+		return 0;
+	DWORD r;
+	if (owner_only_mode(mode)) {
+		SECURITY_INFORMATION si = DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
+		PACL acl = (PACL)(dir ? oo_acl_dir : oo_acl_file);
+		if (h)
+			r = oo_set_security_info(h, OO_SE_FILE_OBJECT, si, NULL, NULL, acl, NULL);
+		else if (path)
+			r = oo_set_named_security_info((LPWSTR)path, OO_SE_FILE_OBJECT, si, NULL, NULL, acl, NULL);
+		else
+			return -L_EPERM;
+	} else if (oldmode >= 0 && owner_only_mode((unsigned)oldmode)) {
+		if (!path)
+			return -L_EPERM;
+		r = oo_set_named_security_info((LPWSTR)path, OO_SE_FILE_OBJECT,
+					       DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+					       NULL, NULL, (PACL)oo_acl_empty, NULL);
+	} else {
+		return 0;
+	}
+	if (r == ERROR_NOT_SUPPORTED || r == ERROR_INVALID_FUNCTION)
+		return 0;                              /* FAT/exFAT: no DACLs to set, as before */
+	return r == ERROR_SUCCESS ? 0 : ws_err(r);
 }
 
 /* Linux x86_64 struct stat (kernel layout, what musl's kstat expects) */
@@ -739,7 +908,12 @@ static i64 sys_open(int dirfd, const char *path, int flags, int mode)
 		if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_READONLY) && !isdir)
 			SetFileAttributesW(w, attrs & ~FILE_ATTRIBUTE_READONLY);
 	}
-	HANDLE h = CreateFileW(w, acc, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, disp,
+	/* a file this call creates with owner-only bits is created owner-only
+	 * (Windows applies the attributes only when it creates the file) */
+	SECURITY_ATTRIBUTES sa;
+	SECURITY_ATTRIBUTES *psa = (flags & L_O_CREAT) && !isdir
+		? owner_only_sa(&sa, (unsigned)mode & ~(unsigned)umask_bits & 07777, 0) : NULL;
+	HANDLE h = CreateFileW(w, acc, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, psa, disp,
 			       FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS | lnk, NULL);
 	if (h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_USER_MAPPED_FILE && (flags & L_O_TRUNC) && !isdir) {
 		/* O_TRUNC on a file something still maps (a reader's cached view of
@@ -748,13 +922,20 @@ static i64 sys_open(int dirfd, const char *path, int flags, int mode)
 		 * name is free -- and create the file afresh. A reader that checks
 		 * what it mapped (the LSM's generation) sees the old file whole
 		 * rather than Linux's truncated one. */
+		/* the replacement keeps the old file's bits, and with them an
+		 * owner-only DACL: an O_TRUNC of the 0600 key must not leave a
+		 * readable one behind */
+		int oldmode = mode_get_path(w);
 		if (delete_path(w, 0) == 0) {
-			h = CreateFileW(w, acc, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, CREATE_NEW,
+			if (oldmode >= 0)
+				mode = oldmode;
+			else if (!(flags & L_O_CREAT))
+				mode = 0644;
+			psa = owner_only_sa(&sa, (unsigned)mode & ~(unsigned)umask_bits & 07777, 0);
+			h = CreateFileW(w, acc, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, psa, CREATE_NEW,
 					FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, NULL);
 			if (h != INVALID_HANDLE_VALUE) {
 				disp = CREATE_NEW;
-				if (!(flags & L_O_CREAT))
-					mode = 0644;
 				flags |= L_O_CREAT;
 			}
 		} else {
@@ -1783,10 +1964,12 @@ static i64 sys_mkdir(int dirfd, const char *path, int mode)
 	wchar_t *w = ws_path(dirfd, path, &err);
 	if (!w)
 		return err;
-	BOOL ok = CreateDirectoryW(w, NULL);
+	unsigned eff = (unsigned)mode & ~(unsigned)umask_bits & 07777;
+	SECURITY_ATTRIBUTES sa;
+	BOOL ok = CreateDirectoryW(w, owner_only_sa(&sa, eff, 1));
 	DWORD e = GetLastError();
 	if (ok) {
-		mode_set_path(w, (unsigned)mode & ~(unsigned)umask_bits & 07777);
+		mode_set_path(w, eff);
 		ns_changed();
 	}
 	ws_free(w);
@@ -2159,8 +2342,12 @@ static i64 sys_chmod(int dirfd, const char *path, unsigned mode)
 		a = GetFileAttributesW(w);
 	}
 	i64 r = a == INVALID_FILE_ATTRIBUTES ? ws_err(GetLastError()) : 0;
-	if (!r)
-		mode_set_path(w, mode);
+	if (!r) {
+		int oldmode = mode_get_path(w);
+		r = owner_only_chmod(NULL, w, (a & FILE_ATTRIBUTE_DIRECTORY) != 0, oldmode, mode & 07777);
+		if (!r)
+			mode_set_path(w, mode);
+	}
 	ws_free(w);
 	return r;
 }
@@ -2170,18 +2357,27 @@ static i64 sys_fchmod(int fd, unsigned mode)
 	ws_desc *d = ws_fd_get(fd);
 	if (!d)
 		return -L_EBADF;
+	i64 r = 0;
 	if (d->type == FT_FILE || d->type == FT_DIR) {
-		HANDLE wh = ReOpenFile(d->h, FILE_WRITE_EA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-				       d->type == FT_DIR ? FILE_FLAG_BACKUP_SEMANTICS : 0);
-		if (wh != INVALID_HANDLE_VALUE) {
-			mode_set_handle(wh, mode);
-			CloseHandle(wh);
-		} else if (d->wpath) {
-			mode_set_path(d->wpath, mode);
+		int dir = d->type == FT_DIR;
+		DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+		int oldmode = mode_get_handle(d->h);
+		HANDLE dh = ReOpenFile(d->h, WRITE_DAC | READ_CONTROL, share, dir ? FILE_FLAG_BACKUP_SEMANTICS : 0);
+		r = owner_only_chmod(dh != INVALID_HANDLE_VALUE ? dh : NULL, d->wpath, dir, oldmode, mode & 07777);
+		if (dh != INVALID_HANDLE_VALUE)
+			CloseHandle(dh);
+		if (!r) {
+			HANDLE wh = ReOpenFile(d->h, FILE_WRITE_EA, share, dir ? FILE_FLAG_BACKUP_SEMANTICS : 0);
+			if (wh != INVALID_HANDLE_VALUE) {
+				mode_set_handle(wh, mode);
+				CloseHandle(wh);
+			} else if (d->wpath) {
+				mode_set_path(d->wpath, mode);
+			}
 		}
 	}
 	ws_desc_put(d);
-	return 0;
+	return r;
 }
 
 i64 ws_sys_file(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6, int *handled)

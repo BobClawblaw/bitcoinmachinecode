@@ -726,12 +726,21 @@ void ws_crash_report(PEXCEPTION_POINTERS ep, const char *what)
 	}
 }
 
+/* An unhandled fault ends the process here, with the exception code as its
+ * exit status -- the status Windows would have given it, so wait4 still reads
+ * SIGSEGV and the rest (ws_fork.c status_of). Returning
+ * EXCEPTION_CONTINUE_SEARCH handed the crash to Windows Error Reporting, and
+ * SEM_NOGPFAULTERRORBOX only hides its dialog: with LocalDumps configured, or
+ * a report queued, WER writes a dump of the process, and this process holds
+ * the wallet seed. The Linux service runs with LimitCORE=0 for the same
+ * reason. A debugger, when attached, still sees the fault first. */
 static LONG WINAPI last_chance(PEXCEPTION_POINTERS ep)
 {
 	if (GetEnvironmentVariableA("BMC_WIN_CRASHLOG", NULL, 0))
 		ws_crash_report(ep, "bmc_win crash:");
 	ws_robust_release_all();
-	return EXCEPTION_CONTINUE_SEARCH;
+	TerminateProcess(GetCurrentProcess(), ep->ExceptionRecord->ExceptionCode);
+	return EXCEPTION_CONTINUE_SEARCH;              /* not reached */
 }
 
 void ws_sig_init(void)
