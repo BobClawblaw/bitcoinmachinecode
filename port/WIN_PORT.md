@@ -39,6 +39,25 @@ builds on Windows as it is, unless it calls a syscall (or a flag of one)
 that winsys does not emulate yet. In that case the call returns `ENOSYS` or
 `EINVAL` at run time, and the Windows gate shows the test that depends on it.
 
+## Security: what stands in for Linux's
+
+- **Mode bits.** Windows enforces the DACL, not mode bits; `BMCMODE` (an
+  NTFS extended attribute) only records them. A file or directory whose
+  mode gives group and other nothing (the 0600 keys, the wallet's `.pass`
+  file, the RPC cookie, a 0700 directory) gets a protected DACL: this
+  user and SYSTEM, full access, nothing inherited. It is set at creation,
+  so the file never exists readable, and by `chmod`/`fchmod`; a `chmod`
+  that gives group or other bits back restores the inherited DACL
+  (`ws_fd.c`, "owner-only access"). On FAT/exFAT there is no DACL to set.
+- **Crash dumps.** The Linux service runs with `LimitCORE=0` because the
+  process holds the wallet seed. An unhandled fault here ends in the
+  last-chance filter (`ws_sig.c`), which terminates the process with the
+  exception code instead of handing the crash to Windows Error Reporting,
+  so no WER dump is written. The exit status is unchanged.
+- **seccomp** is emulated inside the process for the tests that use it.
+  It is not a sandbox: a direct Win32 call bypasses it. The daemon does
+  not use seccomp.
+
 ## Building
 
 Requirements:
