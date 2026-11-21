@@ -3081,3 +3081,45 @@ were still on disk. Nothing in them is new measurement.
   also appeared at the 2026-11-18 boot; it predates this deploy.
 - **Rollback:** relink to `deploy-20261118b` and restart
   (`70-watchdog.conf` stays). No on-disk format changed.
+
+## 2026-11-21 00:32Z — `deploy-20261121a`: no strike for a pass that failed in, or just after, a host-wide silence (PR #508)
+
+- **What:** `main` at `0f954abc`. #508: a failing sync pass is not a
+  strike while the last moment a failing pass found the whole host silent
+  lies within its own window plus 25 s (`PASS_SILENCE_GRACE_MS`). It closes
+  the 2026-09-27 item where passes that waited through a silence and failed
+  just after it ended cost five legs their third strike. A lone leg still
+  counts. Also on `main` since the last deploy: #506 (Windows port only,
+  `asm/` unchanged) and #507 (a validation harness and docs).
+- **Checked before the deploy:** the x86 gate passed with 0 failures and no
+  warnings. `test_pass_silence_strike` passes 31 of 31; with the new rule
+  disabled, its check "three passes failing just after the silence ended
+  keep the leg" fails.
+- Built from clean (`make -B daemon/bmcbitcoind` and the helpers by name) in
+  a clean worktree at the merge commit, with no warnings. All five exec'd
+  helpers were byte-identical; none was replaced. Wallet files were saved
+  first. `MALLOC_ARENA_MAX=4` and `70-watchdog.conf` stay in place.
+- **Before the restart:** `deploy-20261119a`, up since 2026-11-19 23:24Z
+  (25 h), tip 976,807 = the Core v31.1 oracle; 163 open descriptors.
+- **Stopped and started:** SIGTERM at 00:32:21Z. The worker exited with
+  status 0 and the lock was released in 0.1 s. RPC answered by 00:33:02Z.
+  At 00:33:23Z: `[chainwork] spot check: 40 of 976808 record(s) agree with
+  their headers`. Mempool reload at 00:35:40Z: 61,504 of 61,504 admitted,
+  0 refused.
+- **Verified live:**
+  - New block 976,808 applied by 00:39:33Z with the oracle's hash and
+    chainwork
+    (`00000000000000000001c148115a290a8e731ebb888a464bd9690ba56c126b05`).
+  - `NRestarts=0` and `active` at 10 minutes (00:42:31Z),
+    `WatchdogTimestamp` advancing (00:40:28Z); no `[crash]` or `FATAL`
+    line; 63 open descriptors in the main process; 8 peers; tip 976,808 =
+    the oracle.
+- **Not yet seen on mainnet:** the new rule's log line (`... after the host
+  was last seen silent ... not a strike`) needs a host-wide silence; none
+  occurred in the first 10 minutes.
+- **Note:** `systemctl` warned that the unit "changed on disk". No file of
+  this unit changed after the running process started, and the loaded
+  limits, watchdog and environment matched the files; the flag came from a
+  system-wide reload on 2026-11-20. No `daemon-reload` was run.
+- **Rollback:** relink to `deploy-20261119a` and restart
+  (`70-watchdog.conf` stays). No on-disk format changed.
