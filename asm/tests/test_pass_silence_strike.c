@@ -19,6 +19,11 @@
  * socket down) -- so a probe does not start while no leg has heard anything
  * for PROBE_SILENCE_MS (300 ms here). reorg_probe_host_silent is the gate.
  *
+ * 9. (2026-11-20): the grace after a silence. A pass that failed while the
+ * host was silent, or within PASS_SILENCE_GRACE_MS (500 ms here) of the last
+ * time a failing pass found it silent, is not a strike either, even though
+ * another leg has data again by the time it fails. A lone leg still counts.
+ *
  * 7./8. (P2P-1/2/3, audit 2026-10-23): a pass that failed on the peer's
  * misbehaviour (where=12 an invalid header, where=14 bogus compact-block
  * indexes) scores it and closes the leg at once, and a pushed cmpctblock
@@ -33,6 +38,7 @@
 
 #define PASS_SILENCE_SLACK_MS 0
 #define PROBE_SILENCE_MS 300
+#define PASS_SILENCE_GRACE_MS 500
 #define main daemon_main_disabled
 #include "../daemon/main.c"
 #undef main
@@ -89,6 +95,8 @@ int main(void){
     three_failing_passes();
     ck("host-wide silence: the leg is kept after three failing passes", mux_out_fd[0] >= 0);
     ck("...and none of them was counted", g_sync_fail_streak[0] == 0);
+    ck("...and the silence is on record", g_host_silent_seen_ms != 0);
+    g_host_silent_seen_ms = 0;   /* 2.-8. are about passes with no silence on record (9. is the grace) */
 
     /* ---- 2. another leg heard data: the silence is this peer's, strikes count ---- */
     if (write(srv_fd[1], "x", 1) != 1){ perror("write"); return 2; }
@@ -198,6 +206,39 @@ int main(void){
       ck("...and the peer is scored to a ban", ctl_is_banned("198.51.100.24") == 1); }
     leg_shut(0);
     free(g_node_status); g_node_status = NULL;
+
+    /* ---- 9. the grace after a silence (2026-11-20). On 09-27 a 3-minute
+     * silence at 12:44Z ended inside passes that had been waiting through
+     * it; other legs had data again when they failed, so each counted, and
+     * five legs took their third strike within 33 s of the silence's end ---- */
+    mux_n_out = 3;
+    leg_open(0, "198.51.100.25:8333"); leg_open(1, "198.51.100.26:8333"); leg_open(2, "198.51.100.27:8333");
+    g_host_silent_seen_ms = 0;
+    nap_ms(800);
+    pass_fail_bookkeeping(1, 0, 3, 0.3);           /* a pass that failed during the silence */
+    ck("grace: a pass failing in the silence puts it on record", g_host_silent_seen_ms != 0 && g_sync_fail_streak[1] == 0);
+    if (write(srv_fd[2], "g", 1) != 1){ perror("write"); return 2; }   /* the silence ends */
+    nap_ms(20);
+    three_failing_passes();
+    ck("grace: three passes failing just after the silence ended keep the leg", mux_out_fd[0] >= 0);
+    ck("...and none of them was counted", g_sync_fail_streak[0] == 0);
+    nap_ms(900);                                    /* past the window (300 ms) + the grace (500 ms) */
+    if (write(srv_fd[2], "h", 1) != 1){ perror("write"); return 2; }
+    nap_ms(20);
+    three_failing_passes();
+    ck("grace over: three failing passes close the leg, as before", mux_out_fd[0] < 0);
+    leg_shut(0); leg_shut(1); leg_shut(2);
+    /* a lone leg: the mark is fresh, but with no other leg the silence proves nothing */
+    mux_n_out = 2;
+    leg_open(0, "198.51.100.28:8333"); leg_open(1, "198.51.100.29:8333");
+    g_host_silent_seen_ms = 0;
+    nap_ms(800);
+    pass_fail_bookkeeping(1, 0, 3, 0.3);
+    ck("grace: the silence is on record again", g_host_silent_seen_ms != 0);
+    leg_shut(1);
+    three_failing_passes();
+    ck("grace: a lone leg is closed by three failing passes inside the grace, as before", mux_out_fd[0] < 0);
+    leg_shut(0);
 
     close(g_lfd);
     printf("\n%s (%d checks, %d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", checks, fails);
