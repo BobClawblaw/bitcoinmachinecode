@@ -2918,12 +2918,18 @@ test, and the bug was in the measurement.
   is a MUTATED failure with its own hook: the archive back to h-1, no mark,
   no headers rollback, the delivering peer scored. It happened on the Mac at
   968,824; x86 production was not hit.
-- **Still open from this day:** the outage rule's tail. A ~3-minute
+- ~~**Still open from this day:** the outage rule's tail. A ~3-minute
   host-wide silence at 12:44Z (the second in two days; cause upstream of the
   box) had #316 withholding strikes while no leg received anything, but the
   passes whose 24.1 s window straddled the end of the silence still counted,
   and five legs lost their third strike within 33 s of it. A design call:
-  no strike for N s after a silence ends.
+  no strike for N s after a silence ends.~~ **Closed 2026-11-20:** a failing
+  pass is not a strike while the last moment a failing pass found the host
+  silent lies within its own window plus 25 s (`PASS_SILENCE_GRACE_MS`, one
+  mainnet pass rounded up); a lone leg still counts.
+  `tests/test_pass_silence_strike` section 9. No silence-then-close cluster
+  appears in the production logs kept since 10-11, so the rule has not yet
+  been seen to fire on mainnet.
 
 ## Update 2026-11-04 — Lightning on bmc: `echo`, the version number, and blocks reorged off
 

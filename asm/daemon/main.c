@@ -4093,6 +4093,19 @@ static int reorg_probe_host_silent(void){ return legs_heard_within(-1, PROBE_SIL
 #ifndef PASS_SILENCE_SLACK_MS
 #define PASS_SILENCE_SLACK_MS 5000
 #endif
+/* Test seam: how long after the host was last seen silent a failing pass is
+ * still not a strike, on top of the pass's own window. One pass's length
+ * (24.1 s on mainnet) rounded up: a pass that began during the silence or
+ * just after it ended fails on the silence, not on its peer. */
+#ifndef PASS_SILENCE_GRACE_MS
+#define PASS_SILENCE_GRACE_MS 25000
+#endif
+/* When a failing pass last found the whole host silent (CLOCK_MONOTONIC ms;
+ * 0 never). Only the "no leg heard anything, and another leg was there to
+ * hear it" verdict below sets it, so a lone leg's silence never does. In a
+ * pass helper it is set in the child and lost, and the parent's replay of
+ * the report sets it again from the same sockets. */
+static long long g_host_silent_seen_ms = 0;
 static void pass_fail_bookkeeping(int i, long ok, int fail_code, double sync_s){
     anchor_locator(mux_out_loc[i]);
     if(ok == 1){ g_sync_fail_streak[i] = 0; return; }   /* peer had nothing: normal at tip */
@@ -4127,11 +4140,29 @@ static void pass_fail_bookkeeping(int i, long ok, int fail_code, double sync_s){
      * drops. 21% of the sync-failed-3x closes since 09-11 came in such
      * clusters. Core keeps a peer through that (its ping timeout is 20 min).
      * With no other leg to compare against, the strike counts as before. */
-    if(legs_heard_within(i, (long long)(sync_s * 1000.0) + PASS_SILENCE_SLACK_MS) == 0){
+    long long window_ms = (long long)(sync_s * 1000.0) + PASS_SILENCE_SLACK_MS;
+    int heard = legs_heard_within(i, window_ms);
+    if(heard == 0){
+        g_host_silent_seen_ms = mono_now_ms();
         fprintf(stderr,"[mux:%d] %s: the pass failed (where=%d in %.1fs) while no leg received anything -- "
                        "the host's network, not this peer: not a strike (%d of 3)\n",
                 i, mux_out_host[i], fail_code, sync_s, g_sync_fail_streak[i]);
         return;
+    }
+    /* 2026-11-20: ... nor when the host was silent during the pass, or ended
+     * a silence just before it. The rule above sees only the end of the pass:
+     * on 09-27 a 3-minute silence at 12:44Z ended inside passes that had been
+     * waiting through it, other legs had data again by the time they failed,
+     * and five legs took their third strike within 33 s of the silence's end.
+     * A lone leg still counts (heard == -1, and it never sets the mark). */
+    if(heard == 1 && g_host_silent_seen_ms){
+        long long ago = mono_now_ms() - g_host_silent_seen_ms;
+        if(ago <= window_ms + PASS_SILENCE_GRACE_MS){
+            fprintf(stderr,"[mux:%d] %s: the pass failed (where=%d in %.1fs) %.1fs after the host was last seen silent -- "
+                           "the host's network, not this peer: not a strike (%d of 3)\n",
+                    i, mux_out_host[i], fail_code, sync_s, ago / 1000.0, g_sync_fail_streak[i]);
+            return;
+        }
     }
     g_sync_fail_streak[i]++;
     if(g_sync_fail_streak[i] >= 3){
