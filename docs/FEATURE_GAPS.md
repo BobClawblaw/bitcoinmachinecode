@@ -3115,8 +3115,11 @@ test, and the bug was in the measurement.
   up to the tip before the lookup. The log order quoted above is not evidence
   of a window: an `[idx] fold` pass that adds blocks within 5 s of the last
   logged one is not logged. The -5 seen on 11-04 is unexplained; nothing
-  since has been found to fix it, and the 11-04 test (the Lightning run) was
-  not repeated.
+  since has been found to fix it. The 11-04 test was repeated on 2026-11-21
+  against main 0f954abc (`validation/lightning_regtest_e2e.py`, LND v0.21.6
+  and Core Lightning v26.06.9 on bmc alone): PASS, 37 of 37 checks,
+  including the reorg phase. The harness deletes its working directory on a
+  pass, so the LND and bmc logs of that run were not searched for a -5.
 - ~~**OPEN: LND runs against this node in its pre-0.19 compatibility
   mode.**~~ **CLOSED 2026-11-04 (decided with the operator).** LND's RPC
   client (btcd `rpcclient/backend_version.go`) does not read `version`; it
